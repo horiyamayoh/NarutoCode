@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
 Count SVN diff size (added/deleted lines, files changed) in a revision range.
 
@@ -90,15 +90,15 @@ param(
     [string]$Path,
 
     [Parameter(Mandatory = $true)]
-    [Alias('Pre','Start','StartRevision','From')]
+    [Alias('Pre', 'Start', 'StartRevision', 'From')]
     [int]$FromRevision,
 
     [Parameter(Mandatory = $true)]
-    [Alias('Post','End','EndRevision','To')]
+    [Alias('Post', 'End', 'EndRevision', 'To')]
     [int]$ToRevision,
 
     [Parameter(Mandatory = $false)]
-    [Alias('Name','User')]
+    [Alias('Name', 'User')]
     [string]$Author,
 
     [Parameter(Mandatory = $false)]
@@ -124,13 +124,15 @@ param(
 
 # region Utility
 
-function Normalize-Extensions {
+function ConvertTo-NormalizedExtension
+{
     param([string[]]$Extensions)
 
     if (-not $Extensions) { return @() }
 
     $list = New-Object 'System.Collections.Generic.List[string]'
-    foreach ($e in $Extensions) {
+    foreach ($e in $Extensions)
+    {
         if ([string]::IsNullOrWhiteSpace($e)) { continue }
         $x = $e.Trim()
         if ($x.StartsWith('.')) { $x = $x.Substring(1) }
@@ -141,19 +143,21 @@ function Normalize-Extensions {
     return $list.ToArray() | Select-Object -Unique
 }
 
-function Invoke-SvnCommand {
+function Invoke-SvnCommand
+{
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory=$true)]
+        [Parameter(Mandatory = $true)]
         [string[]]$Arguments,
-        
-        [Parameter(Mandatory=$false)]
+
+        [Parameter(Mandatory = $false)]
         [string]$ErrorContext = "SVN command"
     )
 
     Write-Verbose "Executing: $script:SvnExecutable $($Arguments -join ' ')"
-    
-    try {
+
+    try
+    {
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = $script:SvnExecutable
         $psi.Arguments = $Arguments -join ' '
@@ -164,55 +168,62 @@ function Invoke-SvnCommand {
         # SVN出力は常にUTF-8で処理（日本語環境でもXMLパースを正しく行うため）
         $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
         $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
-        
+
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo = $psi
-        
+
         $null = $process.Start()
-        
+
         # 同期読み取り（XMLの構造を壊さないため）
         $outputText = $process.StandardOutput.ReadToEnd()
         $errorText = $process.StandardError.ReadToEnd()
-        
+
         # プロセスが完全に終了するまで待機（タイムアウト設定）
         $timeout = 300000 # 5分
-        if (-not $process.WaitForExit($timeout)) {
-            try { $process.Kill() } catch { }
+        if (-not $process.WaitForExit($timeout))
+        {
+            try { $process.Kill() } catch { Write-Verbose "Failed to kill process: $($_.Exception.Message)" }
             throw "$ErrorContext timed out after $($timeout/1000) seconds"
         }
-        
+
         $exitCode = $process.ExitCode
-        
+
         Write-Verbose "Exit code: $exitCode"
         Write-Verbose "Output length: $($outputText.Length) chars"
-        if ($errorText) {
+        if ($errorText)
+        {
             Write-Verbose "STDERR length: $($errorText.Length) chars"
             Write-Verbose "STDERR output: $errorText"
         }
-        
+
         # 終了コードが0以外の場合はエラー
-        if ($exitCode -ne 0) {
+        if ($exitCode -ne 0)
+        {
             $errorMsg = "$ErrorContext failed (exit code $exitCode)."
-            if ($errorText) {
+            if ($errorText)
+            {
                 $errorMsg += "`nSTDERR: $errorText"
             }
-            if ($outputText) {
+            if ($outputText)
+            {
                 $preview = $outputText
                 if ($preview.Length -gt 1000) { $preview = $preview.Substring(0, 1000) + "`n...(truncated)" }
                 $errorMsg += "`nSTDOUT: $preview"
             }
             throw $errorMsg
         }
-        
+
         return $outputText
     }
-    finally {
+    finally
+    {
         if ($process) { $process.Dispose() }
     }
 }
 
-function Parse-SvnXmlFromText {
-    param([Parameter(Mandatory=$true)][string]$Text, [string]$ContextLabel = 'svn output')
+function ConvertFrom-SvnXmlText
+{
+    param([Parameter(Mandatory = $true)][string]$Text, [string]$ContextLabel = 'svn output')
 
     Write-Verbose "Parsing XML from $ContextLabel (length: $($Text.Length) chars)"
 
@@ -223,80 +234,96 @@ function Parse-SvnXmlFromText {
     if ($idx -lt 0) { $idx = $Text.IndexOf('<diff') }
 
     $xmlText = $Text
-    if ($idx -gt 0) { 
+    if ($idx -gt 0)
+    {
         Write-Verbose "Skipping $idx characters before XML content"
-        $xmlText = $Text.Substring($idx) 
+        $xmlText = $Text.Substring($idx)
     }
 
     Write-Verbose "XML text to parse (length: $($xmlText.Length) chars)"
-    
+
     # デバッグ: XMLの最初と最後を表示
-    if ($xmlText.Length -lt 1000) {
+    if ($xmlText.Length -lt 1000)
+    {
         Write-Verbose "XML content (full):`n$xmlText"
-    } else {
+    }
+    else
+    {
         $head = $xmlText.Substring(0, [Math]::Min(500, $xmlText.Length))
         $tail = if ($xmlText.Length -gt 500) { $xmlText.Substring([Math]::Max(0, $xmlText.Length - 500)) } else { "" }
         Write-Verbose "XML content (first 500 chars):`n$head"
         Write-Verbose "XML content (last 500 chars):`n$tail"
     }
 
-    try {
+    try
+    {
         return [xml]$xmlText
     }
-    catch {
+    catch
+    {
         $preview = $xmlText
-        if ($preview.Length -gt 2000) { 
-            $preview = $preview.Substring(0,1000) + "`n`n... (middle truncated) ...`n`n" + $preview.Substring($preview.Length - 1000)
+        if ($preview.Length -gt 2000)
+        {
+            $preview = $preview.Substring(0, 1000) + "`n`n... (middle truncated) ...`n`n" + $preview.Substring($preview.Length - 1000)
         }
         throw "Failed to parse XML from $ContextLabel.`n--- Raw (head and tail) ---`n$preview`n--- Error ---`n$($_.Exception.Message)"
     }
 }
 
-function Resolve-SvnTargetUrl {
-    param([Parameter(Mandatory=$true)][string]$Target)
+function Resolve-SvnTargetUrl
+{
+    param([Parameter(Mandatory = $true)][string]$Target)
 
     # URLスキームで始まることを確認
-    if (-not ($Target -match '^(https?|svn|file)://')) {
+    if (-not ($Target -match '^(https?|svn|file)://'))
+    {
         throw "Path must be a remote SVN repository URL (http://, https://, svn://, or file://). Local working copy paths are not supported. Provided: '$Target'"
     }
-    
+
     Write-Verbose "Validating SVN repository URL: $Target"
-    
+
     # URLが有効かチェック（svn info で確認）
-    try {
+    try
+    {
         $infoText = Invoke-SvnCommand -Arguments @('info', '--xml', $Target) -ErrorContext "svn info (validating URL)"
-        $xml = Parse-SvnXmlFromText -Text $infoText -ContextLabel 'svn info'
+        $xml = ConvertFrom-SvnXmlText -Text $infoText -ContextLabel 'svn info'
         $url = $xml.info.entry.url
-        
-        if ([string]::IsNullOrWhiteSpace($url)) {
+
+        if ([string]::IsNullOrWhiteSpace($url))
+        {
             throw "Could not validate repository URL. Target='$Target'"
         }
-        
+
         Write-Verbose "Validated URL: $url"
         return $url.Trim()
     }
-    catch {
+    catch
+    {
         throw "Failed to validate SVN URL '$Target': $($_.Exception.Message)"
     }
 }
 
-function Should-CountFile {
+function Test-ShouldCountFile
+{
     param(
-        [Parameter(Mandatory=$true)][string]$FilePath,
+        [Parameter(Mandatory = $true)][string]$FilePath,
         [string[]]$IncludeExt,
         [string[]]$ExcludeExt,
         [string[]]$ExcludePathPatterns
     )
 
-    if ($ExcludePathPatterns) {
-        foreach ($pat in $ExcludePathPatterns) {
+    if ($ExcludePathPatterns)
+    {
+        foreach ($pat in $ExcludePathPatterns)
+        {
             if ([string]::IsNullOrWhiteSpace($pat)) { continue }
             if ($FilePath -like $pat) { return $false }
         }
     }
 
     $ext = [System.IO.Path]::GetExtension($FilePath)
-    if ([string]::IsNullOrEmpty($ext)) {
+    if ([string]::IsNullOrEmpty($ext))
+    {
         # 拡張子なしファイルは IncludeExt 指定時は除外
         if ($IncludeExt -and $IncludeExt.Count -gt 0) { return $false }
         return $true
@@ -304,21 +331,24 @@ function Should-CountFile {
 
     $extNorm = $ext.TrimStart('.').ToLowerInvariant()
 
-    if ($IncludeExt -and $IncludeExt.Count -gt 0) {
+    if ($IncludeExt -and $IncludeExt.Count -gt 0)
+    {
         if (-not ($IncludeExt -contains $extNorm)) { return $false }
     }
 
-    if ($ExcludeExt -and $ExcludeExt.Count -gt 0) {
+    if ($ExcludeExt -and $ExcludeExt.Count -gt 0)
+    {
         if ($ExcludeExt -contains $extNorm) { return $false }
     }
 
     return $true
 }
 
-function Measure-SvnDiffStreaming {
+function Measure-SvnDiffStreaming
+{
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory=$true)]
+        [Parameter(Mandatory = $true)]
         [string[]]$DiffArguments,
 
         [string[]]$IncludeExt,
@@ -338,7 +368,8 @@ function Measure-SvnDiffStreaming {
 
     Write-Verbose "Running diff with arguments: $($DiffArguments -join ' ')"
 
-    try {
+    try
+    {
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = $script:SvnExecutable
         $psi.Arguments = $DiffArguments -join ' '
@@ -349,25 +380,29 @@ function Measure-SvnDiffStreaming {
         # SVN出力は常にUTF-8で処理
         $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
         $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
-        
+
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo = $psi
-        
+
         $null = $process.Start()
-        
+
         # 標準出力を行単位で処理
-        while (-not $process.StandardOutput.EndOfStream) {
+        while (-not $process.StandardOutput.EndOfStream)
+        {
             $line = $process.StandardOutput.ReadLine()
 
             # file start
-            if ($line -like 'Index: *') {
+            if ($line -like 'Index: *')
+            {
                 $currentFile = $line.Substring(7).Trim()
                 $isBinary = $false
                 $countThisFile = $true
-                if ($currentFile) {
-                    $countThisFile = Should-CountFile -FilePath $currentFile -IncludeExt $IncludeExt -ExcludeExt $ExcludeExt -ExcludePathPatterns $ExcludePathPatterns
+                if ($currentFile)
+                {
+                    $countThisFile = Test-ShouldCountFile -FilePath $currentFile -IncludeExt $IncludeExt -ExcludeExt $ExcludeExt -ExcludePathPatterns $ExcludePathPatterns
                 }
-                if ($countThisFile -and -not [string]::IsNullOrWhiteSpace($currentFile)) {
+                if ($countThisFile -and -not [string]::IsNullOrWhiteSpace($currentFile))
+                {
                     $null = $files.Add($currentFile)
                 }
                 continue
@@ -376,12 +411,14 @@ function Measure-SvnDiffStreaming {
             if (-not $countThisFile) { continue }
 
             # binary hints
-            if ($line -match '^Cannot display: file marked as a binary type\.') {
+            if ($line -match '^Cannot display: file marked as a binary type\.')
+            {
                 if ($currentFile) { $null = $binaryFiles.Add($currentFile) }
                 $isBinary = $true
                 continue
             }
-            if ($line -match '^Binary files .* differ') {
+            if ($line -match '^Binary files .* differ')
+            {
                 if ($currentFile) { $null = $binaryFiles.Add($currentFile) }
                 $isBinary = $true
                 continue
@@ -396,60 +433,68 @@ function Measure-SvnDiffStreaming {
 
             # count hunks
             $first = $line[0]
-            if ($first -eq '+') {
+            if ($first -eq '+')
+            {
                 if ($line -eq '+\ No newline at end of file') { continue }
                 $linesAdded++
                 continue
             }
-            if ($first -eq '-') {
+            if ($first -eq '-')
+            {
                 if ($line -eq '-\ No newline at end of file') { continue }
                 $linesDeleted++
                 continue
             }
         }
-        
+
         # エラー出力を読み取る（ブロックしないように最後に）
         $errorText = $process.StandardError.ReadToEnd()
-        
+
         $process.WaitForExit()
         $exitCode = $process.ExitCode
-        
-        if ($exitCode -ne 0) {
+
+        if ($exitCode -ne 0)
+        {
             $errorMsg = "svn diff failed (exit code $exitCode)."
-            if ($errorText) {
+            if ($errorText)
+            {
                 $errorMsg += "`nSTDERR: $errorText"
             }
             throw $errorMsg
         }
-        
-        if ($errorText) {
+
+        if ($errorText)
+        {
             Write-Verbose "svn diff STDERR (non-fatal): $errorText"
         }
     }
-    finally {
+    finally
+    {
         if ($process) { $process.Dispose() }
     }
 
     return [pscustomobject]@{
-        LinesAdded         = $linesAdded
-        LinesDeleted       = $linesDeleted
-        NetLines           = ($linesAdded - $linesDeleted)
-        TextLinesChanged   = ($linesAdded + $linesDeleted)
-        FilesChanged       = $files.Count
+        LinesAdded = $linesAdded
+        LinesDeleted = $linesDeleted
+        NetLines = ($linesAdded - $linesDeleted)
+        TextLinesChanged = ($linesAdded + $linesDeleted)
+        FilesChanged = $files.Count
         BinaryFilesChanged = $binaryFiles.Count
-        Files              = $files
-        BinaryFiles        = $binaryFiles
+        Files = $files
+        BinaryFiles = $binaryFiles
     }
 }
 
-function Write-FileIfRequested {
+function Write-FileIfRequested
+{
     param(
-        [Parameter(Mandatory=$true)][string]$FilePath,
-        [Parameter(Mandatory=$true)][string]$Content
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [Parameter(Mandatory = $true)][string]$Content
     )
 
     $dir = Split-Path -Parent $FilePath
-    if ($dir -and -not (Test-Path $dir)) {
+    if ($dir -and -not (Test-Path $dir))
+    {
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
     }
     # PowerShell 5.1: Set-Content -Encoding UTF8 は BOM 付き。問題になる場合は Out-File などに変更してください。
@@ -458,17 +503,20 @@ function Write-FileIfRequested {
 
 # endregion Utility
 
-try {
+try
+{
     # Normalize / validate
-    $IncludeExtensions = Normalize-Extensions -Extensions $IncludeExtensions
-    $ExcludeExtensions = Normalize-Extensions -Extensions $ExcludeExtensions
+    $IncludeExtensions = ConvertTo-NormalizedExtension -Extensions $IncludeExtensions
+    $ExcludeExtensions = ConvertTo-NormalizedExtension -Extensions $ExcludeExtensions
 
-    if ($IgnoreAllSpace -and $IgnoreSpaceChange) {
+    if ($IgnoreAllSpace -and $IgnoreSpaceChange)
+    {
         Write-Verbose "Both -IgnoreAllSpace and -IgnoreSpaceChange specified. Using -IgnoreAllSpace."
         $IgnoreSpaceChange = $false
     }
 
-    if ($FromRevision -gt $ToRevision) {
+    if ($FromRevision -gt $ToRevision)
+    {
         Write-Verbose "Swapping revisions because FromRevision > ToRevision"
         $tmp = $FromRevision
         $FromRevision = $ToRevision
@@ -477,7 +525,8 @@ try {
 
     # Check svn existence
     $svnCmd = Get-Command $SvnExecutable -ErrorAction SilentlyContinue
-    if (-not $svnCmd) {
+    if (-not $svnCmd)
+    {
         throw "svn executable not found: '$SvnExecutable'. Install Subversion client or specify -SvnExecutable."
     }
     $script:SvnExecutable = $svnCmd.Source
@@ -492,11 +541,13 @@ try {
     $null = $commonDiffArgs.Add('diff')
     $null = $commonDiffArgs.Add('--internal-diff')
 
-    if (-not $IncludeProperties) {
+    if (-not $IncludeProperties)
+    {
         $null = $commonDiffArgs.Add('--ignore-properties')
     }
 
-    if ($ForceBinary) {
+    if ($ForceBinary)
+    {
         $null = $commonDiffArgs.Add('--force')
     }
 
@@ -506,7 +557,8 @@ try {
     elseif ($IgnoreSpaceChange) { $null = $extArgs.Add('--ignore-space-change') }
     if ($IgnoreEolStyle) { $null = $extArgs.Add('--ignore-eol-style') }
 
-    if ($extArgs.Count -gt 0) {
+    if ($extArgs.Count -gt 0)
+    {
         # svn diff は -x(--extensions) を複数回受け付けない実装があるため 1 つにまとめて渡す
         $null = $commonDiffArgs.Add('--extensions')
         $null = $commonDiffArgs.Add(($extArgs.ToArray() -join ' '))
@@ -515,21 +567,26 @@ try {
     # Fetch log (for commit list / incremental targets)
     Write-Verbose "Fetching SVN log for r$FromRevision`:r$ToRevision"
     $logText = Invoke-SvnCommand -Arguments @('log', $targetUrl, '--xml', '--verbose', '-r', "$FromRevision`:$ToRevision") -ErrorContext "svn log"
-    $logXml = Parse-SvnXmlFromText -Text $logText -ContextLabel 'svn log'
+    $logXml = ConvertFrom-SvnXmlText -Text $logText -ContextLabel 'svn log'
 
     $logEntries = @()
-    if ($logXml -and $logXml.log -and $logXml.log.logentry) {
+    if ($logXml -and $logXml.log -and $logXml.log.logentry)
+    {
         $logEntries = @($logXml.log.logentry) | Sort-Object { [int]$_.revision }
     }
 
     Write-Verbose "Found $($logEntries.Count) log entries in range"
 
     $filteredEntries = $logEntries
-    if (-not [string]::IsNullOrWhiteSpace($Author)) {
+    if (-not [string]::IsNullOrWhiteSpace($Author))
+    {
         # wildcard を許可: *Hoge* のような指定もできる
-        if ($Author -match '[\*\?\[]') {
+        if ($Author -match '[\*\?\[]')
+        {
             $filteredEntries = $logEntries | Where-Object { ([string]$_.author) -like $Author }
-        } else {
+        }
+        else
+        {
             $filteredEntries = $logEntries | Where-Object { ([string]$_.author) -ieq $Author }
         }
         Write-Verbose "Filtered to $($filteredEntries.Count) entries for author: $Author"
@@ -541,32 +598,36 @@ try {
     $allBinaryFiles = New-Object 'System.Collections.Generic.HashSet[string]'
 
     $overall = [ordered]@{
-        Path               = $Path
-        TargetUrl          = $targetUrl
-        FromRevision       = $FromRevision
-        ToRevision         = $ToRevision
-        Author             = $Author
-        CommitsMatched     = $filteredEntries.Count
-        LinesAdded         = 0
-        LinesDeleted       = 0
-        NetLines           = 0
-        TextLinesChanged   = 0
+        Path = $Path
+        TargetUrl = $targetUrl
+        FromRevision = $FromRevision
+        ToRevision = $ToRevision
+        Author = $Author
+        CommitsMatched = $filteredEntries.Count
+        LinesAdded = 0
+        LinesDeleted = 0
+        NetLines = 0
+        TextLinesChanged = 0
         FilesChangedUnique = 0
         BinaryFilesChangedUnique = 0
-        StartedAt          = (Get-Date)
-        FinishedAt         = $null
-        Notes              = $null
+        StartedAt = (Get-Date)
+        FinishedAt = $null
+        Notes = $null
     }
 
     # Incremental モード: 各コミットごとにdiffを取得して集計
-    if ($filteredEntries.Count -eq 0) {
+    if ($filteredEntries.Count -eq 0)
+    {
         $overall.Notes = "No matching commits in range."
         Write-Verbose "No matching commits found"
-    } else {
+    }
+    else
+    {
         $total = $filteredEntries.Count
         $i = 0
 
-        foreach ($e in $filteredEntries) {
+        foreach ($e in $filteredEntries)
+        {
             $i++
 
             $rev = [int]$e.revision
@@ -574,10 +635,13 @@ try {
             try { $date = [datetime]::Parse([string]$e.date) } catch { $date = $e.date }
 
             $msg = [string]$e.msg
-            if ($msg) {
+            if ($msg)
+            {
                 $msgOneLine = ($msg -replace "(\r?\n)+", " ").Trim()
-                if ($msgOneLine.Length -gt 80) { $msgOneLine = $msgOneLine.Substring(0,80) + '…' }
-            } else {
+                if ($msgOneLine.Length -gt 80) { $msgOneLine = $msgOneLine.Substring(0, 80) + '…' }
+            }
+            else
+            {
                 $msgOneLine = ''
             }
 
@@ -589,9 +653,10 @@ try {
             $pathsModified = ($paths | Where-Object { $_.action -eq 'M' }).Count
             $pathsReplaced = ($paths | Where-Object { $_.action -eq 'R' }).Count
 
-            if (-not $NoProgress) {
+            if (-not $NoProgress)
+            {
                 $pct = [int](($i / [double]$total) * 100)
-                Write-Progress -Activity "Counting SVN diffs" -Status ("r{0} ({1}/{2})" -f $rev,$i,$total) -PercentComplete $pct
+                Write-Progress -Activity "Counting SVN diffs" -Status ("r{0} ({1}/{2})" -f $rev, $i, $total) -PercentComplete $pct
             }
 
             Write-Verbose "Processing revision $rev ($i/$total)"
@@ -608,21 +673,21 @@ try {
             foreach ($bf in $m.BinaryFiles) { $null = $allBinaryFiles.Add($bf) }
 
             $row = [pscustomobject]@{
-                Revision           = $rev
-                Date               = $date
-                Author             = [string]$e.author
-                Message            = $msgOneLine
-                PathsChanged       = $paths.Count
-                PathsAdded         = $pathsAdded
-                PathsDeleted       = $pathsDeleted
-                PathsModified      = $pathsModified
-                PathsReplaced      = $pathsReplaced
-                FilesChanged       = $m.FilesChanged
+                Revision = $rev
+                Date = $date
+                Author = [string]$e.author
+                Message = $msgOneLine
+                PathsChanged = $paths.Count
+                PathsAdded = $pathsAdded
+                PathsDeleted = $pathsDeleted
+                PathsModified = $pathsModified
+                PathsReplaced = $pathsReplaced
+                FilesChanged = $m.FilesChanged
                 BinaryFilesChanged = $m.BinaryFilesChanged
-                LinesAdded         = $m.LinesAdded
-                LinesDeleted       = $m.LinesDeleted
-                NetLines           = $m.NetLines
-                TextLinesChanged   = $m.TextLinesChanged
+                LinesAdded = $m.LinesAdded
+                LinesDeleted = $m.LinesDeleted
+                NetLines = $m.NetLines
+                TextLinesChanged = $m.TextLinesChanged
             }
 
             $null = $resultRows.Add($row)
@@ -635,7 +700,8 @@ try {
         $overall.TextLinesChanged = ($overall.LinesAdded + $overall.LinesDeleted)
     }
 
-    if (-not $NoProgress) {
+    if (-not $NoProgress)
+    {
         Write-Progress -Activity "Counting SVN diffs" -Completed
     }
 
@@ -648,10 +714,13 @@ try {
     Write-Host "===== SVN Diff Size Report ====="
     Write-Host ("Path        : {0}" -f $Path)
     Write-Host ("Target URL  : {0}" -f $targetUrl)
-    Write-Host ("Range       : r{0} -> r{1}" -f $FromRevision,$ToRevision)
-    if (-not [string]::IsNullOrWhiteSpace($Author)) {
+    Write-Host ("Range       : r{0} -> r{1}" -f $FromRevision, $ToRevision)
+    if (-not [string]::IsNullOrWhiteSpace($Author))
+    {
         Write-Host ("Author      : {0}" -f $Author)
-    } else {
+    }
+    else
+    {
         Write-Host "Author      : (all)"
     }
     Write-Host ("Commits     : {0}" -f $filteredEntries.Count)
@@ -664,50 +733,55 @@ try {
     Write-Host ("Lines deleted                 : {0}" -f $overall.LinesDeleted)
     Write-Host ("Net lines                     : {0}" -f $overall.NetLines)
     Write-Host ("Text lines changed (+/-)      : {0}" -f $overall.TextLinesChanged)
-    if ($overall.Notes) {
+    if ($overall.Notes)
+    {
         Write-Host ""
         Write-Host ("NOTE: {0}" -f $overall.Notes)
     }
 
-    if ($ShowPerRevision -and $resultRows.Count -gt 0) {
+    if ($ShowPerRevision -and $resultRows.Count -gt 0)
+    {
         Write-Host ""
         Write-Host "---- Per revision ----"
         $resultRows | Select-Object Revision, Date, Author, FilesChanged, LinesAdded, LinesDeleted, NetLines, Message | Format-Table -AutoSize | Out-Host
     }
 
     # Export files
-    if ($OutputCsv) {
+    if ($OutputCsv)
+    {
         # Export summary + detail rows (same file, summary as first row)
         $csvRows = New-Object 'System.Collections.Generic.List[object]'
         $summaryRow = [pscustomobject]@{
-            Revision           = ("r{0}:r{1}" -f $FromRevision,$ToRevision)
-            Date               = $overall.FinishedAt
-            Author             = $Author
-            Message            = "SUMMARY"
-            PathsChanged       = $null
-            PathsAdded         = $null
-            PathsDeleted       = $null
-            PathsModified      = $null
-            PathsReplaced      = $null
-            FilesChanged       = $overall.FilesChangedUnique
+            Revision = ("r{0}:r{1}" -f $FromRevision, $ToRevision)
+            Date = $overall.FinishedAt
+            Author = $Author
+            Message = "SUMMARY"
+            PathsChanged = $null
+            PathsAdded = $null
+            PathsDeleted = $null
+            PathsModified = $null
+            PathsReplaced = $null
+            FilesChanged = $overall.FilesChangedUnique
             BinaryFilesChanged = $overall.BinaryFilesChangedUnique
-            LinesAdded         = $overall.LinesAdded
-            LinesDeleted       = $overall.LinesDeleted
-            NetLines           = $overall.NetLines
-            TextLinesChanged   = $overall.TextLinesChanged
+            LinesAdded = $overall.LinesAdded
+            LinesDeleted = $overall.LinesDeleted
+            NetLines = $overall.NetLines
+            TextLinesChanged = $overall.TextLinesChanged
         }
         $null = $csvRows.Add($summaryRow)
         foreach ($r in $resultRows) { $null = $csvRows.Add($r) }
 
         $dir = Split-Path -Parent $OutputCsv
-        if ($dir -and -not (Test-Path $dir)) {
+        if ($dir -and -not (Test-Path $dir))
+        {
             New-Item -ItemType Directory -Path $dir -Force | Out-Null
         }
         $csvRows | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
         Write-Host ("CSV written : {0}" -f $OutputCsv)
     }
 
-    if ($OutputJson) {
+    if ($OutputJson)
+    {
         $obj = [pscustomobject]@{
             Summary = [pscustomobject]$overall
             Details = $resultRows
@@ -717,13 +791,14 @@ try {
         Write-Host ("JSON written: {0}" -f $OutputJson)
     }
 
-    if ($OutputMarkdown) {
+    if ($OutputMarkdown)
+    {
         $md = New-Object System.Text.StringBuilder
         [void]$md.AppendLine("# SVN Diff Size Report")
         [void]$md.AppendLine("")
         [void]$md.AppendLine(('* Path: `{0}`' -f $Path))
         [void]$md.AppendLine(('* Target URL: `{0}`' -f $targetUrl))
-        [void]$md.AppendLine(('* Range: `r{0}:r{1}`' -f $FromRevision,$ToRevision))
+        [void]$md.AppendLine(('* Range: `r{0}:r{1}`' -f $FromRevision, $ToRevision))
         if ($Author) { [void]$md.AppendLine(('* Author: `{0}`' -f $Author)) } else { [void]$md.AppendLine("* Author: (all)") }
         [void]$md.AppendLine(('* Commits matched: `{0}`' -f $filteredEntries.Count))
         [void]$md.AppendLine("")
@@ -731,24 +806,27 @@ try {
         [void]$md.AppendLine("")
         [void]$md.AppendLine("| Item | Value |")
         [void]$md.AppendLine("|---|---:|")
-        [void]$md.AppendLine("| Files changed (unique) | "+$overall.FilesChangedUnique+" |")
-        [void]$md.AppendLine("| Binary files changed (unique) | "+$overall.BinaryFilesChangedUnique+" |")
-        [void]$md.AppendLine("| Lines added | "+$overall.LinesAdded+" |")
-        [void]$md.AppendLine("| Lines deleted | "+$overall.LinesDeleted+" |")
-        [void]$md.AppendLine("| Net lines | "+$overall.NetLines+" |")
-        [void]$md.AppendLine("| Text lines changed (+/-) | "+$overall.TextLinesChanged+" |")
-        if ($overall.Notes) {
+        [void]$md.AppendLine("| Files changed (unique) | " + $overall.FilesChangedUnique + " |")
+        [void]$md.AppendLine("| Binary files changed (unique) | " + $overall.BinaryFilesChangedUnique + " |")
+        [void]$md.AppendLine("| Lines added | " + $overall.LinesAdded + " |")
+        [void]$md.AppendLine("| Lines deleted | " + $overall.LinesDeleted + " |")
+        [void]$md.AppendLine("| Net lines | " + $overall.NetLines + " |")
+        [void]$md.AppendLine("| Text lines changed (+/-) | " + $overall.TextLinesChanged + " |")
+        if ($overall.Notes)
+        {
             [void]$md.AppendLine("")
-            [void]$md.AppendLine("> NOTE: "+$overall.Notes)
+            [void]$md.AppendLine("> NOTE: " + $overall.Notes)
         }
 
-        if ($resultRows.Count -gt 0) {
+        if ($resultRows.Count -gt 0)
+        {
             [void]$md.AppendLine("")
             [void]$md.AppendLine("## Details")
             [void]$md.AppendLine("")
             [void]$md.AppendLine("| Revision | Date | Author | Files | + | - | Net | Message |")
             [void]$md.AppendLine("|---:|---|---|---:|---:|---:|---:|---|")
-            foreach ($r in $resultRows) {
+            foreach ($r in $resultRows)
+            {
                 $rev = $r.Revision
                 $d = $r.Date
                 $a = $r.Author
@@ -757,8 +835,8 @@ try {
                 $m = $r.LinesDeleted
                 $n = $r.NetLines
                 $msg = $r.Message
-                if ($msg) { $msg = $msg.Replace('|','\|') }
-                [void]$md.AppendLine(("| {0} | {1} | {2} | {3} | {4} | {5} | {6} | {7} |" -f $rev,$d,$a,$f,$p,$m,$n,$msg))
+                if ($msg) { $msg = $msg.Replace('|', '\|') }
+                [void]$md.AppendLine(("| {0} | {1} | {2} | {3} | {4} | {5} | {6} | {7} |" -f $rev, $d, $a, $f, $p, $m, $n, $msg))
             }
         }
 
@@ -772,7 +850,8 @@ try {
         Details = $resultRows
     }
 }
-catch {
+catch
+{
     Write-Error $_
     Write-Verbose "Error details: $($_.Exception.Message)"
     Write-Verbose "Stack trace: $($_.ScriptStackTrace)"
