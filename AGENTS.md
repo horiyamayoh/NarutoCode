@@ -81,6 +81,15 @@ NarutoCode/
 - `using namespace` や PowerShell クラス構文など 5.1 で問題がある機能は避ける
 - パラメータには適切な型指定・バリデーション属性を付与する
 - Comment-Based Help を維持・更新する
+- **セミコロン `;` で複数の文を1行に圧縮してはならない**
+  - 各文は独立した行に記述すること
+  - 悪い例: `$a = 1; $b = 2; $c = $a + $b`
+  - 良い例:
+    ```powershell
+    $a = 1
+    $b = 2
+    $c = $a + $b
+    ```
 
 ## コミット規約（Conventional Commits）
 
