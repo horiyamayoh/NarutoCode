@@ -138,6 +138,9 @@ function Get-TextEncoding
 function Write-TextFile
 {
     param([string]$FilePath, [string]$Content, [string]$EncodingName = 'UTF8')
+    # Resolve to absolute path so .NET WriteAllText uses the correct base directory
+    # (PowerShell $PWD and .NET Environment.CurrentDirectory can diverge)
+    $FilePath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($FilePath)
     $dir = Split-Path -Parent $FilePath
     if ($dir -and -not (Test-Path $dir))
     {
@@ -1636,6 +1639,8 @@ try
     {
         $OutDir = Join-Path (Get-Location) ("NarutoCode_out_{0}" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
     }
+    # Resolve relative OutDir to absolute path based on PowerShell $PWD
+    $OutDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutDir)
     $cacheDir = Join-Path $OutDir 'cache'
     New-Item -Path $cacheDir -ItemType Directory -Force | Out-Null
 

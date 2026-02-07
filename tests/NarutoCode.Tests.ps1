@@ -457,6 +457,50 @@ Describe 'Write-TextFile and Write-CsvFile' {
         $raw | Should -Match 'Col1'
         $raw | Should -Match 'Col2'
     }
+
+    It 'Write-TextFile resolves relative path correctly' {
+        # Create a temp base dir and a subdirectory to Push-Location into
+        $baseDir = Join-Path $env:TEMP ('narutocode_relpath_' + [guid]::NewGuid().ToString('N'))
+        $subDir  = Join-Path $baseDir 'child'
+        New-Item -Path $subDir -ItemType Directory -Force | Out-Null
+        try {
+            # The output target is a relative path from $subDir
+            $targetDir = Join-Path $baseDir 'output'
+            Push-Location $subDir
+            try {
+                # Use a relative path that goes up and into 'output'
+                Write-TextFile -FilePath '..\output\rel_test.txt' -Content 'relative path works' -EncodingName 'UTF8'
+            } finally {
+                Pop-Location
+            }
+            $resultFile = Join-Path $targetDir 'rel_test.txt'
+            Test-Path $resultFile | Should -BeTrue
+            (Get-Content -Path $resultFile -Raw).Trim() | Should -Be 'relative path works'
+        } finally {
+            Remove-Item -Path $baseDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Write-CsvFile resolves relative path correctly' {
+        $baseDir = Join-Path $env:TEMP ('narutocode_relcsv_' + [guid]::NewGuid().ToString('N'))
+        $subDir  = Join-Path $baseDir 'child'
+        New-Item -Path $subDir -ItemType Directory -Force | Out-Null
+        try {
+            $rows = @([pscustomobject]@{ Name = 'test'; Value = 42 })
+            Push-Location $subDir
+            try {
+                Write-CsvFile -FilePath '..\output\rel_test.csv' -Rows $rows -Headers @('Name','Value')
+            } finally {
+                Pop-Location
+            }
+            $resultFile = Join-Path (Join-Path $baseDir 'output') 'rel_test.csv'
+            Test-Path $resultFile | Should -BeTrue
+            $csv = Import-Csv $resultFile
+            $csv[0].Name | Should -Be 'test'
+        } finally {
+            Remove-Item -Path $baseDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 Describe 'Write-JsonFile' {

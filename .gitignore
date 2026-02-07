@@ -16,3 +16,7 @@ Desktop.ini
 # Temp files
 *.tmp
 *~
+
+# NarutoCode analysis output
+test_output/
+NarutoCode_out_*/
