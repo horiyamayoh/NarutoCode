@@ -1675,3 +1675,266 @@ Describe 'Integration — test SVN repo output matches baseline' -Tag 'Integrati
         $meta.Encoding      | Should -Be 'UTF8'
     }
 }
+
+Describe 'Invoke-ParallelWork' {
+    It 'preserves input order while executing in parallel' {
+        $items = 1..24
+        $worker = {
+            param($Item, $Index)
+            Start-Sleep -Milliseconds (10 + (24 - [int]$Item))
+            return ([int]$Item * [int]$Item)
+        }
+        $actual = @(Invoke-ParallelWork -InputItems $items -WorkerScript $worker -MaxParallel 4 -ErrorContext 'test parallel')
+        $expected = @($items | ForEach-Object { [int]$_ * [int]$_ })
+        $actual | Should -Be $expected
+    }
+}
+
+Describe 'Initialize-CommitDiffData parallel consistency' {
+    BeforeAll {
+        $script:origGetCachedOrFetchDiffText = (Get-Item function:Get-CachedOrFetchDiffText).ScriptBlock.ToString()
+        Set-Item -Path function:Get-CachedOrFetchDiffText -Value {
+            param([string]$CacheDir, [int]$Revision, [string]$TargetUrl, [string[]]$DiffArguments)
+            @"
+Index: trunk/src/file$Revision.txt
+===================================================================
+--- trunk/src/file$Revision.txt	(revision $([Math]::Max(0, $Revision - 1)))
++++ trunk/src/file$Revision.txt	(revision $Revision)
+@@ -1,0 +1,1 @@
++line$Revision
+"@
+        }
+        $script:commitFactory = {
+            $commits = New-Object 'System.Collections.Generic.List[object]'
+            for ($rev = 1; $rev -le 12; $rev++) {
+                $path = "trunk/src/file{0}.txt" -f $rev
+                $commits.Add([pscustomobject]@{
+                        Revision = $rev
+                        Author = 'alice'
+                        Date = [datetime]'2026-01-01T00:00:00Z'
+                        Message = "m$rev"
+                        ChangedPaths = @([pscustomobject]@{
+                                Path = $path
+                                Action = 'M'
+                                CopyFromPath = $null
+                                CopyFromRev = $null
+                                IsDirectory = $false
+                            })
+                        ChangedPathsFiltered = @()
+                        FileDiffStats = @{}
+                        FilesChanged = @()
+                        AddedLines = 0
+                        DeletedLines = 0
+                        Churn = 0
+                        Entropy = 0.0
+                        MsgLen = 0
+                        MessageShort = ''
+                    }) | Out-Null
+            }
+            return @($commits.ToArray())
+        }
+    }
+
+    AfterAll {
+        Set-Item -Path function:Get-CachedOrFetchDiffText -Value $script:origGetCachedOrFetchDiffText
+    }
+
+    It 'returns identical commit metrics between -Parallel 1 and -Parallel 4' {
+        $commitsSeq = & $script:commitFactory
+        $commitsPar = & $script:commitFactory
+
+        $mapSeq = Initialize-CommitDiffData -Commits $commitsSeq -CacheDir 'dummy' -TargetUrl 'https://example.invalid/svn/repo' -DiffArguments @('diff') -DeadDetailLevel 2 -IncludeExtensions @() -ExcludeExtensions @() -IncludePathPatterns @() -ExcludePathPatterns @() -Parallel 1
+        $mapPar = Initialize-CommitDiffData -Commits $commitsPar -CacheDir 'dummy' -TargetUrl 'https://example.invalid/svn/repo' -DiffArguments @('diff') -DeadDetailLevel 2 -IncludeExtensions @() -ExcludeExtensions @() -IncludePathPatterns @() -ExcludePathPatterns @() -Parallel 4
+
+        @($mapSeq.Keys | Sort-Object) | Should -Be @($mapPar.Keys | Sort-Object)
+        foreach ($rev in @($mapSeq.Keys)) {
+            $mapSeq[$rev] | Should -Be $mapPar[$rev]
+        }
+
+        for ($i = 0; $i -lt $commitsSeq.Count; $i++) {
+            $s = $commitsSeq[$i]
+            $p = $commitsPar[$i]
+            $s.FilesChanged | Should -Be $p.FilesChanged
+            $s.AddedLines | Should -Be $p.AddedLines
+            $s.DeletedLines | Should -Be $p.DeletedLines
+            $s.Churn | Should -Be $p.Churn
+            [Math]::Round([double]$s.Entropy, 10) | Should -Be ([Math]::Round([double]$p.Entropy, 10))
+
+            @($s.FileDiffStats.Keys | Sort-Object) | Should -Be @($p.FileDiffStats.Keys | Sort-Object)
+            foreach ($filePath in @($s.FileDiffStats.Keys)) {
+                $sStat = $s.FileDiffStats[$filePath]
+                $pStat = $p.FileDiffStats[$filePath]
+                [int]$sStat.AddedLines | Should -Be ([int]$pStat.AddedLines)
+                [int]$sStat.DeletedLines | Should -Be ([int]$pStat.DeletedLines)
+            }
+        }
+    }
+}
+
+Describe 'Update-StrictAttributionMetric parallel consistency' {
+    BeforeAll {
+        $script:origGetRenameMap = (Get-Item function:Get-RenameMap).ScriptBlock.ToString()
+        $script:origGetExactDeathAttribution = (Get-Item function:Get-ExactDeathAttribution).ScriptBlock.ToString()
+        $script:origGetAllRepositoryFile = (Get-Item function:Get-AllRepositoryFile).ScriptBlock.ToString()
+        $script:origGetSvnBlameSummary = (Get-Item function:Get-SvnBlameSummary).ScriptBlock.ToString()
+        $script:origGetAuthorModifiedOthersSurvivedCount = (Get-Item function:Get-AuthorModifiedOthersSurvivedCount).ScriptBlock.ToString()
+        $script:origUpdateFileRowWithStrictMetric = (Get-Item function:Update-FileRowWithStrictMetric).ScriptBlock.ToString()
+        $script:origUpdateCommitterRowWithStrictMetric = (Get-Item function:Update-CommitterRowWithStrictMetric).ScriptBlock.ToString()
+
+        Set-Item -Path function:Get-RenameMap -Value { param([object[]]$Commits) @{} }
+        Set-Item -Path function:Get-ExactDeathAttribution -Value {
+            param([object[]]$Commits, [hashtable]$RevToAuthor, [string]$TargetUrl, [int]$FromRevision, [int]$ToRevision, [string]$CacheDir, [hashtable]$RenameMap, [int]$Parallel)
+            [pscustomobject]@{
+                AuthorBorn = @{}
+                AuthorDead = @{}
+                AuthorSurvived = @{ 'alice' = 7; 'bob' = 5 }
+                AuthorSelfDead = @{}
+                AuthorOtherDead = @{}
+                AuthorCrossRevert = @{}
+                AuthorRemovedByOthers = @{}
+                FileBorn = @{}
+                FileDead = @{}
+                FileSurvived = @{}
+                FileSelfCancel = @{}
+                FileCrossRevert = @{}
+                AuthorInternalMoveCount = @{}
+                FileInternalMoveCount = @{}
+                AuthorRepeatedHunk = @{}
+                AuthorPingPong = @{}
+                FileRepeatedHunk = @{}
+                FilePingPong = @{}
+                AuthorModifiedOthersCode = @{}
+                RevsWhereKilledOthers = (New-Object 'System.Collections.Generic.HashSet[string]')
+            }
+        }
+        Set-Item -Path function:Get-AllRepositoryFile -Value {
+            param([string]$Repo, [int]$Revision, [string[]]$IncludeExt, [string[]]$ExcludeExt, [string[]]$IncludePathPatterns, [string[]]$ExcludePathPatterns)
+            @('src/a.cs', 'src/b.cs', 'src/c.cs')
+        }
+        Set-Item -Path function:Get-SvnBlameSummary -Value {
+            param([string]$Repo, [string]$FilePath, [int]$ToRevision, [string]$CacheDir)
+            if ($FilePath -eq 'src/a.cs') {
+                return [pscustomobject]@{
+                    LineCountTotal = 3
+                    LineCountByRevision = @{}
+                    LineCountByAuthor = @{ 'alice' = 2; 'bob' = 1 }
+                    Lines = @()
+                }
+            }
+            return [pscustomobject]@{
+                LineCountTotal = 2
+                LineCountByRevision = @{}
+                LineCountByAuthor = @{ 'alice' = 1; 'bob' = 1 }
+                Lines = @()
+            }
+        }
+        Set-Item -Path function:Get-AuthorModifiedOthersSurvivedCount -Value {
+            param([hashtable]$BlameByFile, [System.Collections.Generic.HashSet[string]]$RevsWhereKilledOthers, [int]$FromRevision, [int]$ToRevision)
+            @{ 'alice' = 2; 'bob' = 1 }
+        }
+        Set-Item -Path function:Update-FileRowWithStrictMetric -Value {
+            param([object[]]$FileRows, [hashtable]$RenameMap, [object]$StrictDetail, [System.Collections.Generic.HashSet[string]]$ExistingFileSet, [hashtable]$BlameByFile, [string]$TargetUrl, [int]$ToRevision, [string]$CacheDir)
+            foreach ($row in @($FileRows)) {
+                $path = [string]$row.'ファイルパス'
+                if ($BlameByFile.ContainsKey($path)) {
+                    $row.'生存行数 (範囲指定)' = [int]$BlameByFile[$path].LineCountTotal
+                }
+                else {
+                    $row.'生存行数 (範囲指定)' = 0
+                }
+            }
+        }
+        Set-Item -Path function:Update-CommitterRowWithStrictMetric -Value {
+            param([object[]]$CommitterRows, [hashtable]$AuthorSurvived, [hashtable]$AuthorOwned, [int]$OwnedTotal, [object]$StrictDetail, [hashtable]$AuthorModifiedOthersSurvived)
+            foreach ($row in @($CommitterRows)) {
+                $author = [string]$row.'作者'
+                $row.'生存行数' = Get-HashtableIntValue -Table $AuthorSurvived -Key $author
+                $row.'所有行数' = Get-HashtableIntValue -Table $AuthorOwned -Key $author
+                $row.'他者コード変更生存行数' = Get-HashtableIntValue -Table $AuthorModifiedOthersSurvived -Key $author
+            }
+        }
+    }
+
+    AfterAll {
+        Set-Item -Path function:Get-RenameMap -Value $script:origGetRenameMap
+        Set-Item -Path function:Get-ExactDeathAttribution -Value $script:origGetExactDeathAttribution
+        Set-Item -Path function:Get-AllRepositoryFile -Value $script:origGetAllRepositoryFile
+        Set-Item -Path function:Get-SvnBlameSummary -Value $script:origGetSvnBlameSummary
+        Set-Item -Path function:Get-AuthorModifiedOthersSurvivedCount -Value $script:origGetAuthorModifiedOthersSurvivedCount
+        Set-Item -Path function:Update-FileRowWithStrictMetric -Value $script:origUpdateFileRowWithStrictMetric
+        Set-Item -Path function:Update-CommitterRowWithStrictMetric -Value $script:origUpdateCommitterRowWithStrictMetric
+    }
+
+    It 'produces identical outputs for -Parallel 1 and -Parallel 4' {
+        $commits = @([pscustomobject]@{ Revision = 10; Author = 'alice'; FilesChanged = @(); ChangedPathsFiltered = @(); FileDiffStats = @{} })
+        $revToAuthor = @{ 10 = 'alice' }
+
+        $fileRowsSeq = @(
+            [pscustomobject]@{ 'ファイルパス' = 'src/a.cs'; '生存行数 (範囲指定)' = $null },
+            [pscustomobject]@{ 'ファイルパス' = 'src/b.cs'; '生存行数 (範囲指定)' = $null },
+            [pscustomobject]@{ 'ファイルパス' = 'src/c.cs'; '生存行数 (範囲指定)' = $null }
+        )
+        $fileRowsPar = @(
+            [pscustomobject]@{ 'ファイルパス' = 'src/a.cs'; '生存行数 (範囲指定)' = $null },
+            [pscustomobject]@{ 'ファイルパス' = 'src/b.cs'; '生存行数 (範囲指定)' = $null },
+            [pscustomobject]@{ 'ファイルパス' = 'src/c.cs'; '生存行数 (範囲指定)' = $null }
+        )
+        $committerRowsSeq = @(
+            [pscustomobject]@{ '作者' = 'alice'; '生存行数' = $null; '所有行数' = $null; '他者コード変更生存行数' = $null },
+            [pscustomobject]@{ '作者' = 'bob'; '生存行数' = $null; '所有行数' = $null; '他者コード変更生存行数' = $null }
+        )
+        $committerRowsPar = @(
+            [pscustomobject]@{ '作者' = 'alice'; '生存行数' = $null; '所有行数' = $null; '他者コード変更生存行数' = $null },
+            [pscustomobject]@{ '作者' = 'bob'; '生存行数' = $null; '所有行数' = $null; '他者コード変更生存行数' = $null }
+        )
+
+        Initialize-StrictModeContext
+        Update-StrictAttributionMetric -Commits $commits -RevToAuthor $revToAuthor -TargetUrl 'https://example.invalid/svn/repo' -FromRevision 1 -ToRevision 20 -CacheDir 'dummy' -IncludeExtensions @() -ExcludeExtensions @() -IncludePaths @() -ExcludePaths @() -FileRows $fileRowsSeq -CommitterRows $committerRowsSeq -Parallel 1
+
+        Initialize-StrictModeContext
+        Update-StrictAttributionMetric -Commits $commits -RevToAuthor $revToAuthor -TargetUrl 'https://example.invalid/svn/repo' -FromRevision 1 -ToRevision 20 -CacheDir 'dummy' -IncludeExtensions @() -ExcludeExtensions @() -IncludePaths @() -ExcludePaths @() -FileRows $fileRowsPar -CommitterRows $committerRowsPar -Parallel 4
+
+        ($fileRowsSeq | ConvertTo-Json -Depth 10 -Compress) | Should -Be ($fileRowsPar | ConvertTo-Json -Depth 10 -Compress)
+        ($committerRowsSeq | ConvertTo-Json -Depth 10 -Compress) | Should -Be ($committerRowsPar | ConvertTo-Json -Depth 10 -Compress)
+    }
+}
+
+Describe 'Invoke-StrictBlameCachePrefetch parallel consistency' {
+    BeforeAll {
+        $script:origInitializeSvnBlameLineCache = (Get-Item function:Initialize-SvnBlameLineCache).ScriptBlock.ToString()
+        Set-Item -Path function:Initialize-SvnBlameLineCache -Value {
+            param([string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir)
+            if ($FilePath -like '*miss*') {
+                return [pscustomobject]@{ CacheHits = 0; CacheMisses = 1 }
+            }
+            return [pscustomobject]@{ CacheHits = 1; CacheMisses = 0 }
+        }
+    }
+
+    AfterAll {
+        Set-Item -Path function:Initialize-SvnBlameLineCache -Value $script:origInitializeSvnBlameLineCache
+    }
+
+    It 'keeps cache hit/miss counts identical between sequential and parallel prefetch' {
+        $targets = @(
+            [pscustomobject]@{ FilePath = 'src/hit-a.cs'; Revision = 10 },
+            [pscustomobject]@{ FilePath = 'src/miss-b.cs'; Revision = 10 },
+            [pscustomobject]@{ FilePath = 'src/hit-c.cs'; Revision = 11 }
+        )
+
+        Initialize-StrictModeContext
+        Invoke-StrictBlameCachePrefetch -Targets $targets -TargetUrl 'https://example.invalid/svn/repo' -CacheDir 'dummy' -Parallel 1
+        $seqHits = [int]$script:StrictBlameCacheHits
+        $seqMisses = [int]$script:StrictBlameCacheMisses
+
+        Initialize-StrictModeContext
+        Invoke-StrictBlameCachePrefetch -Targets $targets -TargetUrl 'https://example.invalid/svn/repo' -CacheDir 'dummy' -Parallel 4
+        $parHits = [int]$script:StrictBlameCacheHits
+        $parMisses = [int]$script:StrictBlameCacheMisses
+
+        $seqHits | Should -Be $parHits
+        $seqMisses | Should -Be $parMisses
+        $parHits | Should -Be 2
+        $parMisses | Should -Be 1
+    }
+}

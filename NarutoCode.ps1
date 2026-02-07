@@ -221,6 +221,265 @@ function Add-Count
     }
     $Table[$Key] = [int]$Table[$Key] + $Delta
 }
+function Invoke-ParallelWork
+{
+    <#
+    .SYNOPSIS
+        Executes a scriptblock in parallel across a collection of items using a RunspacePool.
+    .DESCRIPTION
+        When MaxParallel > 1, the WorkerScript is serialized to text via .ToString() and
+        re-created inside each runspace with [scriptblock]::Create(). This means closures
+        over outer-scope variables are NOT preserved; any external state the worker needs
+        must be passed via InputItems properties or SessionVariables. Functions from the
+        caller scope are injected via RequiredFunctions using SessionStateFunctionEntry.
+        Each worker receives two positional parameters: $Item and $Index.
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [object[]]$InputItems,
+        [scriptblock]$WorkerScript,
+        [ValidateRange(1, 128)][int]$MaxParallel = 1,
+        [string[]]$RequiredFunctions = @(),
+        [hashtable]$SessionVariables = @{},
+        [string]$ErrorContext = 'parallel work'
+    )
+
+    $items = @($InputItems)
+    if ($items.Count -eq 0)
+    {
+        return @()
+    }
+    if ($null -eq $WorkerScript)
+    {
+        throw "WorkerScript is required for $ErrorContext."
+    }
+
+    $effectiveParallel = [Math]::Max(1, [Math]::Min([int]$MaxParallel, $items.Count))
+    if ($effectiveParallel -le 1)
+    {
+        $sequentialResults = [System.Collections.Generic.List[object]]::new()
+        for ($i = 0
+            $i -lt $items.Count
+            $i++)
+        {
+            try
+            {
+                [void]$sequentialResults.Add((& $WorkerScript -Item $items[$i] -Index $i))
+            }
+            catch
+            {
+                throw ("{0} failed at item index {1}: {2}" -f $ErrorContext, $i, $_.Exception.Message)
+            }
+        }
+        return @($sequentialResults.ToArray())
+    }
+
+    $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault2()
+    $iss.ImportPSModule(@('Microsoft.PowerShell.Management', 'Microsoft.PowerShell.Utility'))
+    $requiredUnique = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($rawName in @($RequiredFunctions))
+    {
+        if ([string]::IsNullOrWhiteSpace([string]$rawName))
+        {
+            continue
+        }
+        $name = [string]$rawName
+        if (-not $requiredUnique.Add($name))
+        {
+            continue
+        }
+        $functionPath = "function:{0}" -f $name
+        try
+        {
+            $definition = (Get-Item -LiteralPath $functionPath -ErrorAction Stop).ScriptBlock.ToString()
+        }
+        catch
+        {
+            throw ("Required function '{0}' was not found for {1}." -f $name, $ErrorContext)
+        }
+        $iss.Commands.Add((New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry($name, $definition)))
+    }
+    foreach ($key in @($SessionVariables.Keys))
+    {
+        $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry([string]$key, $SessionVariables[$key], ("Injected for {0}" -f $ErrorContext))))
+    }
+
+    $workerText = $WorkerScript.ToString()
+    $invokeScript = @'
+param([string]$WorkerText, [object]$Item, [int]$Index)
+try
+{
+    $worker = [scriptblock]::Create($WorkerText)
+    $result = & $worker -Item $Item -Index $Index
+    [pscustomobject]@{
+        Index = [int]$Index
+        Succeeded = $true
+        Result = $result
+        ErrorMessage = $null
+        ErrorStack = $null
+    }
+}
+catch
+{
+    [pscustomobject]@{
+        Index = [int]$Index
+        Succeeded = $false
+        Result = $null
+        ErrorMessage = $_.Exception.Message
+        ErrorStack = $_.ScriptStackTrace
+    }
+}
+'@
+
+    $pool = [runspacefactory]::CreateRunspacePool($iss)
+    $null = $pool.SetMinRunspaces(1)
+    $null = $pool.SetMaxRunspaces($effectiveParallel)
+    $jobs = [System.Collections.Generic.List[object]]::new()
+    $wrappedResults = [System.Collections.Generic.List[object]]::new()
+    try
+    {
+        $pool.Open()
+        for ($i = 0
+            $i -lt $items.Count
+            $i++)
+        {
+            $ps = [PowerShell]::Create()
+            $ps.RunspacePool = $pool
+            $null = $ps.AddScript($invokeScript).AddArgument($workerText).AddArgument($items[$i]).AddArgument($i)
+            $handle = $ps.BeginInvoke()
+            [void]$jobs.Add([pscustomobject]@{
+                    Index = $i
+                    PowerShell = $ps
+                    Handle = $handle
+                })
+        }
+
+        foreach ($job in @($jobs.ToArray()))
+        {
+            if ($null -eq $job -or $null -eq $job.PowerShell)
+            {
+                [void]$wrappedResults.Add([pscustomobject]@{
+                        Index = if ($null -ne $job)
+                        {
+                            [int]$job.Index
+                        }
+                        else
+                        {
+                            -1
+                        }
+                        Succeeded = $false
+                        Result = $null
+                        ErrorMessage = 'Worker handle was not initialized.'
+                        ErrorStack = $null
+                    })
+                continue
+            }
+            $wrapped = $null
+            try
+            {
+                $resultSet = $job.PowerShell.EndInvoke($job.Handle)
+                if ($resultSet -and $resultSet.Count -gt 0)
+                {
+                    $wrapped = $resultSet[0]
+                }
+                else
+                {
+                    $wrapped = [pscustomobject]@{
+                        Index = [int]$job.Index
+                        Succeeded = $false
+                        Result = $null
+                        ErrorMessage = 'Worker returned no result.'
+                        ErrorStack = $null
+                    }
+                }
+            }
+            catch
+            {
+                $wrapped = [pscustomobject]@{
+                    Index = [int]$job.Index
+                    Succeeded = $false
+                    Result = $null
+                    ErrorMessage = $_.Exception.Message
+                    ErrorStack = $_.ScriptStackTrace
+                }
+            }
+            finally
+            {
+                if ($job.PowerShell)
+                {
+                    $job.PowerShell.Dispose()
+                    $job.PowerShell = $null
+                }
+            }
+            [void]$wrappedResults.Add($wrapped)
+        }
+    }
+    catch
+    {
+        throw ("{0} infrastructure failure: {1}" -f $ErrorContext, $_.Exception.Message)
+    }
+    finally
+    {
+        foreach ($job in @($jobs.ToArray()))
+        {
+            if ($null -ne $job -and $null -ne $job.PowerShell)
+            {
+                try
+                {
+                    $job.PowerShell.Dispose()
+                }
+                catch
+                {
+                    $null = $_
+                }
+            }
+        }
+        if ($pool)
+        {
+            $pool.Dispose()
+        }
+    }
+
+    $failed = [System.Collections.Generic.List[object]]::new()
+    foreach ($entry in @($wrappedResults.ToArray()))
+    {
+        if ($null -eq $entry -or -not [bool]$entry.Succeeded)
+        {
+            [void]$failed.Add($entry)
+        }
+    }
+    if ($failed.Count -gt 0)
+    {
+        $lines = [System.Collections.Generic.List[string]]::new()
+        foreach ($f in @($failed.ToArray()))
+        {
+            $idx = -1
+            $msg = 'Unknown worker failure.'
+            $stack = $null
+            if ($null -ne $f)
+            {
+                $idx = [int]$f.Index
+                $msg = [string]$f.ErrorMessage
+                $stack = [string]$f.ErrorStack
+            }
+            $line = "[{0}] {1}" -f $idx, $msg
+            if (-not [string]::IsNullOrWhiteSpace($stack))
+            {
+                $line += "`n" + $stack
+            }
+            [void]$lines.Add($line)
+        }
+        throw ("{0} failed for {1} item(s).`n{2}" -f $ErrorContext, $failed.Count, ($lines.ToArray() -join "`n"))
+    }
+
+    $results = [System.Collections.Generic.List[object]]::new()
+    foreach ($entry in @($wrappedResults.ToArray()))
+    {
+        [void]$results.Add($entry.Result)
+    }
+    return @($results.ToArray())
+}
 function Get-NormalizedAuthorName
 {
     param([string]$Author)
@@ -1219,6 +1478,54 @@ function Get-SvnBlameLine
     $contentLines = ConvertTo-TextLine -Text $catText
     return (ConvertFrom-SvnBlameXml -XmlText $blameXml -ContentLines $contentLines)
 }
+function Initialize-SvnBlameLineCache
+{
+    [CmdletBinding()]
+    [OutputType([object])]
+    param([string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir)
+    if ($Revision -le 0 -or [string]::IsNullOrWhiteSpace($FilePath))
+    {
+        return [pscustomobject]@{
+            CacheHits = 0
+            CacheMisses = 0
+        }
+    }
+
+    $path = (ConvertTo-PathKey -Path $FilePath).TrimStart('/')
+    $url = $Repo.TrimEnd('/') + '/' + $path + '@' + [string]$Revision
+
+    $hits = 0
+    $misses = 0
+
+    $blameXml = Read-BlameCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
+    if ([string]::IsNullOrEmpty($blameXml))
+    {
+        $misses++
+        $blameXml = Invoke-SvnCommand -Arguments @('blame', '--xml', '-r', [string]$Revision, $url) -ErrorContext ("svn blame $FilePath@$Revision")
+        Write-BlameCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath -Content $blameXml
+    }
+    else
+    {
+        $hits++
+    }
+
+    $catText = Read-CatCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
+    if ($null -eq $catText)
+    {
+        $misses++
+        $catText = Invoke-SvnCommand -Arguments @('cat', '-r', [string]$Revision, $url) -ErrorContext ("svn cat $FilePath@$Revision")
+        Write-CatCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath -Content $catText
+    }
+    else
+    {
+        $hits++
+    }
+
+    return [pscustomobject]@{
+        CacheHits = $hits
+        CacheMisses = $misses
+    }
+}
 function Get-LineIdentityKey
 {
     param([object]$Line)
@@ -1834,6 +2141,170 @@ function Get-StrictHunkDetail
         FilePingPong = $filePingPong
     }
 }
+function Get-StrictBlamePrefetchTarget
+{
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [object[]]$Commits,
+        [int]$FromRevision,
+        [int]$ToRevision,
+        [string]$CacheDir
+    )
+
+    $targets = New-Object 'System.Collections.Generic.List[object]'
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+
+    foreach ($c in @($Commits | Sort-Object Revision))
+    {
+        $rev = [int]$c.Revision
+        if ($rev -lt $FromRevision -or $rev -gt $ToRevision)
+        {
+            continue
+        }
+        $transitions = @(Get-CommitFileTransition -Commit $c)
+        foreach ($t in $transitions)
+        {
+            $beforePath = if ($null -ne $t.BeforePath)
+            {
+                ConvertTo-PathKey -Path ([string]$t.BeforePath)
+            }
+            else
+            {
+                $null
+            }
+            $afterPath = if ($null -ne $t.AfterPath)
+            {
+                ConvertTo-PathKey -Path ([string]$t.AfterPath)
+            }
+            else
+            {
+                $null
+            }
+
+            if ($beforePath -and ($rev - 1) -gt 0)
+            {
+                # Unit Separator (U+001F) as key delimiter — never appears in file paths
+                $key = [string]($rev - 1) + [char]31 + $beforePath
+                if ($seen.Add($key))
+                {
+                    $blameXml = Read-BlameCacheFile -CacheDir $CacheDir -Revision ($rev - 1) -FilePath $beforePath
+                    $catText = Read-CatCacheFile -CacheDir $CacheDir -Revision ($rev - 1) -FilePath $beforePath
+                    if ([string]::IsNullOrEmpty($blameXml) -or $null -eq $catText)
+                    {
+                        [void]$targets.Add([pscustomobject]@{
+                                FilePath = $beforePath
+                                Revision = [int]($rev - 1)
+                            })
+                    }
+                }
+            }
+            if ($afterPath -and $rev -gt 0)
+            {
+                # Unit Separator (U+001F) as key delimiter — never appears in file paths
+                $key = [string]$rev + [char]31 + $afterPath
+                if ($seen.Add($key))
+                {
+                    $blameXml = Read-BlameCacheFile -CacheDir $CacheDir -Revision $rev -FilePath $afterPath
+                    $catText = Read-CatCacheFile -CacheDir $CacheDir -Revision $rev -FilePath $afterPath
+                    if ([string]::IsNullOrEmpty($blameXml) -or $null -eq $catText)
+                    {
+                        [void]$targets.Add([pscustomobject]@{
+                                FilePath = $afterPath
+                                Revision = [int]$rev
+                            })
+                    }
+                }
+            }
+        }
+    }
+
+    return @($targets.ToArray())
+}
+function Invoke-StrictBlameCachePrefetch
+{
+    [CmdletBinding()]
+    param(
+        [object[]]$Targets,
+        [string]$TargetUrl,
+        [string]$CacheDir,
+        [int]$Parallel = 1
+    )
+    $items = @($Targets)
+    if ($items.Count -eq 0)
+    {
+        return
+    }
+
+    if ($Parallel -le 1)
+    {
+        foreach ($item in $items)
+        {
+            try
+            {
+                $prefetchStats = Initialize-SvnBlameLineCache -Repo $TargetUrl -FilePath ([string]$item.FilePath) -Revision ([int]$item.Revision) -CacheDir $CacheDir
+                $script:StrictBlameCacheHits += [int]$prefetchStats.CacheHits
+                $script:StrictBlameCacheMisses += [int]$prefetchStats.CacheMisses
+            }
+            catch
+            {
+                throw ("Strict blame prefetch failed for '{0}' at r{1}: {2}" -f [string]$item.FilePath, [int]$item.Revision, $_.Exception.Message)
+            }
+        }
+        return
+    }
+
+    $prefetchItems = [System.Collections.Generic.List[object]]::new()
+    foreach ($item in $items)
+    {
+        [void]$prefetchItems.Add([pscustomobject]@{
+                FilePath = [string]$item.FilePath
+                Revision = [int]$item.Revision
+                TargetUrl = $TargetUrl
+                CacheDir = $CacheDir
+            })
+    }
+
+    $worker = {
+        param($Item, $Index)
+        $null = $Index # Required by Invoke-ParallelWork contract
+        try
+        {
+            $stats = Initialize-SvnBlameLineCache -Repo $Item.TargetUrl -FilePath ([string]$Item.FilePath) -Revision ([int]$Item.Revision) -CacheDir $Item.CacheDir
+            [pscustomobject]@{
+                CacheHits = [int]$stats.CacheHits
+                CacheMisses = [int]$stats.CacheMisses
+            }
+        }
+        catch
+        {
+            throw ("Strict blame prefetch failed for '{0}' at r{1}: {2}" -f [string]$Item.FilePath, [int]$Item.Revision, $_.Exception.Message)
+        }
+    }
+    $results = @(Invoke-ParallelWork -InputItems $prefetchItems.ToArray() -WorkerScript $worker -MaxParallel $Parallel -RequiredFunctions @(
+            'ConvertTo-PathKey',
+            'Get-Sha1Hex',
+            'Get-PathCacheHash',
+            'Get-BlameCachePath',
+            'Get-CatCachePath',
+            'Read-BlameCacheFile',
+            'Write-BlameCacheFile',
+            'Read-CatCacheFile',
+            'Write-CatCacheFile',
+            'Join-CommandArgument',
+            'Invoke-SvnCommand',
+            'Initialize-SvnBlameLineCache'
+        ) -SessionVariables @{
+            SvnExecutable = $script:SvnExecutable
+            SvnGlobalArguments = @($script:SvnGlobalArguments)
+        } -ErrorContext 'strict blame prefetch')
+
+    foreach ($entry in @($results))
+    {
+        $script:StrictBlameCacheHits += [int]$entry.CacheHits
+        $script:StrictBlameCacheMisses += [int]$entry.CacheMisses
+    }
+}
 function Get-ExactDeathAttribution
 {
     [CmdletBinding()]
@@ -1844,7 +2315,8 @@ function Get-ExactDeathAttribution
         [int]$FromRevision,
         [int]$ToRevision,
         [string]$CacheDir,
-        [hashtable]$RenameMap = @{}
+        [hashtable]$RenameMap = @{},
+        [int]$Parallel = 1
     )
 
     $authorBorn = @{}
@@ -1866,6 +2338,9 @@ function Get-ExactDeathAttribution
 
     $authorModifiedOthersCode = @{}
     $revsWhereKilledOthers = New-Object 'System.Collections.Generic.HashSet[string]'
+
+    $prefetchTargets = @(Get-StrictBlamePrefetchTarget -Commits $Commits -FromRevision $FromRevision -ToRevision $ToRevision -CacheDir $CacheDir)
+    Invoke-StrictBlameCachePrefetch -Targets $prefetchTargets -TargetUrl $TargetUrl -CacheDir $CacheDir -Parallel $Parallel
 
     foreach ($c in @($Commits | Sort-Object Revision))
     {
@@ -2954,7 +3429,7 @@ function Get-CachedOrFetchDiffText
     Set-Content -Path $cacheFile -Value $diffText -Encoding UTF8
     return $diffText
 }
-function Get-FilteredChangedPathEntries
+function Get-FilteredChangedPathEntry
 {
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -2990,6 +3465,7 @@ function Get-FilteredChangedPathEntries
 }
 function Set-DiffStatCollectionProperty
 {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     param([object]$TargetStat, [object]$SourceStat, [string]$PropertyName, [switch]$AsString)
     if ($TargetStat.PSObject.Properties.Match($PropertyName).Count -eq 0)
@@ -3051,6 +3527,7 @@ function Set-DiffStatCollectionProperty
 }
 function Clear-DiffStatCollectionProperty
 {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     param([object]$TargetStat, [string]$PropertyName)
     if ($TargetStat.PSObject.Properties.Match($PropertyName).Count -eq 0)
@@ -3069,6 +3546,7 @@ function Clear-DiffStatCollectionProperty
 }
 function Set-DiffStatFromSource
 {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     param([object]$TargetStat, [object]$SourceStat)
     $TargetStat.AddedLines = [int]$SourceStat.AddedLines
@@ -3083,6 +3561,7 @@ function Set-DiffStatFromSource
 }
 function Reset-DiffStatForRemovedPath
 {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     param([object]$DiffStat)
     $DiffStat.AddedLines = 0
@@ -3091,8 +3570,9 @@ function Reset-DiffStatForRemovedPath
     Clear-DiffStatCollectionProperty -TargetStat $DiffStat -PropertyName 'AddedLineHashes'
     Clear-DiffStatCollectionProperty -TargetStat $DiffStat -PropertyName 'DeletedLineHashes'
 }
-function Update-RenamePairDiffStats
+function Update-RenamePairDiffStat
 {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     param([object]$Commit, [int]$Revision, [string]$TargetUrl, [string[]]$DiffArguments, [int]$DeadDetailLevel)
     $deletedSet = New-Object 'System.Collections.Generic.HashSet[string]'
@@ -3174,6 +3654,7 @@ function Update-RenamePairDiffStats
 }
 function Set-CommitDerivedMetric
 {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     param([object]$Commit)
     $added = 0
@@ -3218,17 +3699,65 @@ function Initialize-CommitDiffData
         [string[]]$IncludeExtensions,
         [string[]]$ExcludeExtensions,
         [string[]]$IncludePathPatterns,
-        [string[]]$ExcludePathPatterns
+        [string[]]$ExcludePathPatterns,
+        [int]$Parallel = 1
     )
     $revToAuthor = @{}
+    $phaseAItems = [System.Collections.Generic.List[object]]::new()
     foreach ($commit in @($Commits))
     {
         $revision = [int]$commit.Revision
         $revToAuthor[$revision] = [string]$commit.Author
+        [void]$phaseAItems.Add([pscustomobject]@{
+                Revision = $revision
+                CacheDir = $CacheDir
+                TargetUrl = $TargetUrl
+                DiffArguments = @($DiffArguments)
+                DeadDetailLevel = $DeadDetailLevel
+            })
+    }
 
-        $diffText = Get-CachedOrFetchDiffText -CacheDir $CacheDir -Revision $revision -TargetUrl $TargetUrl -DiffArguments $DiffArguments
-        $rawDiffByPath = ConvertFrom-SvnUnifiedDiff -DiffText $diffText -DetailLevel $DeadDetailLevel
+    $phaseAResults = @()
+    if ($phaseAItems.Count -gt 0)
+    {
+        $phaseAWorker = {
+            param($Item, $Index)
+            $null = $Index # Required by Invoke-ParallelWork contract
+            $diffText = Get-CachedOrFetchDiffText -CacheDir $Item.CacheDir -Revision ([int]$Item.Revision) -TargetUrl $Item.TargetUrl -DiffArguments @($Item.DiffArguments)
+            $rawDiffByPath = ConvertFrom-SvnUnifiedDiff -DiffText $diffText -DetailLevel ([int]$Item.DeadDetailLevel)
+            [pscustomobject]@{
+                Revision = [int]$Item.Revision
+                RawDiffByPath = $rawDiffByPath
+            }
+        }
+        $phaseAResults = @(Invoke-ParallelWork -InputItems $phaseAItems.ToArray() -WorkerScript $phaseAWorker -MaxParallel $Parallel -RequiredFunctions @(
+                'ConvertTo-PathKey',
+                'ConvertTo-LineHash',
+                'ConvertTo-ContextHash',
+                'ConvertFrom-SvnUnifiedDiff',
+                'Join-CommandArgument',
+                'Invoke-SvnCommand',
+                'Get-CachedOrFetchDiffText'
+            ) -SessionVariables @{
+                SvnExecutable = $script:SvnExecutable
+                SvnGlobalArguments = @($script:SvnGlobalArguments)
+            } -ErrorContext 'commit diff prefetch')
+    }
 
+    $rawDiffByRevision = @{}
+    foreach ($result in @($phaseAResults))
+    {
+        $rawDiffByRevision[[int]$result.Revision] = $result.RawDiffByPath
+    }
+
+    foreach ($commit in @($Commits))
+    {
+        $revision = [int]$commit.Revision
+        $rawDiffByPath = @{}
+        if ($rawDiffByRevision.ContainsKey($revision))
+        {
+            $rawDiffByPath = $rawDiffByRevision[$revision]
+        }
         $filteredDiffByPath = @{}
         foreach ($path in $rawDiffByPath.Keys)
         {
@@ -3239,7 +3768,7 @@ function Initialize-CommitDiffData
         }
         $commit.FileDiffStats = $filteredDiffByPath
 
-        $commit.ChangedPathsFiltered = Get-FilteredChangedPathEntries -ChangedPaths @($commit.ChangedPaths) -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns
+        $commit.ChangedPathsFiltered = Get-FilteredChangedPathEntry -ChangedPaths @($commit.ChangedPaths) -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns
 
         $allowedFilePathSet = New-Object 'System.Collections.Generic.HashSet[string]'
         foreach ($pathEntry in @($commit.ChangedPathsFiltered))
@@ -3262,13 +3791,14 @@ function Initialize-CommitDiffData
         $commit.FileDiffStats = $filteredByLog
         $commit.FilesChanged = @($commit.FileDiffStats.Keys | Sort-Object)
 
-        Update-RenamePairDiffStats -Commit $commit -Revision $revision -TargetUrl $TargetUrl -DiffArguments $DiffArguments -DeadDetailLevel $DeadDetailLevel
+        Update-RenamePairDiffStat -Commit $commit -Revision $revision -TargetUrl $TargetUrl -DiffArguments $DiffArguments -DeadDetailLevel $DeadDetailLevel
         Set-CommitDerivedMetric -Commit $commit
     }
     return $revToAuthor
 }
-function New-CommitRowsFromCommits
+function New-CommitRowFromCommit
 {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     [OutputType([object[]])]
     param([object[]]$Commits)
@@ -3334,8 +3864,9 @@ function Get-AuthorModifiedOthersSurvivedCount
     }
     return $authorModifiedOthersSurvived
 }
-function Update-FileRowsWithStrictMetrics
+function Update-FileRowWithStrictMetric
 {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     param(
         [object[]]$FileRows,
@@ -3446,8 +3977,9 @@ function Update-FileRowsWithStrictMetrics
         $row.'最多作者blame占有率' = Format-MetricValue -Value $topBlameShare
     }
 }
-function Update-CommitterRowsWithStrictMetrics
+function Update-CommitterRowWithStrictMetric
 {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     param(
         [object[]]$CommitterRows,
@@ -3496,8 +4028,9 @@ function Update-CommitterRowsWithStrictMetrics
         $row.'他者コード変更生存行数' = $modifiedOthersSurvived
     }
 }
-function Update-StrictAttributionMetrics
+function Update-StrictAttributionMetric
 {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     param(
         [object[]]$Commits,
@@ -3511,7 +4044,8 @@ function Update-StrictAttributionMetrics
         [string[]]$IncludePaths,
         [string[]]$ExcludePaths,
         [object[]]$FileRows,
-        [object[]]$CommitterRows
+        [object[]]$CommitterRows,
+        [int]$Parallel = 1
     )
     if (@($FileRows).Count -le 0)
     {
@@ -3519,7 +4053,7 @@ function Update-StrictAttributionMetrics
     }
 
     $renameMap = Get-RenameMap -Commits $Commits
-    $strictDetail = Get-ExactDeathAttribution -Commits $Commits -RevToAuthor $RevToAuthor -TargetUrl $TargetUrl -FromRevision $FromRevision -ToRevision $ToRevision -CacheDir $CacheDir -RenameMap $renameMap
+    $strictDetail = Get-ExactDeathAttribution -Commits $Commits -RevToAuthor $RevToAuthor -TargetUrl $TargetUrl -FromRevision $FromRevision -ToRevision $ToRevision -CacheDir $CacheDir -RenameMap $renameMap -Parallel $Parallel
     if ($null -eq $strictDetail)
     {
         throw "Strict death attribution returned null."
@@ -3535,29 +4069,90 @@ function Update-StrictAttributionMetrics
     {
         $null = $existingFileSet.Add([string]$file)
     }
-    foreach ($file in $ownershipTargets)
+    if ($Parallel -le 1)
     {
-        try
+        foreach ($file in $ownershipTargets)
         {
-            $blame = Get-SvnBlameSummary -Repo $TargetUrl -FilePath $file -ToRevision $ToRevision -CacheDir $CacheDir
+            try
+            {
+                $blame = Get-SvnBlameSummary -Repo $TargetUrl -FilePath $file -ToRevision $ToRevision -CacheDir $CacheDir
+            }
+            catch
+            {
+                throw ("Strict ownership blame failed for '{0}' at r{1}: {2}" -f $file, $ToRevision, $_.Exception.Message)
+            }
+            $blameByFile[$file] = $blame
+            $ownedTotal += [int]$blame.LineCountTotal
+            foreach ($author in $blame.LineCountByAuthor.Keys)
+            {
+                Add-Count -Table $authorOwned -Key ([string]$author) -Delta ([int]$blame.LineCountByAuthor[$author])
+            }
         }
-        catch
+    }
+    else
+    {
+        $ownershipItems = [System.Collections.Generic.List[object]]::new()
+        foreach ($file in $ownershipTargets)
         {
-            throw ("Strict ownership blame failed for '{0}' at r{1}: {2}" -f $file, $ToRevision, $_.Exception.Message)
+            [void]$ownershipItems.Add([pscustomobject]@{
+                    FilePath = [string]$file
+                    ToRevision = [int]$ToRevision
+                    TargetUrl = $TargetUrl
+                    CacheDir = $CacheDir
+                })
         }
-        $blameByFile[$file] = $blame
-        $ownedTotal += [int]$blame.LineCountTotal
-        foreach ($author in $blame.LineCountByAuthor.Keys)
+
+        $ownershipWorker = {
+            param($Item, $Index)
+            $null = $Index # Required by Invoke-ParallelWork contract
+            try
+            {
+                $blame = Get-SvnBlameSummary -Repo $Item.TargetUrl -FilePath ([string]$Item.FilePath) -ToRevision ([int]$Item.ToRevision) -CacheDir $Item.CacheDir
+                [pscustomobject]@{
+                    FilePath = [string]$Item.FilePath
+                    Blame = $blame
+                }
+            }
+            catch
+            {
+                throw ("Strict ownership blame failed for '{0}' at r{1}: {2}" -f [string]$Item.FilePath, [int]$Item.ToRevision, $_.Exception.Message)
+            }
+        }
+        $ownershipResults = @(Invoke-ParallelWork -InputItems $ownershipItems.ToArray() -WorkerScript $ownershipWorker -MaxParallel $Parallel -RequiredFunctions @(
+                'ConvertTo-PathKey',
+                'Get-Sha1Hex',
+                'Get-PathCacheHash',
+                'Get-BlameCachePath',
+                'Read-BlameCacheFile',
+                'Write-BlameCacheFile',
+                'ConvertFrom-SvnXmlText',
+                'ConvertFrom-SvnBlameXml',
+                'Join-CommandArgument',
+                'Invoke-SvnCommand',
+                'Get-SvnBlameSummary'
+            ) -SessionVariables @{
+                SvnExecutable = $script:SvnExecutable
+                SvnGlobalArguments = @($script:SvnGlobalArguments)
+            } -ErrorContext 'strict ownership blame')
+
+        foreach ($entry in @($ownershipResults))
         {
-            Add-Count -Table $authorOwned -Key ([string]$author) -Delta ([int]$blame.LineCountByAuthor[$author])
+            $file = [string]$entry.FilePath
+            $blame = $entry.Blame
+            $blameByFile[$file] = $blame
+            $ownedTotal += [int]$blame.LineCountTotal
+            foreach ($author in $blame.LineCountByAuthor.Keys)
+            {
+                Add-Count -Table $authorOwned -Key ([string]$author) -Delta ([int]$blame.LineCountByAuthor[$author])
+            }
         }
     }
 
     $authorModifiedOthersSurvived = Get-AuthorModifiedOthersSurvivedCount -BlameByFile $blameByFile -RevsWhereKilledOthers $strictDetail.RevsWhereKilledOthers -FromRevision $FromRevision -ToRevision $ToRevision
-    Update-FileRowsWithStrictMetrics -FileRows $FileRows -RenameMap $renameMap -StrictDetail $strictDetail -ExistingFileSet $existingFileSet -BlameByFile $blameByFile -TargetUrl $TargetUrl -ToRevision $ToRevision -CacheDir $CacheDir
-    Update-CommitterRowsWithStrictMetrics -CommitterRows $CommitterRows -AuthorSurvived $authorSurvived -AuthorOwned $authorOwned -OwnedTotal $ownedTotal -StrictDetail $strictDetail -AuthorModifiedOthersSurvived $authorModifiedOthersSurvived
+    Update-FileRowWithStrictMetric -FileRows $FileRows -RenameMap $renameMap -StrictDetail $strictDetail -ExistingFileSet $existingFileSet -BlameByFile $blameByFile -TargetUrl $TargetUrl -ToRevision $ToRevision -CacheDir $CacheDir
+    Update-CommitterRowWithStrictMetric -CommitterRows $CommitterRows -AuthorSurvived $authorSurvived -AuthorOwned $authorOwned -OwnedTotal $ownedTotal -StrictDetail $strictDetail -AuthorModifiedOthersSurvived $authorModifiedOthersSurvived
 }
-function Get-MetricHeaders
+function Get-MetricHeader
 {
     [CmdletBinding()]
     [OutputType([object])]
@@ -3571,6 +4166,7 @@ function Get-MetricHeaders
 }
 function New-RunMetaData
 {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     [OutputType([hashtable])]
     param(
@@ -3786,16 +4382,16 @@ try
     }
 
     $diffArgs = Get-SvnDiffArgumentList -IncludeProperties:$IncludeProperties -ForceBinary:$ForceBinary -IgnoreAllSpace:$IgnoreAllSpace -IgnoreSpaceChange:$IgnoreSpaceChange -IgnoreEolStyle:$IgnoreEolStyle
-    $revToAuthor = Initialize-CommitDiffData -Commits $commits -CacheDir $cacheDir -TargetUrl $targetUrl -DiffArguments $diffArgs -DeadDetailLevel $DeadDetailLevel -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePaths -ExcludePathPatterns $ExcludePaths
+    $revToAuthor = Initialize-CommitDiffData -Commits $commits -CacheDir $cacheDir -TargetUrl $targetUrl -DiffArguments $diffArgs -DeadDetailLevel $DeadDetailLevel -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePaths -ExcludePathPatterns $ExcludePaths -Parallel $Parallel
 
     $committerRows = @(Get-CommitterMetric -Commits $commits)
     $fileRows = @(Get-FileMetric -Commits $commits)
     $couplingRows = @(Get-CoChangeMetric -Commits $commits -TopNCount $TopN)
-    $commitRows = @(New-CommitRowsFromCommits -Commits $commits)
+    $commitRows = @(New-CommitRowFromCommit -Commits $commits)
 
-    Update-StrictAttributionMetrics -Commits $commits -RevToAuthor $revToAuthor -TargetUrl $targetUrl -FromRevision $FromRev -ToRevision $ToRev -CacheDir $cacheDir -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -FileRows $fileRows -CommitterRows $committerRows
+    Update-StrictAttributionMetric -Commits $commits -RevToAuthor $revToAuthor -TargetUrl $targetUrl -FromRevision $FromRev -ToRevision $ToRev -CacheDir $cacheDir -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -FileRows $fileRows -CommitterRows $committerRows -Parallel $Parallel
 
-    $headers = Get-MetricHeaders
+    $headers = Get-MetricHeader
     Write-CsvFile -FilePath (Join-Path $OutDir 'committers.csv') -Rows $committerRows -Headers $headers.Committer -EncodingName $Encoding
     Write-CsvFile -FilePath (Join-Path $OutDir 'files.csv') -Rows $fileRows -Headers $headers.File -EncodingName $Encoding
     Write-CsvFile -FilePath (Join-Path $OutDir 'commits.csv') -Rows $commitRows -Headers $headers.Commit -EncodingName $Encoding
