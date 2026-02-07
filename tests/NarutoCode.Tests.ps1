@@ -861,6 +861,103 @@ Describe 'Metrics functions — detailed verification' {
     }
 }
 
+Describe 'StrictMode behavior' {
+    AfterEach {
+        Initialize-StrictModeContext -Enabled $false
+    }
+
+    It 'Format-MetricValue bypasses rounding when strict mode is enabled' {
+        Initialize-StrictModeContext -Enabled $false
+        (Format-MetricValue -Value 1.23456) | Should -Be 1.2346
+
+        Initialize-StrictModeContext -Enabled $true
+        (Format-MetricValue -Value 1.23456) | Should -Be 1.23456
+    }
+
+    It 'Get-CommitterMetric returns null ratios for zero denominators in strict mode' {
+        Initialize-StrictModeContext -Enabled $true
+        $commits = @(
+            [pscustomobject]@{
+                Revision = 1
+                Author = 'strict-user'
+                Date = [datetime]'2026-01-01'
+                Message = 'strict'
+                ChangedPathsFiltered = @([pscustomobject]@{ Path='src/A.cs'; Action='M' })
+                FileDiffStats = @{ 'src/A.cs' = [pscustomobject]@{ AddedLines=0; DeletedLines=0; Hunks=@(); IsBinary=$false } }
+                FilesChanged = @('src/A.cs')
+                AddedLines = 0
+                DeletedLines = 0
+                Churn = 0
+                Entropy = 0.0
+                MsgLen = 6
+                MessageShort = 'strict'
+            }
+        )
+        $row = @(Get-CommitterMetric -Commits $commits)[0]
+        $row.'削除対追加比' | Should -Be $null
+        $row.'チャーン対純増比' | Should -Be $null
+    }
+
+    It 'Get-CoChangeMetric does not skip large commits in strict mode' {
+        Initialize-StrictModeContext -Enabled $true
+        $bigCommit = [pscustomobject]@{
+            Revision = 99
+            Author = 'bulk'
+            Date = [datetime]'2026-06-01'
+            Message = 'bulk import'
+            ChangedPathsFiltered = @()
+            FileDiffStats = @{}
+            FilesChanged = (1..150 | ForEach-Object { "file$_.cs" })
+            AddedLines = 0
+            DeletedLines = 0
+            Churn = 0
+            Entropy = 0.0
+            MsgLen = 11
+            MessageShort = 'bulk import'
+        }
+        $result = @(Get-CoChangeMetric -Commits @($bigCommit) -TopNCount 10 -LargeCommitFileThreshold 100)
+        $result.Count | Should -Be 10
+    }
+
+    It 'switches dead-related column names in strict mode' {
+        Initialize-StrictModeContext -Enabled $true
+        $rows = @(Get-CommitterMetric -Commits @(
+                [pscustomobject]@{
+                    Revision = 1
+                    Author = 'strict-user'
+                    Date = [datetime]'2026-01-01'
+                    Message = ''
+                    ChangedPathsFiltered = @()
+                    FileDiffStats = @{}
+                    FilesChanged = @()
+                    AddedLines = 0
+                    DeletedLines = 0
+                    Churn = 0
+                    Entropy = 0.0
+                    MsgLen = 0
+                    MessageShort = ''
+                }
+            ))
+        $row = $rows[0]
+        $row.PSObject.Properties.Name -contains '消滅追加行数' | Should -BeTrue
+        $row.PSObject.Properties.Name -contains '自己消滅行数' | Should -BeTrue
+        $row.PSObject.Properties.Name -contains '被他者消滅行数' | Should -BeTrue
+    }
+}
+
+Describe 'ConvertFrom-SvnUnifiedDiff localized binary marker' {
+    It 'detects binary via mime-type line even when marker text is localized' {
+        $diff = @"
+Index: assets/logo.png
+===================================================================
+表示できません: バイナリタイプとしてマークされたファイルです。
+svn:mime-type = application/octet-stream
+"@
+        $parsed = ConvertFrom-SvnUnifiedDiff -DiffText $diff
+        $parsed['assets/logo.png'].IsBinary | Should -BeTrue
+    }
+}
+
 Describe 'Test-ShouldCountFile extended' {
     It 'returns true for file with no extension when no IncludeExt specified' {
         Test-ShouldCountFile -FilePath 'Makefile' | Should -BeTrue
@@ -962,6 +1059,25 @@ Describe 'NarutoCode.ps1 execution' {
                     -NoBlame `
                     -ErrorAction Stop
             } | Should -Throw -ExpectedMessage '*not found*'
+        }
+        finally {
+            Remove-Item -Path $tempOut -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'fails when StrictMode and NoBlame are both specified' {
+        $tempOut = Join-Path $env:TEMP ('narutocode_test_' + [guid]::NewGuid().ToString('N'))
+        try {
+            {
+                & $script:ScriptPath `
+                    -RepoUrl 'https://svn.example.com/repos/proj/trunk' `
+                    -FromRev 1 -ToRev 2 `
+                    -OutDir $tempOut `
+                    -SvnExecutable 'nonexistent_svn_command_xyz' `
+                    -StrictMode `
+                    -NoBlame `
+                    -ErrorAction Stop
+            } | Should -Throw -ExpectedMessage '*StrictMode requires blame analysis*'
         }
         finally {
             Remove-Item -Path $tempOut -Recurse -Force -ErrorAction SilentlyContinue

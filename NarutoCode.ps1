@@ -29,7 +29,8 @@ param(
     [switch]$IncludeProperties,
     [switch]$ForceBinary,
     [switch]$NoProgress,
-    [ValidateRange(0, 2)][int]$DeadDetailLevel = 0
+    [ValidateRange(0, 2)][int]$DeadDetailLevel = 0,
+    [switch]$StrictMode
 )
 
 # Suppress progress output when -NoProgress is specified
@@ -39,6 +40,32 @@ if ($NoProgress)
 }
 
 # region Utility
+$script:StrictModeEnabled = $false
+$script:ColDeadAdded = '消滅追加行数 (概算)'
+$script:ColSelfDead = '自己消滅行数 (概算)'
+$script:ColOtherDead = '被他者消滅行数 (概算)'
+$script:StrictBlameCacheHits = 0
+$script:StrictBlameCacheMisses = 0
+
+function Initialize-StrictModeContext
+{
+    param([bool]$Enabled)
+    $script:StrictModeEnabled = $Enabled
+    $script:StrictBlameCacheHits = 0
+    $script:StrictBlameCacheMisses = 0
+    if ($Enabled)
+    {
+        $script:ColDeadAdded = '消滅追加行数'
+        $script:ColSelfDead = '自己消滅行数'
+        $script:ColOtherDead = '被他者消滅行数'
+    }
+    else
+    {
+        $script:ColDeadAdded = '消滅追加行数 (概算)'
+        $script:ColSelfDead = '自己消滅行数 (概算)'
+        $script:ColOtherDead = '被他者消滅行数 (概算)'
+    }
+}
 function ConvertTo-NormalizedExtension
 {
     param([string[]]$Extensions)
@@ -154,7 +181,12 @@ function Write-CsvFile
     $lines = @()
     if (@($Rows).Count -gt 0)
     {
-        $lines = $Rows | ConvertTo-Csv -NoTypeInformation
+        $csvRows = $Rows
+        if ($Headers -and $Headers.Count -gt 0)
+        {
+            $csvRows = $Rows | Select-Object -Property $Headers
+        }
+        $lines = $csvRows | ConvertTo-Csv -NoTypeInformation
     }
     elseif ($Headers -and $Headers.Count -gt 0)
     {
@@ -182,6 +214,37 @@ function Get-RoundedNumber
 {
     param([double]$Value, [int]$Digits = 4) [Math]::Round($Value, $Digits)
 }
+function Format-MetricValue
+{
+    param([double]$Value, [int]$Digits = 4)
+    if ($script:StrictModeEnabled)
+    {
+        return $Value
+    }
+    return Get-RoundedNumber -Value $Value -Digits $Digits
+}
+function Add-Count
+{
+    param([hashtable]$Table, [string]$Key, [int]$Delta = 1)
+    if ([string]::IsNullOrWhiteSpace($Key))
+    {
+        $Key = '(unknown)'
+    }
+    if (-not $Table.ContainsKey($Key))
+    {
+        $Table[$Key] = 0
+    }
+    $Table[$Key] = [int]$Table[$Key] + $Delta
+}
+function Get-NormalizedAuthorName
+{
+    param([string]$Author)
+    if ([string]::IsNullOrWhiteSpace($Author))
+    {
+        return '(unknown)'
+    }
+    return $Author.Trim()
+}
 function ConvertTo-PathKey
 {
     param([string]$Path)
@@ -200,6 +263,256 @@ function ConvertTo-PathKey
         $x = $x.Substring(2)
     }
     return $x
+}
+function Get-Sha1Hex
+{
+    param([string]$Text)
+    if ($null -eq $Text)
+    {
+        $Text = ''
+    }
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
+    $sha = New-Object System.Security.Cryptography.SHA1CryptoServiceProvider
+    try
+    {
+        $hash = $sha.ComputeHash($bytes)
+        return [BitConverter]::ToString($hash).Replace('-', '').ToLowerInvariant()
+    }
+    finally
+    {
+        $sha.Dispose()
+    }
+}
+function Get-PathCacheHash
+{
+    param([string]$FilePath)
+    return Get-Sha1Hex -Text (ConvertTo-PathKey -Path $FilePath)
+}
+function Get-BlameCachePath
+{
+    param([string]$CacheDir, [int]$Revision, [string]$FilePath)
+    $dir = Join-Path (Join-Path $CacheDir 'blame') ("r{0}" -f $Revision)
+    return Join-Path $dir ((Get-PathCacheHash -FilePath $FilePath) + '.xml')
+}
+function Get-CatCachePath
+{
+    param([string]$CacheDir, [int]$Revision, [string]$FilePath)
+    $dir = Join-Path (Join-Path $CacheDir 'cat') ("r{0}" -f $Revision)
+    return Join-Path $dir ((Get-PathCacheHash -FilePath $FilePath) + '.txt')
+}
+function Read-BlameCacheFile
+{
+    param([string]$CacheDir, [int]$Revision, [string]$FilePath)
+    if ([string]::IsNullOrWhiteSpace($CacheDir))
+    {
+        return $null
+    }
+    $path = Get-BlameCachePath -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
+    if (-not (Test-Path $path))
+    {
+        return $null
+    }
+    return (Get-Content -Path $path -Raw -Encoding UTF8)
+}
+function Write-BlameCacheFile
+{
+    param([string]$CacheDir, [int]$Revision, [string]$FilePath, [string]$Content)
+    if ([string]::IsNullOrWhiteSpace($CacheDir))
+    {
+        return
+    }
+    $path = Get-BlameCachePath -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
+    $dir = Split-Path -Parent $path
+    if (-not (Test-Path $dir))
+    {
+        New-Item -Path $dir -ItemType Directory -Force | Out-Null
+    }
+    Set-Content -Path $path -Value $Content -Encoding UTF8
+}
+function Read-CatCacheFile
+{
+    param([string]$CacheDir, [int]$Revision, [string]$FilePath)
+    if ([string]::IsNullOrWhiteSpace($CacheDir))
+    {
+        return $null
+    }
+    $path = Get-CatCachePath -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
+    if (-not (Test-Path $path))
+    {
+        return $null
+    }
+    return (Get-Content -Path $path -Raw -Encoding UTF8)
+}
+function Write-CatCacheFile
+{
+    param([string]$CacheDir, [int]$Revision, [string]$FilePath, [string]$Content)
+    if ([string]::IsNullOrWhiteSpace($CacheDir))
+    {
+        return
+    }
+    $path = Get-CatCachePath -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
+    $dir = Split-Path -Parent $path
+    if (-not (Test-Path $dir))
+    {
+        New-Item -Path $dir -ItemType Directory -Force | Out-Null
+    }
+    Set-Content -Path $path -Value $Content -Encoding UTF8
+}
+function ConvertTo-TextLine
+{
+    param([string]$Text)
+    if ($null -eq $Text)
+    {
+        return @()
+    }
+    $lines = $Text -split "`r`n|`n|`r", -1
+    if ($lines.Count -gt 0 -and $lines[$lines.Count - 1] -eq '')
+    {
+        if ($lines.Count -eq 1)
+        {
+            return @()
+        }
+        $lines = @($lines[0..($lines.Count - 2)])
+    }
+    return @($lines)
+}
+function Resolve-PathByRenameMap
+{
+    param([string]$FilePath, [hashtable]$RenameMap)
+    $resolved = ConvertTo-PathKey -Path $FilePath
+    if ($null -eq $RenameMap -or -not $resolved)
+    {
+        return $resolved
+    }
+    $guard = 0
+    while ($RenameMap.ContainsKey($resolved) -and $guard -lt 4096)
+    {
+        $next = [string]$RenameMap[$resolved]
+        if ([string]::IsNullOrWhiteSpace($next) -or $next -eq $resolved)
+        {
+            break
+        }
+        $resolved = $next
+        $guard++
+    }
+    return $resolved
+}
+function Get-DiffLineStat
+{
+    param([string]$DiffText)
+    $added = 0
+    $deleted = 0
+    if ([string]::IsNullOrEmpty($DiffText))
+    {
+        return [pscustomobject]@{ AddedLines = 0; DeletedLines = 0 }
+    }
+    $lines = $DiffText -split "`r?`n"
+    foreach ($line in $lines)
+    {
+        if (-not $line)
+        {
+            continue
+        }
+        if ($line.StartsWith('+++') -or $line.StartsWith('---') -or $line.StartsWith('@@') -or $line.StartsWith('Index: ') -or $line.StartsWith('===') -or $line -eq '\ No newline at end of file')
+        {
+            continue
+        }
+        if ($line[0] -eq '+')
+        {
+            $added++
+            continue
+        }
+        if ($line[0] -eq '-')
+        {
+            $deleted++
+            continue
+        }
+    }
+    return [pscustomobject]@{ AddedLines = $added; DeletedLines = $deleted }
+}
+function Get-AllRepositoryFile
+{
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param([string]$Repo, [int]$Revision, [string[]]$IncludeExt, [string[]]$ExcludeExt, [string[]]$IncludePathPatterns, [string[]]$ExcludePathPatterns)
+    $xmlText = Invoke-SvnCommand -Arguments @('list', '-R', '--xml', '-r', [string]$Revision, $Repo) -ErrorContext 'svn list'
+    $xml = ConvertFrom-SvnXmlText -Text $xmlText -ContextLabel 'svn list'
+    $nodes = @()
+    if ($xml)
+    {
+        $entries = $xml.SelectNodes('/lists/list/entry')
+        if ($entries -and $entries.Count -gt 0)
+        {
+            $nodes = @($entries)
+        }
+    }
+    $files = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($node in $nodes)
+    {
+        if ([string]$node.kind -ne 'file')
+        {
+            continue
+        }
+        $nameNode = $node.SelectSingleNode('name')
+        if ($null -eq $nameNode)
+        {
+            continue
+        }
+        $path = ConvertTo-PathKey -Path ([string]$nameNode.InnerText)
+        if (-not $path)
+        {
+            continue
+        }
+        if (Test-ShouldCountFile -FilePath $path -IncludeExt $IncludeExt -ExcludeExt $ExcludeExt -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns)
+        {
+            $files.Add($path) | Out-Null
+        }
+    }
+    return @($files.ToArray() | Sort-Object -Unique)
+}
+function Initialize-CanonicalOffsetMap
+{
+    return (New-Object 'System.Collections.Generic.List[object]')
+}
+function Get-CanonicalLineNumber
+{
+    param([object[]]$OffsetEvents, [int]$LineNumber)
+    $sum = 0
+    foreach ($ev in @($OffsetEvents))
+    {
+        if ([int]$ev.Threshold -le $LineNumber)
+        {
+            $sum += [int]$ev.Delta
+        }
+    }
+    return $LineNumber + $sum
+}
+function Add-CanonicalOffsetEvent
+{
+    param([System.Collections.Generic.List[object]]$OffsetEvents, [int]$ThresholdLine, [int]$ShiftDelta)
+    if ($null -eq $OffsetEvents)
+    {
+        return
+    }
+    if ($ShiftDelta -eq 0)
+    {
+        return
+    }
+    $OffsetEvents.Add([pscustomobject]@{ Threshold = $ThresholdLine; Delta = $ShiftDelta }) | Out-Null
+}
+function Test-RangeOverlap
+{
+    param([int]$StartA, [int]$EndA, [int]$StartB, [int]$EndB)
+    $left = [Math]::Max($StartA, $StartB)
+    $right = [Math]::Min($EndA, $EndB)
+    return ($left -le $right)
+}
+function Test-RangeTripleOverlap
+{
+    param([int]$StartA, [int]$EndA, [int]$StartB, [int]$EndB, [int]$StartC, [int]$EndC)
+    $left = [Math]::Max([Math]::Max($StartA, $StartB), $StartC)
+    $right = [Math]::Min([Math]::Min($EndA, $EndB), $EndC)
+    return ($left -le $right)
 }
 function Test-ShouldCountFile
 {
@@ -656,7 +969,7 @@ function ConvertFrom-SvnUnifiedDiff
             }
             continue
         }
-        if ($line -match '^Cannot display: file marked as a binary type\.' -or $line -match '^Binary files .* differ')
+        if ($line -match '^Cannot display: file marked as a binary type\.' -or $line -match '^Binary files .* differ' -or $line -match '(?i)mime-type\s*=\s*application/octet-stream')
         {
             $current.IsBinary = $true
             continue
@@ -714,7 +1027,7 @@ function ConvertFrom-SvnUnifiedDiff
 }
 function ConvertFrom-SvnBlameXml
 {
-    [CmdletBinding()]param([string]$XmlText)
+    [CmdletBinding()]param([string]$XmlText, [string[]]$ContentLines)
     $xml = ConvertFrom-SvnXmlText -Text $XmlText -ContextLabel 'svn blame'
     $entries = @()
     if ($xml)
@@ -731,16 +1044,38 @@ function ConvertFrom-SvnBlameXml
     }
     $byRev = @{}
     $byAuthor = @{}
+    $lineRows = New-Object 'System.Collections.Generic.List[object]'
     $total = 0
     foreach ($entry in $entries)
     {
         $total++
         $commit = $entry.commit
-        if ($null -eq $commit)
+        $lineNumber = 0
+        try
         {
-            continue
+            $lineNumber = [int]$entry.'line-number'
+        }
+        catch
+        {
+            $lineNumber = $total
         }
         $rev = $null
+        $author = '(unknown)'
+        if ($null -eq $commit)
+        {
+            $content = ''
+            if ($ContentLines -and $lineNumber -gt 0 -and ($lineNumber - 1) -lt $ContentLines.Count)
+            {
+                $content = [string]$ContentLines[$lineNumber - 1]
+            }
+            $lineRows.Add([pscustomobject]@{
+                    LineNumber = $lineNumber
+                    Content = $content
+                    Revision = $null
+                    Author = '(unknown)'
+                }) | Out-Null
+            continue
+        }
         try
         {
             $rev = [int]$commit.revision
@@ -775,10 +1110,23 @@ function ConvertFrom-SvnBlameXml
             $byAuthor[$author] = 0
         }
         $byAuthor[$author]++
+
+        $content = ''
+        if ($ContentLines -and $lineNumber -gt 0 -and ($lineNumber - 1) -lt $ContentLines.Count)
+        {
+            $content = [string]$ContentLines[$lineNumber - 1]
+        }
+        $lineRows.Add([pscustomobject]@{
+                LineNumber = $lineNumber
+                Content = $content
+                Revision = $rev
+                Author = $author
+            }) | Out-Null
     }
     return [pscustomobject]@{ LineCountTotal = $total
         LineCountByRevision = $byRev
         LineCountByAuthor = $byAuthor
+        Lines = @($lineRows.ToArray() | Sort-Object LineNumber)
     }
 }
 function Get-Entropy
@@ -826,10 +1174,808 @@ function Get-MessageMetricCount
 }
 function Get-SvnBlameSummary
 {
-    [CmdletBinding()]param([string]$Repo, [string]$FilePath, [int]$ToRevision)
+    [CmdletBinding()]param([string]$Repo, [string]$FilePath, [int]$ToRevision, [string]$CacheDir)
     $url = $Repo.TrimEnd('/') + '/' + (ConvertTo-PathKey -Path $FilePath).TrimStart('/') + '@' + [string]$ToRevision
-    $text = Invoke-SvnCommand -Arguments @('blame', '--xml', '-r', [string]$ToRevision, $url) -ErrorContext ("svn blame $FilePath")
+    $text = Read-BlameCacheFile -CacheDir $CacheDir -Revision $ToRevision -FilePath $FilePath
+    if ([string]::IsNullOrEmpty($text))
+    {
+        $script:StrictBlameCacheMisses++
+        $text = Invoke-SvnCommand -Arguments @('blame', '--xml', '-r', [string]$ToRevision, $url) -ErrorContext ("svn blame $FilePath")
+        Write-BlameCacheFile -CacheDir $CacheDir -Revision $ToRevision -FilePath $FilePath -Content $text
+    }
+    else
+    {
+        $script:StrictBlameCacheHits++
+    }
     ConvertFrom-SvnBlameXml -XmlText $text
+}
+function Get-SvnBlameLine
+{
+    [CmdletBinding()]
+    param([string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir)
+    $path = (ConvertTo-PathKey -Path $FilePath).TrimStart('/')
+    $url = $Repo.TrimEnd('/') + '/' + $path + '@' + [string]$Revision
+
+    $blameXml = Read-BlameCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
+    if ([string]::IsNullOrEmpty($blameXml))
+    {
+        $script:StrictBlameCacheMisses++
+        $blameXml = Invoke-SvnCommand -Arguments @('blame', '--xml', '-r', [string]$Revision, $url) -ErrorContext ("svn blame $FilePath@$Revision")
+        Write-BlameCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath -Content $blameXml
+    }
+    else
+    {
+        $script:StrictBlameCacheHits++
+    }
+
+    $catText = Read-CatCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
+    if ($null -eq $catText)
+    {
+        $catText = Invoke-SvnCommand -Arguments @('cat', '-r', [string]$Revision, $url) -ErrorContext ("svn cat $FilePath@$Revision")
+        Write-CatCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath -Content $catText
+    }
+    $contentLines = ConvertTo-TextLine -Text $catText
+    return (ConvertFrom-SvnBlameXml -XmlText $blameXml -ContentLines $contentLines)
+}
+function Get-LineIdentityKey
+{
+    param([object]$Line)
+    if ($null -eq $Line)
+    {
+        return ''
+    }
+    $rev = if ($null -ne $Line.Revision)
+    {
+        [string]$Line.Revision
+    }
+    else
+    {
+        ''
+    }
+    $author = Get-NormalizedAuthorName -Author ([string]$Line.Author)
+    $content = if ($null -ne $Line.Content)
+    {
+        [string]$Line.Content
+    }
+    else
+    {
+        ''
+    }
+    return ($rev + [char]31 + $author + [char]31 + $content)
+}
+function Compare-BlameOutput
+{
+    [CmdletBinding()]
+    param([object[]]$PreviousLines, [object[]]$CurrentLines)
+
+    $prev = @($PreviousLines)
+    $curr = @($CurrentLines)
+    $m = $prev.Count
+    $n = $curr.Count
+
+    $prevContent = New-Object 'string[]' $m
+    $currContent = New-Object 'string[]' $n
+    for ($i = 0
+        $i -lt $m
+        $i++)
+    {
+        $prevContent[$i] = [string]$prev[$i].Content
+    }
+    for ($j = 0
+        $j -lt $n
+        $j++)
+    {
+        $currContent[$j] = [string]$curr[$j].Content
+    }
+
+    $dp = New-Object 'int[,]' ($m + 1), ($n + 1)
+    for ($i = 1
+        $i -le $m
+        $i++)
+    {
+        for ($j = 1
+            $j -le $n
+            $j++)
+        {
+            $iPrev = $i - 1
+            $jPrev = $j - 1
+            if ($prevContent[$i - 1] -ceq $currContent[$j - 1])
+            {
+                $dp[$i, $j] = $dp[$iPrev, $jPrev] + 1
+            }
+            else
+            {
+                $left = $dp[$iPrev, $j]
+                $up = $dp[$i, $jPrev]
+                $dp[$i, $j] = [Math]::Max($left, $up)
+            }
+        }
+    }
+
+    $matchedPairs = New-Object 'System.Collections.Generic.List[object]'
+    $prevMatched = New-Object 'bool[]' $m
+    $currMatched = New-Object 'bool[]' $n
+    $i = $m
+    $j = $n
+    while ($i -gt 0 -and $j -gt 0)
+    {
+        if ($prevContent[$i - 1] -ceq $currContent[$j - 1])
+        {
+            $prevIdx = $i - 1
+            $currIdx = $j - 1
+            $prevMatched[$prevIdx] = $true
+            $currMatched[$currIdx] = $true
+            $matchedPairs.Add([pscustomobject]@{
+                    PrevIndex = $prevIdx
+                    CurrIndex = $currIdx
+                    PrevLine = $prev[$prevIdx]
+                    CurrLine = $curr[$currIdx]
+                    MatchType = 'Lcs'
+                }) | Out-Null
+            $i--
+            $j--
+        }
+        else
+        {
+            $iPrev = $i - 1
+            $jPrev = $j - 1
+            $left = $dp[$iPrev, $j]
+            $up = $dp[$i, $jPrev]
+            if ($left -ge $up)
+            {
+                $i--
+            }
+            else
+            {
+                $j--
+            }
+        }
+    }
+
+    $unmatchedPrevByKey = @{}
+    for ($pi = 0
+        $pi -lt $m
+        $pi++)
+    {
+        if ($prevMatched[$pi])
+        {
+            continue
+        }
+        $key = Get-LineIdentityKey -Line $prev[$pi]
+        if (-not $unmatchedPrevByKey.ContainsKey($key))
+        {
+            $unmatchedPrevByKey[$key] = New-Object 'System.Collections.Generic.List[int]'
+        }
+        $unmatchedPrevByKey[$key].Add($pi) | Out-Null
+    }
+
+    $movedPairs = New-Object 'System.Collections.Generic.List[object]'
+    for ($ci = 0
+        $ci -lt $n
+        $ci++)
+    {
+        if ($currMatched[$ci])
+        {
+            continue
+        }
+        $key = Get-LineIdentityKey -Line $curr[$ci]
+        if (-not $unmatchedPrevByKey.ContainsKey($key))
+        {
+            continue
+        }
+        $queue = $unmatchedPrevByKey[$key]
+        if ($queue.Count -le 0)
+        {
+            continue
+        }
+        $prevIdx = [int]$queue[0]
+        $queue.RemoveAt(0)
+        $prevMatched[$prevIdx] = $true
+        $currMatched[$ci] = $true
+        $pair = [pscustomobject]@{
+            PrevIndex = $prevIdx
+            CurrIndex = $ci
+            PrevLine = $prev[$prevIdx]
+            CurrLine = $curr[$ci]
+            MatchType = 'Move'
+        }
+        $matchedPairs.Add($pair) | Out-Null
+        $movedPairs.Add($pair) | Out-Null
+    }
+
+    $killed = New-Object 'System.Collections.Generic.List[object]'
+    for ($pi = 0
+        $pi -lt $m
+        $pi++)
+    {
+        if (-not $prevMatched[$pi])
+        {
+            $killed.Add([pscustomobject]@{
+                    Index = $pi
+                    Line = $prev[$pi]
+                }) | Out-Null
+        }
+    }
+    $born = New-Object 'System.Collections.Generic.List[object]'
+    for ($ci = 0
+        $ci -lt $n
+        $ci++)
+    {
+        if (-not $currMatched[$ci])
+        {
+            $born.Add([pscustomobject]@{
+                    Index = $ci
+                    Line = $curr[$ci]
+                }) | Out-Null
+        }
+    }
+
+    $reattributed = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($pair in @($matchedPairs.ToArray()))
+    {
+        $prevLine = $pair.PrevLine
+        $currLine = $pair.CurrLine
+        if ([string]$prevLine.Content -ceq [string]$currLine.Content -and (([string]$prevLine.Revision -ne [string]$currLine.Revision) -or ((Get-NormalizedAuthorName -Author ([string]$prevLine.Author)) -ne (Get-NormalizedAuthorName -Author ([string]$currLine.Author)))))
+        {
+            $reattributed.Add($pair) | Out-Null
+        }
+    }
+
+    return [pscustomobject]@{
+        KilledLines = @($killed.ToArray())
+        BornLines = @($born.ToArray())
+        MatchedPairs = @($matchedPairs.ToArray() | Sort-Object PrevIndex, CurrIndex)
+        MovedPairs = @($movedPairs.ToArray())
+        ReattributedPairs = @($reattributed.ToArray())
+    }
+}
+function Get-CommitFileTransition
+{
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param([object]$Commit)
+
+    $paths = @($Commit.ChangedPathsFiltered)
+    $pathMap = @{}
+    $deleted = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($p in $paths)
+    {
+        $path = ConvertTo-PathKey -Path ([string]$p.Path)
+        if (-not $path)
+        {
+            continue
+        }
+        if (-not $pathMap.ContainsKey($path))
+        {
+            $pathMap[$path] = New-Object 'System.Collections.Generic.List[object]'
+        }
+        $pathMap[$path].Add($p) | Out-Null
+        if (([string]$p.Action).ToUpperInvariant() -eq 'D')
+        {
+            $null = $deleted.Add($path)
+        }
+    }
+
+    $renameNewToOld = @{}
+    $consumedOld = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($p in $paths)
+    {
+        $action = ([string]$p.Action).ToUpperInvariant()
+        if (($action -ne 'A' -and $action -ne 'R') -or [string]::IsNullOrWhiteSpace([string]$p.CopyFromPath))
+        {
+            continue
+        }
+        $newPath = ConvertTo-PathKey -Path ([string]$p.Path)
+        $oldPath = ConvertTo-PathKey -Path ([string]$p.CopyFromPath)
+        if (-not $newPath -or -not $oldPath)
+        {
+            continue
+        }
+        if ($deleted.Contains($oldPath))
+        {
+            $renameNewToOld[$newPath] = $oldPath
+            $null = $consumedOld.Add($oldPath)
+        }
+    }
+
+    $result = New-Object 'System.Collections.Generic.List[object]'
+    $dedup = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($newPath in @($renameNewToOld.Keys | Sort-Object))
+    {
+        $oldPath = [string]$renameNewToOld[$newPath]
+        $key = $oldPath + [char]31 + $newPath
+        if ($dedup.Add($key))
+        {
+            $result.Add([pscustomobject]@{
+                    BeforePath = $oldPath
+                    AfterPath = $newPath
+                }) | Out-Null
+        }
+    }
+
+    foreach ($oldPath in $deleted)
+    {
+        if ($consumedOld.Contains($oldPath))
+        {
+            continue
+        }
+        $key = $oldPath + [char]31
+        if ($dedup.Add($key))
+        {
+            $result.Add([pscustomobject]@{
+                    BeforePath = $oldPath
+                    AfterPath = $null
+                }) | Out-Null
+        }
+    }
+
+    $candidates = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($f in @($Commit.FilesChanged))
+    {
+        $null = $candidates.Add((ConvertTo-PathKey -Path ([string]$f)))
+    }
+    foreach ($path in $pathMap.Keys)
+    {
+        $null = $candidates.Add($path)
+    }
+
+    foreach ($path in $candidates)
+    {
+        if (-not $path)
+        {
+            continue
+        }
+        if ($renameNewToOld.ContainsKey($path) -or $consumedOld.Contains($path) -or $deleted.Contains($path))
+        {
+            continue
+        }
+        $beforePath = $path
+        $afterPath = $path
+        if ($pathMap.ContainsKey($path))
+        {
+            $entries = $pathMap[$path]
+            if ($null -ne $entries -and $entries.Count -gt 0)
+            {
+                $entry = $entries[0]
+                $action = ([string]$entry.Action).ToUpperInvariant()
+                if ($action -eq 'A')
+                {
+                    $beforePath = $null
+                }
+            }
+        }
+        $key = ([string]$beforePath) + [char]31 + ([string]$afterPath)
+        if ($dedup.Add($key))
+        {
+            $result.Add([pscustomobject]@{
+                    BeforePath = $beforePath
+                    AfterPath = $afterPath
+                }) | Out-Null
+        }
+    }
+
+    return @($result.ToArray())
+}
+function Get-StrictHunkDetail
+{
+    [CmdletBinding()]
+    param([object[]]$Commits, [hashtable]$RevToAuthor, [hashtable]$RenameMap)
+
+    $offsetByFile = @{}
+    $eventsByFile = @{}
+    foreach ($c in @($Commits | Sort-Object Revision))
+    {
+        $rev = [int]$c.Revision
+        $author = if ($RevToAuthor.ContainsKey($rev))
+        {
+            Get-NormalizedAuthorName -Author ([string]$RevToAuthor[$rev])
+        }
+        else
+        {
+            Get-NormalizedAuthorName -Author ([string]$c.Author)
+        }
+        foreach ($f in @($c.FilesChanged))
+        {
+            if (-not $c.FileDiffStats.ContainsKey($f))
+            {
+                continue
+            }
+            $d = $c.FileDiffStats[$f]
+            if ($null -eq $d -or -not ($d.PSObject.Properties.Name -contains 'Hunks'))
+            {
+                continue
+            }
+            $hunksRaw = $d.Hunks
+            if ($null -eq $hunksRaw)
+            {
+                continue
+            }
+            $hunks = New-Object 'System.Collections.Generic.List[object]'
+            if ($hunksRaw -is [System.Collections.IEnumerable] -and -not ($hunksRaw -is [string]))
+            {
+                foreach ($hx in $hunksRaw)
+                {
+                    $hunks.Add($hx) | Out-Null
+                }
+            }
+            else
+            {
+                $hunks.Add($hunksRaw) | Out-Null
+            }
+            if ($hunks.Count -eq 0)
+            {
+                continue
+            }
+            $resolved = Resolve-PathByRenameMap -FilePath $f -RenameMap $RenameMap
+            if ([string]::IsNullOrWhiteSpace($resolved))
+            {
+                continue
+            }
+            if (-not $offsetByFile.ContainsKey($resolved))
+            {
+                $offsetByFile[$resolved] = Initialize-CanonicalOffsetMap
+            }
+            if (-not $eventsByFile.ContainsKey($resolved))
+            {
+                $eventsByFile[$resolved] = New-Object 'System.Collections.Generic.List[object]'
+            }
+
+            $offset = $offsetByFile[$resolved]
+            $pending = New-Object 'System.Collections.Generic.List[object]'
+            foreach ($h in @($hunks.ToArray() | Sort-Object OldStart, NewStart))
+            {
+                $oldStart = [int]$h.OldStart
+                $oldCount = [int]$h.OldCount
+                $newCount = [int]$h.NewCount
+                if ($oldStart -lt 1)
+                {
+                    continue
+                }
+                $start = Get-CanonicalLineNumber -OffsetEvents $offset -LineNumber $oldStart
+                $end = $start
+                if ($oldCount -gt 0)
+                {
+                    $end = Get-CanonicalLineNumber -OffsetEvents $offset -LineNumber ($oldStart + $oldCount - 1)
+                }
+                if ($end -lt $start)
+                {
+                    $tmp = $start
+                    $start = $end
+                    $end = $tmp
+                }
+                $eventsByFile[$resolved].Add([pscustomobject]@{
+                        Revision = $rev
+                        Author = $author
+                        Start = $start
+                        End = $end
+                    }) | Out-Null
+
+                $shift = $newCount - $oldCount
+                if ($shift -ne 0)
+                {
+                    $threshold = $oldStart + $oldCount
+                    if ($oldCount -eq 0)
+                    {
+                        $threshold = $oldStart
+                    }
+                    $pending.Add([pscustomobject]@{
+                            Threshold = $threshold
+                            Delta = $shift
+                        }) | Out-Null
+                }
+            }
+            foreach ($p in @($pending.ToArray() | Sort-Object Threshold))
+            {
+                Add-CanonicalOffsetEvent -OffsetEvents $offset -ThresholdLine ([int]$p.Threshold) -ShiftDelta ([int]$p.Delta)
+            }
+        }
+    }
+
+    $authorRepeated = @{}
+    $fileRepeated = @{}
+    $authorPingPong = @{}
+    $filePingPong = @{}
+    foreach ($file in $eventsByFile.Keys)
+    {
+        $events = @($eventsByFile[$file].ToArray() | Sort-Object Revision)
+        for ($i = 0
+            $i -lt $events.Count
+            $i++)
+        {
+            for ($j = $i + 1
+                $j -lt $events.Count
+                $j++)
+            {
+                $a1 = [string]$events[$i].Author
+                $a2 = [string]$events[$j].Author
+                if ($a1 -ne $a2)
+                {
+                    continue
+                }
+                if (Test-RangeOverlap -StartA ([int]$events[$i].Start) -EndA ([int]$events[$i].End) -StartB ([int]$events[$j].Start) -EndB ([int]$events[$j].End))
+                {
+                    Add-Count -Table $authorRepeated -Key $a1
+                    Add-Count -Table $fileRepeated -Key $file
+                }
+            }
+        }
+        for ($i = 0
+            $i -lt ($events.Count - 2)
+            $i++)
+        {
+            for ($j = $i + 1
+                $j -lt ($events.Count - 1)
+                $j++)
+            {
+                $a1 = [string]$events[$i].Author
+                $a2 = [string]$events[$j].Author
+                if ($a1 -eq $a2)
+                {
+                    continue
+                }
+                if (-not (Test-RangeOverlap -StartA ([int]$events[$i].Start) -EndA ([int]$events[$i].End) -StartB ([int]$events[$j].Start) -EndB ([int]$events[$j].End)))
+                {
+                    continue
+                }
+                for ($k = $j + 1
+                    $k -lt $events.Count
+                    $k++)
+                {
+                    $a3 = [string]$events[$k].Author
+                    if ($a3 -ne $a1)
+                    {
+                        continue
+                    }
+                    if (Test-RangeTripleOverlap -StartA ([int]$events[$i].Start) -EndA ([int]$events[$i].End) -StartB ([int]$events[$j].Start) -EndB ([int]$events[$j].End) -StartC ([int]$events[$k].Start) -EndC ([int]$events[$k].End))
+                    {
+                        Add-Count -Table $authorPingPong -Key $a1
+                        Add-Count -Table $filePingPong -Key $file
+                    }
+                }
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        AuthorRepeatedHunk = $authorRepeated
+        AuthorPingPong = $authorPingPong
+        FileRepeatedHunk = $fileRepeated
+        FilePingPong = $filePingPong
+    }
+}
+function Get-ExactDeathAttribution
+{
+    [CmdletBinding()]
+    param(
+        [object[]]$Commits,
+        [hashtable]$RevToAuthor,
+        [string]$TargetUrl,
+        [int]$FromRevision,
+        [int]$ToRevision,
+        [string]$CacheDir,
+        [hashtable]$RenameMap = @{}
+    )
+
+    $authorBorn = @{}
+    $authorDead = @{}
+    $authorSelfDead = @{}
+    $authorOtherDead = @{}
+    $authorSurvived = @{}
+    $authorCrossRevert = @{}
+    $authorRemovedByOthers = @{}
+
+    $fileBorn = @{}
+    $fileDead = @{}
+    $fileSurvived = @{}
+    $fileSelfCancel = @{}
+    $fileCrossRevert = @{}
+
+    $authorInternalMove = @{}
+    $fileInternalMove = @{}
+
+    foreach ($c in @($Commits | Sort-Object Revision))
+    {
+        $rev = [int]$c.Revision
+        if ($rev -lt $FromRevision -or $rev -gt $ToRevision)
+        {
+            continue
+        }
+        $killer = if ($RevToAuthor.ContainsKey($rev))
+        {
+            Get-NormalizedAuthorName -Author ([string]$RevToAuthor[$rev])
+        }
+        else
+        {
+            Get-NormalizedAuthorName -Author ([string]$c.Author)
+        }
+        $transitions = @(Get-CommitFileTransition -Commit $c)
+        foreach ($t in $transitions)
+        {
+            try
+            {
+                $beforePath = if ($null -ne $t.BeforePath)
+                {
+                    ConvertTo-PathKey -Path ([string]$t.BeforePath)
+                }
+                else
+                {
+                    $null
+                }
+                $afterPath = if ($null -ne $t.AfterPath)
+                {
+                    ConvertTo-PathKey -Path ([string]$t.AfterPath)
+                }
+                else
+                {
+                    $null
+                }
+                if ([string]::IsNullOrWhiteSpace($beforePath) -and [string]::IsNullOrWhiteSpace($afterPath))
+                {
+                    continue
+                }
+
+                $isBinary = $false
+                foreach ($bp in @($beforePath, $afterPath))
+                {
+                    if (-not $bp)
+                    {
+                        continue
+                    }
+                    if ($c.FileDiffStats.ContainsKey($bp))
+                    {
+                        $d = $c.FileDiffStats[$bp]
+                        if ($null -ne $d -and $d.PSObject.Properties.Match('IsBinary') -and [bool]$d.IsBinary)
+                        {
+                            $isBinary = $true
+                        }
+                    }
+                }
+                if ($isBinary)
+                {
+                    continue
+                }
+
+                $metricFile = if ($afterPath)
+                {
+                    Resolve-PathByRenameMap -FilePath $afterPath -RenameMap $RenameMap
+                }
+                else
+                {
+                    Resolve-PathByRenameMap -FilePath $beforePath -RenameMap $RenameMap
+                }
+
+                $prevLines = @()
+                if ($beforePath)
+                {
+                    try
+                    {
+                        $prevBlame = Get-SvnBlameLine -Repo $TargetUrl -FilePath $beforePath -Revision ($rev - 1) -CacheDir $CacheDir
+                        $prevLines = @($prevBlame.Lines)
+                    }
+                    catch
+                    {
+                        $prevLines = @()
+                    }
+                }
+                $currLines = @()
+                if ($afterPath)
+                {
+                    try
+                    {
+                        $currBlame = Get-SvnBlameLine -Repo $TargetUrl -FilePath $afterPath -Revision $rev -CacheDir $CacheDir
+                        $currLines = @($currBlame.Lines)
+                    }
+                    catch
+                    {
+                        $currLines = @()
+                    }
+                }
+
+                $cmp = Compare-BlameOutput -PreviousLines $prevLines -CurrentLines $currLines
+                $moveCount = @($cmp.MovedPairs).Count
+                if ($moveCount -gt 0)
+                {
+                    Add-Count -Table $authorInternalMove -Key $killer -Delta $moveCount
+                    Add-Count -Table $fileInternalMove -Key $metricFile -Delta $moveCount
+                }
+
+                foreach ($born in @($cmp.BornLines))
+                {
+                    $line = $born.Line
+                    $bornRev = $null
+                    try
+                    {
+                        $bornRev = [int]$line.Revision
+                    }
+                    catch
+                    {
+                        $bornRev = $null
+                    }
+                    if ($null -eq $bornRev -or $bornRev -ne $rev)
+                    {
+                        continue
+                    }
+                    if ($bornRev -lt $FromRevision -or $bornRev -gt $ToRevision)
+                    {
+                        continue
+                    }
+                    $bornAuthor = Get-NormalizedAuthorName -Author ([string]$line.Author)
+                    Add-Count -Table $authorBorn -Key $bornAuthor
+                    Add-Count -Table $authorSurvived -Key $bornAuthor
+                    Add-Count -Table $fileBorn -Key $metricFile
+                    Add-Count -Table $fileSurvived -Key $metricFile
+                }
+
+                foreach ($killed in @($cmp.KilledLines))
+                {
+                    $line = $killed.Line
+                    $bornRev = $null
+                    try
+                    {
+                        $bornRev = [int]$line.Revision
+                    }
+                    catch
+                    {
+                        $bornRev = $null
+                    }
+                    if ($null -eq $bornRev -or $bornRev -lt $FromRevision -or $bornRev -gt $ToRevision)
+                    {
+                        continue
+                    }
+                    $bornAuthor = Get-NormalizedAuthorName -Author ([string]$line.Author)
+                    Add-Count -Table $authorDead -Key $bornAuthor
+                    Add-Count -Table $fileDead -Key $metricFile
+                    Add-Count -Table $authorSurvived -Key $bornAuthor -Delta (-1)
+                    Add-Count -Table $fileSurvived -Key $metricFile -Delta (-1)
+                    if ($bornAuthor -eq $killer)
+                    {
+                        Add-Count -Table $authorSelfDead -Key $bornAuthor
+                        Add-Count -Table $fileSelfCancel -Key $metricFile
+                    }
+                    else
+                    {
+                        Add-Count -Table $authorOtherDead -Key $bornAuthor
+                        Add-Count -Table $authorCrossRevert -Key $bornAuthor
+                        Add-Count -Table $authorRemovedByOthers -Key $bornAuthor
+                        Add-Count -Table $fileCrossRevert -Key $metricFile
+                    }
+                }
+            }
+            catch
+            {
+                throw ("Strict blame attribution failed at r{0} (before='{1}', after='{2}'): {3}" -f $rev, [string]$t.BeforePath, [string]$t.AfterPath, $_.Exception.Message)
+            }
+        }
+    }
+
+    try
+    {
+        $strictHunk = Get-StrictHunkDetail -Commits $Commits -RevToAuthor $RevToAuthor -RenameMap $RenameMap
+    }
+    catch
+    {
+        throw ("Strict hunk analysis failed: {0}`n{1}" -f $_.Exception.Message, $_.ScriptStackTrace)
+    }
+    return [pscustomobject]@{
+        AuthorBorn = $authorBorn
+        AuthorDead = $authorDead
+        AuthorSurvived = $authorSurvived
+        AuthorSelfDead = $authorSelfDead
+        AuthorOtherDead = $authorOtherDead
+        AuthorCrossRevert = $authorCrossRevert
+        AuthorRemovedByOthers = $authorRemovedByOthers
+        FileBorn = $fileBorn
+        FileDead = $fileDead
+        FileSurvived = $fileSurvived
+        FileSelfCancel = $fileSelfCancel
+        FileCrossRevert = $fileCrossRevert
+        AuthorInternalMoveCount = $authorInternalMove
+        FileInternalMoveCount = $fileInternalMove
+        AuthorRepeatedHunk = $strictHunk.AuthorRepeatedHunk
+        AuthorPingPong = $strictHunk.AuthorPingPong
+        FileRepeatedHunk = $strictHunk.FileRepeatedHunk
+        FilePingPong = $strictHunk.FilePingPong
+    }
 }
 function Get-CommitterMetric
 {
@@ -996,16 +2142,30 @@ function Get-CommitterMetric
                 '削除行数' = [int]$s.Deleted
                 '純増行数' = $net
                 '総チャーン' = $ch
-                'コミットあたりチャーン' = Get-RoundedNumber -Value $churnPerCommit
-                '削除対追加比' = Get-RoundedNumber -Value ([int]$s.Deleted / [double][Math]::Max(1, [int]$s.Added))
-                'チャーン対純増比' = Get-RoundedNumber -Value ($ch / [double][Math]::Max(1, [Math]::Abs($net)))
+                'コミットあたりチャーン' = Format-MetricValue -Value $churnPerCommit
+                '削除対追加比' = if ([int]$s.Added -gt 0)
+                {
+                    Format-MetricValue -Value ([int]$s.Deleted / [double]$s.Added)
+                }
+                else
+                {
+                    $null
+                }
+                'チャーン対純増比' = if ([Math]::Abs($net) -gt 0)
+                {
+                    Format-MetricValue -Value ($ch / [double][Math]::Abs($net))
+                }
+                else
+                {
+                    $null
+                }
                 'バイナリ変更回数' = [int]$s.Binary
                 '追加アクション数' = [int]$s.ActA
                 '変更アクション数' = [int]$s.ActM
                 '削除アクション数' = [int]$s.ActD
                 '置換アクション数' = [int]$s.ActR
                 '生存行数' = $null
-                '消滅追加行数 (概算)' = $null
+                $script:ColDeadAdded = $null
                 '所有行数' = $null
                 '所有割合' = $null
                 '自己相殺行数' = $null
@@ -1015,13 +2175,13 @@ function Get-CommitterMetric
                 '同一箇所反復編集数' = $null
                 'ピンポン回数' = $null
                 '内部移動行数' = $null
-                '自己消滅行数 (概算)' = $null
-                '被他者消滅行数 (概算)' = $null
-                '変更エントロピー' = Get-RoundedNumber -Value $entropy
-                '平均共同作者数' = Get-RoundedNumber -Value $coAvg
+                $script:ColSelfDead = $null
+                $script:ColOtherDead = $null
+                '変更エントロピー' = Format-MetricValue -Value $entropy
+                '平均共同作者数' = Format-MetricValue -Value $coAvg
                 '最大共同作者数' = [int]$coMax
                 'メッセージ総文字数' = [int]$s.MsgLen
-                'メッセージ平均文字数' = Get-RoundedNumber -Value $msgLenAvg
+                'メッセージ平均文字数' = Format-MetricValue -Value $msgLenAvg
                 '課題ID言及数' = [int]$s.Issue
                 '修正キーワード数' = [int]$s.Fix
                 '差戻キーワード数' = [int]$s.Revert
@@ -1161,10 +2321,10 @@ function Get-FileMetric
                 '置換回数' = [int]$s.Replace
                 '初回変更リビジョン' = $first
                 '最終変更リビジョン' = $last
-                '平均変更間隔日数' = Get-RoundedNumber -Value $avg
+                '平均変更間隔日数' = Format-MetricValue -Value $avg
                 '生存行数 (範囲指定)' = $null
-                '消滅追加行数 (概算)' = $null
-                '最多作者チャーン占有率' = Get-RoundedNumber -Value $topShare
+                $script:ColDeadAdded = $null
+                '最多作者チャーン占有率' = Format-MetricValue -Value $topShare
                 '最多作者blame占有率' = $null
                 '自己相殺行数 (合計)' = $null
                 '他者差戻行数 (合計)' = $null
@@ -1216,7 +2376,7 @@ function Get-CoChangeMetric
             }
             $fileCount[$f]++
         }
-        if ($files.Count -gt $LargeCommitFileThreshold)
+        if (-not $script:StrictModeEnabled -and $files.Count -gt $LargeCommitFileThreshold)
         {
             continue
         }
@@ -1267,8 +2427,8 @@ function Get-CoChangeMetric
         $rows.Add([pscustomobject][ordered]@{ 'ファイルA' = $a
                 'ファイルB' = $b
                 '共変更回数' = $co
-                'Jaccard' = Get-RoundedNumber -Value $j
-                'リフト値' = Get-RoundedNumber -Value $lift
+                'Jaccard' = Format-MetricValue -Value $j
+                'リフト値' = Format-MetricValue -Value $lift
             }) | Out-Null
     }
     $sorted = @($rows.ToArray() | Sort-Object -Property @{Expression = '共変更回数'
@@ -1286,7 +2446,7 @@ function Get-CoChangeMetric
 }
 function Write-PlantUmlFile
 {
-    param([string]$OutDirectory, [object[]]$Committers, [object[]]$Files, [object[]]$Couplings, [int]$TopNCount, [string]$EncodingName)
+    param([string]$OutDirectory, [object[]]$Committers, [object[]]$Files, [object[]]$Couplings, [int]$TopNCount, [string]$EncodingName, [switch]$StrictMode)
     $topCommitters = @($Committers | Sort-Object -Property @{Expression = '総チャーン'
             Descending = $true
         }, '作者' | Select-Object -First $TopNCount)
@@ -1299,6 +2459,11 @@ function Write-PlantUmlFile
 
     $sb1 = New-Object System.Text.StringBuilder
     [void]$sb1.AppendLine('@startuml')
+    if ($StrictMode)
+    {
+        [void]$sb1.AppendLine(''' NOTE: This PlantUML shows top N entries only. See CSV files for complete data.')
+        [void]$sb1.AppendLine(''' StrictMode is enabled - all metric values are exact where mathematically definable.')
+    }
     [void]$sb1.AppendLine('salt')
     [void]$sb1.AppendLine('{')
     [void]$sb1.AppendLine('{T')
@@ -1314,6 +2479,11 @@ function Write-PlantUmlFile
 
     $sb2 = New-Object System.Text.StringBuilder
     [void]$sb2.AppendLine('@startuml')
+    if ($StrictMode)
+    {
+        [void]$sb2.AppendLine(''' NOTE: This PlantUML shows top N entries only. See CSV files for complete data.')
+        [void]$sb2.AppendLine(''' StrictMode is enabled - all metric values are exact where mathematically definable.')
+    }
     [void]$sb2.AppendLine('salt')
     [void]$sb2.AppendLine('{')
     [void]$sb2.AppendLine('{T')
@@ -1329,6 +2499,11 @@ function Write-PlantUmlFile
 
     $sb3 = New-Object System.Text.StringBuilder
     [void]$sb3.AppendLine('@startuml')
+    if ($StrictMode)
+    {
+        [void]$sb3.AppendLine(''' NOTE: This PlantUML shows top N entries only. See CSV files for complete data.')
+        [void]$sb3.AppendLine(''' StrictMode is enabled - all metric values are exact where mathematically definable.')
+    }
     [void]$sb3.AppendLine('left to right direction')
     [void]$sb3.AppendLine('skinparam linetype ortho')
     foreach ($r in $topCouplings)
@@ -1629,6 +2804,15 @@ function Get-RenameMap
 try
 {
     $startedAt = Get-Date
+    Initialize-StrictModeContext -Enabled ([bool]$StrictMode)
+    if ($StrictMode -and $NoBlame)
+    {
+        throw "-StrictMode requires blame analysis. Remove -NoBlame."
+    }
+    if ($StrictMode -and $DeadDetailLevel -lt 2)
+    {
+        $DeadDetailLevel = 2
+    }
     if ($FromRev -gt $ToRev)
     {
         $tmp = $FromRev
@@ -1804,6 +2988,79 @@ try
         }
         $c.ChangedPathsFiltered = $fpaths.ToArray()
 
+        if ($StrictMode)
+        {
+            $deletedSet = New-Object 'System.Collections.Generic.HashSet[string]'
+            foreach ($p in @($c.ChangedPathsFiltered))
+            {
+                if (([string]$p.Action).ToUpperInvariant() -eq 'D')
+                {
+                    $null = $deletedSet.Add((ConvertTo-PathKey -Path ([string]$p.Path)))
+                }
+            }
+            foreach ($p in @($c.ChangedPathsFiltered))
+            {
+                $action = ([string]$p.Action).ToUpperInvariant()
+                if (($action -ne 'A' -and $action -ne 'R') -or [string]::IsNullOrWhiteSpace([string]$p.CopyFromPath))
+                {
+                    continue
+                }
+                $newPath = ConvertTo-PathKey -Path ([string]$p.Path)
+                $oldPath = ConvertTo-PathKey -Path ([string]$p.CopyFromPath)
+                if (-not $newPath -or -not $oldPath -or -not $deletedSet.Contains($oldPath))
+                {
+                    continue
+                }
+                if (-not $c.FileDiffStats.ContainsKey($oldPath) -or -not $c.FileDiffStats.ContainsKey($newPath))
+                {
+                    continue
+                }
+                $copyRev = $p.CopyFromRev
+                if ($null -eq $copyRev)
+                {
+                    $copyRev = $rev - 1
+                }
+
+                $cmpArgs = New-Object 'System.Collections.Generic.List[string]'
+                foreach ($x in $diffArgs)
+                {
+                    $cmpArgs.Add([string]$x) | Out-Null
+                }
+                $cmpArgs.Add(($targetUrl.TrimEnd('/') + '/' + $oldPath + '@' + [string]$copyRev)) | Out-Null
+                $cmpArgs.Add(($targetUrl.TrimEnd('/') + '/' + $newPath + '@' + [string]$rev)) | Out-Null
+                $realDiff = Invoke-SvnCommand -Arguments $cmpArgs.ToArray() -ErrorContext ("svn diff rename pair r{0} {1}->{2}" -f $rev, $oldPath, $newPath)
+                $realStats = Get-DiffLineStat -DiffText $realDiff
+
+                $newStat = $c.FileDiffStats[$newPath]
+                $oldStat = $c.FileDiffStats[$oldPath]
+                $newStat.AddedLines = [int]$realStats.AddedLines
+                $newStat.DeletedLines = [int]$realStats.DeletedLines
+                if ($newStat.PSObject.Properties.Match('AddedLineHashes').Count -gt 0)
+                {
+                    $newStat.AddedLineHashes = @()
+                }
+                if ($newStat.PSObject.Properties.Match('DeletedLineHashes').Count -gt 0)
+                {
+                    $newStat.DeletedLineHashes = @()
+                }
+
+                $oldStat.AddedLines = 0
+                $oldStat.DeletedLines = 0
+                if ($oldStat.PSObject.Properties.Match('Hunks').Count -gt 0)
+                {
+                    $oldStat.Hunks = @()
+                }
+                if ($oldStat.PSObject.Properties.Match('AddedLineHashes').Count -gt 0)
+                {
+                    $oldStat.AddedLineHashes = @()
+                }
+                if ($oldStat.PSObject.Properties.Match('DeletedLineHashes').Count -gt 0)
+                {
+                    $oldStat.DeletedLineHashes = @()
+                }
+            }
+        }
+
         $added = 0
         $deleted = 0
         $ch = @()
@@ -1854,21 +3111,30 @@ try
                 '追加行数' = [int]$_.AddedLines
                 '削除行数' = [int]$_.DeletedLines
                 'チャーン' = [int]$_.Churn
-                'エントロピー' = (Get-RoundedNumber -Value ([double]$_.Entropy))
+                'エントロピー' = (Format-MetricValue -Value ([double]$_.Entropy))
             }
         }
     )
 
     if (-not $NoBlame -and $fileRows.Count -gt 0)
     {
-        $renameMap = @{}
+        $renameMap = Get-RenameMap -Commits $commits
         $deadDetail = $null
-        if ($DeadDetailLevel -ge 1)
+        $strictDetail = $null
+        if ($StrictMode)
         {
-            $renameMap = Get-RenameMap -Commits $commits
+            $strictDetail = Get-ExactDeathAttribution -Commits $commits -RevToAuthor $revToAuthor -TargetUrl $targetUrl -FromRevision $FromRev -ToRevision $ToRev -CacheDir $cacheDir -RenameMap $renameMap
+        }
+        elseif ($DeadDetailLevel -ge 1)
+        {
             $deadDetail = Get-DeadLineDetail -Commits $commits -RevToAuthor $revToAuthor -DetailLevel $DeadDetailLevel -RenameMap $renameMap
         }
+
         $authorSurvived = @{}
+        if ($StrictMode -and $null -ne $strictDetail)
+        {
+            $authorSurvived = $strictDetail.AuthorSurvived
+        }
         $authorOwned = @{}
         $ownedTotal = 0
         $fileMap = @{}
@@ -1876,60 +3142,241 @@ try
         {
             $fileMap[[string]$r.'ファイルパス'] = $r
         }
-        foreach ($file in @($fileMap.Keys))
+
+        $blameByFile = @{}
+        $ownershipTargets = @()
+        if ($StrictMode)
+        {
+            $ownershipTargets = @(Get-AllRepositoryFile -Repo $targetUrl -Revision $ToRev -IncludeExt $IncludeExtensions -ExcludeExt $ExcludeExtensions -IncludePathPatterns $IncludePaths -ExcludePathPatterns $ExcludePaths)
+        }
+        else
+        {
+            $ownershipTargets = @($fileMap.Keys)
+        }
+        foreach ($file in $ownershipTargets)
         {
             try
             {
-                $b = Get-SvnBlameSummary -Repo $targetUrl -FilePath $file -ToRevision $ToRev
+                $b = Get-SvnBlameSummary -Repo $targetUrl -FilePath $file -ToRevision $ToRev -CacheDir $cacheDir
             }
             catch
             {
                 continue
             }
+            $blameByFile[$file] = $b
             $ownedTotal += [int]$b.LineCountTotal
             foreach ($a in $b.LineCountByAuthor.Keys)
             {
-                if (-not $authorOwned.ContainsKey($a))
-                {
-                    $authorOwned[$a] = 0
-                }
-                $authorOwned[$a] += [int]$b.LineCountByAuthor[$a]
+                Add-Count -Table $authorOwned -Key ([string]$a) -Delta ([int]$b.LineCountByAuthor[$a])
             }
-            $surv = 0
-            foreach ($rk in $b.LineCountByRevision.Keys)
+            if (-not $StrictMode)
             {
-                $rv = [int]$rk
-                $cnt = [int]$b.LineCountByRevision[$rk]
-                if ($rv -lt $FromRev -or $rv -gt $ToRev)
+                $surv = 0
+                foreach ($rk in $b.LineCountByRevision.Keys)
+                {
+                    $rv = [int]$rk
+                    $cnt = [int]$b.LineCountByRevision[$rk]
+                    if ($rv -lt $FromRev -or $rv -gt $ToRev)
+                    {
+                        continue
+                    }
+                    $surv += $cnt
+                    $sa = '(unknown)'
+                    if ($revToAuthor.ContainsKey($rv))
+                    {
+                        $sa = [string]$revToAuthor[$rv]
+                    }
+                    Add-Count -Table $authorSurvived -Key $sa -Delta $cnt
+                }
+            }
+        }
+
+        foreach ($r in $fileRows)
+        {
+            $fp = [string]$r.'ファイルパス'
+            $resolvedFp = Resolve-PathByRenameMap -FilePath $fp -RenameMap $renameMap
+            $isOldRenamePath = ($StrictMode -and $renameMap.ContainsKey($fp) -and ([string]$renameMap[$fp] -ne $fp))
+            $metricKey = if ($isOldRenamePath)
+            {
+                $null
+            }
+            else
+            {
+                $resolvedFp
+            }
+
+            $b = $null
+            $lookupCandidates = if ($StrictMode)
+            {
+                @($metricKey, $fp, $resolvedFp)
+            }
+            else
+            {
+                @($fp)
+            }
+            foreach ($lookup in $lookupCandidates)
+            {
+                if (-not $lookup)
                 {
                     continue
                 }
-                $surv += $cnt
-                $sa = '(unknown)'
-                if ($revToAuthor.ContainsKey($rv))
+                if ($blameByFile.ContainsKey($lookup))
                 {
-                    $sa = [string]$revToAuthor[$rv]
+                    $b = $blameByFile[$lookup]
+                    break
                 }
-                if (-not $authorSurvived.ContainsKey($sa))
+                try
                 {
-                    $authorSurvived[$sa] = 0
+                    $tmpB = Get-SvnBlameSummary -Repo $targetUrl -FilePath $lookup -ToRevision $ToRev -CacheDir $cacheDir
+                    $blameByFile[$lookup] = $tmpB
+                    $b = $tmpB
+                    break
                 }
-                $authorSurvived[$sa] += $cnt
+                catch
+                {
+                    $null = $_
+                }
             }
-            $fr = $fileMap[$file]
-            $fr.'生存行数 (範囲指定)' = $surv
-            $dead = [int]$fr.'追加行数' - $surv
-            if ($dead -lt 0)
+
+            if ($StrictMode -and $null -ne $strictDetail)
             {
-                $dead = 0
+                $sur = if ($metricKey -and $strictDetail.FileSurvived.ContainsKey($metricKey))
+                {
+                    [int]$strictDetail.FileSurvived[$metricKey]
+                }
+                else
+                {
+                    0
+                }
+                $dead = if ($metricKey -and $strictDetail.FileDead.ContainsKey($metricKey))
+                {
+                    [int]$strictDetail.FileDead[$metricKey]
+                }
+                else
+                {
+                    0
+                }
+                $r.'生存行数 (範囲指定)' = $sur
+                $r.($script:ColDeadAdded) = $dead
+
+                $fsc = if ($metricKey -and $strictDetail.FileSelfCancel.ContainsKey($metricKey))
+                {
+                    [int]$strictDetail.FileSelfCancel[$metricKey]
+                }
+                else
+                {
+                    0
+                }
+                $fcr = if ($metricKey -and $strictDetail.FileCrossRevert.ContainsKey($metricKey))
+                {
+                    [int]$strictDetail.FileCrossRevert[$metricKey]
+                }
+                else
+                {
+                    0
+                }
+                $frh = if ($metricKey -and $strictDetail.FileRepeatedHunk.ContainsKey($metricKey))
+                {
+                    [int]$strictDetail.FileRepeatedHunk[$metricKey]
+                }
+                else
+                {
+                    0
+                }
+                $fpp = if ($metricKey -and $strictDetail.FilePingPong.ContainsKey($metricKey))
+                {
+                    [int]$strictDetail.FilePingPong[$metricKey]
+                }
+                else
+                {
+                    0
+                }
+                $fim = if ($metricKey -and $strictDetail.FileInternalMoveCount.ContainsKey($metricKey))
+                {
+                    [int]$strictDetail.FileInternalMoveCount[$metricKey]
+                }
+                else
+                {
+                    0
+                }
+                $r.'自己相殺行数 (合計)' = $fsc
+                $r.'他者差戻行数 (合計)' = $fcr
+                $r.'同一箇所反復編集数 (合計)' = $frh
+                $r.'ピンポン回数 (合計)' = $fpp
+                $r.'内部移動行数 (合計)' = $fim
             }
-            $fr.'消滅追加行数 (概算)' = $dead
+            else
+            {
+                $surv = if ($null -ne $b)
+                {
+                    $tmp = 0
+                    foreach ($rk in $b.LineCountByRevision.Keys)
+                    {
+                        $rv = [int]$rk
+                        if ($rv -lt $FromRev -or $rv -gt $ToRev)
+                        {
+                            continue
+                        }
+                        $tmp += [int]$b.LineCountByRevision[$rk]
+                    }
+                    $tmp
+                }
+                else
+                {
+                    0
+                }
+                $r.'生存行数 (範囲指定)' = $surv
+                $dead = [int]$r.'追加行数' - $surv
+                if ($dead -lt 0)
+                {
+                    $dead = 0
+                }
+                $r.($script:ColDeadAdded) = $dead
+
+                if ($null -ne $deadDetail)
+                {
+                    $fsc = 0
+                    $fcr = 0
+                    $frh = 0
+                    $fpp = 0
+                    $fim = 0
+                    foreach ($lookupKey in @($fp, $resolvedFp))
+                    {
+                        if ($deadDetail.FileSelfCancel.ContainsKey($lookupKey))
+                        {
+                            $fsc += [int]$deadDetail.FileSelfCancel[$lookupKey]
+                        }
+                        if ($deadDetail.FileCrossRevert.ContainsKey($lookupKey))
+                        {
+                            $fcr += [int]$deadDetail.FileCrossRevert[$lookupKey]
+                        }
+                        if ($deadDetail.FileRepeatedHunk.ContainsKey($lookupKey))
+                        {
+                            $frh += [int]$deadDetail.FileRepeatedHunk[$lookupKey]
+                        }
+                        if ($deadDetail.FilePingPong.ContainsKey($lookupKey))
+                        {
+                            $fpp += [int]$deadDetail.FilePingPong[$lookupKey]
+                        }
+                        if ($deadDetail.FileInternalMoveCount.ContainsKey($lookupKey))
+                        {
+                            $fim += [int]$deadDetail.FileInternalMoveCount[$lookupKey]
+                        }
+                    }
+                    $r.'自己相殺行数 (合計)' = $fsc
+                    $r.'他者差戻行数 (合計)' = $fcr
+                    $r.'同一箇所反復編集数 (合計)' = $frh
+                    $r.'ピンポン回数 (合計)' = $fpp
+                    $r.'内部移動行数 (合計)' = $fim
+                }
+            }
+
             $mx = 0
-            if ($b.LineCountByAuthor.Count -gt 0)
+            if ($null -ne $b -and $b.LineCountByAuthor.Count -gt 0)
             {
                 $mx = ($b.LineCountByAuthor.Values | Measure-Object -Maximum).Maximum
             }
-            $topBlameShare = if ($b.LineCountTotal -gt 0)
+            $topBlameShare = if ($null -ne $b -and $b.LineCountTotal -gt 0)
             {
                 $mx / [double]$b.LineCountTotal
             }
@@ -1937,8 +3384,9 @@ try
             {
                 0
             }
-            $fr.'最多作者blame占有率' = Get-RoundedNumber -Value $topBlameShare
+            $r.'最多作者blame占有率' = Format-MetricValue -Value $topBlameShare
         }
+
         foreach ($r in $committerRows)
         {
             $a = [string]$r.'作者'
@@ -1959,12 +3407,26 @@ try
                 0
             }
             $r.'生存行数' = $sur
-            $dead = [int]$r.'追加行数' - $sur
-            if ($dead -lt 0)
+            if ($StrictMode -and $null -ne $strictDetail)
             {
-                $dead = 0
+                $dead = if ($strictDetail.AuthorDead.ContainsKey($a))
+                {
+                    [int]$strictDetail.AuthorDead[$a]
+                }
+                else
+                {
+                    0
+                }
             }
-            $r.'消滅追加行数 (概算)' = $dead
+            else
+            {
+                $dead = [int]$r.'追加行数' - $sur
+                if ($dead -lt 0)
+                {
+                    $dead = 0
+                }
+            }
+            $r.($script:ColDeadAdded) = $dead
             $r.'所有行数' = $own
             $ownShare = if ($ownedTotal -gt 0)
             {
@@ -1974,8 +3436,61 @@ try
             {
                 0
             }
-            $r.'所有割合' = Get-RoundedNumber -Value $ownShare
-            if ($null -ne $deadDetail)
+            $r.'所有割合' = Format-MetricValue -Value $ownShare
+
+            if ($StrictMode -and $null -ne $strictDetail)
+            {
+                $sc = if ($strictDetail.AuthorSelfDead.ContainsKey($a))
+                {
+                    [int]$strictDetail.AuthorSelfDead[$a]
+                }
+                else
+                {
+                    0
+                }
+                $cr = if ($strictDetail.AuthorOtherDead.ContainsKey($a))
+                {
+                    [int]$strictDetail.AuthorOtherDead[$a]
+                }
+                else
+                {
+                    0
+                }
+                $rh = if ($strictDetail.AuthorRepeatedHunk.ContainsKey($a))
+                {
+                    [int]$strictDetail.AuthorRepeatedHunk[$a]
+                }
+                else
+                {
+                    0
+                }
+                $pp = if ($strictDetail.AuthorPingPong.ContainsKey($a))
+                {
+                    [int]$strictDetail.AuthorPingPong[$a]
+                }
+                else
+                {
+                    0
+                }
+                $im = if ($strictDetail.AuthorInternalMoveCount.ContainsKey($a))
+                {
+                    [int]$strictDetail.AuthorInternalMoveCount[$a]
+                }
+                else
+                {
+                    0
+                }
+                $r.'自己相殺行数' = $sc
+                $r.'自己差戻行数' = $sc
+                $r.'他者差戻行数' = $cr
+                $r.'被他者削除行数' = $cr
+                $r.'同一箇所反復編集数' = $rh
+                $r.'ピンポン回数' = $pp
+                $r.'内部移動行数' = $im
+                $r.($script:ColSelfDead) = $sc
+                $r.($script:ColOtherDead) = $cr
+            }
+            elseif ($null -ne $deadDetail)
             {
                 $sc = if ($deadDetail.AuthorSelfCancel.ContainsKey($a))
                 {
@@ -2032,72 +3547,16 @@ try
                 $r.'同一箇所反復編集数' = $rh
                 $r.'ピンポン回数' = $pp
                 $r.'内部移動行数' = $im
-                $adjDead = [Math]::Max(0, [int]$r.'消滅追加行数 (概算)' - $im)
+                $adjDead = [Math]::Max(0, [int]$r.($script:ColDeadAdded) - $im)
                 $dbs = [Math]::Min($sc, $adjDead)
-                $r.'自己消滅行数 (概算)' = $dbs
-                $r.'被他者消滅行数 (概算)' = [Math]::Max(0, $adjDead - $dbs)
-            }
-        }
-        foreach ($r in $fileRows)
-        {
-            if ($null -eq $r.'生存行数 (範囲指定)')
-            {
-                $r.'生存行数 (範囲指定)' = 0
-                $r.'消滅追加行数 (概算)' = [int]$r.'追加行数'
-                $r.'最多作者blame占有率' = 0.0
-            }
-            if ($null -ne $deadDetail)
-            {
-                $fp = [string]$r.'ファイルパス'
-                $resolvedFp = $fp
-                if ($renameMap.ContainsKey($fp))
-                {
-                    $resolvedFp = [string]$renameMap[$fp]
-                }
-                $fsc = 0
-                $fcr = 0
-                $frh = 0
-                $fpp = 0
-                $fim = 0
-                foreach ($lookupKey in @($fp, $resolvedFp))
-                {
-                    if ($deadDetail.FileSelfCancel.ContainsKey($lookupKey))
-                    {
-                        $fsc += [int]$deadDetail.FileSelfCancel[$lookupKey]
-                    }
-                    if ($deadDetail.FileCrossRevert.ContainsKey($lookupKey))
-                    {
-                        $fcr += [int]$deadDetail.FileCrossRevert[$lookupKey]
-                    }
-                    if ($deadDetail.FileRepeatedHunk.ContainsKey($lookupKey))
-                    {
-                        $frh += [int]$deadDetail.FileRepeatedHunk[$lookupKey]
-                    }
-                    if ($deadDetail.FilePingPong.ContainsKey($lookupKey))
-                    {
-                        $fpp += [int]$deadDetail.FilePingPong[$lookupKey]
-                    }
-                    if ($deadDetail.FileInternalMoveCount.ContainsKey($lookupKey))
-                    {
-                        $fim += [int]$deadDetail.FileInternalMoveCount[$lookupKey]
-                    }
-                }
-                if ($fp -eq $resolvedFp)
-                {
-                    $fsc = [Math]::Min($fsc, [Math]::Max(1, $fsc))
-                    $fcr = [Math]::Min($fcr, [Math]::Max(1, $fcr))
-                }
-                $r.'自己相殺行数 (合計)' = $fsc
-                $r.'他者差戻行数 (合計)' = $fcr
-                $r.'同一箇所反復編集数 (合計)' = $frh
-                $r.'ピンポン回数 (合計)' = $fpp
-                $r.'内部移動行数 (合計)' = $fim
+                $r.($script:ColSelfDead) = $dbs
+                $r.($script:ColOtherDead) = [Math]::Max(0, $adjDead - $dbs)
             }
         }
     }
 
-    $headersCommitter = @('作者', 'コミット数', '活動日数', '変更ファイル数', '変更ディレクトリ数', '追加行数', '削除行数', '純増行数', '総チャーン', 'コミットあたりチャーン', '削除対追加比', 'チャーン対純増比', 'バイナリ変更回数', '追加アクション数', '変更アクション数', '削除アクション数', '置換アクション数', '生存行数', '消滅追加行数 (概算)', '所有行数', '所有割合', '自己相殺行数', '自己差戻行数', '他者差戻行数', '被他者削除行数', '同一箇所反復編集数', 'ピンポン回数', '内部移動行数', '自己消滅行数 (概算)', '被他者消滅行数 (概算)', '変更エントロピー', '平均共同作者数', '最大共同作者数', 'メッセージ総文字数', 'メッセージ平均文字数', '課題ID言及数', '修正キーワード数', '差戻キーワード数', 'マージキーワード数')
-    $headersFile = @('ファイルパス', 'コミット数', '作者数', '追加行数', '削除行数', '純増行数', '総チャーン', 'バイナリ変更回数', '作成回数', '削除回数', '置換回数', '初回変更リビジョン', '最終変更リビジョン', '平均変更間隔日数', '生存行数 (範囲指定)', '消滅追加行数 (概算)', '最多作者チャーン占有率', '最多作者blame占有率', '自己相殺行数 (合計)', '他者差戻行数 (合計)', '同一箇所反復編集数 (合計)', 'ピンポン回数 (合計)', '内部移動行数 (合計)', 'ホットスポットスコア', 'ホットスポット順位')
+    $headersCommitter = @('作者', 'コミット数', '活動日数', '変更ファイル数', '変更ディレクトリ数', '追加行数', '削除行数', '純増行数', '総チャーン', 'コミットあたりチャーン', '削除対追加比', 'チャーン対純増比', 'バイナリ変更回数', '追加アクション数', '変更アクション数', '削除アクション数', '置換アクション数', '生存行数', $script:ColDeadAdded, '所有行数', '所有割合', '自己相殺行数', '自己差戻行数', '他者差戻行数', '被他者削除行数', '同一箇所反復編集数', 'ピンポン回数', '内部移動行数', $script:ColSelfDead, $script:ColOtherDead, '変更エントロピー', '平均共同作者数', '最大共同作者数', 'メッセージ総文字数', 'メッセージ平均文字数', '課題ID言及数', '修正キーワード数', '差戻キーワード数', 'マージキーワード数')
+    $headersFile = @('ファイルパス', 'コミット数', '作者数', '追加行数', '削除行数', '純増行数', '総チャーン', 'バイナリ変更回数', '作成回数', '削除回数', '置換回数', '初回変更リビジョン', '最終変更リビジョン', '平均変更間隔日数', '生存行数 (範囲指定)', $script:ColDeadAdded, '最多作者チャーン占有率', '最多作者blame占有率', '自己相殺行数 (合計)', '他者差戻行数 (合計)', '同一箇所反復編集数 (合計)', 'ピンポン回数 (合計)', '内部移動行数 (合計)', 'ホットスポットスコア', 'ホットスポット順位')
     $headersCommit = @('リビジョン', '日時', '作者', 'メッセージ文字数', 'メッセージ', '変更ファイル数', '追加行数', '削除行数', 'チャーン', 'エントロピー')
     $headersCoupling = @('ファイルA', 'ファイルB', '共変更回数', 'Jaccard', 'リフト値')
 
@@ -2107,20 +3566,21 @@ try
     Write-CsvFile -FilePath (Join-Path $OutDir 'couplings.csv') -Rows $couplingRows -Headers $headersCoupling -EncodingName $Encoding
     if ($EmitPlantUml)
     {
-        Write-PlantUmlFile -OutDirectory $OutDir -Committers $committerRows -Files $fileRows -Couplings $couplingRows -TopNCount $TopN -EncodingName $Encoding
+        Write-PlantUmlFile -OutDirectory $OutDir -Committers $committerRows -Files $fileRows -Couplings $couplingRows -TopNCount $TopN -EncodingName $Encoding -StrictMode:$StrictMode
     }
 
     $finishedAt = Get-Date
     $meta = [ordered]@{
         StartTime = $startedAt.ToString('o')
         EndTime = $finishedAt.ToString('o')
-        DurationSeconds = Get-RoundedNumber -Value ((New-TimeSpan -Start $startedAt -End $finishedAt).TotalSeconds) -Digits 3
+        DurationSeconds = Format-MetricValue -Value ((New-TimeSpan -Start $startedAt -End $finishedAt).TotalSeconds) -Digits 3
         RepoUrl = $targetUrl
         FromRev = $FromRev
         ToRev = $ToRev
         AuthorFilter = $Author
         SvnExecutable = $script:SvnExecutable
         SvnVersion = $svnVersion
+        StrictMode = [bool]$StrictMode
         NoBlame = [bool]$NoBlame
         DeadDetailLevel = $DeadDetailLevel
         Parallel = $Parallel
@@ -2129,6 +3589,46 @@ try
         CommitCount = @($commits).Count
         FileCount = @($fileRows).Count
         OutputDirectory = (Resolve-Path $OutDir).Path
+        StrictBlameCallCount = if ($StrictMode)
+        {
+            [int]($script:StrictBlameCacheHits + $script:StrictBlameCacheMisses)
+        }
+        else
+        {
+            0
+        }
+        StrictBlameCacheHits = if ($StrictMode)
+        {
+            [int]$script:StrictBlameCacheHits
+        }
+        else
+        {
+            0
+        }
+        StrictBlameCacheMisses = if ($StrictMode)
+        {
+            [int]$script:StrictBlameCacheMisses
+        }
+        else
+        {
+            0
+        }
+        NonStrictMetrics = if ($StrictMode)
+        {
+            @('課題ID言及数', '修正キーワード数', '差戻キーワード数', 'マージキーワード数')
+        }
+        else
+        {
+            @()
+        }
+        NonStrictReason = if ($StrictMode)
+        {
+            '正規表現ベースのヒューリスティックであり厳密化不可能'
+        }
+        else
+        {
+            $null
+        }
         Parameters = [ordered]@{ IncludePaths = $IncludePaths
             ExcludePaths = $ExcludePaths
             IncludeExtensions = $IncludeExtensions
@@ -2175,7 +3675,11 @@ try
     }
     Write-JsonFile -Data $meta -FilePath (Join-Path $OutDir 'run_meta.json') -Depth 12 -EncodingName $Encoding
 
-    $phaseLabel = if ($DeadDetailLevel -ge 1)
+    $phaseLabel = if ($StrictMode)
+    {
+        'StrictMode'
+    }
+    elseif ($DeadDetailLevel -ge 1)
     {
         'Phase 1 + Phase 2'
     }
