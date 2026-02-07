@@ -714,15 +714,15 @@ Describe 'Metrics functions — detailed verification' {
         }
 
         It 'calculates ChurnPerCommit' {
-            $script:alice.'コミットあたりチャーン' | Should -Be (Get-RoundedNumber -Value (24.0 / 2))
+            $script:alice.'コミットあたりチャーン' | Should -Be (24.0 / 2)
         }
 
         It 'calculates DeletedToAddedRatio' {
-            $script:alice.'削除対追加比' | Should -Be (Get-RoundedNumber -Value (6.0 / 18))
+            $script:alice.'削除対追加比' | Should -Be (6.0 / 18)
         }
 
         It 'calculates ChurnToNetRatio' {
-            $script:alice.'チャーン対純増比' | Should -Be (Get-RoundedNumber -Value (24.0 / 12))
+            $script:alice.'チャーン対純増比' | Should -Be (24.0 / 12)
         }
 
         It 'detects action types' {
@@ -789,7 +789,7 @@ Describe 'Metrics functions — detailed verification' {
 
         It 'calculates TopAuthorShareByChurn' {
             # src/A.cs total churn=16, alice churn=14, bob churn=2 => top share = 14/16
-            $expected = Get-RoundedNumber -Value (14.0 / 16)
+            $expected = (14.0 / 16)
             $script:fileA.'最多作者チャーン占有率' | Should -Be $expected
         }
 
@@ -820,7 +820,7 @@ Describe 'Metrics functions — detailed verification' {
         It 'calculates Jaccard correctly' {
             # A.cs appears in 3 commits, B.cs in 1, co-change=1
             # Jaccard = 1 / (3+1-1) = 1/3
-            $expected = Get-RoundedNumber -Value (1.0 / 3)
+            $expected = (1.0 / 3)
             $script:coRows[0].'Jaccard' | Should -Be $expected
         }
 
@@ -837,8 +837,8 @@ Describe 'Metrics functions — detailed verification' {
         }
     }
 
-    Context 'Get-CoChangeMetric with LargeCommitFileThreshold' {
-        It 'skips commits exceeding threshold' {
+    Context 'Get-CoChangeMetric large commit handling' {
+        It 'includes commits with many files' {
             $bigCommit = [pscustomobject]@{
                 Revision = 99
                 Author = 'bulk'
@@ -854,28 +854,18 @@ Describe 'Metrics functions — detailed verification' {
                 MsgLen = 11
                 MessageShort = 'bulk import'
             }
-            $result = @(Get-CoChangeMetric -Commits @($bigCommit) -TopNCount 100 -LargeCommitFileThreshold 100)
-            # Over 100 files, so no pairs should be generated
-            $result.Count | Should -Be 0
+            $result = @(Get-CoChangeMetric -Commits @($bigCommit) -TopNCount 100)
+            $result.Count | Should -Be 100
         }
     }
 }
 
-Describe 'StrictMode behavior' {
-    AfterEach {
-        Initialize-StrictModeContext -Enabled $false
-    }
-
-    It 'Format-MetricValue bypasses rounding when strict mode is enabled' {
-        Initialize-StrictModeContext -Enabled $false
-        (Format-MetricValue -Value 1.23456) | Should -Be 1.2346
-
-        Initialize-StrictModeContext -Enabled $true
+Describe 'Strict-only behavior' {
+    It 'Format-MetricValue returns exact value without rounding' {
         (Format-MetricValue -Value 1.23456) | Should -Be 1.23456
     }
 
-    It 'Get-CommitterMetric returns null ratios for zero denominators in strict mode' {
-        Initialize-StrictModeContext -Enabled $true
+    It 'Get-CommitterMetric returns null ratios for zero denominators' {
         $commits = @(
             [pscustomobject]@{
                 Revision = 1
@@ -898,8 +888,7 @@ Describe 'StrictMode behavior' {
         $row.'チャーン対純増比' | Should -Be $null
     }
 
-    It 'Get-CoChangeMetric does not skip large commits in strict mode' {
-        Initialize-StrictModeContext -Enabled $true
+    It 'Get-CoChangeMetric does not skip large commits' {
         $bigCommit = [pscustomobject]@{
             Revision = 99
             Author = 'bulk'
@@ -915,12 +904,11 @@ Describe 'StrictMode behavior' {
             MsgLen = 11
             MessageShort = 'bulk import'
         }
-        $result = @(Get-CoChangeMetric -Commits @($bigCommit) -TopNCount 10 -LargeCommitFileThreshold 100)
+        $result = @(Get-CoChangeMetric -Commits @($bigCommit) -TopNCount 10)
         $result.Count | Should -Be 10
     }
 
-    It 'switches dead-related column names in strict mode' {
-        Initialize-StrictModeContext -Enabled $true
+    It 'uses strict dead-related column names by default' {
         $rows = @(Get-CommitterMetric -Commits @(
                 [pscustomobject]@{
                     Revision = 1
@@ -1056,7 +1044,6 @@ Describe 'NarutoCode.ps1 execution' {
                     -FromRev 1 -ToRev 2 `
                     -OutDir $tempOut `
                     -SvnExecutable 'nonexistent_svn_command_xyz' `
-                    -NoBlame `
                     -ErrorAction Stop
             } | Should -Throw -ExpectedMessage '*not found*'
         }
@@ -1065,7 +1052,7 @@ Describe 'NarutoCode.ps1 execution' {
         }
     }
 
-    It 'fails when StrictMode and NoBlame are both specified' {
+    It 'fails when NoBlame is specified in strict-only mode' {
         $tempOut = Join-Path $env:TEMP ('narutocode_test_' + [guid]::NewGuid().ToString('N'))
         try {
             {
@@ -1074,10 +1061,9 @@ Describe 'NarutoCode.ps1 execution' {
                     -FromRev 1 -ToRev 2 `
                     -OutDir $tempOut `
                     -SvnExecutable 'nonexistent_svn_command_xyz' `
-                    -StrictMode `
                     -NoBlame `
                     -ErrorAction Stop
-            } | Should -Throw -ExpectedMessage '*StrictMode requires blame analysis*'
+            } | Should -Throw -ExpectedMessage '*strict-only mode*'
         }
         finally {
             Remove-Item -Path $tempOut -Recurse -Force -ErrorAction SilentlyContinue

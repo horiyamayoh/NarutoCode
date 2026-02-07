@@ -1,11 +1,13 @@
 @startuml
+' NOTE: This PlantUML shows top N entries only. See CSV files for complete data.
+' StrictMode is enabled - all metric values are exact where mathematically definable.
 salt
 {
 {T
 + 作者 | コミット数 | 総チャーン
 | alice | 8 | 402
-| bob | 7 | 253
 | charlie | 5 | 174
+| bob | 7 | 123
 }
 }
 @enduml
