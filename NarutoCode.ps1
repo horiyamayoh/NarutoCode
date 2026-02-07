@@ -31,6 +31,9 @@ param(
     [switch]$NoProgress
 )
 
+# Suppress progress output when -NoProgress is specified
+if ($NoProgress) { $ProgressPreference = 'SilentlyContinue' }
+
 # region Utility
 function ConvertTo-NormalizedExtension
 {
@@ -89,8 +92,8 @@ function Write-JsonFile
     param($Data, [string]$FilePath, [int]$Depth = 12, [string]$EncodingName = 'UTF8')
     Write-TextFile -FilePath $FilePath -Content ($Data | ConvertTo-Json -Depth $Depth) -EncodingName $EncodingName
 }
-function Round-Number { param([double]$Value, [int]$Digits = 4) [Math]::Round($Value, $Digits) }
-function Normalize-PathKey
+function Get-RoundedNumber { param([double]$Value, [int]$Digits = 4) [Math]::Round($Value, $Digits) }
+function ConvertTo-PathKey
 {
     param([string]$Path)
     if ([string]::IsNullOrWhiteSpace($Path)){ return '' }
@@ -103,7 +106,7 @@ function Test-ShouldCountFile
 {
     param([string]$FilePath, [string[]]$IncludeExt, [string[]]$ExcludeExt, [string[]]$IncludePathPatterns, [string[]]$ExcludePathPatterns)
     if ([string]::IsNullOrWhiteSpace($FilePath)){ return $false }
-    $path = Normalize-PathKey -Path $FilePath
+    $path = ConvertTo-PathKey -Path $FilePath
     if ($path.EndsWith('/')){ return $false }
     if ($IncludePathPatterns -and $IncludePathPatterns.Count -gt 0){ $ok = $false; foreach ($p in $IncludePathPatterns){ if ($path -like $p){ $ok = $true; break } }; if (-not $ok){ return $false } }
     if ($ExcludePathPatterns -and $ExcludePathPatterns.Count -gt 0){ foreach ($p in $ExcludePathPatterns){ if ($path -like $p){ return $false } } }
@@ -114,7 +117,7 @@ function Test-ShouldCountFile
     if ($ExcludeExt -and $ExcludeExt.Count -gt 0 -and ($ExcludeExt -contains $ext)){ return $false }
     return $true
 }
-function Join-CommandArguments
+function Join-CommandArgument
 {
     param([string[]]$Arguments)
     $parts = New-Object 'System.Collections.Generic.List[string]'
@@ -129,7 +132,7 @@ function Invoke-SvnCommand
     {
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = $script:SvnExecutable
-        $psi.Arguments = Join-CommandArguments -Arguments $all.ToArray()
+        $psi.Arguments = Join-CommandArgument -Arguments $all.ToArray()
         $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.CreateNoWindow = $true
         $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8; $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
         $process = New-Object System.Diagnostics.Process; $process.StartInfo = $psi
@@ -155,7 +158,7 @@ function Resolve-SvnTargetUrl
     if ([string]::IsNullOrWhiteSpace($url)){ throw "Could not validate repository URL: $Target" }
     return $url.TrimEnd('/')
 }
-function Parse-SvnLogXml
+function ConvertFrom-SvnLogXml
 {
     [CmdletBinding()]param([string]$XmlText)
     $xml = ConvertFrom-SvnXmlText -Text $XmlText -ContextLabel 'svn log'
@@ -163,18 +166,18 @@ function Parse-SvnLogXml
     $list = New-Object 'System.Collections.Generic.List[object]'
     foreach ($e in $entries)
     {
-        $rev = 0; try{ $rev = [int]$e.revision }catch{}
+        $rev = 0; try{ $rev = [int]$e.revision }catch{ $null = $_ }
         $author = [string]$e.author; if ([string]::IsNullOrWhiteSpace($author)){ $author = '(unknown)' }
-        $date = $null; $dateText = [string]$e.date; if ($dateText){ try{ $date = [datetime]::Parse($dateText, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind) }catch{ try{ $date = [datetime]$dateText }catch{ $date = $null } } }
+        $date = $null; $dateText = [string]$e.date; if ($dateText){ try{ $date = [datetime]::Parse($dateText, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind) }catch{ try{ $date = [datetime]$dateText }catch{ $null = $_; $date = $null } } }
         $msg = [string]$e.msg
         $paths = New-Object 'System.Collections.Generic.List[object]'
         $pathNodes = @(); if ($e.paths -and $e.paths.path){ $pathNodes = @($e.paths.path) }
         foreach ($p in $pathNodes)
         {
             $raw = [string]$p.'#text'; if ([string]::IsNullOrWhiteSpace($raw)){ continue }
-            $path = Normalize-PathKey -Path $raw; if (-not $path){ continue }
-            $copyPath = $null; if ($p.'copyfrom-path'){ $copyPath = Normalize-PathKey -Path ([string]$p.'copyfrom-path') }
-            $copyRev = $null; if ($p.'copyfrom-rev'){ try{ $copyRev = [int]$p.'copyfrom-rev' }catch{} }
+            $path = ConvertTo-PathKey -Path $raw; if (-not $path){ continue }
+            $copyPath = $null; if ($p.'copyfrom-path'){ $copyPath = ConvertTo-PathKey -Path ([string]$p.'copyfrom-path') }
+            $copyRev = $null; if ($p.'copyfrom-rev'){ try{ $copyRev = [int]$p.'copyfrom-rev' }catch{ $null = $_ } }
             $paths.Add([pscustomobject]@{ Path = $path; Action = [string]$p.action; CopyFromPath = $copyPath; CopyFromRev = $copyRev; IsDirectory = $raw.Trim().EndsWith('/') }) | Out-Null
         }
         $list.Add([pscustomobject]@{
@@ -185,7 +188,7 @@ function Parse-SvnLogXml
     }
     return $list.ToArray() | Sort-Object Revision
 }
-function Parse-SvnUnifiedDiff
+function ConvertFrom-SvnUnifiedDiff
 {
     [CmdletBinding()]param([string]$DiffText)
     $result = @{}
@@ -196,7 +199,7 @@ function Parse-SvnUnifiedDiff
     {
         if ($line -like 'Index: *')
         {
-            $file = Normalize-PathKey -Path $line.Substring(7).Trim()
+            $file = ConvertTo-PathKey -Path $line.Substring(7).Trim()
             if ($file){ if (-not $result.ContainsKey($file)){ $result[$file] = [pscustomobject]@{ AddedLines = 0; DeletedLines = 0; Hunks = (New-Object 'System.Collections.Generic.List[object]'); IsBinary = $false } }; $current = $result[$file] }
             continue
         }
@@ -214,7 +217,7 @@ function Parse-SvnUnifiedDiff
     }
     return $result
 }
-function Parse-SvnBlameXml
+function ConvertFrom-SvnBlameXml
 {
     [CmdletBinding()]param([string]$XmlText)
     $xml = ConvertFrom-SvnXmlText -Text $XmlText -ContextLabel 'svn blame'
@@ -224,7 +227,7 @@ function Parse-SvnBlameXml
     {
         $total++
         $commit = $entry.commit; if ($null -eq $commit){ continue }
-        $rev = $null; try{ $rev = [int]$commit.revision }catch{}
+        $rev = $null; try{ $rev = [int]$commit.revision }catch{ $null = $_ }
         if ($null -ne $rev){ if (-not $byRev.ContainsKey($rev)){ $byRev[$rev] = 0 }; $byRev[$rev]++ }
         $author = [string]$commit.author; if ([string]::IsNullOrWhiteSpace($author)){ $author = '(unknown)' }
         if (-not $byAuthor.ContainsKey($author)){ $byAuthor[$author] = 0 }; $byAuthor[$author]++
@@ -240,7 +243,7 @@ function Get-Entropy
     $e = 0.0; foreach ($v in $Values){ $x = [double]$v; if ($x -le 0){ continue }; $p = $x / $sum; $e += (-1.0) * $p * ([Math]::Log($p, 2.0)) }
     return $e
 }
-function Get-MessageMetricCounts
+function Get-MessageMetricCount
 {
     param([string]$Message)
     if ($null -eq $Message){ $Message = '' }
@@ -254,13 +257,15 @@ function Get-MessageMetricCounts
 function Get-SvnBlameSummary
 {
     [CmdletBinding()]param([string]$Repo, [string]$FilePath, [int]$ToRevision)
-    $url = $Repo.TrimEnd('/') + '/' + (Normalize-PathKey -Path $FilePath).TrimStart('/') + '@' + [string]$ToRevision
+    $url = $Repo.TrimEnd('/') + '/' + (ConvertTo-PathKey -Path $FilePath).TrimStart('/') + '@' + [string]$ToRevision
     $text = Invoke-SvnCommand -Arguments @('blame', '--xml', '-r', [string]$ToRevision, $url) -ErrorContext ("svn blame $FilePath")
-    Parse-SvnBlameXml -XmlText $text
+    ConvertFrom-SvnBlameXml -XmlText $text
 }
-function Compute-CommitterMetrics
+function Get-CommitterMetric
 {
-    [CmdletBinding()]param([object[]]$Commits)
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param([object[]]$Commits)
     $states = @{}; $fileAuthors = @{}
     foreach ($c in $Commits){ $a = [string]$c.Author; foreach ($f in @($c.FilesChanged)){ if (-not $fileAuthors.ContainsKey($f)){ $fileAuthors[$f] = New-Object 'System.Collections.Generic.HashSet[string]' }; $null = $fileAuthors[$f].Add($a) } }
     foreach ($c in $Commits)
@@ -278,7 +283,7 @@ function Compute-CommitterMetrics
         $s.CommitCount++; if ($c.Date){ $null = $s.ActiveDays.Add(([datetime]$c.Date).ToString('yyyy-MM-dd')) }
         $s.Added += [int]$c.AddedLines; $s.Deleted += [int]$c.DeletedLines
         $msg = [string]$c.Message; if ($null -eq $msg){ $msg = '' }; $s.MsgLen += $msg.Length
-        $m = Get-MessageMetricCounts -Message $msg; $s.Issue += $m.IssueIdMentionCount; $s.Fix += $m.FixKeywordCount; $s.Revert += $m.RevertKeywordCount; $s.Merge += $m.MergeKeywordCount
+        $m = Get-MessageMetricCount -Message $msg; $s.Issue += $m.IssueIdMentionCount; $s.Fix += $m.FixKeywordCount; $s.Revert += $m.RevertKeywordCount; $s.Merge += $m.MergeKeywordCount
         foreach ($f in @($c.FilesChanged))
         {
             $null = $s.Files.Add($f)
@@ -301,19 +306,19 @@ function Compute-CommitterMetrics
         $rows.Add([pscustomobject][ordered]@{
                 Author = [string]$s.Author; CommitCount = [int]$s.CommitCount; ActiveDays = [int]$s.ActiveDays.Count; FilesTouched = [int]$s.Files.Count; DirsTouched = [int]$s.Dirs.Count
                 AddedLines = [int]$s.Added; DeletedLines = [int]$s.Deleted; NetLines = $net; TotalChurn = $ch
-                ChurnPerCommit = Round-Number -Value $churnPerCommit
-                DeletedToAddedRatio = Round-Number -Value ([int]$s.Deleted / [double][Math]::Max(1, [int]$s.Added))
-                ChurnToNetRatio = Round-Number -Value ($ch / [double][Math]::Max(1, [Math]::Abs($net)))
+                ChurnPerCommit = Get-RoundedNumber -Value $churnPerCommit
+                DeletedToAddedRatio = Get-RoundedNumber -Value ([int]$s.Deleted / [double][Math]::Max(1, [int]$s.Added))
+                ChurnToNetRatio = Get-RoundedNumber -Value ($ch / [double][Math]::Max(1, [Math]::Abs($net)))
                 BinaryChangeCount = [int]$s.Binary; ActionAddCount = [int]$s.ActA; ActionModCount = [int]$s.ActM; ActionDelCount = [int]$s.ActD; ActionRepCount = [int]$s.ActR
                 SurvivedLinesToToRev = $null; DeadAddedLinesApprox = $null; OwnedLinesToToRev = $null; OwnershipShareToToRev = $null
-                AuthorChangeEntropy = Round-Number -Value $entropy; AvgCoAuthorsPerTouchedFile = Round-Number -Value $coAvg; MaxCoAuthorsPerTouchedFile = [int]$coMax
-                MsgLenTotalChars = [int]$s.MsgLen; MsgLenAvgChars = Round-Number -Value $msgLenAvg
+                AuthorChangeEntropy = Get-RoundedNumber -Value $entropy; AvgCoAuthorsPerTouchedFile = Get-RoundedNumber -Value $coAvg; MaxCoAuthorsPerTouchedFile = [int]$coMax
+                MsgLenTotalChars = [int]$s.MsgLen; MsgLenAvgChars = Get-RoundedNumber -Value $msgLenAvg
                 IssueIdMentionCount = [int]$s.Issue; FixKeywordCount = [int]$s.Fix; RevertKeywordCount = [int]$s.Revert; MergeKeywordCount = [int]$s.Merge
             }) | Out-Null
     }
     return @($rows.ToArray() | Sort-Object -Property @{Expression = 'TotalChurn'; Descending = $true }, Author)
 }
-function Compute-FileMetrics
+function Get-FileMetric
 {
     [CmdletBinding()]param([object[]]$Commits)
     $states = @{}
@@ -343,17 +348,19 @@ function Compute-FileMetrics
         $topShare = 0.0; if ($ch -gt 0 -and $s.AuthorChurn.Count -gt 0){ $mx = ($s.AuthorChurn.Values | Measure-Object -Maximum).Maximum; $topShare = $mx / [double]$ch }
         $rows.Add([pscustomobject][ordered]@{
                 FilePath = [string]$s.FilePath; FileCommitCount = $cc; FileAuthors = [int]$s.Authors.Count; AddedLines = $add; DeletedLines = $del; NetLines = ($add - $del); TotalChurn = $ch; BinaryChangeCount = [int]$s.Binary
-                CreateCount = [int]$s.Create; DeleteCount = [int]$s.Delete; ReplaceCount = [int]$s.Replace; FirstChangeRev = $first; LastChangeRev = $last; AvgDaysBetweenChanges = Round-Number -Value $avg
-                SurvivedLinesFromRangeToToRev = $null; DeadAddedLinesApprox = $null; TopAuthorShareByChurn = Round-Number -Value $topShare; TopAuthorShareByBlame = $null; HotspotScore = ($cc * $ch); RankByHotspot = 0
+                CreateCount = [int]$s.Create; DeleteCount = [int]$s.Delete; ReplaceCount = [int]$s.Replace; FirstChangeRev = $first; LastChangeRev = $last; AvgDaysBetweenChanges = Get-RoundedNumber -Value $avg
+                SurvivedLinesFromRangeToToRev = $null; DeadAddedLinesApprox = $null; TopAuthorShareByChurn = Get-RoundedNumber -Value $topShare; TopAuthorShareByBlame = $null; HotspotScore = ($cc * $ch); RankByHotspot = 0
             }) | Out-Null
     }
     $sorted = @($rows.ToArray() | Sort-Object -Property @{Expression = 'HotspotScore'; Descending = $true }, @{Expression = 'TotalChurn'; Descending = $true }, FilePath)
     $rank = 0; foreach ($r in $sorted){ $rank++; $r.RankByHotspot = $rank }
     return $sorted
 }
-function Compute-CoChangeMetrics
+function Get-CoChangeMetric
 {
-    [CmdletBinding()]param([object[]]$Commits, [int]$TopNCount = 50, [int]$LargeCommitFileThreshold = 100)
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param([object[]]$Commits, [int]$TopNCount = 50, [int]$LargeCommitFileThreshold = 100)
     $pair = @{}; $fileCount = @{}; $commitTotal = 0
     foreach ($c in $Commits)
     {
@@ -371,13 +378,13 @@ function Compute-CoChangeMetrics
         $p = $k -split [char]31, 2; $a = $p[0]; $b = $p[1]; $co = [int]$pair[$k]; $ca = [int]$fileCount[$a]; $cb = [int]$fileCount[$b]
         $j = 0.0; $den = ($ca + $cb - $co); if ($den -gt 0){ $j = $co / [double]$den }
         $lift = 0.0; if ($commitTotal -gt 0 -and $ca -gt 0 -and $cb -gt 0){ $pab = $co / [double]$commitTotal; $pa = $ca / [double]$commitTotal; $pb = $cb / [double]$commitTotal; if (($pa * $pb) -gt 0){ $lift = $pab / ($pa * $pb) } }
-        $rows.Add([pscustomobject][ordered]@{ FileA = $a; FileB = $b; CoChangeCount = $co; Jaccard = Round-Number -Value $j; Lift = Round-Number -Value $lift }) | Out-Null
+        $rows.Add([pscustomobject][ordered]@{ FileA = $a; FileB = $b; CoChangeCount = $co; Jaccard = Get-RoundedNumber -Value $j; Lift = Get-RoundedNumber -Value $lift }) | Out-Null
     }
     $sorted = @($rows.ToArray() | Sort-Object -Property @{Expression = 'CoChangeCount'; Descending = $true }, @{Expression = 'Jaccard'; Descending = $true }, @{Expression = 'Lift'; Descending = $true }, FileA, FileB)
     if ($TopNCount -gt 0){ return @($sorted | Select-Object -First $TopNCount) }
     return $sorted
 }
-function Write-PlantUmlFiles
+function Write-PlantUmlFile
 {
     param([string]$OutDirectory, [object[]]$Committers, [object[]]$Files, [object[]]$Couplings, [int]$TopNCount, [string]$EncodingName)
     $topCommitters = @($Committers | Sort-Object -Property @{Expression = 'TotalChurn'; Descending = $true }, Author | Select-Object -First $TopNCount)
@@ -428,10 +435,10 @@ try
     $script:SvnGlobalArguments = $ga.ToArray()
 
     $targetUrl = Resolve-SvnTargetUrl -Target $RepoUrl
-    $svnVersion = $null; try{ $svnVersion = (Invoke-SvnCommand -Arguments @('--version', '--quiet') -ErrorContext 'svn version').Split("`n")[0].Trim() }catch{}
+    $svnVersion = $null; try{ $svnVersion = (Invoke-SvnCommand -Arguments @('--version', '--quiet') -ErrorContext 'svn version').Split("`n")[0].Trim() }catch{ $null = $_ }
 
     $logText = Invoke-SvnCommand -Arguments @('log', '--xml', '--verbose', '-r', "$FromRev`:$ToRev", $targetUrl) -ErrorContext 'svn log'
-    $commits = @(Parse-SvnLogXml -XmlText $logText)
+    $commits = @(ConvertFrom-SvnLogXml -XmlText $logText)
     if ($Author){ if ($Author -match '[\*\?\[]'){ $commits = @($commits | Where-Object { ([string]$_.Author) -like $Author }) } else { $commits = @($commits | Where-Object { ([string]$_.Author) -ieq $Author }) } }
 
     $diffArgs = New-Object 'System.Collections.Generic.List[string]'; $null = $diffArgs.Add('diff'); $null = $diffArgs.Add('--internal-diff')
@@ -454,7 +461,7 @@ try
             Set-Content -Path $cacheFile -Value $diffText -Encoding UTF8
         }
 
-        $raw = Parse-SvnUnifiedDiff -DiffText $diffText
+        $raw = ConvertFrom-SvnUnifiedDiff -DiffText $diffText
         $filtered = @{}
         foreach ($path in $raw.Keys){ if (Test-ShouldCountFile -FilePath $path -IncludeExt $IncludeExtensions -ExcludeExt $ExcludeExtensions -IncludePathPatterns $IncludePaths -ExcludePathPatterns $ExcludePaths){ $filtered[$path] = $raw[$path] } }
         $c.FileDiffStats = $filtered; $c.FilesChanged = @($filtered.Keys | Sort-Object)
@@ -463,7 +470,7 @@ try
         foreach ($p in @($c.ChangedPaths))
         {
             if ($null -eq $p){ continue }; if ($p.PSObject.Properties.Match('IsDirectory').Count -gt 0 -and [bool]$p.IsDirectory){ continue }
-            $path = Normalize-PathKey -Path ([string]$p.Path); if (-not $path){ continue }
+            $path = ConvertTo-PathKey -Path ([string]$p.Path); if (-not $path){ continue }
             if (Test-ShouldCountFile -FilePath $path -IncludeExt $IncludeExtensions -ExcludeExt $ExcludeExtensions -IncludePathPatterns $IncludePaths -ExcludePathPatterns $ExcludePaths){ $fpaths.Add([pscustomobject]@{Path = $path; Action = [string]$p.Action; CopyFromPath = [string]$p.CopyFromPath; CopyFromRev = $p.CopyFromRev; IsDirectory = $false }) | Out-Null }
         }
         $c.ChangedPathsFiltered = $fpaths.ToArray()
@@ -474,9 +481,9 @@ try
         $msg = [string]$c.Message; if ($null -eq $msg){ $msg = '' }; $c.MsgLen = $msg.Length; $one = ($msg -replace '(\r?\n)+', ' ').Trim(); if ($one.Length -gt 140){ $one = $one.Substring(0, 140) + '...' }; $c.MessageShort = $one
     }
 
-    $committerRows = @(Compute-CommitterMetrics -Commits $commits)
-    $fileRows = @(Compute-FileMetrics -Commits $commits)
-    $couplingRows = @(Compute-CoChangeMetrics -Commits $commits -TopNCount $TopN)
+    $committerRows = @(Get-CommitterMetric -Commits $commits)
+    $fileRows = @(Get-FileMetric -Commits $commits)
+    $couplingRows = @(Get-CoChangeMetric -Commits $commits -TopNCount $TopN)
     $commitRows = @(
         $commits | Sort-Object Revision | ForEach-Object {
             [pscustomobject][ordered]@{
@@ -489,7 +496,7 @@ try
                 AddedLines = [int]$_.AddedLines
                 DeletedLines = [int]$_.DeletedLines
                 Churn = [int]$_.Churn
-                Entropy = (Round-Number -Value ([double]$_.Entropy))
+                Entropy = (Get-RoundedNumber -Value ([double]$_.Entropy))
             }
         }
     )
@@ -512,7 +519,7 @@ try
             $mx = 0
             if ($b.LineCountByAuthor.Count -gt 0){ $mx = ($b.LineCountByAuthor.Values | Measure-Object -Maximum).Maximum }
             $topBlameShare = if ($b.LineCountTotal -gt 0){ $mx / [double]$b.LineCountTotal }else{ 0 }
-            $fr.TopAuthorShareByBlame = Round-Number -Value $topBlameShare
+            $fr.TopAuthorShareByBlame = Get-RoundedNumber -Value $topBlameShare
         }
         foreach ($r in $committerRows)
         {
@@ -525,7 +532,7 @@ try
             $r.DeadAddedLinesApprox = $dead
             $r.OwnedLinesToToRev = $own
             $ownShare = if ($ownedTotal -gt 0){ $own / [double]$ownedTotal } else { 0 }
-            $r.OwnershipShareToToRev = Round-Number -Value $ownShare
+            $r.OwnershipShareToToRev = Get-RoundedNumber -Value $ownShare
         }
         foreach ($r in $fileRows){ if ($null -eq $r.SurvivedLinesFromRangeToToRev){ $r.SurvivedLinesFromRangeToToRev = 0; $r.DeadAddedLinesApprox = [int]$r.AddedLines; $r.TopAuthorShareByBlame = 0.0 } }
     }
@@ -539,11 +546,11 @@ try
     Write-CsvFile -FilePath (Join-Path $OutDir 'files.csv') -Rows $fileRows -Headers $headersFile -EncodingName $Encoding
     Write-CsvFile -FilePath (Join-Path $OutDir 'commits.csv') -Rows $commitRows -Headers $headersCommit -EncodingName $Encoding
     Write-CsvFile -FilePath (Join-Path $OutDir 'couplings.csv') -Rows $couplingRows -Headers $headersCoupling -EncodingName $Encoding
-    if ($EmitPlantUml){ Write-PlantUmlFiles -OutDirectory $OutDir -Committers $committerRows -Files $fileRows -Couplings $couplingRows -TopNCount $TopN -EncodingName $Encoding }
+    if ($EmitPlantUml){ Write-PlantUmlFile -OutDirectory $OutDir -Committers $committerRows -Files $fileRows -Couplings $couplingRows -TopNCount $TopN -EncodingName $Encoding }
 
     $finishedAt = Get-Date
     $meta = [ordered]@{
-        StartTime = $startedAt.ToString('o'); EndTime = $finishedAt.ToString('o'); DurationSeconds = Round-Number -Value ((New-TimeSpan -Start $startedAt -End $finishedAt).TotalSeconds) -Digits 3
+        StartTime = $startedAt.ToString('o'); EndTime = $finishedAt.ToString('o'); DurationSeconds = Get-RoundedNumber -Value ((New-TimeSpan -Start $startedAt -End $finishedAt).TotalSeconds) -Digits 3
         RepoUrl = $targetUrl; FromRev = $FromRev; ToRev = $ToRev; AuthorFilter = $Author; SvnExecutable = $script:SvnExecutable; SvnVersion = $svnVersion
         NoBlame = [bool]$NoBlame; Parallel = $Parallel; TopN = $TopN; Encoding = $Encoding; CommitCount = @($commits).Count; FileCount = @($fileRows).Count; OutputDirectory = (Resolve-Path $OutDir).Path
         Parameters = [ordered]@{ IncludePaths = $IncludePaths; ExcludePaths = $ExcludePaths; IncludeExtensions = $IncludeExtensions; ExcludeExtensions = $ExcludeExtensions; EmitPlantUml = [bool]$EmitPlantUml; NonInteractive = [bool]$NonInteractive; TrustServerCert = [bool]$TrustServerCert; IgnoreSpaceChange = [bool]$IgnoreSpaceChange; IgnoreAllSpace = [bool]$IgnoreAllSpace; IgnoreEolStyle = [bool]$IgnoreEolStyle; IncludeProperties = [bool]$IncludeProperties; ForceBinary = [bool]$ForceBinary }

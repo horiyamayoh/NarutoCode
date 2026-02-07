@@ -59,7 +59,7 @@ Describe 'Test-ShouldCountFile' {
     }
 }
 
-Describe 'Parse-SvnLogXml' {
+Describe 'ConvertFrom-SvnLogXml' {
     It 'parses revisions, actions, and copyfrom metadata' {
         $xml = @"
 <log>
@@ -74,7 +74,7 @@ Describe 'Parse-SvnLogXml' {
   </logentry>
 </log>
 "@
-        $commits = @(Parse-SvnLogXml -XmlText $xml)
+        $commits = @(ConvertFrom-SvnLogXml -XmlText $xml)
         $commits.Count | Should -Be 1
         $commits[0].Revision | Should -Be 10
         $commits[0].ChangedPaths.Count | Should -Be 2
@@ -92,12 +92,12 @@ Describe 'Parse-SvnLogXml' {
   </logentry>
 </log>
 "@
-        $commits = @(Parse-SvnLogXml -XmlText $xml)
+        $commits = @(ConvertFrom-SvnLogXml -XmlText $xml)
         $commits[0].Author | Should -Be '(unknown)'
     }
 }
 
-Describe 'Parse-SvnUnifiedDiff' {
+Describe 'ConvertFrom-SvnUnifiedDiff' {
     It 'counts added and deleted lines with hunk metadata' {
         $diff = @"
 Index: trunk/src/Main.cs
@@ -110,7 +110,7 @@ Index: trunk/src/Main.cs
 +new
 +extra
 "@
-        $parsed = Parse-SvnUnifiedDiff -DiffText $diff
+        $parsed = ConvertFrom-SvnUnifiedDiff -DiffText $diff
         $parsed['trunk/src/Main.cs'].AddedLines | Should -Be 2
         $parsed['trunk/src/Main.cs'].DeletedLines | Should -Be 1
         $parsed['trunk/src/Main.cs'].Hunks.Count | Should -Be 1
@@ -124,12 +124,12 @@ Index: trunk/bin/data.bin
 Cannot display: file marked as a binary type.
 svn:mime-type = application/octet-stream
 "@
-        $parsed = Parse-SvnUnifiedDiff -DiffText $diff
+        $parsed = ConvertFrom-SvnUnifiedDiff -DiffText $diff
         $parsed['trunk/bin/data.bin'].IsBinary | Should -BeTrue
     }
 }
 
-Describe 'Parse-SvnBlameXml' {
+Describe 'ConvertFrom-SvnBlameXml' {
     It 'parses totals and per-revision/author counts' {
         $xml = @"
 <blame>
@@ -140,7 +140,7 @@ Describe 'Parse-SvnBlameXml' {
   </target>
 </blame>
 "@
-        $summary = Parse-SvnBlameXml -XmlText $xml
+        $summary = ConvertFrom-SvnBlameXml -XmlText $xml
         $summary.LineCountTotal | Should -Be 3
         $summary.LineCountByRevision[10] | Should -Be 2
         $summary.LineCountByAuthor['alice'] | Should -Be 2
@@ -190,7 +190,7 @@ Describe 'Metrics functions' {
     }
 
     It 'computes committer metrics' {
-        $rows = @(Compute-CommitterMetrics -Commits $script:mockCommits)
+        $rows = @(Get-CommitterMetric -Commits $script:mockCommits)
         $alice = $rows | Where-Object { $_.Author -eq 'alice' }
         $alice.CommitCount | Should -Be 1
         $alice.AddedLines | Should -Be 5
@@ -199,7 +199,7 @@ Describe 'Metrics functions' {
     }
 
     It 'computes file metrics and hotspot rank' {
-        $rows = @(Compute-FileMetrics -Commits $script:mockCommits)
+        $rows = @(Get-FileMetric -Commits $script:mockCommits)
         $a = $rows | Where-Object { $_.FilePath -eq 'src/A.cs' }
         $a.FileCommitCount | Should -Be 2
         $a.FileAuthors | Should -Be 2
@@ -207,7 +207,7 @@ Describe 'Metrics functions' {
     }
 
     It 'computes co-change metrics' {
-        $rows = @(Compute-CoChangeMetrics -Commits $script:mockCommits -TopNCount 10)
+        $rows = @(Get-CoChangeMetric -Commits $script:mockCommits -TopNCount 10)
         $rows.Count | Should -Be 1
         $rows[0].FileA | Should -Be 'src/A.cs'
         $rows[0].FileB | Should -Be 'src/B.cs'
