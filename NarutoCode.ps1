@@ -2838,6 +2838,854 @@ function Get-DeadLineDetail
         AuthorInternalMoveCount = $authorInternalMoveCount
     }
 }
+function Get-HashtableIntValue
+{
+    param([hashtable]$Table, [string]$Key, [int]$Default = 0)
+    if ($null -eq $Table -or [string]::IsNullOrWhiteSpace($Key))
+    {
+        return $Default
+    }
+    if ($Table.ContainsKey($Key))
+    {
+        return [int]$Table[$Key]
+    }
+    return $Default
+}
+function Get-SvnGlobalArgumentList
+{
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param([string]$Username, [securestring]$Password, [switch]$NonInteractive, [switch]$TrustServerCert)
+    $ga = New-Object 'System.Collections.Generic.List[string]'
+    if ($Username)
+    {
+        $null = $ga.Add('--username')
+        $null = $ga.Add($Username)
+    }
+    if ($Password)
+    {
+        $plain = ConvertTo-PlainText -SecureValue $Password
+        if ($plain)
+        {
+            $null = $ga.Add('--password')
+            $null = $ga.Add($plain)
+        }
+    }
+    if ($NonInteractive)
+    {
+        $null = $ga.Add('--non-interactive')
+    }
+    if ($TrustServerCert)
+    {
+        $null = $ga.Add('--trust-server-cert')
+    }
+    return $ga.ToArray()
+}
+function Get-SvnVersionSafe
+{
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+    try
+    {
+        return (Invoke-SvnCommand -Arguments @('--version', '--quiet') -ErrorContext 'svn version').Split("`n")[0].Trim()
+    }
+    catch
+    {
+        return $null
+    }
+}
+function Get-SvnDiffArgumentList
+{
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param([switch]$IncludeProperties, [switch]$ForceBinary, [switch]$IgnoreAllSpace, [switch]$IgnoreSpaceChange, [switch]$IgnoreEolStyle)
+    $diffArgs = New-Object 'System.Collections.Generic.List[string]'
+    $null = $diffArgs.Add('diff')
+    $null = $diffArgs.Add('--internal-diff')
+    if (-not $IncludeProperties)
+    {
+        $null = $diffArgs.Add('--ignore-properties')
+    }
+    if ($ForceBinary)
+    {
+        $null = $diffArgs.Add('--force')
+    }
+    $extensions = New-Object 'System.Collections.Generic.List[string]'
+    if ($IgnoreAllSpace)
+    {
+        $null = $extensions.Add('--ignore-all-space')
+    }
+    elseif ($IgnoreSpaceChange)
+    {
+        $null = $extensions.Add('--ignore-space-change')
+    }
+    if ($IgnoreEolStyle)
+    {
+        $null = $extensions.Add('--ignore-eol-style')
+    }
+    if ($extensions.Count -gt 0)
+    {
+        $null = $diffArgs.Add('--extensions')
+        $null = $diffArgs.Add(($extensions.ToArray() -join ' '))
+    }
+    return $diffArgs.ToArray()
+}
+function Get-CachedOrFetchDiffText
+{
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([string]$CacheDir, [int]$Revision, [string]$TargetUrl, [string[]]$DiffArguments)
+    $cacheFile = Join-Path $CacheDir ("diff_r{0}.txt" -f $Revision)
+    if (Test-Path $cacheFile)
+    {
+        return (Get-Content -Path $cacheFile -Raw -Encoding UTF8)
+    }
+
+    $fetchArgs = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($item in $DiffArguments)
+    {
+        $null = $fetchArgs.Add([string]$item)
+    }
+    $null = $fetchArgs.Add('-c')
+    $null = $fetchArgs.Add([string]$Revision)
+    $null = $fetchArgs.Add($TargetUrl)
+    $diffText = Invoke-SvnCommand -Arguments $fetchArgs.ToArray() -ErrorContext ("svn diff -c {0}" -f $Revision)
+    Set-Content -Path $cacheFile -Value $diffText -Encoding UTF8
+    return $diffText
+}
+function Get-FilteredChangedPathEntries
+{
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param([object[]]$ChangedPaths, [string[]]$IncludeExtensions, [string[]]$ExcludeExtensions, [string[]]$IncludePathPatterns, [string[]]$ExcludePathPatterns)
+    $filtered = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($pathEntry in @($ChangedPaths))
+    {
+        if ($null -eq $pathEntry)
+        {
+            continue
+        }
+        if ($pathEntry.PSObject.Properties.Match('IsDirectory').Count -gt 0 -and [bool]$pathEntry.IsDirectory)
+        {
+            continue
+        }
+        $path = ConvertTo-PathKey -Path ([string]$pathEntry.Path)
+        if (-not $path)
+        {
+            continue
+        }
+        if (Test-ShouldCountFile -FilePath $path -IncludeExt $IncludeExtensions -ExcludeExt $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns)
+        {
+            $filtered.Add([pscustomobject]@{
+                    Path = $path
+                    Action = [string]$pathEntry.Action
+                    CopyFromPath = [string]$pathEntry.CopyFromPath
+                    CopyFromRev = $pathEntry.CopyFromRev
+                    IsDirectory = $false
+                }) | Out-Null
+        }
+    }
+    return $filtered.ToArray()
+}
+function Set-DiffStatCollectionProperty
+{
+    [CmdletBinding()]
+    param([object]$TargetStat, [object]$SourceStat, [string]$PropertyName, [switch]$AsString)
+    if ($TargetStat.PSObject.Properties.Match($PropertyName).Count -eq 0)
+    {
+        return
+    }
+
+    $sourceItems = New-Object 'System.Collections.Generic.List[object]'
+    if ($SourceStat.PSObject.Properties.Match($PropertyName).Count -gt 0 -and $null -ne $SourceStat.$PropertyName)
+    {
+        $sourceValue = $SourceStat.$PropertyName
+        if ($sourceValue -is [System.Collections.IEnumerable] -and -not ($sourceValue -is [string]))
+        {
+            foreach ($item in $sourceValue)
+            {
+                if ($AsString)
+                {
+                    $sourceItems.Add([string]$item) | Out-Null
+                }
+                else
+                {
+                    $sourceItems.Add($item) | Out-Null
+                }
+            }
+        }
+        else
+        {
+            if ($AsString)
+            {
+                $sourceItems.Add([string]$sourceValue) | Out-Null
+            }
+            else
+            {
+                $sourceItems.Add($sourceValue) | Out-Null
+            }
+        }
+    }
+
+    $targetValue = $TargetStat.$PropertyName
+    if ($targetValue -is [System.Collections.IList])
+    {
+        $targetValue.Clear()
+        foreach ($item in $sourceItems.ToArray())
+        {
+            $targetValue.Add($item) | Out-Null
+        }
+    }
+    else
+    {
+        if ($AsString)
+        {
+            $TargetStat.$PropertyName = @($sourceItems.ToArray() | ForEach-Object { [string]$_ })
+        }
+        else
+        {
+            $TargetStat.$PropertyName = $sourceItems.ToArray()
+        }
+    }
+}
+function Clear-DiffStatCollectionProperty
+{
+    [CmdletBinding()]
+    param([object]$TargetStat, [string]$PropertyName)
+    if ($TargetStat.PSObject.Properties.Match($PropertyName).Count -eq 0)
+    {
+        return
+    }
+    $targetValue = $TargetStat.$PropertyName
+    if ($targetValue -is [System.Collections.IList])
+    {
+        $targetValue.Clear()
+    }
+    else
+    {
+        $TargetStat.$PropertyName = @()
+    }
+}
+function Set-DiffStatFromSource
+{
+    [CmdletBinding()]
+    param([object]$TargetStat, [object]$SourceStat)
+    $TargetStat.AddedLines = [int]$SourceStat.AddedLines
+    $TargetStat.DeletedLines = [int]$SourceStat.DeletedLines
+    Set-DiffStatCollectionProperty -TargetStat $TargetStat -SourceStat $SourceStat -PropertyName 'Hunks'
+    Set-DiffStatCollectionProperty -TargetStat $TargetStat -SourceStat $SourceStat -PropertyName 'AddedLineHashes' -AsString
+    Set-DiffStatCollectionProperty -TargetStat $TargetStat -SourceStat $SourceStat -PropertyName 'DeletedLineHashes' -AsString
+    if ($TargetStat.PSObject.Properties.Match('IsBinary').Count -gt 0 -and $SourceStat.PSObject.Properties.Match('IsBinary').Count -gt 0)
+    {
+        $TargetStat.IsBinary = [bool]$SourceStat.IsBinary
+    }
+}
+function Reset-DiffStatForRemovedPath
+{
+    [CmdletBinding()]
+    param([object]$DiffStat)
+    $DiffStat.AddedLines = 0
+    $DiffStat.DeletedLines = 0
+    Clear-DiffStatCollectionProperty -TargetStat $DiffStat -PropertyName 'Hunks'
+    Clear-DiffStatCollectionProperty -TargetStat $DiffStat -PropertyName 'AddedLineHashes'
+    Clear-DiffStatCollectionProperty -TargetStat $DiffStat -PropertyName 'DeletedLineHashes'
+}
+function Update-RenamePairDiffStats
+{
+    [CmdletBinding()]
+    param([object]$Commit, [int]$Revision, [string]$TargetUrl, [string[]]$DiffArguments, [int]$DeadDetailLevel)
+    $deletedSet = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($pathEntry in @($Commit.ChangedPathsFiltered))
+    {
+        if (([string]$pathEntry.Action).ToUpperInvariant() -eq 'D')
+        {
+            $null = $deletedSet.Add((ConvertTo-PathKey -Path ([string]$pathEntry.Path)))
+        }
+    }
+
+    foreach ($pathEntry in @($Commit.ChangedPathsFiltered))
+    {
+        $action = ([string]$pathEntry.Action).ToUpperInvariant()
+        if (($action -ne 'A' -and $action -ne 'R') -or [string]::IsNullOrWhiteSpace([string]$pathEntry.CopyFromPath))
+        {
+            continue
+        }
+
+        $newPath = ConvertTo-PathKey -Path ([string]$pathEntry.Path)
+        $oldPath = ConvertTo-PathKey -Path ([string]$pathEntry.CopyFromPath)
+        if (-not $newPath -or -not $oldPath -or -not $deletedSet.Contains($oldPath))
+        {
+            continue
+        }
+        if (-not $Commit.FileDiffStats.ContainsKey($oldPath) -or -not $Commit.FileDiffStats.ContainsKey($newPath))
+        {
+            continue
+        }
+
+        $copyRev = $pathEntry.CopyFromRev
+        if ($null -eq $copyRev)
+        {
+            $copyRev = $Revision - 1
+        }
+
+        $compareArguments = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($item in $DiffArguments)
+        {
+            $compareArguments.Add([string]$item) | Out-Null
+        }
+        $compareArguments.Add(($TargetUrl.TrimEnd('/') + '/' + $oldPath + '@' + [string]$copyRev)) | Out-Null
+        $compareArguments.Add(($TargetUrl.TrimEnd('/') + '/' + $newPath + '@' + [string]$Revision)) | Out-Null
+
+        $realDiff = Invoke-SvnCommand -Arguments $compareArguments.ToArray() -ErrorContext ("svn diff rename pair r{0} {1}->{2}" -f $Revision, $oldPath, $newPath)
+        $realParsed = ConvertFrom-SvnUnifiedDiff -DiffText $realDiff -DetailLevel $DeadDetailLevel
+
+        $realStat = $null
+        if ($realParsed.ContainsKey($newPath))
+        {
+            $realStat = $realParsed[$newPath]
+        }
+        elseif ($realParsed.ContainsKey($oldPath))
+        {
+            $realStat = $realParsed[$oldPath]
+        }
+        elseif ($realParsed.Keys.Count -gt 0)
+        {
+            $firstKey = @($realParsed.Keys | Sort-Object | Select-Object -First 1)[0]
+            $realStat = $realParsed[$firstKey]
+        }
+        if ($null -eq $realStat)
+        {
+            $realStat = [pscustomobject]@{
+                AddedLines = 0
+                DeletedLines = 0
+                Hunks = @()
+                IsBinary = $false
+                AddedLineHashes = @()
+                DeletedLineHashes = @()
+            }
+        }
+
+        $newStat = $Commit.FileDiffStats[$newPath]
+        $oldStat = $Commit.FileDiffStats[$oldPath]
+        Set-DiffStatFromSource -TargetStat $newStat -SourceStat $realStat
+        Reset-DiffStatForRemovedPath -DiffStat $oldStat
+    }
+}
+function Set-CommitDerivedMetric
+{
+    [CmdletBinding()]
+    param([object]$Commit)
+    $added = 0
+    $deleted = 0
+    $churnPerFile = @()
+    foreach ($filePath in @($Commit.FilesChanged))
+    {
+        $diffStat = $Commit.FileDiffStats[$filePath]
+        $added += [int]$diffStat.AddedLines
+        $deleted += [int]$diffStat.DeletedLines
+        $churnPerFile += ([int]$diffStat.AddedLines + [int]$diffStat.DeletedLines)
+    }
+
+    $Commit.AddedLines = $added
+    $Commit.DeletedLines = $deleted
+    $Commit.Churn = $added + $deleted
+    $Commit.Entropy = Get-Entropy -Values @($churnPerFile | ForEach-Object { [double]$_ })
+
+    $message = [string]$Commit.Message
+    if ($null -eq $message)
+    {
+        $message = ''
+    }
+    $Commit.MsgLen = $message.Length
+    $oneLineMessage = ($message -replace '(\r?\n)+', ' ').Trim()
+    if ($oneLineMessage.Length -gt 140)
+    {
+        $oneLineMessage = $oneLineMessage.Substring(0, 140) + '...'
+    }
+    $Commit.MessageShort = $oneLineMessage
+}
+function Initialize-CommitDiffData
+{
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [object[]]$Commits,
+        [string]$CacheDir,
+        [string]$TargetUrl,
+        [string[]]$DiffArguments,
+        [int]$DeadDetailLevel,
+        [string[]]$IncludeExtensions,
+        [string[]]$ExcludeExtensions,
+        [string[]]$IncludePathPatterns,
+        [string[]]$ExcludePathPatterns
+    )
+    $revToAuthor = @{}
+    foreach ($commit in @($Commits))
+    {
+        $revision = [int]$commit.Revision
+        $revToAuthor[$revision] = [string]$commit.Author
+
+        $diffText = Get-CachedOrFetchDiffText -CacheDir $CacheDir -Revision $revision -TargetUrl $TargetUrl -DiffArguments $DiffArguments
+        $rawDiffByPath = ConvertFrom-SvnUnifiedDiff -DiffText $diffText -DetailLevel $DeadDetailLevel
+
+        $filteredDiffByPath = @{}
+        foreach ($path in $rawDiffByPath.Keys)
+        {
+            if (Test-ShouldCountFile -FilePath $path -IncludeExt $IncludeExtensions -ExcludeExt $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns)
+            {
+                $filteredDiffByPath[$path] = $rawDiffByPath[$path]
+            }
+        }
+        $commit.FileDiffStats = $filteredDiffByPath
+
+        $commit.ChangedPathsFiltered = Get-FilteredChangedPathEntries -ChangedPaths @($commit.ChangedPaths) -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns
+
+        $allowedFilePathSet = New-Object 'System.Collections.Generic.HashSet[string]'
+        foreach ($pathEntry in @($commit.ChangedPathsFiltered))
+        {
+            $path = ConvertTo-PathKey -Path ([string]$pathEntry.Path)
+            if ($path)
+            {
+                $null = $allowedFilePathSet.Add($path)
+            }
+        }
+
+        $filteredByLog = @{}
+        foreach ($path in $commit.FileDiffStats.Keys)
+        {
+            if ($allowedFilePathSet.Contains([string]$path))
+            {
+                $filteredByLog[$path] = $commit.FileDiffStats[$path]
+            }
+        }
+        $commit.FileDiffStats = $filteredByLog
+        $commit.FilesChanged = @($commit.FileDiffStats.Keys | Sort-Object)
+
+        Update-RenamePairDiffStats -Commit $commit -Revision $revision -TargetUrl $TargetUrl -DiffArguments $DiffArguments -DeadDetailLevel $DeadDetailLevel
+        Set-CommitDerivedMetric -Commit $commit
+    }
+    return $revToAuthor
+}
+function New-CommitRowsFromCommits
+{
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param([object[]]$Commits)
+    return @(
+        $Commits | Sort-Object Revision | ForEach-Object {
+            [pscustomobject][ordered]@{
+                'リビジョン' = [int]$_.Revision
+                '日時' = if ($_.Date)
+                {
+                    ([datetime]$_.Date).ToString('o')
+                }
+                else
+                {
+                    $null
+                }
+                '作者' = [string]$_.Author
+                'メッセージ文字数' = [int]$_.MsgLen
+                'メッセージ' = [string]$_.MessageShort
+                '変更ファイル数' = @($_.FilesChanged).Count
+                '追加行数' = [int]$_.AddedLines
+                '削除行数' = [int]$_.DeletedLines
+                'チャーン' = [int]$_.Churn
+                'エントロピー' = (Format-MetricValue -Value ([double]$_.Entropy))
+            }
+        }
+    )
+}
+function Get-AuthorModifiedOthersSurvivedCount
+{
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param([hashtable]$BlameByFile, [System.Collections.Generic.HashSet[string]]$RevsWhereKilledOthers, [int]$FromRevision, [int]$ToRevision)
+    $authorModifiedOthersSurvived = @{}
+    foreach ($file in $BlameByFile.Keys)
+    {
+        $blameData = $BlameByFile[$file]
+        if ($null -eq $blameData -or $null -eq $blameData.Lines)
+        {
+            continue
+        }
+        foreach ($blameLine in @($blameData.Lines))
+        {
+            $blameLineRevision = $null
+            try
+            {
+                $blameLineRevision = [int]$blameLine.Revision
+            }
+            catch
+            {
+                continue
+            }
+            if ($null -eq $blameLineRevision -or $blameLineRevision -lt $FromRevision -or $blameLineRevision -gt $ToRevision)
+            {
+                continue
+            }
+            $blameLineAuthor = Get-NormalizedAuthorName -Author ([string]$blameLine.Author)
+            $lookupKey = [string]$blameLineRevision + [char]31 + $blameLineAuthor
+            if ($RevsWhereKilledOthers.Contains($lookupKey))
+            {
+                Add-Count -Table $authorModifiedOthersSurvived -Key $blameLineAuthor
+            }
+        }
+    }
+    return $authorModifiedOthersSurvived
+}
+function Update-FileRowsWithStrictMetrics
+{
+    [CmdletBinding()]
+    param(
+        [object[]]$FileRows,
+        [hashtable]$RenameMap,
+        [object]$StrictDetail,
+        [System.Collections.Generic.HashSet[string]]$ExistingFileSet,
+        [hashtable]$BlameByFile,
+        [string]$TargetUrl,
+        [int]$ToRevision,
+        [string]$CacheDir
+    )
+    foreach ($row in @($FileRows))
+    {
+        $filePath = [string]$row.'ファイルパス'
+        $resolvedFilePath = Resolve-PathByRenameMap -FilePath $filePath -RenameMap $RenameMap
+        $isOldRenamePath = ($RenameMap.ContainsKey($filePath) -and ([string]$RenameMap[$filePath] -ne $filePath))
+        $metricKey = if ($isOldRenamePath)
+        {
+            $null
+        }
+        else
+        {
+            $resolvedFilePath
+        }
+
+        $blame = $null
+        $existsAtToRevision = $false
+        if ($metricKey)
+        {
+            $existsAtToRevision = $ExistingFileSet.Contains([string]$metricKey)
+        }
+        $lookupCandidates = if ($existsAtToRevision)
+        {
+            @($metricKey, $filePath, $resolvedFilePath)
+        }
+        else
+        {
+            @()
+        }
+        $lookupErrors = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($lookup in $lookupCandidates)
+        {
+            if (-not $lookup)
+            {
+                continue
+            }
+            if ($BlameByFile.ContainsKey($lookup))
+            {
+                $blame = $BlameByFile[$lookup]
+                break
+            }
+            try
+            {
+                $tmpBlame = Get-SvnBlameSummary -Repo $TargetUrl -FilePath $lookup -ToRevision $ToRevision -CacheDir $CacheDir
+                $BlameByFile[$lookup] = $tmpBlame
+                $blame = $tmpBlame
+                break
+            }
+            catch
+            {
+                $lookupErrors.Add(([string]$lookup + ': ' + $_.Exception.Message)) | Out-Null
+            }
+        }
+        if ($null -eq $blame -and $existsAtToRevision)
+        {
+            throw ("Strict file blame lookup failed for '{0}' at r{1}. Attempts: {2}" -f $metricKey, $ToRevision, ($lookupErrors.ToArray() -join ' | '))
+        }
+
+        $survived = 0
+        $dead = 0
+        $selfCancel = 0
+        $crossRevert = 0
+        $repeatedHunk = 0
+        $pingPong = 0
+        $internalMoveCount = 0
+        if ($metricKey)
+        {
+            $survived = Get-HashtableIntValue -Table $StrictDetail.FileSurvived -Key $metricKey
+            $dead = Get-HashtableIntValue -Table $StrictDetail.FileDead -Key $metricKey
+            $selfCancel = Get-HashtableIntValue -Table $StrictDetail.FileSelfCancel -Key $metricKey
+            $crossRevert = Get-HashtableIntValue -Table $StrictDetail.FileCrossRevert -Key $metricKey
+            $repeatedHunk = Get-HashtableIntValue -Table $StrictDetail.FileRepeatedHunk -Key $metricKey
+            $pingPong = Get-HashtableIntValue -Table $StrictDetail.FilePingPong -Key $metricKey
+            $internalMoveCount = Get-HashtableIntValue -Table $StrictDetail.FileInternalMoveCount -Key $metricKey
+        }
+
+        $row.'生存行数 (範囲指定)' = $survived
+        $row.($script:ColDeadAdded) = $dead
+        $row.'自己相殺行数 (合計)' = $selfCancel
+        $row.'他者差戻行数 (合計)' = $crossRevert
+        $row.'同一箇所反復編集数 (合計)' = $repeatedHunk
+        $row.'ピンポン回数 (合計)' = $pingPong
+        $row.'内部移動行数 (合計)' = $internalMoveCount
+
+        $maxOwned = 0
+        if ($null -ne $blame -and $blame.LineCountByAuthor.Count -gt 0)
+        {
+            $maxOwned = ($blame.LineCountByAuthor.Values | Measure-Object -Maximum).Maximum
+        }
+        $topBlameShare = if ($null -ne $blame -and $blame.LineCountTotal -gt 0)
+        {
+            $maxOwned / [double]$blame.LineCountTotal
+        }
+        else
+        {
+            0
+        }
+        $row.'最多作者blame占有率' = Format-MetricValue -Value $topBlameShare
+    }
+}
+function Update-CommitterRowsWithStrictMetrics
+{
+    [CmdletBinding()]
+    param(
+        [object[]]$CommitterRows,
+        [hashtable]$AuthorSurvived,
+        [hashtable]$AuthorOwned,
+        [int]$OwnedTotal,
+        [object]$StrictDetail,
+        [hashtable]$AuthorModifiedOthersSurvived
+    )
+    foreach ($row in @($CommitterRows))
+    {
+        $author = [string]$row.'作者'
+        $survived = Get-HashtableIntValue -Table $AuthorSurvived -Key $author
+        $owned = Get-HashtableIntValue -Table $AuthorOwned -Key $author
+        $dead = Get-HashtableIntValue -Table $StrictDetail.AuthorDead -Key $author
+        $selfDead = Get-HashtableIntValue -Table $StrictDetail.AuthorSelfDead -Key $author
+        $otherDead = Get-HashtableIntValue -Table $StrictDetail.AuthorOtherDead -Key $author
+        $repeatedHunk = Get-HashtableIntValue -Table $StrictDetail.AuthorRepeatedHunk -Key $author
+        $pingPong = Get-HashtableIntValue -Table $StrictDetail.AuthorPingPong -Key $author
+        $internalMove = Get-HashtableIntValue -Table $StrictDetail.AuthorInternalMoveCount -Key $author
+        $modifiedOthersCode = Get-HashtableIntValue -Table $StrictDetail.AuthorModifiedOthersCode -Key $author
+        $modifiedOthersSurvived = Get-HashtableIntValue -Table $AuthorModifiedOthersSurvived -Key $author
+
+        $row.'生存行数' = $survived
+        $row.($script:ColDeadAdded) = $dead
+        $row.'所有行数' = $owned
+        $ownShare = if ($OwnedTotal -gt 0)
+        {
+            $owned / [double]$OwnedTotal
+        }
+        else
+        {
+            0
+        }
+        $row.'所有割合' = Format-MetricValue -Value $ownShare
+        $row.'自己相殺行数' = $selfDead
+        $row.'自己差戻行数' = $selfDead
+        $row.'他者差戻行数' = $otherDead
+        $row.'被他者削除行数' = $otherDead
+        $row.'同一箇所反復編集数' = $repeatedHunk
+        $row.'ピンポン回数' = $pingPong
+        $row.'内部移動行数' = $internalMove
+        $row.($script:ColSelfDead) = $selfDead
+        $row.($script:ColOtherDead) = $otherDead
+        $row.'他者コード変更行数' = $modifiedOthersCode
+        $row.'他者コード変更生存行数' = $modifiedOthersSurvived
+    }
+}
+function Update-StrictAttributionMetrics
+{
+    [CmdletBinding()]
+    param(
+        [object[]]$Commits,
+        [hashtable]$RevToAuthor,
+        [string]$TargetUrl,
+        [int]$FromRevision,
+        [int]$ToRevision,
+        [string]$CacheDir,
+        [string[]]$IncludeExtensions,
+        [string[]]$ExcludeExtensions,
+        [string[]]$IncludePaths,
+        [string[]]$ExcludePaths,
+        [object[]]$FileRows,
+        [object[]]$CommitterRows
+    )
+    if (@($FileRows).Count -le 0)
+    {
+        return
+    }
+
+    $renameMap = Get-RenameMap -Commits $Commits
+    $strictDetail = Get-ExactDeathAttribution -Commits $Commits -RevToAuthor $RevToAuthor -TargetUrl $TargetUrl -FromRevision $FromRevision -ToRevision $ToRevision -CacheDir $CacheDir -RenameMap $renameMap
+    if ($null -eq $strictDetail)
+    {
+        throw "Strict death attribution returned null."
+    }
+
+    $authorSurvived = $strictDetail.AuthorSurvived
+    $authorOwned = @{}
+    $ownedTotal = 0
+    $blameByFile = @{}
+    $ownershipTargets = @(Get-AllRepositoryFile -Repo $TargetUrl -Revision $ToRevision -IncludeExt $IncludeExtensions -ExcludeExt $ExcludeExtensions -IncludePathPatterns $IncludePaths -ExcludePathPatterns $ExcludePaths)
+    $existingFileSet = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($file in $ownershipTargets)
+    {
+        $null = $existingFileSet.Add([string]$file)
+    }
+    foreach ($file in $ownershipTargets)
+    {
+        try
+        {
+            $blame = Get-SvnBlameSummary -Repo $TargetUrl -FilePath $file -ToRevision $ToRevision -CacheDir $CacheDir
+        }
+        catch
+        {
+            throw ("Strict ownership blame failed for '{0}' at r{1}: {2}" -f $file, $ToRevision, $_.Exception.Message)
+        }
+        $blameByFile[$file] = $blame
+        $ownedTotal += [int]$blame.LineCountTotal
+        foreach ($author in $blame.LineCountByAuthor.Keys)
+        {
+            Add-Count -Table $authorOwned -Key ([string]$author) -Delta ([int]$blame.LineCountByAuthor[$author])
+        }
+    }
+
+    $authorModifiedOthersSurvived = Get-AuthorModifiedOthersSurvivedCount -BlameByFile $blameByFile -RevsWhereKilledOthers $strictDetail.RevsWhereKilledOthers -FromRevision $FromRevision -ToRevision $ToRevision
+    Update-FileRowsWithStrictMetrics -FileRows $FileRows -RenameMap $renameMap -StrictDetail $strictDetail -ExistingFileSet $existingFileSet -BlameByFile $blameByFile -TargetUrl $TargetUrl -ToRevision $ToRevision -CacheDir $CacheDir
+    Update-CommitterRowsWithStrictMetrics -CommitterRows $CommitterRows -AuthorSurvived $authorSurvived -AuthorOwned $authorOwned -OwnedTotal $ownedTotal -StrictDetail $strictDetail -AuthorModifiedOthersSurvived $authorModifiedOthersSurvived
+}
+function Get-MetricHeaders
+{
+    [CmdletBinding()]
+    [OutputType([object])]
+    param()
+    return [pscustomobject]@{
+        Committer = @('作者', 'コミット数', '活動日数', '変更ファイル数', '変更ディレクトリ数', '追加行数', '削除行数', '純増行数', '総チャーン', 'コミットあたりチャーン', '削除対追加比', 'チャーン対純増比', 'バイナリ変更回数', '追加アクション数', '変更アクション数', '削除アクション数', '置換アクション数', '生存行数', $script:ColDeadAdded, '所有行数', '所有割合', '自己相殺行数', '自己差戻行数', '他者差戻行数', '被他者削除行数', '同一箇所反復編集数', 'ピンポン回数', '内部移動行数', $script:ColSelfDead, $script:ColOtherDead, '他者コード変更行数', '他者コード変更生存行数', '変更エントロピー', '平均共同作者数', '最大共同作者数', 'メッセージ総文字数', 'メッセージ平均文字数', '課題ID言及数', '修正キーワード数', '差戻キーワード数', 'マージキーワード数')
+        File = @('ファイルパス', 'コミット数', '作者数', '追加行数', '削除行数', '純増行数', '総チャーン', 'バイナリ変更回数', '作成回数', '削除回数', '置換回数', '初回変更リビジョン', '最終変更リビジョン', '平均変更間隔日数', '生存行数 (範囲指定)', $script:ColDeadAdded, '最多作者チャーン占有率', '最多作者blame占有率', '自己相殺行数 (合計)', '他者差戻行数 (合計)', '同一箇所反復編集数 (合計)', 'ピンポン回数 (合計)', '内部移動行数 (合計)', 'ホットスポットスコア', 'ホットスポット順位')
+        Commit = @('リビジョン', '日時', '作者', 'メッセージ文字数', 'メッセージ', '変更ファイル数', '追加行数', '削除行数', 'チャーン', 'エントロピー')
+        Coupling = @('ファイルA', 'ファイルB', '共変更回数', 'Jaccard', 'リフト値')
+    }
+}
+function New-RunMetaData
+{
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [datetime]$StartTime,
+        [datetime]$EndTime,
+        [string]$TargetUrl,
+        [int]$FromRevision,
+        [int]$ToRevision,
+        [string]$AuthorFilter,
+        [string]$SvnVersion,
+        [switch]$NoBlame,
+        [int]$DeadDetailLevel,
+        [int]$Parallel,
+        [int]$TopN,
+        [string]$Encoding,
+        [object[]]$Commits,
+        [object[]]$FileRows,
+        [string]$OutDir,
+        [string[]]$IncludePaths,
+        [string[]]$ExcludePaths,
+        [string[]]$IncludeExtensions,
+        [string[]]$ExcludeExtensions,
+        [switch]$EmitPlantUml,
+        [switch]$NonInteractive,
+        [switch]$TrustServerCert,
+        [switch]$IgnoreSpaceChange,
+        [switch]$IgnoreAllSpace,
+        [switch]$IgnoreEolStyle,
+        [switch]$IncludeProperties,
+        [switch]$ForceBinary
+    )
+    return [ordered]@{
+        StartTime = $StartTime.ToString('o')
+        EndTime = $EndTime.ToString('o')
+        DurationSeconds = Format-MetricValue -Value ((New-TimeSpan -Start $StartTime -End $EndTime).TotalSeconds)
+        RepoUrl = $TargetUrl
+        FromRev = $FromRevision
+        ToRev = $ToRevision
+        AuthorFilter = $AuthorFilter
+        SvnExecutable = $script:SvnExecutable
+        SvnVersion = $SvnVersion
+        StrictMode = $true
+        NoBlame = [bool]$NoBlame
+        DeadDetailLevel = $DeadDetailLevel
+        Parallel = $Parallel
+        TopN = $TopN
+        Encoding = $Encoding
+        CommitCount = @($Commits).Count
+        FileCount = @($FileRows).Count
+        OutputDirectory = (Resolve-Path $OutDir).Path
+        StrictBlameCallCount = [int]($script:StrictBlameCacheHits + $script:StrictBlameCacheMisses)
+        StrictBlameCacheHits = [int]$script:StrictBlameCacheHits
+        StrictBlameCacheMisses = [int]$script:StrictBlameCacheMisses
+        NonStrictMetrics = @('課題ID言及数', '修正キーワード数', '差戻キーワード数', 'マージキーワード数')
+        NonStrictReason = '正規表現ベースのヒューリスティックであり厳密化不可能'
+        Parameters = [ordered]@{
+            IncludePaths = $IncludePaths
+            ExcludePaths = $ExcludePaths
+            IncludeExtensions = $IncludeExtensions
+            ExcludeExtensions = $ExcludeExtensions
+            EmitPlantUml = [bool]$EmitPlantUml
+            NonInteractive = [bool]$NonInteractive
+            TrustServerCert = [bool]$TrustServerCert
+            IgnoreSpaceChange = [bool]$IgnoreSpaceChange
+            IgnoreAllSpace = [bool]$IgnoreAllSpace
+            IgnoreEolStyle = [bool]$IgnoreEolStyle
+            IncludeProperties = [bool]$IncludeProperties
+            ForceBinary = [bool]$ForceBinary
+        }
+        Outputs = [ordered]@{
+            CommittersCsv = 'committers.csv'
+            FilesCsv = 'files.csv'
+            CommitsCsv = 'commits.csv'
+            CouplingsCsv = 'couplings.csv'
+            RunMetaJson = 'run_meta.json'
+            ContributorsPlantUml = if ($EmitPlantUml)
+            {
+                'contributors_summary.puml'
+            }
+            else
+            {
+                $null
+            }
+            HotspotsPlantUml = if ($EmitPlantUml)
+            {
+                'hotspots.puml'
+            }
+            else
+            {
+                $null
+            }
+            CoChangePlantUml = if ($EmitPlantUml)
+            {
+                'cochange_network.puml'
+            }
+            else
+            {
+                $null
+            }
+        }
+    }
+}
+function Write-RunSummary
+{
+    [CmdletBinding()]
+    param([string]$TargetUrl, [int]$FromRevision, [int]$ToRevision, [object[]]$Commits, [object[]]$FileRows, [string]$OutDir)
+    $phaseLabel = 'StrictMode'
+    Write-Host ''
+    Write-Host ("===== NarutoCode {0} =====" -f $phaseLabel)
+    Write-Host ("Repo         : {0}" -f $TargetUrl)
+    Write-Host ("Range        : r{0} -> r{1}" -f $FromRevision, $ToRevision)
+    Write-Host ("Commits      : {0}" -f @($Commits).Count)
+    Write-Host ("Files        : {0}" -f @($FileRows).Count)
+    Write-Host ("OutDir       : {0}" -f (Resolve-Path $OutDir).Path)
+}
 function Get-RenameMap
 {
     [CmdletBinding()]
@@ -2896,6 +3744,7 @@ try
     {
         $OutDir = Join-Path (Get-Location) ("NarutoCode_out_{0}" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
     }
+
     # Resolve relative OutDir to absolute path based on PowerShell $PWD
     $OutDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutDir)
     $cacheDir = Join-Path $OutDir 'cache'
@@ -2915,42 +3764,12 @@ try
     {
         throw "svn executable not found: '$SvnExecutable'. Install Subversion client or specify -SvnExecutable."
     }
+
     $script:SvnExecutable = $svnCmd.Source
-    $ga = New-Object 'System.Collections.Generic.List[string]'
-    if ($Username)
-    {
-        $null = $ga.Add('--username')
-        $null = $ga.Add($Username)
-    }
-    if ($Password)
-    {
-        $plain = ConvertTo-PlainText -SecureValue $Password
-        if ($plain)
-        {
-            $null = $ga.Add('--password')
-            $null = $ga.Add($plain)
-        }
-    }
-    if ($NonInteractive)
-    {
-        $null = $ga.Add('--non-interactive')
-    }
-    if ($TrustServerCert)
-    {
-        $null = $ga.Add('--trust-server-cert')
-    }
-    $script:SvnGlobalArguments = $ga.ToArray()
+    $script:SvnGlobalArguments = Get-SvnGlobalArgumentList -Username $Username -Password $Password -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert
 
     $targetUrl = Resolve-SvnTargetUrl -Target $RepoUrl
-    $svnVersion = $null
-    try
-    {
-        $svnVersion = (Invoke-SvnCommand -Arguments @('--version', '--quiet') -ErrorContext 'svn version').Split("`n")[0].Trim()
-    }
-    catch
-    {
-        $null = $_
-    }
+    $svnVersion = Get-SvnVersionSafe
 
     $logText = Invoke-SvnCommand -Arguments @('log', '--xml', '--verbose', '-r', "$FromRev`:$ToRev", $targetUrl) -ErrorContext 'svn log'
     $commits = @(ConvertFrom-SvnLogXml -XmlText $logText)
@@ -2966,800 +3785,34 @@ try
         }
     }
 
-    $diffArgs = New-Object 'System.Collections.Generic.List[string]'
-    $null = $diffArgs.Add('diff')
-    $null = $diffArgs.Add('--internal-diff')
-    if (-not $IncludeProperties)
-    {
-        $null = $diffArgs.Add('--ignore-properties')
-    }
-    if ($ForceBinary)
-    {
-        $null = $diffArgs.Add('--force')
-    }
-    $ext = New-Object 'System.Collections.Generic.List[string]'
-    if ($IgnoreAllSpace)
-    {
-        $null = $ext.Add('--ignore-all-space')
-    }
-    elseif ($IgnoreSpaceChange)
-    {
-        $null = $ext.Add('--ignore-space-change')
-    }
-    if ($IgnoreEolStyle)
-    {
-        $null = $ext.Add('--ignore-eol-style')
-    }
-    if ($ext.Count -gt 0)
-    {
-        $null = $diffArgs.Add('--extensions')
-        $null = $diffArgs.Add(($ext.ToArray() -join ' '))
-    }
-
-    $revToAuthor = @{}
-    foreach ($c in $commits)
-    {
-        $rev = [int]$c.Revision
-        $revToAuthor[$rev] = [string]$c.Author
-        $cacheFile = Join-Path $cacheDir ("diff_r{0}.txt" -f $rev)
-        $diffText = ''
-        if (Test-Path $cacheFile)
-        {
-            $diffText = Get-Content -Path $cacheFile -Raw -Encoding UTF8
-        }
-        else
-        {
-            $a = New-Object 'System.Collections.Generic.List[string]'
-            foreach ($x in $diffArgs)
-            {
-                $null = $a.Add([string]$x)
-            }
-            $null = $a.Add('-c')
-            $null = $a.Add([string]$rev)
-            $null = $a.Add($targetUrl)
-            $diffText = Invoke-SvnCommand -Arguments $a.ToArray() -ErrorContext ("svn diff -c $rev")
-            Set-Content -Path $cacheFile -Value $diffText -Encoding UTF8
-        }
-
-        $raw = ConvertFrom-SvnUnifiedDiff -DiffText $diffText -DetailLevel $DeadDetailLevel
-        $filtered = @{}
-        foreach ($path in $raw.Keys)
-        {
-            if (Test-ShouldCountFile -FilePath $path -IncludeExt $IncludeExtensions -ExcludeExt $ExcludeExtensions -IncludePathPatterns $IncludePaths -ExcludePathPatterns $ExcludePaths)
-            {
-                $filtered[$path] = $raw[$path]
-            }
-        }
-        $c.FileDiffStats = $filtered
-
-        $fpaths = New-Object 'System.Collections.Generic.List[object]'
-        foreach ($p in @($c.ChangedPaths))
-        {
-            if ($null -eq $p)
-            {
-                continue
-            }
-            if ($p.PSObject.Properties.Match('IsDirectory').Count -gt 0 -and [bool]$p.IsDirectory)
-            {
-                continue
-            }
-            $path = ConvertTo-PathKey -Path ([string]$p.Path)
-            if (-not $path)
-            {
-                continue
-            }
-            if (Test-ShouldCountFile -FilePath $path -IncludeExt $IncludeExtensions -ExcludeExt $ExcludeExtensions -IncludePathPatterns $IncludePaths -ExcludePathPatterns $ExcludePaths)
-            {
-                $fpaths.Add([pscustomobject]@{Path = $path
-                        Action = [string]$p.Action
-                        CopyFromPath = [string]$p.CopyFromPath
-                        CopyFromRev = $p.CopyFromRev
-                        IsDirectory = $false
-                    }) | Out-Null
-            }
-        }
-        $c.ChangedPathsFiltered = $fpaths.ToArray()
-        $allowedFilePaths = New-Object 'System.Collections.Generic.HashSet[string]'
-        foreach ($fp in @($c.ChangedPathsFiltered))
-        {
-            $path = ConvertTo-PathKey -Path ([string]$fp.Path)
-            if ($path)
-            {
-                $null = $allowedFilePaths.Add($path)
-            }
-        }
-        $filteredByLog = @{}
-        foreach ($key in $c.FileDiffStats.Keys)
-        {
-            if ($allowedFilePaths.Contains([string]$key))
-            {
-                $filteredByLog[$key] = $c.FileDiffStats[$key]
-            }
-        }
-        $c.FileDiffStats = $filteredByLog
-        $c.FilesChanged = @($c.FileDiffStats.Keys | Sort-Object)
-
-        $deletedSet = New-Object 'System.Collections.Generic.HashSet[string]'
-        foreach ($p in @($c.ChangedPathsFiltered))
-        {
-            if (([string]$p.Action).ToUpperInvariant() -eq 'D')
-            {
-                $null = $deletedSet.Add((ConvertTo-PathKey -Path ([string]$p.Path)))
-            }
-        }
-        foreach ($p in @($c.ChangedPathsFiltered))
-        {
-            $action = ([string]$p.Action).ToUpperInvariant()
-            if (($action -ne 'A' -and $action -ne 'R') -or [string]::IsNullOrWhiteSpace([string]$p.CopyFromPath))
-            {
-                continue
-            }
-            $newPath = ConvertTo-PathKey -Path ([string]$p.Path)
-            $oldPath = ConvertTo-PathKey -Path ([string]$p.CopyFromPath)
-            if (-not $newPath -or -not $oldPath -or -not $deletedSet.Contains($oldPath))
-            {
-                continue
-            }
-            if (-not $c.FileDiffStats.ContainsKey($oldPath) -or -not $c.FileDiffStats.ContainsKey($newPath))
-            {
-                continue
-            }
-            $copyRev = $p.CopyFromRev
-            if ($null -eq $copyRev)
-            {
-                $copyRev = $rev - 1
-            }
-
-            $cmpArgs = New-Object 'System.Collections.Generic.List[string]'
-            foreach ($x in $diffArgs)
-            {
-                $cmpArgs.Add([string]$x) | Out-Null
-            }
-            $cmpArgs.Add(($targetUrl.TrimEnd('/') + '/' + $oldPath + '@' + [string]$copyRev)) | Out-Null
-            $cmpArgs.Add(($targetUrl.TrimEnd('/') + '/' + $newPath + '@' + [string]$rev)) | Out-Null
-            $realDiff = Invoke-SvnCommand -Arguments $cmpArgs.ToArray() -ErrorContext ("svn diff rename pair r{0} {1}->{2}" -f $rev, $oldPath, $newPath)
-            $realParsed = ConvertFrom-SvnUnifiedDiff -DiffText $realDiff -DetailLevel $DeadDetailLevel
-            $realStat = $null
-            if ($realParsed.ContainsKey($newPath))
-            {
-                $realStat = $realParsed[$newPath]
-            }
-            elseif ($realParsed.ContainsKey($oldPath))
-            {
-                $realStat = $realParsed[$oldPath]
-            }
-            elseif ($realParsed.Keys.Count -gt 0)
-            {
-                $firstKey = @($realParsed.Keys | Sort-Object | Select-Object -First 1)[0]
-                $realStat = $realParsed[$firstKey]
-            }
-            if ($null -eq $realStat)
-            {
-                $realStat = [pscustomobject]@{
-                    AddedLines = 0
-                    DeletedLines = 0
-                    Hunks = @()
-                    IsBinary = $false
-                    AddedLineHashes = @()
-                    DeletedLineHashes = @()
-                }
-            }
-
-            $newStat = $c.FileDiffStats[$newPath]
-            $oldStat = $c.FileDiffStats[$oldPath]
-            $newStat.AddedLines = [int]$realStat.AddedLines
-            $newStat.DeletedLines = [int]$realStat.DeletedLines
-            if ($newStat.PSObject.Properties.Match('Hunks').Count -gt 0)
-            {
-                $srcHunks = New-Object 'System.Collections.Generic.List[object]'
-                if ($realStat.PSObject.Properties.Match('Hunks').Count -gt 0 -and $null -ne $realStat.Hunks)
-                {
-                    if ($realStat.Hunks -is [System.Collections.IEnumerable] -and -not ($realStat.Hunks -is [string]))
-                    {
-                        foreach ($h in $realStat.Hunks)
-                        {
-                            $srcHunks.Add($h) | Out-Null
-                        }
-                    }
-                    else
-                    {
-                        $srcHunks.Add($realStat.Hunks) | Out-Null
-                    }
-                }
-                $dstHunks = $newStat.Hunks
-                if ($dstHunks -is [System.Collections.IList])
-                {
-                    $dstHunks.Clear()
-                    foreach ($h in $srcHunks.ToArray())
-                    {
-                        $dstHunks.Add($h) | Out-Null
-                    }
-                }
-                else
-                {
-                    $newStat.Hunks = $srcHunks.ToArray()
-                }
-            }
-            if ($newStat.PSObject.Properties.Match('AddedLineHashes').Count -gt 0)
-            {
-                $srcAddedHashes = New-Object 'System.Collections.Generic.List[string]'
-                if ($realStat.PSObject.Properties.Match('AddedLineHashes').Count -gt 0 -and $null -ne $realStat.AddedLineHashes)
-                {
-                    if ($realStat.AddedLineHashes -is [System.Collections.IEnumerable] -and -not ($realStat.AddedLineHashes -is [string]))
-                    {
-                        foreach ($h in $realStat.AddedLineHashes)
-                        {
-                            $srcAddedHashes.Add([string]$h) | Out-Null
-                        }
-                    }
-                    else
-                    {
-                        $srcAddedHashes.Add([string]$realStat.AddedLineHashes) | Out-Null
-                    }
-                }
-                $dstAddedHashes = $newStat.AddedLineHashes
-                if ($dstAddedHashes -is [System.Collections.IList])
-                {
-                    $dstAddedHashes.Clear()
-                    foreach ($h in $srcAddedHashes.ToArray())
-                    {
-                        $dstAddedHashes.Add($h) | Out-Null
-                    }
-                }
-                else
-                {
-                    $newStat.AddedLineHashes = $srcAddedHashes.ToArray()
-                }
-            }
-            if ($newStat.PSObject.Properties.Match('DeletedLineHashes').Count -gt 0)
-            {
-                $srcDeletedHashes = New-Object 'System.Collections.Generic.List[string]'
-                if ($realStat.PSObject.Properties.Match('DeletedLineHashes').Count -gt 0 -and $null -ne $realStat.DeletedLineHashes)
-                {
-                    if ($realStat.DeletedLineHashes -is [System.Collections.IEnumerable] -and -not ($realStat.DeletedLineHashes -is [string]))
-                    {
-                        foreach ($h in $realStat.DeletedLineHashes)
-                        {
-                            $srcDeletedHashes.Add([string]$h) | Out-Null
-                        }
-                    }
-                    else
-                    {
-                        $srcDeletedHashes.Add([string]$realStat.DeletedLineHashes) | Out-Null
-                    }
-                }
-                $dstDeletedHashes = $newStat.DeletedLineHashes
-                if ($dstDeletedHashes -is [System.Collections.IList])
-                {
-                    $dstDeletedHashes.Clear()
-                    foreach ($h in $srcDeletedHashes.ToArray())
-                    {
-                        $dstDeletedHashes.Add($h) | Out-Null
-                    }
-                }
-                else
-                {
-                    $newStat.DeletedLineHashes = $srcDeletedHashes.ToArray()
-                }
-            }
-            if ($newStat.PSObject.Properties.Match('IsBinary').Count -gt 0 -and $realStat.PSObject.Properties.Match('IsBinary').Count -gt 0)
-            {
-                $newStat.IsBinary = [bool]$realStat.IsBinary
-            }
-
-            $oldStat.AddedLines = 0
-            $oldStat.DeletedLines = 0
-            if ($oldStat.PSObject.Properties.Match('Hunks').Count -gt 0)
-            {
-                if ($oldStat.Hunks -is [System.Collections.IList])
-                {
-                    $oldStat.Hunks.Clear()
-                }
-                else
-                {
-                    $oldStat.Hunks = @()
-                }
-            }
-            if ($oldStat.PSObject.Properties.Match('AddedLineHashes').Count -gt 0)
-            {
-                if ($oldStat.AddedLineHashes -is [System.Collections.IList])
-                {
-                    $oldStat.AddedLineHashes.Clear()
-                }
-                else
-                {
-                    $oldStat.AddedLineHashes = @()
-                }
-            }
-            if ($oldStat.PSObject.Properties.Match('DeletedLineHashes').Count -gt 0)
-            {
-                if ($oldStat.DeletedLineHashes -is [System.Collections.IList])
-                {
-                    $oldStat.DeletedLineHashes.Clear()
-                }
-                else
-                {
-                    $oldStat.DeletedLineHashes = @()
-                }
-            }
-        }
-
-        $added = 0
-        $deleted = 0
-        $ch = @()
-        foreach ($f in $c.FilesChanged)
-        {
-            $d = $c.FileDiffStats[$f]
-            $added += [int]$d.AddedLines
-            $deleted += [int]$d.DeletedLines
-            $ch += ([int]$d.AddedLines + [int]$d.DeletedLines)
-        }
-        $c.AddedLines = $added
-        $c.DeletedLines = $deleted
-        $c.Churn = $added + $deleted
-        $c.Entropy = Get-Entropy -Values @($ch | ForEach-Object { [double]$_ })
-        $msg = [string]$c.Message
-        if ($null -eq $msg)
-        {
-            $msg = ''
-        }
-        $c.MsgLen = $msg.Length
-        $one = ($msg -replace '(\r?\n)+', ' ').Trim()
-        if ($one.Length -gt 140)
-        {
-            $one = $one.Substring(0, 140) + '...'
-        }
-        $c.MessageShort = $one
-    }
+    $diffArgs = Get-SvnDiffArgumentList -IncludeProperties:$IncludeProperties -ForceBinary:$ForceBinary -IgnoreAllSpace:$IgnoreAllSpace -IgnoreSpaceChange:$IgnoreSpaceChange -IgnoreEolStyle:$IgnoreEolStyle
+    $revToAuthor = Initialize-CommitDiffData -Commits $commits -CacheDir $cacheDir -TargetUrl $targetUrl -DiffArguments $diffArgs -DeadDetailLevel $DeadDetailLevel -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePaths -ExcludePathPatterns $ExcludePaths
 
     $committerRows = @(Get-CommitterMetric -Commits $commits)
     $fileRows = @(Get-FileMetric -Commits $commits)
     $couplingRows = @(Get-CoChangeMetric -Commits $commits -TopNCount $TopN)
-    $commitRows = @(
-        $commits | Sort-Object Revision | ForEach-Object {
-            [pscustomobject][ordered]@{
-                'リビジョン' = [int]$_.Revision
-                '日時' = if ($_.Date)
-                {
-                    ([datetime]$_.Date).ToString('o')
-                }
-                else
-                {
-                    $null
-                }
-                '作者' = [string]$_.Author
-                'メッセージ文字数' = [int]$_.MsgLen
-                'メッセージ' = [string]$_.MessageShort
-                '変更ファイル数' = @($_.FilesChanged).Count
-                '追加行数' = [int]$_.AddedLines
-                '削除行数' = [int]$_.DeletedLines
-                'チャーン' = [int]$_.Churn
-                'エントロピー' = (Format-MetricValue -Value ([double]$_.Entropy))
-            }
-        }
-    )
+    $commitRows = @(New-CommitRowsFromCommits -Commits $commits)
 
-    if ($fileRows.Count -gt 0)
-    {
-        $renameMap = Get-RenameMap -Commits $commits
-        $strictDetail = Get-ExactDeathAttribution -Commits $commits -RevToAuthor $revToAuthor -TargetUrl $targetUrl -FromRevision $FromRev -ToRevision $ToRev -CacheDir $cacheDir -RenameMap $renameMap
-        if ($null -eq $strictDetail)
-        {
-            throw "Strict death attribution returned null."
-        }
-        $authorSurvived = $strictDetail.AuthorSurvived
-        $authorOwned = @{}
-        $ownedTotal = 0
-        $fileMap = @{}
-        foreach ($r in $fileRows)
-        {
-            $fileMap[[string]$r.'ファイルパス'] = $r
-        }
+    Update-StrictAttributionMetrics -Commits $commits -RevToAuthor $revToAuthor -TargetUrl $targetUrl -FromRevision $FromRev -ToRevision $ToRev -CacheDir $cacheDir -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -FileRows $fileRows -CommitterRows $committerRows
 
-        $blameByFile = @{}
-        $ownershipTargets = @(Get-AllRepositoryFile -Repo $targetUrl -Revision $ToRev -IncludeExt $IncludeExtensions -ExcludeExt $ExcludeExtensions -IncludePathPatterns $IncludePaths -ExcludePathPatterns $ExcludePaths)
-        $existingFileSet = New-Object 'System.Collections.Generic.HashSet[string]'
-        foreach ($f in $ownershipTargets)
-        {
-            $null = $existingFileSet.Add([string]$f)
-        }
-        foreach ($file in $ownershipTargets)
-        {
-            try
-            {
-                $b = Get-SvnBlameSummary -Repo $targetUrl -FilePath $file -ToRevision $ToRev -CacheDir $cacheDir
-            }
-            catch
-            {
-                throw ("Strict ownership blame failed for '{0}' at r{1}: {2}" -f $file, $ToRev, $_.Exception.Message)
-            }
-            $blameByFile[$file] = $b
-            $ownedTotal += [int]$b.LineCountTotal
-            foreach ($a in $b.LineCountByAuthor.Keys)
-            {
-                Add-Count -Table $authorOwned -Key ([string]$a) -Delta ([int]$b.LineCountByAuthor[$a])
-            }
-        }
-
-        # Compute authorModifiedOthersSurvived: count lines in the final blame (ToRev)
-        # whose (revision, author) pair is in revsWhereKilledOthers.
-        $authorModifiedOthersSurvived = @{}
-        $revsKilledOthersSet = $strictDetail.RevsWhereKilledOthers
-        foreach ($file in $blameByFile.Keys)
-        {
-            $bData = $blameByFile[$file]
-            if ($null -eq $bData -or $null -eq $bData.Lines)
-            {
-                continue
-            }
-            foreach ($bLine in @($bData.Lines))
-            {
-                $bLineRev = $null
-                try
-                {
-                    $bLineRev = [int]$bLine.Revision
-                }
-                catch
-                {
-                    continue
-                }
-                if ($null -eq $bLineRev -or $bLineRev -lt $FromRev -or $bLineRev -gt $ToRev)
-                {
-                    continue
-                }
-                $bLineAuthor = Get-NormalizedAuthorName -Author ([string]$bLine.Author)
-                $lookupKey = [string]$bLineRev + [char]31 + $bLineAuthor
-                if ($revsKilledOthersSet.Contains($lookupKey))
-                {
-                    Add-Count -Table $authorModifiedOthersSurvived -Key $bLineAuthor
-                }
-            }
-        }
-
-        foreach ($r in $fileRows)
-        {
-            $fp = [string]$r.'ファイルパス'
-            $resolvedFp = Resolve-PathByRenameMap -FilePath $fp -RenameMap $renameMap
-            $isOldRenamePath = ($renameMap.ContainsKey($fp) -and ([string]$renameMap[$fp] -ne $fp))
-            $metricKey = if ($isOldRenamePath)
-            {
-                $null
-            }
-            else
-            {
-                $resolvedFp
-            }
-
-            $b = $null
-            $existsAtToRev = $false
-            if ($metricKey)
-            {
-                $existsAtToRev = $existingFileSet.Contains([string]$metricKey)
-            }
-            $lookupCandidates = if ($existsAtToRev)
-            {
-                @($metricKey, $fp, $resolvedFp)
-            }
-            else
-            {
-                @()
-            }
-            $lookupErrors = New-Object 'System.Collections.Generic.List[string]'
-            foreach ($lookup in $lookupCandidates)
-            {
-                if (-not $lookup)
-                {
-                    continue
-                }
-                if ($blameByFile.ContainsKey($lookup))
-                {
-                    $b = $blameByFile[$lookup]
-                    break
-                }
-                try
-                {
-                    $tmpB = Get-SvnBlameSummary -Repo $targetUrl -FilePath $lookup -ToRevision $ToRev -CacheDir $cacheDir
-                    $blameByFile[$lookup] = $tmpB
-                    $b = $tmpB
-                    break
-                }
-                catch
-                {
-                    $lookupErrors.Add(([string]$lookup + ': ' + $_.Exception.Message)) | Out-Null
-                }
-            }
-            if ($null -eq $b -and $existsAtToRev)
-            {
-                throw ("Strict file blame lookup failed for '{0}' at r{1}. Attempts: {2}" -f $metricKey, $ToRev, ($lookupErrors.ToArray() -join ' | '))
-            }
-
-            $sur = if ($metricKey -and $strictDetail.FileSurvived.ContainsKey($metricKey))
-            {
-                [int]$strictDetail.FileSurvived[$metricKey]
-            }
-            else
-            {
-                0
-            }
-            $dead = if ($metricKey -and $strictDetail.FileDead.ContainsKey($metricKey))
-            {
-                [int]$strictDetail.FileDead[$metricKey]
-            }
-            else
-            {
-                0
-            }
-            $r.'生存行数 (範囲指定)' = $sur
-            $r.($script:ColDeadAdded) = $dead
-
-            $fsc = if ($metricKey -and $strictDetail.FileSelfCancel.ContainsKey($metricKey))
-            {
-                [int]$strictDetail.FileSelfCancel[$metricKey]
-            }
-            else
-            {
-                0
-            }
-            $fcr = if ($metricKey -and $strictDetail.FileCrossRevert.ContainsKey($metricKey))
-            {
-                [int]$strictDetail.FileCrossRevert[$metricKey]
-            }
-            else
-            {
-                0
-            }
-            $frh = if ($metricKey -and $strictDetail.FileRepeatedHunk.ContainsKey($metricKey))
-            {
-                [int]$strictDetail.FileRepeatedHunk[$metricKey]
-            }
-            else
-            {
-                0
-            }
-            $fpp = if ($metricKey -and $strictDetail.FilePingPong.ContainsKey($metricKey))
-            {
-                [int]$strictDetail.FilePingPong[$metricKey]
-            }
-            else
-            {
-                0
-            }
-            $fim = if ($metricKey -and $strictDetail.FileInternalMoveCount.ContainsKey($metricKey))
-            {
-                [int]$strictDetail.FileInternalMoveCount[$metricKey]
-            }
-            else
-            {
-                0
-            }
-            $r.'自己相殺行数 (合計)' = $fsc
-            $r.'他者差戻行数 (合計)' = $fcr
-            $r.'同一箇所反復編集数 (合計)' = $frh
-            $r.'ピンポン回数 (合計)' = $fpp
-            $r.'内部移動行数 (合計)' = $fim
-
-            $mx = 0
-            if ($null -ne $b -and $b.LineCountByAuthor.Count -gt 0)
-            {
-                $mx = ($b.LineCountByAuthor.Values | Measure-Object -Maximum).Maximum
-            }
-            $topBlameShare = if ($null -ne $b -and $b.LineCountTotal -gt 0)
-            {
-                $mx / [double]$b.LineCountTotal
-            }
-            else
-            {
-                0
-            }
-            $r.'最多作者blame占有率' = Format-MetricValue -Value $topBlameShare
-        }
-
-        foreach ($r in $committerRows)
-        {
-            $a = [string]$r.'作者'
-            $sur = if ($authorSurvived.ContainsKey($a))
-            {
-                [int]$authorSurvived[$a]
-            }
-            else
-            {
-                0
-            }
-            $own = if ($authorOwned.ContainsKey($a))
-            {
-                [int]$authorOwned[$a]
-            }
-            else
-            {
-                0
-            }
-            $r.'生存行数' = $sur
-            $dead = if ($strictDetail.AuthorDead.ContainsKey($a))
-            {
-                [int]$strictDetail.AuthorDead[$a]
-            }
-            else
-            {
-                0
-            }
-            $r.($script:ColDeadAdded) = $dead
-            $r.'所有行数' = $own
-            $ownShare = if ($ownedTotal -gt 0)
-            {
-                $own / [double]$ownedTotal
-            }
-            else
-            {
-                0
-            }
-            $r.'所有割合' = Format-MetricValue -Value $ownShare
-
-            $sc = if ($strictDetail.AuthorSelfDead.ContainsKey($a))
-            {
-                [int]$strictDetail.AuthorSelfDead[$a]
-            }
-            else
-            {
-                0
-            }
-            $cr = if ($strictDetail.AuthorOtherDead.ContainsKey($a))
-            {
-                [int]$strictDetail.AuthorOtherDead[$a]
-            }
-            else
-            {
-                0
-            }
-            $rh = if ($strictDetail.AuthorRepeatedHunk.ContainsKey($a))
-            {
-                [int]$strictDetail.AuthorRepeatedHunk[$a]
-            }
-            else
-            {
-                0
-            }
-            $pp = if ($strictDetail.AuthorPingPong.ContainsKey($a))
-            {
-                [int]$strictDetail.AuthorPingPong[$a]
-            }
-            else
-            {
-                0
-            }
-            $im = if ($strictDetail.AuthorInternalMoveCount.ContainsKey($a))
-            {
-                [int]$strictDetail.AuthorInternalMoveCount[$a]
-            }
-            else
-            {
-                0
-            }
-            $r.'自己相殺行数' = $sc
-            $r.'自己差戻行数' = $sc
-            $r.'他者差戻行数' = $cr
-            $r.'被他者削除行数' = $cr
-            $r.'同一箇所反復編集数' = $rh
-            $r.'ピンポン回数' = $pp
-            $r.'内部移動行数' = $im
-            $r.($script:ColSelfDead) = $sc
-            $r.($script:ColOtherDead) = $cr
-
-            $moc = if ($strictDetail.AuthorModifiedOthersCode.ContainsKey($a))
-            {
-                [int]$strictDetail.AuthorModifiedOthersCode[$a]
-            }
-            else
-            {
-                0
-            }
-            $mocs = if ($authorModifiedOthersSurvived.ContainsKey($a))
-            {
-                [int]$authorModifiedOthersSurvived[$a]
-            }
-            else
-            {
-                0
-            }
-            $r.'他者コード変更行数' = $moc
-            $r.'他者コード変更生存行数' = $mocs
-        }
-    }
-
-    $headersCommitter = @('作者', 'コミット数', '活動日数', '変更ファイル数', '変更ディレクトリ数', '追加行数', '削除行数', '純増行数', '総チャーン', 'コミットあたりチャーン', '削除対追加比', 'チャーン対純増比', 'バイナリ変更回数', '追加アクション数', '変更アクション数', '削除アクション数', '置換アクション数', '生存行数', $script:ColDeadAdded, '所有行数', '所有割合', '自己相殺行数', '自己差戻行数', '他者差戻行数', '被他者削除行数', '同一箇所反復編集数', 'ピンポン回数', '内部移動行数', $script:ColSelfDead, $script:ColOtherDead, '他者コード変更行数', '他者コード変更生存行数', '変更エントロピー', '平均共同作者数', '最大共同作者数', 'メッセージ総文字数', 'メッセージ平均文字数', '課題ID言及数', '修正キーワード数', '差戻キーワード数', 'マージキーワード数')
-    $headersFile = @('ファイルパス', 'コミット数', '作者数', '追加行数', '削除行数', '純増行数', '総チャーン', 'バイナリ変更回数', '作成回数', '削除回数', '置換回数', '初回変更リビジョン', '最終変更リビジョン', '平均変更間隔日数', '生存行数 (範囲指定)', $script:ColDeadAdded, '最多作者チャーン占有率', '最多作者blame占有率', '自己相殺行数 (合計)', '他者差戻行数 (合計)', '同一箇所反復編集数 (合計)', 'ピンポン回数 (合計)', '内部移動行数 (合計)', 'ホットスポットスコア', 'ホットスポット順位')
-    $headersCommit = @('リビジョン', '日時', '作者', 'メッセージ文字数', 'メッセージ', '変更ファイル数', '追加行数', '削除行数', 'チャーン', 'エントロピー')
-    $headersCoupling = @('ファイルA', 'ファイルB', '共変更回数', 'Jaccard', 'リフト値')
-
-    Write-CsvFile -FilePath (Join-Path $OutDir 'committers.csv') -Rows $committerRows -Headers $headersCommitter -EncodingName $Encoding
-    Write-CsvFile -FilePath (Join-Path $OutDir 'files.csv') -Rows $fileRows -Headers $headersFile -EncodingName $Encoding
-    Write-CsvFile -FilePath (Join-Path $OutDir 'commits.csv') -Rows $commitRows -Headers $headersCommit -EncodingName $Encoding
-    Write-CsvFile -FilePath (Join-Path $OutDir 'couplings.csv') -Rows $couplingRows -Headers $headersCoupling -EncodingName $Encoding
+    $headers = Get-MetricHeaders
+    Write-CsvFile -FilePath (Join-Path $OutDir 'committers.csv') -Rows $committerRows -Headers $headers.Committer -EncodingName $Encoding
+    Write-CsvFile -FilePath (Join-Path $OutDir 'files.csv') -Rows $fileRows -Headers $headers.File -EncodingName $Encoding
+    Write-CsvFile -FilePath (Join-Path $OutDir 'commits.csv') -Rows $commitRows -Headers $headers.Commit -EncodingName $Encoding
+    Write-CsvFile -FilePath (Join-Path $OutDir 'couplings.csv') -Rows $couplingRows -Headers $headers.Coupling -EncodingName $Encoding
     if ($EmitPlantUml)
     {
         Write-PlantUmlFile -OutDirectory $OutDir -Committers $committerRows -Files $fileRows -Couplings $couplingRows -TopNCount $TopN -EncodingName $Encoding
     }
 
     $finishedAt = Get-Date
-    $meta = [ordered]@{
-        StartTime = $startedAt.ToString('o')
-        EndTime = $finishedAt.ToString('o')
-        DurationSeconds = Format-MetricValue -Value ((New-TimeSpan -Start $startedAt -End $finishedAt).TotalSeconds)
-        RepoUrl = $targetUrl
-        FromRev = $FromRev
-        ToRev = $ToRev
-        AuthorFilter = $Author
-        SvnExecutable = $script:SvnExecutable
-        SvnVersion = $svnVersion
-        StrictMode = $true
-        NoBlame = [bool]$NoBlame
-        DeadDetailLevel = $DeadDetailLevel
-        Parallel = $Parallel
-        TopN = $TopN
-        Encoding = $Encoding
-        CommitCount = @($commits).Count
-        FileCount = @($fileRows).Count
-        OutputDirectory = (Resolve-Path $OutDir).Path
-        StrictBlameCallCount = [int]($script:StrictBlameCacheHits + $script:StrictBlameCacheMisses)
-        StrictBlameCacheHits = [int]$script:StrictBlameCacheHits
-        StrictBlameCacheMisses = [int]$script:StrictBlameCacheMisses
-        NonStrictMetrics = @('課題ID言及数', '修正キーワード数', '差戻キーワード数', 'マージキーワード数')
-        NonStrictReason = '正規表現ベースのヒューリスティックであり厳密化不可能'
-        Parameters = [ordered]@{ IncludePaths = $IncludePaths
-            ExcludePaths = $ExcludePaths
-            IncludeExtensions = $IncludeExtensions
-            ExcludeExtensions = $ExcludeExtensions
-            EmitPlantUml = [bool]$EmitPlantUml
-            NonInteractive = [bool]$NonInteractive
-            TrustServerCert = [bool]$TrustServerCert
-            IgnoreSpaceChange = [bool]$IgnoreSpaceChange
-            IgnoreAllSpace = [bool]$IgnoreAllSpace
-            IgnoreEolStyle = [bool]$IgnoreEolStyle
-            IncludeProperties = [bool]$IncludeProperties
-            ForceBinary = [bool]$ForceBinary
-        }
-        Outputs = [ordered]@{ CommittersCsv = 'committers.csv'
-            FilesCsv = 'files.csv'
-            CommitsCsv = 'commits.csv'
-            CouplingsCsv = 'couplings.csv'
-            RunMetaJson = 'run_meta.json'
-            ContributorsPlantUml = if ($EmitPlantUml)
-            {
-                'contributors_summary.puml'
-            }
-            else
-            {
-                $null
-            }
-            HotspotsPlantUml = if ($EmitPlantUml)
-            {
-                'hotspots.puml'
-            }
-            else
-            {
-                $null
-            }
-            CoChangePlantUml = if ($EmitPlantUml)
-            {
-                'cochange_network.puml'
-            }
-            else
-            {
-                $null
-            }
-        }
-    }
+    $meta = New-RunMetaData -StartTime $startedAt -EndTime $finishedAt -TargetUrl $targetUrl -FromRevision $FromRev -ToRevision $ToRev -AuthorFilter $Author -SvnVersion $svnVersion -NoBlame:$NoBlame -DeadDetailLevel $DeadDetailLevel -Parallel $Parallel -TopN $TopN -Encoding $Encoding -Commits $commits -FileRows $fileRows -OutDir $OutDir -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -EmitPlantUml:$EmitPlantUml -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -IgnoreSpaceChange:$IgnoreSpaceChange -IgnoreAllSpace:$IgnoreAllSpace -IgnoreEolStyle:$IgnoreEolStyle -IncludeProperties:$IncludeProperties -ForceBinary:$ForceBinary
     Write-JsonFile -Data $meta -FilePath (Join-Path $OutDir 'run_meta.json') -Depth 12 -EncodingName $Encoding
 
-    $phaseLabel = 'StrictMode'
-    Write-Host ''
-    Write-Host ("===== NarutoCode {0} =====" -f $phaseLabel)
-    Write-Host ("Repo         : {0}" -f $targetUrl)
-    Write-Host ("Range        : r{0} -> r{1}" -f $FromRev, $ToRev)
-    Write-Host ("Commits      : {0}" -f @($commits).Count)
-    Write-Host ("Files        : {0}" -f @($fileRows).Count)
-    Write-Host ("OutDir       : {0}" -f (Resolve-Path $OutDir).Path)
+    Write-RunSummary -TargetUrl $targetUrl -FromRevision $FromRev -ToRevision $ToRev -Commits $commits -FileRows $fileRows -OutDir $OutDir
 
-    [pscustomobject]@{ OutDir = (Resolve-Path $OutDir).Path
+    [pscustomobject]@{
+        OutDir = (Resolve-Path $OutDir).Path
         Committers = $committerRows
         Files = $fileRows
         Commits = $commitRows
