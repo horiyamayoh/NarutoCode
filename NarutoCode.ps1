@@ -167,7 +167,7 @@ function ConvertFrom-SvnLogXml
     foreach ($e in $entries)
     {
         $rev = 0; try{ $rev = [int]$e.revision }catch{ $null = $_ }
-        $author = [string]$e.author; if ([string]::IsNullOrWhiteSpace($author)){ $author = '(unknown)' }
+        $authorNode = $e.SelectSingleNode('author'); $author = if ($authorNode) { [string]$authorNode.InnerText } else { '' }; if ([string]::IsNullOrWhiteSpace($author)){ $author = '(unknown)' }
         $date = $null; $dateText = [string]$e.date; if ($dateText){ try{ $date = [datetime]::Parse($dateText, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind) }catch{ try{ $date = [datetime]$dateText }catch{ $null = $_; $date = $null } } }
         $msg = [string]$e.msg
         $paths = New-Object 'System.Collections.Generic.List[object]'
@@ -176,8 +176,8 @@ function ConvertFrom-SvnLogXml
         {
             $raw = [string]$p.'#text'; if ([string]::IsNullOrWhiteSpace($raw)){ continue }
             $path = ConvertTo-PathKey -Path $raw; if (-not $path){ continue }
-            $copyPath = $null; if ($p.'copyfrom-path'){ $copyPath = ConvertTo-PathKey -Path ([string]$p.'copyfrom-path') }
-            $copyRev = $null; if ($p.'copyfrom-rev'){ try{ $copyRev = [int]$p.'copyfrom-rev' }catch{ $null = $_ } }
+            $copyPath = $null; if ($p.HasAttribute('copyfrom-path')){ $copyPath = ConvertTo-PathKey -Path ($p.GetAttribute('copyfrom-path')) }
+            $copyRev = $null; if ($p.HasAttribute('copyfrom-rev')){ try{ $copyRev = [int]$p.GetAttribute('copyfrom-rev') }catch{ $null = $_ } }
             $paths.Add([pscustomobject]@{ Path = $path; Action = [string]$p.action; CopyFromPath = $copyPath; CopyFromRev = $copyRev; IsDirectory = $raw.Trim().EndsWith('/') }) | Out-Null
         }
         $list.Add([pscustomobject]@{
