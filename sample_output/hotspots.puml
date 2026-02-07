@@ -1,0 +1,18 @@
+@startuml
+salt
+{
+{T
++ Rank | FilePath | HotspotScore
+| 1 | src/main/java/com/example/UserService.java | 875
+| 2 | src/main/java/com/example/OrderController.java | 440
+| 3 | src/main/java/com/example/UserRepository.java | 219
+| 4 | src/main/java/com/example/OrderService.java | 108
+| 5 | src/test/java/com/example/UserServiceTest.java | 70
+| 6 | src/main/java/com/example/Config.java | 46
+| 7 | docs/api-spec.yaml | 25
+| 8 | src/main/java/com/example/Application.java | 18
+| 9 | pom.xml | 7
+| 10 | resources/logo.png | 0
+}
+}
+@enduml

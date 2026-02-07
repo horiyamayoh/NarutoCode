@@ -1,0 +1,42 @@
+{
+  "StartTime": "2026-02-07T10:00:00.0000000+09:00",
+  "EndTime": "2026-02-07T10:00:47.1230000+09:00",
+  "DurationSeconds": 47.123,
+  "RepoUrl": "https://svn.example.com/repos/myapp/trunk",
+  "FromRev": 100,
+  "ToRev": 108,
+  "AuthorFilter": null,
+  "SvnExecutable": "C:\\Program Files\\TortoiseSVN\\bin\\svn.exe",
+  "SvnVersion": "1.14.3",
+  "NoBlame": false,
+  "Parallel": 8,
+  "TopN": 50,
+  "Encoding": "UTF8",
+  "CommitCount": 8,
+  "FileCount": 10,
+  "OutputDirectory": "C:\\work\\NarutoCode_out_20260207_100000",
+  "Parameters": {
+    "IncludePaths": [],
+    "ExcludePaths": [],
+    "IncludeExtensions": [],
+    "ExcludeExtensions": [],
+    "EmitPlantUml": true,
+    "NonInteractive": false,
+    "TrustServerCert": false,
+    "IgnoreSpaceChange": false,
+    "IgnoreAllSpace": false,
+    "IgnoreEolStyle": false,
+    "IncludeProperties": false,
+    "ForceBinary": false
+  },
+  "Outputs": {
+    "CommittersCsv": "committers.csv",
+    "FilesCsv": "files.csv",
+    "CommitsCsv": "commits.csv",
+    "CouplingsCsv": "couplings.csv",
+    "RunMetaJson": "run_meta.json",
+    "ContributorsPlantUml": "contributors_summary.puml",
+    "HotspotsPlantUml": "hotspots.puml",
+    "CoChangePlantUml": "cochange_network.puml"
+  }
+}

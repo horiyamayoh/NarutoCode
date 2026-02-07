@@ -1,0 +1,6 @@
+"FileA","FileB","CoChangeCount","Jaccard","Lift"
+"src/main/java/com/example/UserService.java","src/main/java/com/example/UserRepository.java","3","0.6","2.16"
+"src/main/java/com/example/UserService.java","src/test/java/com/example/UserServiceTest.java","2","0.4","1.44"
+"src/main/java/com/example/OrderController.java","src/main/java/com/example/OrderService.java","2","0.5","2.0"
+"src/main/java/com/example/OrderController.java","src/main/java/com/example/Config.java","1","0.2","1.0"
+"src/main/java/com/example/UserRepository.java","resources/logo.png","1","0.3333","2.6667"

@@ -1,0 +1,56 @@
+Index: src/main/java/com/example/UserService.java
+===================================================================
+--- src/main/java/com/example/UserService.java	(nonexistent)
++++ src/main/java/com/example/UserService.java	(revision 100)
+@@ -0,0 +1,45 @@
++package com.example;
++
++import java.util.List;
++import java.util.Optional;
++
++public class UserService {
++    private final UserRepository userRepository;
++
++    public UserService(UserRepository userRepository) {
++        this.userRepository = userRepository;
++    }
++
++    public Optional<User> findById(Long id) {
++        return userRepository.findById(id);
++    }
++
++    public List<User> findAll() {
++        return userRepository.findAll();
++    }
++
++    public User save(User user) {
++        return userRepository.save(user);
++    }
++}
+Index: src/main/java/com/example/UserRepository.java
+===================================================================
+--- src/main/java/com/example/UserRepository.java	(nonexistent)
++++ src/main/java/com/example/UserRepository.java	(revision 100)
+@@ -0,0 +1,22 @@
++package com.example;
++
++import java.util.List;
++import java.util.Optional;
++
++public interface UserRepository {
++    Optional<User> findById(Long id);
++    List<User> findAll();
++    User save(User user);
++}
+Index: src/main/java/com/example/Application.java
+===================================================================
+--- src/main/java/com/example/Application.java	(nonexistent)
++++ src/main/java/com/example/Application.java	(revision 100)
+@@ -0,0 +1,18 @@
++package com.example;
++
++public class Application {
++    public static void main(String[] args) {
++        System.out.println("Application started");
++    }
++}

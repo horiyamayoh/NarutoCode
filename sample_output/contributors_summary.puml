@@ -1,0 +1,11 @@
+@startuml
+salt
+{
+{T
++ Author | CommitCount | TotalChurn
+| tanaka | 4 | 227
+| suzuki | 3 | 163
+| yamada | 1 | 50
+}
+}
+@enduml

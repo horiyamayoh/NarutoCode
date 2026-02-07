@@ -1,0 +1,9 @@
+@startuml
+left to right direction
+skinparam linetype ortho
+"src/main/java/com/example/UserService.java" -- "src/main/java/com/example/UserRepository.java" : co=3\nj=0.6
+"src/main/java/com/example/UserService.java" -- "src/test/java/com/example/UserServiceTest.java" : co=2\nj=0.4
+"src/main/java/com/example/OrderController.java" -- "src/main/java/com/example/OrderService.java" : co=2\nj=0.5
+"src/main/java/com/example/OrderController.java" -- "src/main/java/com/example/Config.java" : co=1\nj=0.2
+"src/main/java/com/example/UserRepository.java" -- "resources/logo.png" : co=1\nj=0.3333
+@enduml
