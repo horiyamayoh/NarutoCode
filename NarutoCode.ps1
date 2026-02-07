@@ -429,9 +429,14 @@ function ConvertFrom-SvnLogXml
         $msg = [string]$e.msg
         $paths = New-Object 'System.Collections.Generic.List[object]'
         $pathNodes = @()
-        if ($e.paths -and $e.paths.path)
+        $pathsNode = $e.SelectSingleNode('paths')
+        if ($pathsNode)
         {
-            $pathNodes = @($e.paths.path)
+            $pathChildren = $pathsNode.SelectNodes('path')
+            if ($pathChildren -and $pathChildren.Count -gt 0)
+            {
+                $pathNodes = @($pathChildren)
+            }
         }
         foreach ($p in $pathNodes)
         {
@@ -575,9 +580,17 @@ function ConvertFrom-SvnBlameXml
     [CmdletBinding()]param([string]$XmlText)
     $xml = ConvertFrom-SvnXmlText -Text $XmlText -ContextLabel 'svn blame'
     $entries = @()
-    if ($xml -and $xml.blame -and $xml.blame.target -and $xml.blame.target.entry)
+    if ($xml)
     {
-        $entries = @($xml.blame.target.entry)
+        $targetNode = $xml.SelectSingleNode('blame/target')
+        if ($targetNode)
+        {
+            $entryNodes = $targetNode.SelectNodes('entry')
+            if ($entryNodes -and $entryNodes.Count -gt 0)
+            {
+                $entries = @($entryNodes)
+            }
+        }
     }
     $byRev = @{}
     $byAuthor = @{}
@@ -607,7 +620,15 @@ function ConvertFrom-SvnBlameXml
             }
             $byRev[$rev]++
         }
-        $author = [string]$commit.author
+        $authorNode = $commit.SelectSingleNode('author')
+        $author = if ($authorNode)
+        {
+            [string]$authorNode.InnerText
+        }
+        else
+        {
+            ''
+        }
         if ([string]::IsNullOrWhiteSpace($author))
         {
             $author = '(unknown)'
