@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-NarutoCode Phase 1 implementation.
+NarutoCode Phase 1 + Phase 2 implementation.
 #>
 [CmdletBinding()]
 param(
@@ -28,7 +28,8 @@ param(
     [switch]$IgnoreEolStyle,
     [switch]$IncludeProperties,
     [switch]$ForceBinary,
-    [switch]$NoProgress
+    [switch]$NoProgress,
+    [ValidateRange(0, 2)][int]$DeadDetailLevel = 0
 )
 
 # Suppress progress output when -NoProgress is specified
@@ -493,9 +494,75 @@ function ConvertFrom-SvnLogXml
     }
     return $list.ToArray() | Sort-Object Revision
 }
+function ConvertTo-LineHash
+{
+    param([string]$FilePath, [string]$Content)
+    $norm = $Content -replace '\s+', ' '
+    $norm = $norm.Trim()
+    $raw = $FilePath + [char]0 + $norm
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($raw)
+    $sha = New-Object System.Security.Cryptography.SHA1CryptoServiceProvider
+    try
+    {
+        $hash = $sha.ComputeHash($bytes)
+        return [BitConverter]::ToString($hash).Replace('-', '').ToLowerInvariant()
+    }
+    finally
+    {
+        $sha.Dispose()
+    }
+}
+function Test-IsTrivialLine
+{
+    param([string]$Content)
+    $t = $Content.Trim()
+    if ($t.Length -le 3)
+    {
+        return $true
+    }
+    $trivials = @('{', '}', '};', 'else', 'else {', 'return;', 'break;', 'continue;', '});', ');', '(', ')', '')
+    if ($trivials -contains $t)
+    {
+        return $true
+    }
+    return $false
+}
+function ConvertTo-ContextHash
+{
+    param([string]$FilePath, [string[]]$ContextLines, [int]$K = 3)
+    $first = @()
+    $last = @()
+    if ($ContextLines -and $ContextLines.Count -gt 0)
+    {
+        $cnt = $ContextLines.Count
+        $take = [Math]::Min($K, $cnt)
+        $first = @($ContextLines[0..($take - 1)])
+        if ($cnt -gt $K)
+        {
+            $startIdx = $cnt - $take
+            $last = @($ContextLines[$startIdx..($cnt - 1)])
+        }
+        else
+        {
+            $last = $first
+        }
+    }
+    $raw = $FilePath + '|' + ($first -join '|') + '|' + ($last -join '|')
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($raw)
+    $sha = New-Object System.Security.Cryptography.SHA1CryptoServiceProvider
+    try
+    {
+        $hash = $sha.ComputeHash($bytes)
+        return [BitConverter]::ToString($hash).Replace('-', '').ToLowerInvariant()
+    }
+    finally
+    {
+        $sha.Dispose()
+    }
+}
 function ConvertFrom-SvnUnifiedDiff
 {
-    [CmdletBinding()]param([string]$DiffText)
+    [CmdletBinding()]param([string]$DiffText, [int]$DetailLevel = 0)
     $result = @{}
     if ([string]::IsNullOrEmpty($DiffText))
     {
@@ -503,23 +570,42 @@ function ConvertFrom-SvnUnifiedDiff
     }
     $lines = $DiffText -split "`r?`n"
     $current = $null
+    $currentFile = $null
+    $currentHunk = $null
+    $hunkContextLines = $null
+    $hunkAddedHashes = $null
+    $hunkDeletedHashes = $null
     foreach ($line in $lines)
     {
         if ($line -like 'Index: *')
         {
+            if ($DetailLevel -ge 1 -and $null -ne $currentHunk -and $null -ne $currentFile)
+            {
+                $currentHunk.ContextHash = ConvertTo-ContextHash -FilePath $currentFile -ContextLines $hunkContextLines
+                $currentHunk.AddedLineHashes = $hunkAddedHashes.ToArray()
+                $currentHunk.DeletedLineHashes = $hunkDeletedHashes.ToArray()
+            }
             $file = ConvertTo-PathKey -Path $line.Substring(7).Trim()
             if ($file)
             {
                 if (-not $result.ContainsKey($file))
                 {
-                    $result[$file] = [pscustomobject]@{ AddedLines = 0
+                    $result[$file] = [pscustomobject]@{
+                        AddedLines = 0
                         DeletedLines = 0
                         Hunks = (New-Object 'System.Collections.Generic.List[object]')
                         IsBinary = $false
+                        AddedLineHashes = (New-Object 'System.Collections.Generic.List[string]')
+                        DeletedLineHashes = (New-Object 'System.Collections.Generic.List[string]')
                     }
                 }
                 $current = $result[$file]
+                $currentFile = $file
             }
+            $currentHunk = $null
+            $hunkContextLines = $null
+            $hunkAddedHashes = $null
+            $hunkDeletedHashes = $null
             continue
         }
         if ($null -eq $current)
@@ -528,25 +614,43 @@ function ConvertFrom-SvnUnifiedDiff
         }
         if ($line -match '^@@\s*-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s*@@')
         {
-            $current.Hunks.Add([pscustomobject]@{ OldStart = [int]$Matches[1]
-                    OldCount = if ($Matches[2])
-                    {
-                        [int]$Matches[2]
-                    }
-                    else
-                    {
-                        1
-                    }
-                    NewStart = [int]$Matches[3]
-                    NewCount = if ($Matches[4])
-                    {
-                        [int]$Matches[4]
-                    }
-                    else
-                    {
-                        1
-                    }
-                }) | Out-Null
+            if ($DetailLevel -ge 1 -and $null -ne $currentHunk -and $null -ne $currentFile)
+            {
+                $currentHunk.ContextHash = ConvertTo-ContextHash -FilePath $currentFile -ContextLines $hunkContextLines
+                $currentHunk.AddedLineHashes = $hunkAddedHashes.ToArray()
+                $currentHunk.DeletedLineHashes = $hunkDeletedHashes.ToArray()
+            }
+            $hunkObj = [pscustomobject]@{
+                OldStart = [int]$Matches[1]
+                OldCount = if ($Matches[2])
+                {
+                    [int]$Matches[2]
+                }
+                else
+                {
+                    1
+                }
+                NewStart = [int]$Matches[3]
+                NewCount = if ($Matches[4])
+                {
+                    [int]$Matches[4]
+                }
+                else
+                {
+                    1
+                }
+                ContextHash = $null
+                AddedLineHashes = @()
+                DeletedLineHashes = @()
+            }
+            $current.Hunks.Add($hunkObj) | Out-Null
+            $currentHunk = $hunkObj
+            if ($DetailLevel -ge 1)
+            {
+                $hunkContextLines = New-Object 'System.Collections.Generic.List[string]'
+                $hunkAddedHashes = New-Object 'System.Collections.Generic.List[string]'
+                $hunkDeletedHashes = New-Object 'System.Collections.Generic.List[string]'
+            }
             continue
         }
         if ($line -match '^Cannot display: file marked as a binary type\.' -or $line -match '^Binary files .* differ')
@@ -565,13 +669,43 @@ function ConvertFrom-SvnUnifiedDiff
         if ($line[0] -eq '+')
         {
             $current.AddedLines++
+            if ($DetailLevel -ge 1 -and $null -ne $currentFile)
+            {
+                $content = $line.Substring(1)
+                $h = ConvertTo-LineHash -FilePath $currentFile -Content $content
+                $current.AddedLineHashes.Add($h)
+                if ($null -ne $hunkAddedHashes)
+                {
+                    $hunkAddedHashes.Add($h)
+                }
+            }
             continue
         }
         if ($line[0] -eq '-')
         {
             $current.DeletedLines++
+            if ($DetailLevel -ge 1 -and $null -ne $currentFile)
+            {
+                $content = $line.Substring(1)
+                $h = ConvertTo-LineHash -FilePath $currentFile -Content $content
+                $current.DeletedLineHashes.Add($h)
+                if ($null -ne $hunkDeletedHashes)
+                {
+                    $hunkDeletedHashes.Add($h)
+                }
+            }
             continue
         }
+        if ($DetailLevel -ge 1 -and $line.Length -gt 0 -and $line[0] -eq ' ' -and $null -ne $hunkContextLines)
+        {
+            $hunkContextLines.Add($line.Substring(1))
+        }
+    }
+    if ($DetailLevel -ge 1 -and $null -ne $currentHunk -and $null -ne $currentFile)
+    {
+        $currentHunk.ContextHash = ConvertTo-ContextHash -FilePath $currentFile -ContextLines $hunkContextLines
+        $currentHunk.AddedLineHashes = $hunkAddedHashes.ToArray()
+        $currentHunk.DeletedLineHashes = $hunkDeletedHashes.ToArray()
     }
     return $result
 }
@@ -871,6 +1005,15 @@ function Get-CommitterMetric
                 DeadAddedLinesApprox = $null
                 OwnedLinesToToRev = $null
                 OwnershipShareToToRev = $null
+                SelfCancelLineCount = $null
+                SelfRevertLines = $null
+                CrossRevertLines = $null
+                RemovedByOthersLines = $null
+                RepeatedSameHunkEdits = $null
+                PingPongCount = $null
+                InternalMoveLineCount = $null
+                DeadBySelfApprox = $null
+                DeadByOthersApprox = $null
                 AuthorChangeEntropy = Get-RoundedNumber -Value $entropy
                 AvgCoAuthorsPerTouchedFile = Get-RoundedNumber -Value $coAvg
                 MaxCoAuthorsPerTouchedFile = [int]$coMax
@@ -1020,6 +1163,11 @@ function Get-FileMetric
                 DeadAddedLinesApprox = $null
                 TopAuthorShareByChurn = Get-RoundedNumber -Value $topShare
                 TopAuthorShareByBlame = $null
+                SelfCancelLinesTotal = $null
+                CrossRevertLinesTotal = $null
+                RepeatedSameHunkEditsTotal = $null
+                PingPongCountTotal = $null
+                InternalMoveLinesTotal = $null
                 HotspotScore = ($cc * $ch)
                 RankByHotspot = 0
             }) | Out-Null
@@ -1187,6 +1335,292 @@ function Write-PlantUmlFile
     [void]$sb3.AppendLine('@enduml')
     Write-TextFile -FilePath (Join-Path $OutDirectory 'cochange_network.puml') -Content $sb3.ToString() -EncodingName $EncodingName
 }
+function Get-DeadLineDetail
+{
+    [CmdletBinding()]
+    param(
+        [object[]]$Commits,
+        [hashtable]$RevToAuthor,
+        [int]$DetailLevel = 1,
+        [hashtable]$RenameMap = @{}
+    )
+    $authorSelfCancel = @{}
+    $authorCrossRevert = @{}
+    $authorRemovedByOthers = @{}
+    $fileSelfCancel = @{}
+    $fileCrossRevert = @{}
+    $authorRepeatedHunk = @{}
+    $authorPingPong = @{}
+    $fileRepeatedHunk = @{}
+    $filePingPong = @{}
+    $addedMultiset = @{}
+    $hunkAuthorCount = @{}
+    $hunkEvents = @{}
+    $fileInternalMoveCount = @{}
+    $authorInternalMoveCount = @{}
+    $sorted = @($Commits | Sort-Object Revision)
+    foreach ($c in $sorted)
+    {
+        $rev = [int]$c.Revision
+        $cAuthor = if ($RevToAuthor.ContainsKey($rev))
+        {
+            [string]$RevToAuthor[$rev]
+        }
+        else
+        {
+            [string]$c.Author
+        }
+        foreach ($f in @($c.FilesChanged))
+        {
+            $d = $c.FileDiffStats[$f]
+            if ($null -eq $d)
+            {
+                continue
+            }
+            $resolvedFile = $f
+            if ($RenameMap.ContainsKey($f))
+            {
+                $resolvedFile = [string]$RenameMap[$f]
+            }
+            $fileAddedHashes = @()
+            $fileDeletedHashes = @()
+            if ($d.PSObject.Properties.Match('AddedLineHashes').Count -gt 0 -and $null -ne $d.AddedLineHashes)
+            {
+                $fileAddedHashes = @($d.AddedLineHashes)
+            }
+            if ($d.PSObject.Properties.Match('DeletedLineHashes').Count -gt 0 -and $null -ne $d.DeletedLineHashes)
+            {
+                $fileDeletedHashes = @($d.DeletedLineHashes)
+            }
+            if ($DetailLevel -ge 2 -and $fileAddedHashes.Count -gt 0 -and $fileDeletedHashes.Count -gt 0)
+            {
+                $addSet = @{}
+                foreach ($ah in $fileAddedHashes)
+                {
+                    if (-not $addSet.ContainsKey($ah))
+                    {
+                        $addSet[$ah] = 0
+                    }
+                    $addSet[$ah]++
+                }
+                $delSet = @{}
+                foreach ($dh in $fileDeletedHashes)
+                {
+                    if (-not $delSet.ContainsKey($dh))
+                    {
+                        $delSet[$dh] = 0
+                    }
+                    $delSet[$dh]++
+                }
+                $moveCount = 0
+                foreach ($mk in $addSet.Keys)
+                {
+                    if ($delSet.ContainsKey($mk))
+                    {
+                        $moveCount += [Math]::Min([int]$addSet[$mk], [int]$delSet[$mk])
+                    }
+                }
+                if ($moveCount -gt 0)
+                {
+                    if (-not $fileInternalMoveCount.ContainsKey($resolvedFile))
+                    {
+                        $fileInternalMoveCount[$resolvedFile] = 0
+                    }
+                    $fileInternalMoveCount[$resolvedFile] += $moveCount
+                    if (-not $authorInternalMoveCount.ContainsKey($cAuthor))
+                    {
+                        $authorInternalMoveCount[$cAuthor] = 0
+                    }
+                    $authorInternalMoveCount[$cAuthor] += $moveCount
+                }
+            }
+            foreach ($delHash in $fileDeletedHashes)
+            {
+                $key = $resolvedFile + [char]31 + $delHash
+                if ($addedMultiset.ContainsKey($key))
+                {
+                    $queue = $addedMultiset[$key]
+                    if ($queue.Count -gt 0)
+                    {
+                        $origAuthor = [string]$queue[0]
+                        $queue.RemoveAt(0)
+                        if ($origAuthor -eq $cAuthor)
+                        {
+                            if (-not $authorSelfCancel.ContainsKey($cAuthor))
+                            {
+                                $authorSelfCancel[$cAuthor] = 0
+                            }
+                            $authorSelfCancel[$cAuthor]++
+                            if (-not $fileSelfCancel.ContainsKey($resolvedFile))
+                            {
+                                $fileSelfCancel[$resolvedFile] = 0
+                            }
+                            $fileSelfCancel[$resolvedFile]++
+                        }
+                        else
+                        {
+                            if (-not $authorCrossRevert.ContainsKey($origAuthor))
+                            {
+                                $authorCrossRevert[$origAuthor] = 0
+                            }
+                            $authorCrossRevert[$origAuthor]++
+                            if (-not $authorRemovedByOthers.ContainsKey($origAuthor))
+                            {
+                                $authorRemovedByOthers[$origAuthor] = 0
+                            }
+                            $authorRemovedByOthers[$origAuthor]++
+                            if (-not $fileCrossRevert.ContainsKey($resolvedFile))
+                            {
+                                $fileCrossRevert[$resolvedFile] = 0
+                            }
+                            $fileCrossRevert[$resolvedFile]++
+                        }
+                        if ($queue.Count -eq 0)
+                        {
+                            $addedMultiset.Remove($key)
+                        }
+                    }
+                }
+            }
+            foreach ($addHash in $fileAddedHashes)
+            {
+                $key = $resolvedFile + [char]31 + $addHash
+                if (-not $addedMultiset.ContainsKey($key))
+                {
+                    $addedMultiset[$key] = New-Object 'System.Collections.Generic.List[string]'
+                }
+                $addedMultiset[$key].Add($cAuthor)
+            }
+            if ($DetailLevel -ge 2)
+            {
+                foreach ($hunk in @($d.Hunks))
+                {
+                    $ctxHash = $null
+                    if ($hunk.PSObject.Properties.Match('ContextHash').Count -gt 0)
+                    {
+                        $ctxHash = $hunk.ContextHash
+                    }
+                    if (-not $ctxHash)
+                    {
+                        continue
+                    }
+                    $hunkKey = $resolvedFile + [char]31 + $ctxHash
+                    $authorHunkKey = $cAuthor + [char]31 + $hunkKey
+                    if (-not $hunkAuthorCount.ContainsKey($authorHunkKey))
+                    {
+                        $hunkAuthorCount[$authorHunkKey] = 0
+                    }
+                    $hunkAuthorCount[$authorHunkKey]++
+                    if (-not $hunkEvents.ContainsKey($hunkKey))
+                    {
+                        $hunkEvents[$hunkKey] = New-Object 'System.Collections.Generic.List[string]'
+                    }
+                    $hunkEvents[$hunkKey].Add($cAuthor)
+                }
+            }
+        }
+    }
+    if ($DetailLevel -ge 2)
+    {
+        foreach ($ahk in $hunkAuthorCount.Keys)
+        {
+            $cnt = [int]$hunkAuthorCount[$ahk]
+            if ($cnt -gt 1)
+            {
+                $repeat = $cnt - 1
+                $parts = $ahk -split [char]31, 3
+                $hAuthor = $parts[0]
+                $hFile = $parts[1]
+                if (-not $authorRepeatedHunk.ContainsKey($hAuthor))
+                {
+                    $authorRepeatedHunk[$hAuthor] = 0
+                }
+                $authorRepeatedHunk[$hAuthor] += $repeat
+                if (-not $fileRepeatedHunk.ContainsKey($hFile))
+                {
+                    $fileRepeatedHunk[$hFile] = 0
+                }
+                $fileRepeatedHunk[$hFile] += $repeat
+            }
+        }
+        foreach ($hk in $hunkEvents.Keys)
+        {
+            $evList = @($hunkEvents[$hk])
+            $hFile = ($hk -split [char]31, 2)[0]
+            if ($evList.Count -ge 3)
+            {
+                for ($i = 0
+                    $i -le ($evList.Count - 3)
+                    $i++)
+                {
+                    $aa = [string]$evList[$i]
+                    $bb = [string]$evList[$i + 1]
+                    $cc = [string]$evList[$i + 2]
+                    if ($aa -ne $bb -and $aa -eq $cc)
+                    {
+                        if (-not $authorPingPong.ContainsKey($aa))
+                        {
+                            $authorPingPong[$aa] = 0
+                        }
+                        $authorPingPong[$aa]++
+                        if (-not $filePingPong.ContainsKey($hFile))
+                        {
+                            $filePingPong[$hFile] = 0
+                        }
+                        $filePingPong[$hFile]++
+                    }
+                }
+            }
+        }
+    }
+    return [pscustomobject]@{
+        AuthorSelfCancel = $authorSelfCancel
+        AuthorCrossRevert = $authorCrossRevert
+        AuthorRemovedByOthers = $authorRemovedByOthers
+        FileSelfCancel = $fileSelfCancel
+        FileCrossRevert = $fileCrossRevert
+        AuthorRepeatedHunk = $authorRepeatedHunk
+        AuthorPingPong = $authorPingPong
+        FileRepeatedHunk = $fileRepeatedHunk
+        FilePingPong = $filePingPong
+        FileInternalMoveCount = $fileInternalMoveCount
+        AuthorInternalMoveCount = $authorInternalMoveCount
+    }
+}
+function Get-RenameMap
+{
+    [CmdletBinding()]
+    param([object[]]$Commits)
+    $map = @{}
+    foreach ($c in ($Commits | Sort-Object Revision))
+    {
+        foreach ($p in @($c.ChangedPaths))
+        {
+            if ($null -eq $p)
+            {
+                continue
+            }
+            $action = ([string]$p.Action).ToUpperInvariant()
+            if (($action -eq 'A' -or $action -eq 'R') -and $p.CopyFromPath)
+            {
+                $oldPath = ConvertTo-PathKey -Path ([string]$p.CopyFromPath)
+                $newPath = ConvertTo-PathKey -Path ([string]$p.Path)
+                if ($oldPath -and $newPath -and $oldPath -ne $newPath)
+                {
+                    $map[$oldPath] = $newPath
+                    foreach ($k in @($map.Keys))
+                    {
+                        if ([string]$map[$k] -eq $oldPath)
+                        {
+                            $map[$k] = $newPath
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return $map
+}
 # endregion Utility
 
 try
@@ -1325,7 +1759,7 @@ try
             Set-Content -Path $cacheFile -Value $diffText -Encoding UTF8
         }
 
-        $raw = ConvertFrom-SvnUnifiedDiff -DiffText $diffText
+        $raw = ConvertFrom-SvnUnifiedDiff -DiffText $diffText -DetailLevel $DeadDetailLevel
         $filtered = @{}
         foreach ($path in $raw.Keys)
         {
@@ -1422,6 +1856,13 @@ try
 
     if (-not $NoBlame -and $fileRows.Count -gt 0)
     {
+        $renameMap = @{}
+        $deadDetail = $null
+        if ($DeadDetailLevel -ge 1)
+        {
+            $renameMap = Get-RenameMap -Commits $commits
+            $deadDetail = Get-DeadLineDetail -Commits $commits -RevToAuthor $revToAuthor -DetailLevel $DeadDetailLevel -RenameMap $renameMap
+        }
         $authorSurvived = @{}
         $authorOwned = @{}
         $ownedTotal = 0
@@ -1529,6 +1970,68 @@ try
                 0
             }
             $r.OwnershipShareToToRev = Get-RoundedNumber -Value $ownShare
+            if ($null -ne $deadDetail)
+            {
+                $sc = if ($deadDetail.AuthorSelfCancel.ContainsKey($a))
+                {
+                    [int]$deadDetail.AuthorSelfCancel[$a]
+                }
+                else
+                {
+                    0
+                }
+                $cr = if ($deadDetail.AuthorCrossRevert.ContainsKey($a))
+                {
+                    [int]$deadDetail.AuthorCrossRevert[$a]
+                }
+                else
+                {
+                    0
+                }
+                $rbo = if ($deadDetail.AuthorRemovedByOthers.ContainsKey($a))
+                {
+                    [int]$deadDetail.AuthorRemovedByOthers[$a]
+                }
+                else
+                {
+                    0
+                }
+                $rh = if ($deadDetail.AuthorRepeatedHunk.ContainsKey($a))
+                {
+                    [int]$deadDetail.AuthorRepeatedHunk[$a]
+                }
+                else
+                {
+                    0
+                }
+                $pp = if ($deadDetail.AuthorPingPong.ContainsKey($a))
+                {
+                    [int]$deadDetail.AuthorPingPong[$a]
+                }
+                else
+                {
+                    0
+                }
+                $im = if ($deadDetail.AuthorInternalMoveCount.ContainsKey($a))
+                {
+                    [int]$deadDetail.AuthorInternalMoveCount[$a]
+                }
+                else
+                {
+                    0
+                }
+                $r.SelfCancelLineCount = $sc
+                $r.SelfRevertLines = $sc
+                $r.CrossRevertLines = $cr
+                $r.RemovedByOthersLines = $rbo
+                $r.RepeatedSameHunkEdits = $rh
+                $r.PingPongCount = $pp
+                $r.InternalMoveLineCount = $im
+                $adjDead = [Math]::Max(0, [int]$r.DeadAddedLinesApprox - $im)
+                $dbs = [Math]::Min($sc, $adjDead)
+                $r.DeadBySelfApprox = $dbs
+                $r.DeadByOthersApprox = [Math]::Max(0, $adjDead - $dbs)
+            }
         }
         foreach ($r in $fileRows)
         {
@@ -1538,11 +2041,58 @@ try
                 $r.DeadAddedLinesApprox = [int]$r.AddedLines
                 $r.TopAuthorShareByBlame = 0.0
             }
+            if ($null -ne $deadDetail)
+            {
+                $fp = [string]$r.FilePath
+                $resolvedFp = $fp
+                if ($renameMap.ContainsKey($fp))
+                {
+                    $resolvedFp = [string]$renameMap[$fp]
+                }
+                $fsc = 0
+                $fcr = 0
+                $frh = 0
+                $fpp = 0
+                $fim = 0
+                foreach ($lookupKey in @($fp, $resolvedFp))
+                {
+                    if ($deadDetail.FileSelfCancel.ContainsKey($lookupKey))
+                    {
+                        $fsc += [int]$deadDetail.FileSelfCancel[$lookupKey]
+                    }
+                    if ($deadDetail.FileCrossRevert.ContainsKey($lookupKey))
+                    {
+                        $fcr += [int]$deadDetail.FileCrossRevert[$lookupKey]
+                    }
+                    if ($deadDetail.FileRepeatedHunk.ContainsKey($lookupKey))
+                    {
+                        $frh += [int]$deadDetail.FileRepeatedHunk[$lookupKey]
+                    }
+                    if ($deadDetail.FilePingPong.ContainsKey($lookupKey))
+                    {
+                        $fpp += [int]$deadDetail.FilePingPong[$lookupKey]
+                    }
+                    if ($deadDetail.FileInternalMoveCount.ContainsKey($lookupKey))
+                    {
+                        $fim += [int]$deadDetail.FileInternalMoveCount[$lookupKey]
+                    }
+                }
+                if ($fp -eq $resolvedFp)
+                {
+                    $fsc = [Math]::Min($fsc, [Math]::Max(1, $fsc))
+                    $fcr = [Math]::Min($fcr, [Math]::Max(1, $fcr))
+                }
+                $r.SelfCancelLinesTotal = $fsc
+                $r.CrossRevertLinesTotal = $fcr
+                $r.RepeatedSameHunkEditsTotal = $frh
+                $r.PingPongCountTotal = $fpp
+                $r.InternalMoveLinesTotal = $fim
+            }
         }
     }
 
-    $headersCommitter = @('Author', 'CommitCount', 'ActiveDays', 'FilesTouched', 'DirsTouched', 'AddedLines', 'DeletedLines', 'NetLines', 'TotalChurn', 'ChurnPerCommit', 'DeletedToAddedRatio', 'ChurnToNetRatio', 'BinaryChangeCount', 'ActionAddCount', 'ActionModCount', 'ActionDelCount', 'ActionRepCount', 'SurvivedLinesToToRev', 'DeadAddedLinesApprox', 'OwnedLinesToToRev', 'OwnershipShareToToRev', 'AuthorChangeEntropy', 'AvgCoAuthorsPerTouchedFile', 'MaxCoAuthorsPerTouchedFile', 'MsgLenTotalChars', 'MsgLenAvgChars', 'IssueIdMentionCount', 'FixKeywordCount', 'RevertKeywordCount', 'MergeKeywordCount')
-    $headersFile = @('FilePath', 'FileCommitCount', 'FileAuthors', 'AddedLines', 'DeletedLines', 'NetLines', 'TotalChurn', 'BinaryChangeCount', 'CreateCount', 'DeleteCount', 'ReplaceCount', 'FirstChangeRev', 'LastChangeRev', 'AvgDaysBetweenChanges', 'SurvivedLinesFromRangeToToRev', 'DeadAddedLinesApprox', 'TopAuthorShareByChurn', 'TopAuthorShareByBlame', 'HotspotScore', 'RankByHotspot')
+    $headersCommitter = @('Author', 'CommitCount', 'ActiveDays', 'FilesTouched', 'DirsTouched', 'AddedLines', 'DeletedLines', 'NetLines', 'TotalChurn', 'ChurnPerCommit', 'DeletedToAddedRatio', 'ChurnToNetRatio', 'BinaryChangeCount', 'ActionAddCount', 'ActionModCount', 'ActionDelCount', 'ActionRepCount', 'SurvivedLinesToToRev', 'DeadAddedLinesApprox', 'OwnedLinesToToRev', 'OwnershipShareToToRev', 'SelfCancelLineCount', 'SelfRevertLines', 'CrossRevertLines', 'RemovedByOthersLines', 'RepeatedSameHunkEdits', 'PingPongCount', 'InternalMoveLineCount', 'DeadBySelfApprox', 'DeadByOthersApprox', 'AuthorChangeEntropy', 'AvgCoAuthorsPerTouchedFile', 'MaxCoAuthorsPerTouchedFile', 'MsgLenTotalChars', 'MsgLenAvgChars', 'IssueIdMentionCount', 'FixKeywordCount', 'RevertKeywordCount', 'MergeKeywordCount')
+    $headersFile = @('FilePath', 'FileCommitCount', 'FileAuthors', 'AddedLines', 'DeletedLines', 'NetLines', 'TotalChurn', 'BinaryChangeCount', 'CreateCount', 'DeleteCount', 'ReplaceCount', 'FirstChangeRev', 'LastChangeRev', 'AvgDaysBetweenChanges', 'SurvivedLinesFromRangeToToRev', 'DeadAddedLinesApprox', 'TopAuthorShareByChurn', 'TopAuthorShareByBlame', 'SelfCancelLinesTotal', 'CrossRevertLinesTotal', 'RepeatedSameHunkEditsTotal', 'PingPongCountTotal', 'InternalMoveLinesTotal', 'HotspotScore', 'RankByHotspot')
     $headersCommit = @('Revision', 'Date', 'Author', 'MsgLen', 'Message', 'FilesChangedCount', 'AddedLines', 'DeletedLines', 'Churn', 'Entropy')
     $headersCoupling = @('FileA', 'FileB', 'CoChangeCount', 'Jaccard', 'Lift')
 
@@ -1567,6 +2117,7 @@ try
         SvnExecutable = $script:SvnExecutable
         SvnVersion = $svnVersion
         NoBlame = [bool]$NoBlame
+        DeadDetailLevel = $DeadDetailLevel
         Parallel = $Parallel
         TopN = $TopN
         Encoding = $Encoding
@@ -1619,8 +2170,16 @@ try
     }
     Write-JsonFile -Data $meta -FilePath (Join-Path $OutDir 'run_meta.json') -Depth 12 -EncodingName $Encoding
 
+    $phaseLabel = if ($DeadDetailLevel -ge 1)
+    {
+        'Phase 1 + Phase 2'
+    }
+    else
+    {
+        'Phase 1'
+    }
     Write-Host ''
-    Write-Host '===== NarutoCode Phase 1 ====='
+    Write-Host ("===== NarutoCode {0} =====" -f $phaseLabel)
     Write-Host ("Repo         : {0}" -f $targetUrl)
     Write-Host ("Range        : r{0} -> r{1}" -f $FromRev, $ToRev)
     Write-Host ("Commits      : {0}" -f @($commits).Count)

@@ -924,3 +924,434 @@ Describe 'NarutoCode.ps1 execution' {
         }
     }
 }
+
+# ===== Phase 2 Tests =====
+
+Describe 'ConvertTo-LineHash' {
+    It 'produces consistent hash for same content' {
+        $h1 = ConvertTo-LineHash -FilePath 'src/A.cs' -Content '    return null;  '
+        $h2 = ConvertTo-LineHash -FilePath 'src/A.cs' -Content '  return  null;'
+        $h1 | Should -Be $h2
+    }
+
+    It 'produces different hash for different files' {
+        $h1 = ConvertTo-LineHash -FilePath 'src/A.cs' -Content 'return null;'
+        $h2 = ConvertTo-LineHash -FilePath 'src/B.cs' -Content 'return null;'
+        $h1 | Should -Not -Be $h2
+    }
+
+    It 'returns a 40 char hex string' {
+        $h = ConvertTo-LineHash -FilePath 'x.cs' -Content 'hello'
+        $h.Length | Should -Be 40
+        $h | Should -Match '^[0-9a-f]{40}$'
+    }
+}
+
+Describe 'Test-IsTrivialLine' {
+    It 'detects trivial lines' {
+        Test-IsTrivialLine -Content '{' | Should -BeTrue
+        Test-IsTrivialLine -Content '  }  ' | Should -BeTrue
+        Test-IsTrivialLine -Content 'return;' | Should -BeTrue
+        Test-IsTrivialLine -Content '' | Should -BeTrue
+        Test-IsTrivialLine -Content '  ' | Should -BeTrue
+    }
+
+    It 'rejects non-trivial lines' {
+        Test-IsTrivialLine -Content 'var x = 42;' | Should -BeFalse
+        Test-IsTrivialLine -Content 'public void Run()' | Should -BeFalse
+    }
+}
+
+Describe 'ConvertTo-ContextHash' {
+    It 'produces consistent hash for same context' {
+        $h1 = ConvertTo-ContextHash -FilePath 'src/A.cs' -ContextLines @('line1', 'line2', 'line3', 'line4')
+        $h2 = ConvertTo-ContextHash -FilePath 'src/A.cs' -ContextLines @('line1', 'line2', 'line3', 'line4')
+        $h1 | Should -Be $h2
+    }
+
+    It 'produces different hash for different files' {
+        $h1 = ConvertTo-ContextHash -FilePath 'src/A.cs' -ContextLines @('line1')
+        $h2 = ConvertTo-ContextHash -FilePath 'src/B.cs' -ContextLines @('line1')
+        $h1 | Should -Not -Be $h2
+    }
+
+    It 'handles empty context lines' {
+        $h = ConvertTo-ContextHash -FilePath 'x.cs' -ContextLines @()
+        $h | Should -Not -BeNullOrEmpty
+    }
+}
+
+Describe 'ConvertFrom-SvnUnifiedDiff with DetailLevel' {
+    It 'captures line hashes at DetailLevel 1' {
+        $diff = @"
+Index: trunk/src/Main.cs
+===================================================================
+--- trunk/src/Main.cs	(revision 9)
++++ trunk/src/Main.cs	(revision 10)
+@@ -10,2 +10,3 @@
+ context line
+-old line
++new line
++extra line
+"@
+        $parsed = ConvertFrom-SvnUnifiedDiff -DiffText $diff -DetailLevel 1
+        $stat = $parsed['trunk/src/Main.cs']
+        $stat.AddedLines | Should -Be 2
+        $stat.DeletedLines | Should -Be 1
+        $stat.AddedLineHashes.Count | Should -Be 2
+        $stat.DeletedLineHashes.Count | Should -Be 1
+    }
+
+    It 'captures context hash on hunks at DetailLevel 1' {
+        $diff = @"
+Index: trunk/src/Main.cs
+===================================================================
+--- trunk/src/Main.cs	(revision 9)
++++ trunk/src/Main.cs	(revision 10)
+@@ -10,4 +10,5 @@
+ context1
+ context2
++added
+ context3
+ context4
+"@
+        $parsed = ConvertFrom-SvnUnifiedDiff -DiffText $diff -DetailLevel 1
+        $hunk = $parsed['trunk/src/Main.cs'].Hunks[0]
+        $hunk.ContextHash | Should -Not -BeNullOrEmpty
+        $hunk.AddedLineHashes.Count | Should -Be 1
+    }
+
+    It 'does not capture hashes at DetailLevel 0' {
+        $diff = @"
+Index: trunk/src/Main.cs
+===================================================================
+--- trunk/src/Main.cs	(revision 9)
++++ trunk/src/Main.cs	(revision 10)
+@@ -10,2 +10,3 @@
+ context
++added
+"@
+        $parsed = ConvertFrom-SvnUnifiedDiff -DiffText $diff -DetailLevel 0
+        $stat = $parsed['trunk/src/Main.cs']
+        $stat.AddedLines | Should -Be 1
+        # AddedLineHashes should be empty at level 0
+        $stat.AddedLineHashes.Count | Should -Be 0
+    }
+}
+
+Describe 'Get-RenameMap' {
+    It 'tracks renames via copyfrom' {
+        $commits = @(
+            [pscustomobject]@{
+                Revision = 10
+                Author = 'alice'
+                ChangedPaths = @(
+                    [pscustomobject]@{ Path='/trunk/NewFile.cs'; Action='A'; CopyFromPath='/trunk/OldFile.cs'; CopyFromRev=9; IsDirectory=$false }
+                )
+            }
+        )
+        $map = Get-RenameMap -Commits $commits
+        $map['trunk/OldFile.cs'] | Should -Be 'trunk/NewFile.cs'
+    }
+
+    It 'chains renames A->B->C' {
+        $commits = @(
+            [pscustomobject]@{
+                Revision = 10
+                Author = 'alice'
+                ChangedPaths = @(
+                    [pscustomobject]@{ Path='/trunk/B.cs'; Action='A'; CopyFromPath='/trunk/A.cs'; CopyFromRev=9; IsDirectory=$false }
+                )
+            },
+            [pscustomobject]@{
+                Revision = 11
+                Author = 'bob'
+                ChangedPaths = @(
+                    [pscustomobject]@{ Path='/trunk/C.cs'; Action='R'; CopyFromPath='/trunk/B.cs'; CopyFromRev=10; IsDirectory=$false }
+                )
+            }
+        )
+        $map = Get-RenameMap -Commits $commits
+        $map['trunk/A.cs'] | Should -Be 'trunk/C.cs'
+        $map['trunk/B.cs'] | Should -Be 'trunk/C.cs'
+    }
+}
+
+Describe 'Get-DeadLineDetail — SelfCancel and CrossRevert' {
+    BeforeAll {
+        # Simulate: alice adds 2 lines in r100, alice deletes 1 in r101, bob deletes 1 in r102
+        $addHash1 = ConvertTo-LineHash -FilePath 'src/A.cs' -Content 'var x = 1;'
+        $addHash2 = ConvertTo-LineHash -FilePath 'src/A.cs' -Content 'var y = 2;'
+
+        $script:ddCommits = @(
+            [pscustomobject]@{
+                Revision = 100
+                Author = 'alice'
+                FilesChanged = @('src/A.cs')
+                FileDiffStats = @{
+                    'src/A.cs' = [pscustomobject]@{
+                        AddedLines = 2; DeletedLines = 0
+                        AddedLineHashes = @($addHash1, $addHash2)
+                        DeletedLineHashes = @()
+                        Hunks = @()
+                        IsBinary = $false
+                    }
+                }
+            },
+            [pscustomobject]@{
+                Revision = 101
+                Author = 'alice'
+                FilesChanged = @('src/A.cs')
+                FileDiffStats = @{
+                    'src/A.cs' = [pscustomobject]@{
+                        AddedLines = 0; DeletedLines = 1
+                        AddedLineHashes = @()
+                        DeletedLineHashes = @($addHash1)
+                        Hunks = @()
+                        IsBinary = $false
+                    }
+                }
+            },
+            [pscustomobject]@{
+                Revision = 102
+                Author = 'bob'
+                FilesChanged = @('src/A.cs')
+                FileDiffStats = @{
+                    'src/A.cs' = [pscustomobject]@{
+                        AddedLines = 0; DeletedLines = 1
+                        AddedLineHashes = @()
+                        DeletedLineHashes = @($addHash2)
+                        Hunks = @()
+                        IsBinary = $false
+                    }
+                }
+            }
+        )
+        $script:revMap = @{ 100 = 'alice'; 101 = 'alice'; 102 = 'bob' }
+    }
+
+    It 'counts SelfCancel correctly' {
+        $result = Get-DeadLineDetail -Commits $script:ddCommits -RevToAuthor $script:revMap -DetailLevel 1
+        $result.AuthorSelfCancel['alice'] | Should -Be 1
+    }
+
+    It 'counts CrossRevert correctly' {
+        $result = Get-DeadLineDetail -Commits $script:ddCommits -RevToAuthor $script:revMap -DetailLevel 1
+        $result.AuthorCrossRevert['alice'] | Should -Be 1
+    }
+
+    It 'counts RemovedByOthers correctly' {
+        $result = Get-DeadLineDetail -Commits $script:ddCommits -RevToAuthor $script:revMap -DetailLevel 1
+        $result.AuthorRemovedByOthers['alice'] | Should -Be 1
+    }
+
+    It 'counts file-level SelfCancel' {
+        $result = Get-DeadLineDetail -Commits $script:ddCommits -RevToAuthor $script:revMap -DetailLevel 1
+        $result.FileSelfCancel['src/A.cs'] | Should -Be 1
+    }
+
+    It 'counts file-level CrossRevert' {
+        $result = Get-DeadLineDetail -Commits $script:ddCommits -RevToAuthor $script:revMap -DetailLevel 1
+        $result.FileCrossRevert['src/A.cs'] | Should -Be 1
+    }
+}
+
+Describe 'Get-DeadLineDetail — Internal Move Detection' {
+    It 'detects file-internal moves at DetailLevel 2' {
+        $moveHash = ConvertTo-LineHash -FilePath 'src/A.cs' -Content 'public void DoWork()'
+
+        $commits = @(
+            [pscustomobject]@{
+                Revision = 200
+                Author = 'alice'
+                FilesChanged = @('src/A.cs')
+                FileDiffStats = @{
+                    'src/A.cs' = [pscustomobject]@{
+                        AddedLines = 1; DeletedLines = 1
+                        AddedLineHashes = @($moveHash)
+                        DeletedLineHashes = @($moveHash)
+                        Hunks = @()
+                        IsBinary = $false
+                    }
+                }
+            }
+        )
+        $result = Get-DeadLineDetail -Commits $commits -RevToAuthor @{ 200 = 'alice' } -DetailLevel 2
+        $result.FileInternalMoveCount['src/A.cs'] | Should -Be 1
+        $result.AuthorInternalMoveCount['alice'] | Should -Be 1
+    }
+}
+
+Describe 'Get-DeadLineDetail — Rename tracking' {
+    It 'tracks line hashes across renames' {
+        $lineHash = ConvertTo-LineHash -FilePath 'src/New.cs' -Content 'important code'
+
+        $commits = @(
+            [pscustomobject]@{
+                Revision = 300
+                Author = 'alice'
+                FilesChanged = @('src/Old.cs')
+                FileDiffStats = @{
+                    'src/Old.cs' = [pscustomobject]@{
+                        AddedLines = 1; DeletedLines = 0
+                        AddedLineHashes = @($lineHash)
+                        DeletedLineHashes = @()
+                        Hunks = @(); IsBinary = $false
+                    }
+                }
+            },
+            [pscustomobject]@{
+                Revision = 301
+                Author = 'bob'
+                FilesChanged = @('src/New.cs')
+                FileDiffStats = @{
+                    'src/New.cs' = [pscustomobject]@{
+                        AddedLines = 0; DeletedLines = 1
+                        AddedLineHashes = @()
+                        DeletedLineHashes = @($lineHash)
+                        Hunks = @(); IsBinary = $false
+                    }
+                }
+            }
+        )
+        $renameMap = @{ 'src/Old.cs' = 'src/New.cs' }
+        $result = Get-DeadLineDetail -Commits $commits -RevToAuthor @{ 300 = 'alice'; 301 = 'bob' } -DetailLevel 1 -RenameMap $renameMap
+        $result.AuthorCrossRevert['alice'] | Should -Be 1
+    }
+}
+
+Describe 'Get-DeadLineDetail — PingPong and RepeatedHunkEdits' {
+    It 'detects ping-pong pattern A-B-A' {
+        $ctxHash = ConvertTo-ContextHash -FilePath 'src/X.cs' -ContextLines @('ctx1', 'ctx2', 'ctx3')
+
+        $commits = @(
+            [pscustomobject]@{
+                Revision = 400
+                Author = 'alice'
+                FilesChanged = @('src/X.cs')
+                FileDiffStats = @{
+                    'src/X.cs' = [pscustomobject]@{
+                        AddedLines = 1; DeletedLines = 0
+                        AddedLineHashes = @(); DeletedLineHashes = @()
+                        Hunks = @([pscustomobject]@{
+                            OldStart = 10; OldCount = 3; NewStart = 10; NewCount = 4
+                            ContextHash = $ctxHash
+                            AddedLineHashes = @(); DeletedLineHashes = @()
+                        })
+                        IsBinary = $false
+                    }
+                }
+            },
+            [pscustomobject]@{
+                Revision = 401
+                Author = 'bob'
+                FilesChanged = @('src/X.cs')
+                FileDiffStats = @{
+                    'src/X.cs' = [pscustomobject]@{
+                        AddedLines = 1; DeletedLines = 1
+                        AddedLineHashes = @(); DeletedLineHashes = @()
+                        Hunks = @([pscustomobject]@{
+                            OldStart = 10; OldCount = 4; NewStart = 10; NewCount = 4
+                            ContextHash = $ctxHash
+                            AddedLineHashes = @(); DeletedLineHashes = @()
+                        })
+                        IsBinary = $false
+                    }
+                }
+            },
+            [pscustomobject]@{
+                Revision = 402
+                Author = 'alice'
+                FilesChanged = @('src/X.cs')
+                FileDiffStats = @{
+                    'src/X.cs' = [pscustomobject]@{
+                        AddedLines = 1; DeletedLines = 1
+                        AddedLineHashes = @(); DeletedLineHashes = @()
+                        Hunks = @([pscustomobject]@{
+                            OldStart = 10; OldCount = 4; NewStart = 10; NewCount = 4
+                            ContextHash = $ctxHash
+                            AddedLineHashes = @(); DeletedLineHashes = @()
+                        })
+                        IsBinary = $false
+                    }
+                }
+            }
+        )
+        $result = Get-DeadLineDetail -Commits $commits -RevToAuthor @{ 400='alice'; 401='bob'; 402='alice' } -DetailLevel 2
+        $result.AuthorPingPong['alice'] | Should -Be 1
+        $result.FilePingPong['src/X.cs'] | Should -Be 1
+    }
+
+    It 'counts repeated hunk edits by same author' {
+        $ctxHash = ConvertTo-ContextHash -FilePath 'src/Y.cs' -ContextLines @('c1', 'c2', 'c3')
+
+        $commits = @(
+            [pscustomobject]@{
+                Revision = 500
+                Author = 'alice'
+                FilesChanged = @('src/Y.cs')
+                FileDiffStats = @{
+                    'src/Y.cs' = [pscustomobject]@{
+                        AddedLines = 1; DeletedLines = 0
+                        AddedLineHashes = @(); DeletedLineHashes = @()
+                        Hunks = @([pscustomobject]@{
+                            OldStart = 1; OldCount = 3; NewStart = 1; NewCount = 4
+                            ContextHash = $ctxHash
+                            AddedLineHashes = @(); DeletedLineHashes = @()
+                        })
+                        IsBinary = $false
+                    }
+                }
+            },
+            [pscustomobject]@{
+                Revision = 501
+                Author = 'alice'
+                FilesChanged = @('src/Y.cs')
+                FileDiffStats = @{
+                    'src/Y.cs' = [pscustomobject]@{
+                        AddedLines = 1; DeletedLines = 1
+                        AddedLineHashes = @(); DeletedLineHashes = @()
+                        Hunks = @([pscustomobject]@{
+                            OldStart = 1; OldCount = 4; NewStart = 1; NewCount = 4
+                            ContextHash = $ctxHash
+                            AddedLineHashes = @(); DeletedLineHashes = @()
+                        })
+                        IsBinary = $false
+                    }
+                }
+            },
+            [pscustomobject]@{
+                Revision = 502
+                Author = 'alice'
+                FilesChanged = @('src/Y.cs')
+                FileDiffStats = @{
+                    'src/Y.cs' = [pscustomobject]@{
+                        AddedLines = 1; DeletedLines = 1
+                        AddedLineHashes = @(); DeletedLineHashes = @()
+                        Hunks = @([pscustomobject]@{
+                            OldStart = 1; OldCount = 4; NewStart = 1; NewCount = 4
+                            ContextHash = $ctxHash
+                            AddedLineHashes = @(); DeletedLineHashes = @()
+                        })
+                        IsBinary = $false
+                    }
+                }
+            }
+        )
+        $result = Get-DeadLineDetail -Commits $commits -RevToAuthor @{ 500='alice'; 501='alice'; 502='alice' } -DetailLevel 2
+        # alice edits the same hunk 3 times => repeated = 3-1 = 2
+        $result.AuthorRepeatedHunk['alice'] | Should -Be 2
+        $result.FileRepeatedHunk['src/Y.cs'] | Should -Be 2
+    }
+}
+
+Describe 'NarutoCode.ps1 parameter definition — Phase 2' {
+    BeforeAll {
+        $script:cmd = Get-Command $script:ScriptPath
+    }
+
+    It 'has DeadDetailLevel parameter with range 0-2' {
+        $script:cmd.Parameters['DeadDetailLevel'] | Should -Not -BeNullOrEmpty
+        $script:cmd.Parameters['DeadDetailLevel'].ParameterType.Name | Should -Be 'Int32'
+    }
+}
