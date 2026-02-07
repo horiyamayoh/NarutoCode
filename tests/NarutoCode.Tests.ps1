@@ -1,366 +1,287 @@
 ﻿<#
 .SYNOPSIS
-NarutoCode.ps1 のユニットテスト (Pester 5.x)
-
-.DESCRIPTION
-SVN が存在しない環境でも動作するテストです。
-スクリプト内部のヘルパー関数を dot-source で読み込み、
-純粋ロジック部分を検証します。
+Pester tests for NarutoCode Phase 1.
 #>
 
 BeforeAll {
     $here = Split-Path -Parent $PSCommandPath
     $script:ScriptPath = Join-Path (Join-Path $here '..') 'NarutoCode.ps1'
 
-    # スクリプト内の関数だけを読み込む:
-    # # region Utility ～ # endregion Utility を抽出して dot-source する
     $scriptContent = Get-Content -Path $script:ScriptPath -Raw -Encoding UTF8
-
     $regionPattern = '(?s)(# region Utility.*?# endregion Utility)'
     if ($scriptContent -match $regionPattern) {
         $functionBlock = $Matches[1]
         $script:SvnExecutable = 'svn'
-        $tempFile = Join-Path $env:TEMP 'NarutoCode_functions_test.ps1'
+        $script:SvnGlobalArguments = @()
+        $tempFile = Join-Path $env:TEMP ('NarutoCode_functions_' + [guid]::NewGuid().ToString('N') + '.ps1')
         Set-Content -Path $tempFile -Value $functionBlock -Encoding UTF8
         . $tempFile
         Remove-Item $tempFile -ErrorAction SilentlyContinue
     }
     else {
-        throw "Could not extract function definitions from NarutoCode.ps1."
+        throw 'Could not extract utility functions from NarutoCode.ps1.'
     }
 }
 
-# ============================================================
-# ConvertTo-NormalizedExtension
-# ============================================================
 Describe 'ConvertTo-NormalizedExtension' {
-
-    It '空配列を渡すと空配列を返す' {
-        $result = ConvertTo-NormalizedExtension -Extensions @()
-        $result | Should -BeNullOrEmpty
+    It 'returns empty for null/empty' {
+        @(ConvertTo-NormalizedExtension -Extensions $null).Count | Should -Be 0
+        @(ConvertTo-NormalizedExtension -Extensions @()).Count | Should -Be 0
     }
 
-    It '$null を渡すと空配列を返す' {
-        $result = ConvertTo-NormalizedExtension -Extensions $null
-        $result | Should -BeNullOrEmpty
-    }
-
-    It 'ドット付き拡張子を正規化する' {
-        $result = @(ConvertTo-NormalizedExtension -Extensions @('.cs', '.PS1', '.txt'))
-        $result -contains 'cs'  | Should -BeTrue
-        $result -contains 'ps1' | Should -BeTrue
-        $result -contains 'txt' | Should -BeTrue
-    }
-
-    It 'ドットなし拡張子もそのまま小文字に変換する' {
-        $result = @(ConvertTo-NormalizedExtension -Extensions @('CS', 'Ps1'))
-        $result -contains 'cs'  | Should -BeTrue
-        $result -contains 'ps1' | Should -BeTrue
-    }
-
-    It '重複を排除する' {
-        $result = @(ConvertTo-NormalizedExtension -Extensions @('.cs', 'cs', '.CS', 'CS'))
-        $result.Count | Should -Be 1
+    It 'normalizes dot and case' {
+        $result = @(ConvertTo-NormalizedExtension -Extensions @('.CS', 'Ps1', '.txt'))
         $result -contains 'cs' | Should -BeTrue
-    }
-
-    It '空白文字列やスペースのみの要素を無視する' {
-        $result = @(ConvertTo-NormalizedExtension -Extensions @('cs', '', '  ', 'txt'))
-        $result.Count | Should -Be 2
-        $result -contains 'cs'  | Should -BeTrue
+        $result -contains 'ps1' | Should -BeTrue
         $result -contains 'txt' | Should -BeTrue
     }
 
-    It 'ドットだけの文字列を無視する' {
-        $result = ConvertTo-NormalizedExtension -Extensions @('.')
-        $result | Should -BeNullOrEmpty
+    It 'removes duplicates' {
+        $result = @(ConvertTo-NormalizedExtension -Extensions @('cs', '.cs', 'CS'))
+        $result.Count | Should -Be 1
     }
 }
 
-# ============================================================
-# Test-ShouldCountFile
-# ============================================================
 Describe 'Test-ShouldCountFile' {
-
-    Context 'フィルタなし（全ファイル対象）' {
-
-        It '通常のファイルは $true を返す' {
-            Test-ShouldCountFile -FilePath 'src/main.cs' | Should -BeTrue
-        }
-
-        It '拡張子なしファイルも $true を返す' {
-            Test-ShouldCountFile -FilePath 'Makefile' | Should -BeTrue
-        }
+    It 'applies include extension' {
+        Test-ShouldCountFile -FilePath 'src/a.cs' -IncludeExt @('cs') | Should -BeTrue
+        Test-ShouldCountFile -FilePath 'src/a.java' -IncludeExt @('cs') | Should -BeFalse
     }
 
-    Context 'IncludeExtensions のみ指定' {
-
-        It '含まれる拡張子のファイルは $true を返す' {
-            Test-ShouldCountFile -FilePath 'src/main.cs' -IncludeExt @('cs') | Should -BeTrue
-        }
-
-        It '含まれない拡張子のファイルは $false を返す' {
-            Test-ShouldCountFile -FilePath 'src/main.java' -IncludeExt @('cs') | Should -BeFalse
-        }
-
-        It '拡張子なしファイルは $false を返す' {
-            Test-ShouldCountFile -FilePath 'Makefile' -IncludeExt @('cs') | Should -BeFalse
-        }
+    It 'applies exclude extension' {
+        Test-ShouldCountFile -FilePath 'src/a.cs' -ExcludeExt @('cs') | Should -BeFalse
+        Test-ShouldCountFile -FilePath 'src/a.java' -ExcludeExt @('cs') | Should -BeTrue
     }
 
-    Context 'ExcludeExtensions のみ指定' {
-
-        It '除外拡張子のファイルは $false を返す' {
-            Test-ShouldCountFile -FilePath 'src/main.designer.cs' -ExcludeExt @('cs') | Should -BeFalse
-        }
-
-        It '除外でない拡張子のファイルは $true を返す' {
-            Test-ShouldCountFile -FilePath 'src/main.java' -ExcludeExt @('cs') | Should -BeTrue
-        }
-
-        It '拡張子なしファイルは $true を返す' {
-            Test-ShouldCountFile -FilePath 'Makefile' -ExcludeExt @('cs') | Should -BeTrue
-        }
-    }
-
-    Context 'ExcludePaths 指定' {
-
-        It 'ワイルドカードに一致するパスは $false を返す' {
-            Test-ShouldCountFile -FilePath 'src/Generated/Model.cs' -ExcludePathPatterns @('*Generated*') | Should -BeFalse
-        }
-
-        It 'ワイルドカードに一致しないパスは $true を返す' {
-            Test-ShouldCountFile -FilePath 'src/Services/Service.cs' -ExcludePathPatterns @('*Generated*') | Should -BeTrue
-        }
-
-        It '*.min.js パターンで minified ファイルを除外する' {
-            Test-ShouldCountFile -FilePath 'wwwroot/app.min.js' -ExcludePathPatterns @('*.min.js') | Should -BeFalse
-        }
-    }
-
-    Context 'Include と Exclude の組み合わせ' {
-
-        It 'Include に含まれ Exclude にも含まれる場合は $false を返す' {
-            Test-ShouldCountFile -FilePath 'test.cs' -IncludeExt @('cs','txt') -ExcludeExt @('cs') | Should -BeFalse
-        }
-
-        It 'Include に含まれ Exclude に含まれない場合は $true を返す' {
-            Test-ShouldCountFile -FilePath 'test.txt' -IncludeExt @('cs','txt') -ExcludeExt @('cs') | Should -BeTrue
-        }
-    }
-
-    Context 'ExcludePaths と拡張子フィルタの組み合わせ' {
-
-        It 'パス除外が優先される' {
-            Test-ShouldCountFile -FilePath 'Generated/code.cs' -IncludeExt @('cs') -ExcludePathPatterns @('Generated/*') | Should -BeFalse
-        }
-
-        It 'パスが一致しなければ拡張子フィルタが適用される' {
-            Test-ShouldCountFile -FilePath 'src/code.cs' -IncludeExt @('cs') -ExcludePathPatterns @('Generated/*') | Should -BeTrue
-        }
+    It 'applies include and exclude path patterns' {
+        Test-ShouldCountFile -FilePath 'src/generated/a.cs' -IncludePathPatterns @('src/*') -ExcludePathPatterns @('*generated*') | Should -BeFalse
+        Test-ShouldCountFile -FilePath 'src/core/a.cs' -IncludePathPatterns @('src/*') -ExcludePathPatterns @('*generated*') | Should -BeTrue
     }
 }
 
-# ============================================================
-# ConvertFrom-SvnXmlText
-# ============================================================
-Describe 'ConvertFrom-SvnXmlText' {
-
-    It '正常な XML をパースできる' {
-        $xml = ConvertFrom-SvnXmlText -Text '<?xml version="1.0"?><log><logentry revision="100"><author>user1</author><date>2025-01-01T00:00:00Z</date><msg>test commit</msg></logentry></log>'
-        $xml | Should -Not -BeNullOrEmpty
-        $xml.log.logentry.revision | Should -Be '100'
-        $xml.log.logentry.author | Should -Be 'user1'
+Describe 'Parse-SvnLogXml' {
+    It 'parses revisions, actions, and copyfrom metadata' {
+        $xml = @"
+<log>
+  <logentry revision="10">
+    <author>alice</author>
+    <date>2026-01-01T00:00:00Z</date>
+    <msg>init</msg>
+    <paths>
+      <path action="M">/trunk/src/Main.cs</path>
+      <path action="R" copyfrom-path="/branches/old/Util.cs" copyfrom-rev="9">/trunk/src/Util.cs</path>
+    </paths>
+  </logentry>
+</log>
+"@
+        $commits = @(Parse-SvnLogXml -XmlText $xml)
+        $commits.Count | Should -Be 1
+        $commits[0].Revision | Should -Be 10
+        $commits[0].ChangedPaths.Count | Should -Be 2
+        $commits[0].ChangedPaths[1].Action | Should -Be 'R'
+        $commits[0].ChangedPaths[1].CopyFromRev | Should -Be 9
     }
 
-    It 'XML の前に警告テキストがあってもパースできる' {
-        $text = "WARNING: some svn warning`n<?xml version=""1.0""?><log><logentry revision=""200""><author>dev</author><date>2025-06-01T00:00:00Z</date><msg>fix</msg></logentry></log>"
-        $xml = ConvertFrom-SvnXmlText -Text $text
-        $xml.log.logentry.revision | Should -Be '200'
-    }
-
-    It 'log タグから始まる場合もパースできる' {
-        $xml = ConvertFrom-SvnXmlText -Text '<log><logentry revision="300"><author>admin</author><date>2025-01-01T00:00:00Z</date><msg>init</msg></logentry></log>'
-        $xml.log.logentry.revision | Should -Be '300'
-    }
-
-    It 'info タグで始まる XML もパースできる' {
-        $xml = ConvertFrom-SvnXmlText -Text '<info><entry revision="1"><url>http://example.com/svn</url></entry></info>'
-        $xml.info.entry.url | Should -Be 'http://example.com/svn'
-    }
-
-    It '不正な XML はエラーを投げる' {
-        { ConvertFrom-SvnXmlText -Text 'this is not xml at all' } | Should -Throw
-    }
-}
-
-# ============================================================
-# Write-FileIfRequested
-# ============================================================
-Describe 'Write-FileIfRequested' {
-
-    It 'ファイルに内容を書き込める' {
-        $tempPath = Join-Path $env:TEMP ('naruto_test_' + [guid]::NewGuid().ToString('N') + '.txt')
-        try {
-            Write-FileIfRequested -FilePath $tempPath -Content 'Hello World'
-            Test-Path $tempPath | Should -BeTrue
-            (Get-Content $tempPath -Raw).Trim() | Should -Be 'Hello World'
-        }
-        finally {
-            Remove-Item $tempPath -ErrorAction SilentlyContinue
-        }
-    }
-
-    It '存在しないディレクトリを自動作成する' {
-        $tempDir = Join-Path $env:TEMP ('naruto_test_' + [guid]::NewGuid().ToString('N'))
-        $tempPath = Join-Path (Join-Path $tempDir 'sub') 'output.txt'
-        try {
-            Write-FileIfRequested -FilePath $tempPath -Content 'nested content'
-            Test-Path $tempPath | Should -BeTrue
-            (Get-Content $tempPath -Raw).Trim() | Should -Be 'nested content'
-        }
-        finally {
-            Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
-        }
+    It 'uses (unknown) for missing author' {
+        $xml = @"
+<log>
+  <logentry revision="11">
+    <date>2026-01-02T00:00:00Z</date>
+    <msg>no author</msg>
+    <paths><path action="A">/trunk/readme.md</path></paths>
+  </logentry>
+</log>
+"@
+        $commits = @(Parse-SvnLogXml -XmlText $xml)
+        $commits[0].Author | Should -Be '(unknown)'
     }
 }
 
-# ============================================================
-# Invoke-SvnCommand (実在コマンドで代替テスト)
-# ============================================================
-Describe 'Invoke-SvnCommand' {
-
-    It 'プロセス正常終了時に stdout を返す' {
-        $script:SvnExecutable = 'powershell'
-        try {
-            $result = Invoke-SvnCommand -Arguments @('-Command', '"Write-Output hello"') -ErrorContext 'test'
-            $result.Trim() | Should -Be 'hello'
-        }
-        finally {
-            $script:SvnExecutable = 'svn'
-        }
+Describe 'Parse-SvnUnifiedDiff' {
+    It 'counts added and deleted lines with hunk metadata' {
+        $diff = @"
+Index: trunk/src/Main.cs
+===================================================================
+--- trunk/src/Main.cs	(revision 9)
++++ trunk/src/Main.cs	(revision 10)
+@@ -10,2 +10,3 @@
+ old
+-new
++new
++extra
+"@
+        $parsed = Parse-SvnUnifiedDiff -DiffText $diff
+        $parsed['trunk/src/Main.cs'].AddedLines | Should -Be 2
+        $parsed['trunk/src/Main.cs'].DeletedLines | Should -Be 1
+        $parsed['trunk/src/Main.cs'].Hunks.Count | Should -Be 1
+        $parsed['trunk/src/Main.cs'].Hunks[0].OldStart | Should -Be 10
     }
 
-    It 'プロセス異常終了時にエラーを投げる' {
-        $script:SvnExecutable = 'powershell'
-        try {
-            { Invoke-SvnCommand -Arguments @('-Command', '"exit 1"') -ErrorContext 'test fail' } | Should -Throw
-        }
-        finally {
-            $script:SvnExecutable = 'svn'
-        }
-    }
-}
-
-# ============================================================
-# Resolve-SvnTargetUrl (URL バリデーション)
-# ============================================================
-Describe 'Resolve-SvnTargetUrl' {
-
-    It 'ローカルパスを指定するとエラーを投げる' {
-        { Resolve-SvnTargetUrl -Target 'C:\work\project' } | Should -Throw
-    }
-
-    It '相対パスを指定するとエラーを投げる' {
-        { Resolve-SvnTargetUrl -Target '.\myrepo' } | Should -Throw
-    }
-
-    It 'UNC パスを指定するとエラーを投げる' {
-        { Resolve-SvnTargetUrl -Target '\\server\share\repo' } | Should -Throw
+    It 'detects binary diff markers' {
+        $diff = @"
+Index: trunk/bin/data.bin
+===================================================================
+Cannot display: file marked as a binary type.
+svn:mime-type = application/octet-stream
+"@
+        $parsed = Parse-SvnUnifiedDiff -DiffText $diff
+        $parsed['trunk/bin/data.bin'].IsBinary | Should -BeTrue
     }
 }
 
-# ============================================================
-# スクリプト パラメータ定義の検証
-# ============================================================
-Describe 'NarutoCode.ps1 パラメータ定義' {
+Describe 'Parse-SvnBlameXml' {
+    It 'parses totals and per-revision/author counts' {
+        $xml = @"
+<blame>
+  <target path="trunk/src/Main.cs">
+    <entry line-number="1"><commit revision="10"><author>alice</author></commit></entry>
+    <entry line-number="2"><commit revision="11"><author>bob</author></commit></entry>
+    <entry line-number="3"><commit revision="10"><author>alice</author></commit></entry>
+  </target>
+</blame>
+"@
+        $summary = Parse-SvnBlameXml -XmlText $xml
+        $summary.LineCountTotal | Should -Be 3
+        $summary.LineCountByRevision[10] | Should -Be 2
+        $summary.LineCountByAuthor['alice'] | Should -Be 2
+    }
+}
 
+Describe 'Metrics functions' {
+    BeforeAll {
+        $script:mockCommits = @(
+            [pscustomobject]@{
+                Revision = 1
+                Author = 'alice'
+                Date = [datetime]'2026-01-01'
+                Message = 'fix #123'
+                ChangedPathsFiltered = @(
+                    [pscustomobject]@{ Path='src/A.cs'; Action='M' },
+                    [pscustomobject]@{ Path='src/B.cs'; Action='A' }
+                )
+                FileDiffStats = @{
+                    'src/A.cs' = [pscustomobject]@{ AddedLines=3; DeletedLines=1; Hunks=@(); IsBinary=$false }
+                    'src/B.cs' = [pscustomobject]@{ AddedLines=2; DeletedLines=0; Hunks=@(); IsBinary=$false }
+                }
+                FilesChanged = @('src/A.cs','src/B.cs')
+                AddedLines = 5
+                DeletedLines = 1
+                Churn = 6
+                Entropy = 0.9
+                MsgLen = 8
+                MessageShort = 'fix #123'
+            },
+            [pscustomobject]@{
+                Revision = 2
+                Author = 'bob'
+                Date = [datetime]'2026-01-02'
+                Message = 'merge branch'
+                ChangedPathsFiltered = @([pscustomobject]@{ Path='src/A.cs'; Action='M' })
+                FileDiffStats = @{ 'src/A.cs' = [pscustomobject]@{ AddedLines=1; DeletedLines=2; Hunks=@(); IsBinary=$false } }
+                FilesChanged = @('src/A.cs')
+                AddedLines = 1
+                DeletedLines = 2
+                Churn = 3
+                Entropy = 0.0
+                MsgLen = 12
+                MessageShort = 'merge branch'
+            }
+        )
+    }
+
+    It 'computes committer metrics' {
+        $rows = @(Compute-CommitterMetrics -Commits $script:mockCommits)
+        $alice = $rows | Where-Object { $_.Author -eq 'alice' }
+        $alice.CommitCount | Should -Be 1
+        $alice.AddedLines | Should -Be 5
+        $alice.ActionAddCount | Should -Be 1
+        $alice.IssueIdMentionCount | Should -Be 1
+    }
+
+    It 'computes file metrics and hotspot rank' {
+        $rows = @(Compute-FileMetrics -Commits $script:mockCommits)
+        $a = $rows | Where-Object { $_.FilePath -eq 'src/A.cs' }
+        $a.FileCommitCount | Should -Be 2
+        $a.FileAuthors | Should -Be 2
+        $a.HotspotScore | Should -Be 14
+    }
+
+    It 'computes co-change metrics' {
+        $rows = @(Compute-CoChangeMetrics -Commits $script:mockCommits -TopNCount 10)
+        $rows.Count | Should -Be 1
+        $rows[0].FileA | Should -Be 'src/A.cs'
+        $rows[0].FileB | Should -Be 'src/B.cs'
+        $rows[0].CoChangeCount | Should -Be 1
+    }
+}
+Describe 'NarutoCode.ps1 parameter definition' {
     BeforeAll {
         $script:cmd = Get-Command $script:ScriptPath
     }
 
-    It 'Path パラメータが必須である' {
-        $param = $script:cmd.Parameters['Path']
-        $param | Should -Not -BeNullOrEmpty
-        $mandatoryAttr = $param.Attributes | Where-Object { $_ -is [System.Management.Automation.ParameterAttribute] }
-        $mandatoryAttr.Mandatory | Should -BeTrue
+    It 'has required RepoUrl/FromRev/ToRev with compatibility aliases' {
+        $script:cmd.Parameters['RepoUrl'] | Should -Not -BeNullOrEmpty
+        $script:cmd.Parameters['RepoUrl'].Aliases -contains 'Path' | Should -BeTrue
+
+        $script:cmd.Parameters['FromRev'] | Should -Not -BeNullOrEmpty
+        $script:cmd.Parameters['FromRev'].Aliases -contains 'FromRevision' | Should -BeTrue
+        $script:cmd.Parameters['FromRev'].Aliases -contains 'From' | Should -BeTrue
+
+        $script:cmd.Parameters['ToRev'] | Should -Not -BeNullOrEmpty
+        $script:cmd.Parameters['ToRev'].Aliases -contains 'ToRevision' | Should -BeTrue
+        $script:cmd.Parameters['ToRev'].Aliases -contains 'To' | Should -BeTrue
     }
 
-    It 'FromRevision パラメータが必須である' {
-        $param = $script:cmd.Parameters['FromRevision']
-        $param | Should -Not -BeNullOrEmpty
-        $mandatoryAttr = $param.Attributes | Where-Object { $_ -is [System.Management.Automation.ParameterAttribute] }
-        $mandatoryAttr.Mandatory | Should -BeTrue
+    It 'contains new Phase 1 parameters' {
+        $names = @('OutDir','Username','Password','NonInteractive','TrustServerCert','NoBlame','Parallel','IncludePaths','EmitPlantUml','TopN','Encoding')
+        foreach ($name in $names) {
+            $script:cmd.Parameters[$name] | Should -Not -BeNullOrEmpty
+        }
+        $script:cmd.Parameters['Password'].ParameterType.Name | Should -Be 'SecureString'
+        $script:cmd.Parameters['NonInteractive'].ParameterType.Name | Should -Be 'SwitchParameter'
+        $script:cmd.Parameters['Parallel'].ParameterType.Name | Should -Be 'Int32'
     }
+}
 
-    It 'ToRevision パラメータが必須である' {
-        $param = $script:cmd.Parameters['ToRevision']
-        $param | Should -Not -BeNullOrEmpty
-        $mandatoryAttr = $param.Attributes | Where-Object { $_ -is [System.Management.Automation.ParameterAttribute] }
-        $mandatoryAttr.Mandatory | Should -BeTrue
-    }
-
-    It 'FromRevision のエイリアスに Pre, Start, StartRevision, From がある' {
-        $aliases = $script:cmd.Parameters['FromRevision'].Aliases
-        $aliases -contains 'Pre'           | Should -BeTrue
-        $aliases -contains 'Start'         | Should -BeTrue
-        $aliases -contains 'StartRevision' | Should -BeTrue
-        $aliases -contains 'From'          | Should -BeTrue
-    }
-
-    It 'ToRevision のエイリアスに Post, End, EndRevision, To がある' {
-        $aliases = $script:cmd.Parameters['ToRevision'].Aliases
-        $aliases -contains 'Post'        | Should -BeTrue
-        $aliases -contains 'End'         | Should -BeTrue
-        $aliases -contains 'EndRevision' | Should -BeTrue
-        $aliases -contains 'To'          | Should -BeTrue
-    }
-
-    It 'Author のエイリアスに Name, User がある' {
-        $aliases = $script:cmd.Parameters['Author'].Aliases
-        $aliases -contains 'Name' | Should -BeTrue
-        $aliases -contains 'User' | Should -BeTrue
-    }
-
-    It 'すべてのスイッチパラメータが存在する' {
-        $switches = @('IgnoreSpaceChange','IgnoreAllSpace','IgnoreEolStyle',
-                      'IncludeProperties','ForceBinary','ShowPerRevision','NoProgress')
-        foreach ($s in $switches) {
-            $script:cmd.Parameters[$s] | Should -Not -BeNullOrEmpty
-            $script:cmd.Parameters[$s].ParameterType.Name | Should -Be 'SwitchParameter'
+Describe 'Invoke-SvnCommand' {
+    It 'returns stdout on success' {
+        $script:SvnExecutable = 'powershell'
+        try {
+            $text = Invoke-SvnCommand -Arguments @('-NoProfile','-Command','Write-Output hello') -ErrorContext 'test'
+            $text.Trim() | Should -Be 'hello'
+        }
+        finally {
+            $script:SvnExecutable = 'svn'
         }
     }
 
-    It '配列パラメータ (string[]) が存在する' {
-        $arrays = @('IncludeExtensions','ExcludeExtensions','ExcludePaths')
-        foreach ($a in $arrays) {
-            $script:cmd.Parameters[$a] | Should -Not -BeNullOrEmpty
-            $script:cmd.Parameters[$a].ParameterType.Name | Should -Be 'String[]'
+    It 'throws on non-zero exit code' {
+        $script:SvnExecutable = 'powershell'
+        try {
+            { Invoke-SvnCommand -Arguments @('-NoProfile','-Command','exit 1') -ErrorContext 'test fail' } | Should -Throw
         }
-    }
-
-    It '出力パラメータ (string) が存在する' {
-        $outputs = @('OutputCsv','OutputJson','OutputMarkdown')
-        foreach ($o in $outputs) {
-            $script:cmd.Parameters[$o] | Should -Not -BeNullOrEmpty
-            $script:cmd.Parameters[$o].ParameterType.Name | Should -Be 'String'
+        finally {
+            $script:SvnExecutable = 'svn'
         }
     }
 }
 
-# ============================================================
-# スクリプト実行: SVN が見つからない場合
-# ============================================================
-Describe 'NarutoCode.ps1 実行テスト' {
-
-    It 'SvnExecutable に存在しないコマンドを指定するとエラーになる' {
-        {
-            & $script:ScriptPath `
-                -Path 'https://svn.example.com/repos/proj/trunk' `
-                -FromRevision 200 -ToRevision 250 `
-                -SvnExecutable 'nonexistent_svn_command_xyz' `
-                -NoProgress `
-                -ErrorAction Stop
-        } | Should -Throw -ExpectedMessage '*not found*'
+Describe 'NarutoCode.ps1 execution' {
+    It 'fails when svn executable does not exist' {
+        $tempOut = Join-Path $env:TEMP ('narutocode_test_' + [guid]::NewGuid().ToString('N'))
+        try {
+            {
+                & $script:ScriptPath `
+                    -RepoUrl 'https://svn.example.com/repos/proj/trunk' `
+                    -FromRev 1 -ToRev 2 `
+                    -OutDir $tempOut `
+                    -SvnExecutable 'nonexistent_svn_command_xyz' `
+                    -NoBlame `
+                    -ErrorAction Stop
+            } | Should -Throw -ExpectedMessage '*not found*'
+        }
+        finally {
+            Remove-Item -Path $tempOut -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 }
