@@ -191,27 +191,27 @@ Describe 'Metrics functions' {
 
     It 'computes committer metrics' {
         $rows = @(Get-CommitterMetric -Commits $script:mockCommits)
-        $alice = $rows | Where-Object { $_.Author -eq 'alice' }
-        $alice.CommitCount | Should -Be 1
-        $alice.AddedLines | Should -Be 5
-        $alice.ActionAddCount | Should -Be 1
-        $alice.IssueIdMentionCount | Should -Be 1
+        $alice = $rows | Where-Object { $_.'作者' -eq 'alice' }
+        $alice.'コミット数' | Should -Be 1
+        $alice.'追加行数' | Should -Be 5
+        $alice.'追加アクション数' | Should -Be 1
+        $alice.'課題ID言及数' | Should -Be 1
     }
 
     It 'computes file metrics and hotspot rank' {
         $rows = @(Get-FileMetric -Commits $script:mockCommits)
-        $a = $rows | Where-Object { $_.FilePath -eq 'src/A.cs' }
-        $a.FileCommitCount | Should -Be 2
-        $a.FileAuthors | Should -Be 2
-        $a.HotspotScore | Should -Be 14
+        $a = $rows | Where-Object { $_.'ファイルパス' -eq 'src/A.cs' }
+        $a.'コミット数' | Should -Be 2
+        $a.'作者数' | Should -Be 2
+        $a.'ホットスポットスコア' | Should -Be 14
     }
 
     It 'computes co-change metrics' {
         $rows = @(Get-CoChangeMetric -Commits $script:mockCommits -TopNCount 10)
         $rows.Count | Should -Be 1
-        $rows[0].FileA | Should -Be 'src/A.cs'
-        $rows[0].FileB | Should -Be 'src/B.cs'
-        $rows[0].CoChangeCount | Should -Be 1
+        $rows[0].'ファイルA' | Should -Be 'src/A.cs'
+        $rows[0].'ファイルB' | Should -Be 'src/B.cs'
+        $rows[0].'共変更回数' | Should -Be 1
     }
 }
 Describe 'NarutoCode.ps1 parameter definition' {
@@ -687,121 +687,121 @@ Describe 'Metrics functions — detailed verification' {
     Context 'Get-CommitterMetric detailed' {
         BeforeAll {
             $script:cRows = @(Get-CommitterMetric -Commits $script:detailedCommits)
-            $script:alice = $script:cRows | Where-Object { $_.Author -eq 'alice' }
-            $script:bob = $script:cRows | Where-Object { $_.Author -eq 'bob' }
+            $script:alice = $script:cRows | Where-Object { $_.'作者' -eq 'alice' }
+            $script:bob = $script:cRows | Where-Object { $_.'作者' -eq 'bob' }
         }
 
         It 'counts commits per author correctly' {
-            $script:alice.CommitCount | Should -Be 2
-            $script:bob.CommitCount | Should -Be 1
+            $script:alice.'コミット数' | Should -Be 2
+            $script:bob.'コミット数' | Should -Be 1
         }
 
         It 'counts active days' {
-            $script:alice.ActiveDays | Should -Be 2  # Jan 1 and Jan 2
-            $script:bob.ActiveDays | Should -Be 1
+            $script:alice.'活動日数' | Should -Be 2  # Jan 1 and Jan 2
+            $script:bob.'活動日数' | Should -Be 1
         }
 
         It 'counts unique files and dirs' {
-            $script:alice.FilesTouched | Should -Be 2   # src/A.cs, src/B.cs
-            $script:alice.DirsTouched | Should -Be 1    # src
+            $script:alice.'変更ファイル数' | Should -Be 2   # src/A.cs, src/B.cs
+            $script:alice.'変更ディレクトリ数' | Should -Be 1    # src
         }
 
         It 'sums added/deleted lines' {
-            $script:alice.AddedLines | Should -Be 18    # 13 + 5
-            $script:alice.DeletedLines | Should -Be 6   # 1 + 5
-            $script:alice.NetLines | Should -Be 12
-            $script:alice.TotalChurn | Should -Be 24
+            $script:alice.'追加行数' | Should -Be 18    # 13 + 5
+            $script:alice.'削除行数' | Should -Be 6   # 1 + 5
+            $script:alice.'純増行数' | Should -Be 12
+            $script:alice.'総チャーン' | Should -Be 24
         }
 
         It 'calculates ChurnPerCommit' {
-            $script:alice.ChurnPerCommit | Should -Be (Get-RoundedNumber -Value (24.0 / 2))
+            $script:alice.'コミットあたりチャーン' | Should -Be (Get-RoundedNumber -Value (24.0 / 2))
         }
 
         It 'calculates DeletedToAddedRatio' {
-            $script:alice.DeletedToAddedRatio | Should -Be (Get-RoundedNumber -Value (6.0 / 18))
+            $script:alice.'削除対追加比' | Should -Be (Get-RoundedNumber -Value (6.0 / 18))
         }
 
         It 'calculates ChurnToNetRatio' {
-            $script:alice.ChurnToNetRatio | Should -Be (Get-RoundedNumber -Value (24.0 / 12))
+            $script:alice.'チャーン対純増比' | Should -Be (Get-RoundedNumber -Value (24.0 / 12))
         }
 
         It 'detects action types' {
-            $script:alice.ActionModCount | Should -Be 2   # M on A.cs in rev1 + M on A.cs in rev2
-            $script:alice.ActionAddCount | Should -Be 1   # A on B.cs in rev1
+            $script:alice.'変更アクション数' | Should -Be 2   # M on A.cs in rev1 + M on A.cs in rev2
+            $script:alice.'追加アクション数' | Should -Be 1   # A on B.cs in rev1
         }
 
         It 'calculates AvgCoAuthorsPerTouchedFile correctly' {
             # src/A.cs is touched by alice & bob => co-authors=1 for alice
             # src/B.cs is touched by alice only => co-authors=0 for alice
             # Average for alice = (1+0)/2 = 0.5
-            $script:alice.AvgCoAuthorsPerTouchedFile | Should -Be 0.5
+            $script:alice.'平均共同作者数' | Should -Be 0.5
         }
 
         It 'detects message keywords' {
-            $script:alice.IssueIdMentionCount | Should -Be 1  # #123
-            $script:alice.FixKeywordCount | Should -Be 1
-            $script:bob.MergeKeywordCount | Should -Be 1
-            $script:bob.IssueIdMentionCount | Should -Be 1    # PROJ-99
+            $script:alice.'課題ID言及数' | Should -Be 1  # #123
+            $script:alice.'修正キーワード数' | Should -Be 1
+            $script:bob.'マージキーワード数' | Should -Be 1
+            $script:bob.'課題ID言及数' | Should -Be 1    # PROJ-99
         }
 
         It 'calculates average message length' {
             # alice: msg lengths are 8 + 8 = 16, avg = 8
-            $script:alice.MsgLenAvgChars | Should -Be 8.0
+            $script:alice.'メッセージ平均文字数' | Should -Be 8.0
         }
     }
 
     Context 'Get-FileMetric detailed' {
         BeforeAll {
             $script:fRows = @(Get-FileMetric -Commits $script:detailedCommits)
-            $script:fileA = $script:fRows | Where-Object { $_.FilePath -eq 'src/A.cs' }
-            $script:fileB = $script:fRows | Where-Object { $_.FilePath -eq 'src/B.cs' }
+            $script:fileA = $script:fRows | Where-Object { $_.'ファイルパス' -eq 'src/A.cs' }
+            $script:fileB = $script:fRows | Where-Object { $_.'ファイルパス' -eq 'src/B.cs' }
         }
 
         It 'counts commits and authors per file' {
-            $script:fileA.FileCommitCount | Should -Be 3   # rev 1, 2, 3
-            $script:fileA.FileAuthors | Should -Be 2       # alice, bob
-            $script:fileB.FileCommitCount | Should -Be 1
-            $script:fileB.FileAuthors | Should -Be 1
+            $script:fileA.'コミット数' | Should -Be 3   # rev 1, 2, 3
+            $script:fileA.'作者数' | Should -Be 2       # alice, bob
+            $script:fileB.'コミット数' | Should -Be 1
+            $script:fileB.'作者数' | Should -Be 1
         }
 
         It 'sums added/deleted lines per file' {
-            $script:fileA.AddedLines | Should -Be 10       # 3 + 5 + 2
-            $script:fileA.DeletedLines | Should -Be 6      # 1 + 5 + 0
-            $script:fileA.NetLines | Should -Be 4
-            $script:fileA.TotalChurn | Should -Be 16
+            $script:fileA.'追加行数' | Should -Be 10       # 3 + 5 + 2
+            $script:fileA.'削除行数' | Should -Be 6      # 1 + 5 + 0
+            $script:fileA.'純増行数' | Should -Be 4
+            $script:fileA.'総チャーン' | Should -Be 16
         }
 
         It 'tracks first and last revision' {
-            $script:fileA.FirstChangeRev | Should -Be 1
-            $script:fileA.LastChangeRev | Should -Be 3
-            $script:fileB.FirstChangeRev | Should -Be 1
-            $script:fileB.LastChangeRev | Should -Be 1
+            $script:fileA.'初回変更リビジョン' | Should -Be 1
+            $script:fileA.'最終変更リビジョン' | Should -Be 3
+            $script:fileB.'初回変更リビジョン' | Should -Be 1
+            $script:fileB.'最終変更リビジョン' | Should -Be 1
         }
 
         It 'calculates HotspotScore = commits * churn' {
-            $script:fileA.HotspotScore | Should -Be (3 * 16)   # 48
-            $script:fileB.HotspotScore | Should -Be (1 * 10)   # 10
+            $script:fileA.'ホットスポットスコア' | Should -Be (3 * 16)   # 48
+            $script:fileB.'ホットスポットスコア' | Should -Be (1 * 10)   # 10
         }
 
         It 'assigns rank by hotspot descending' {
-            $script:fileA.RankByHotspot | Should -BeLessThan $script:fileB.RankByHotspot
+            $script:fileA.'ホットスポット順位' | Should -BeLessThan $script:fileB.'ホットスポット順位'
         }
 
         It 'calculates TopAuthorShareByChurn' {
             # src/A.cs total churn=16, alice churn=14, bob churn=2 => top share = 14/16
             $expected = Get-RoundedNumber -Value (14.0 / 16)
-            $script:fileA.TopAuthorShareByChurn | Should -Be $expected
+            $script:fileA.'最多作者チャーン占有率' | Should -Be $expected
         }
 
         It 'calculates AvgDaysBetweenChanges' {
             # src/A.cs changed on Jan 1, Jan 2, Jan 3 => intervals = 1, 1 => avg = 1.0
-            $script:fileA.AvgDaysBetweenChanges | Should -Be 1.0
+            $script:fileA.'平均変更間隔日数' | Should -Be 1.0
             # src/B.cs changed only once => avg = 0
-            $script:fileB.AvgDaysBetweenChanges | Should -Be 0.0
+            $script:fileB.'平均変更間隔日数' | Should -Be 0.0
         }
 
         It 'counts create/delete/replace actions' {
-            $script:fileB.CreateCount | Should -Be 1   # Action='A' maps to Create
+            $script:fileB.'作成回数' | Should -Be 1   # Action='A' maps to Create
         }
     }
 
@@ -812,22 +812,22 @@ Describe 'Metrics functions — detailed verification' {
 
         It 'finds co-change pairs' {
             $script:coRows.Count | Should -Be 1
-            $script:coRows[0].FileA | Should -Be 'src/A.cs'
-            $script:coRows[0].FileB | Should -Be 'src/B.cs'
-            $script:coRows[0].CoChangeCount | Should -Be 1
+            $script:coRows[0].'ファイルA' | Should -Be 'src/A.cs'
+            $script:coRows[0].'ファイルB' | Should -Be 'src/B.cs'
+            $script:coRows[0].'共変更回数' | Should -Be 1
         }
 
         It 'calculates Jaccard correctly' {
             # A.cs appears in 3 commits, B.cs in 1, co-change=1
             # Jaccard = 1 / (3+1-1) = 1/3
             $expected = Get-RoundedNumber -Value (1.0 / 3)
-            $script:coRows[0].Jaccard | Should -Be $expected
+            $script:coRows[0].'Jaccard' | Should -Be $expected
         }
 
         It 'calculates Lift correctly' {
             # Total commits=3, P(A)=3/3=1, P(B)=1/3, P(AB)=1/3
             # Lift = (1/3) / (1 * 1/3) = 1.0
-            $script:coRows[0].Lift | Should -Be 1.0
+            $script:coRows[0].'リフト値' | Should -Be 1.0
         }
 
         It 'respects TopNCount limit' {
@@ -917,9 +917,9 @@ Describe 'Write-PlantUmlFile' {
     }
 
     It 'creates all three puml files' {
-        $committers = @([pscustomobject]@{ Author='alice'; CommitCount=5; TotalChurn=100 })
-        $files = @([pscustomobject]@{ FilePath='src/A.cs'; RankByHotspot=1; HotspotScore=500 })
-        $couplings = @([pscustomobject]@{ FileA='src/A.cs'; FileB='src/B.cs'; CoChangeCount=3; Jaccard=0.5 })
+        $committers = @([pscustomobject]@{ '作者'='alice'; 'コミット数'=5; '総チャーン'=100 })
+        $files = @([pscustomobject]@{ 'ファイルパス'='src/A.cs'; 'ホットスポット順位'=1; 'ホットスポットスコア'=500 })
+        $couplings = @([pscustomobject]@{ 'ファイルA'='src/A.cs'; 'ファイルB'='src/B.cs'; '共変更回数'=3; 'Jaccard'=0.5 })
 
         Write-PlantUmlFile -OutDirectory $script:pumlDir -Committers $committers -Files $files -Couplings $couplings -TopNCount 50 -EncodingName 'UTF8'
 
@@ -929,7 +929,7 @@ Describe 'Write-PlantUmlFile' {
     }
 
     It 'contributors puml contains @startuml/@enduml and author data' {
-        $committers = @([pscustomobject]@{ Author='bob'; CommitCount=3; TotalChurn=50 })
+        $committers = @([pscustomobject]@{ '作者'='bob'; 'コミット数'=3; '総チャーン'=50 })
         Write-PlantUmlFile -OutDirectory $script:pumlDir -Committers $committers -Files @() -Couplings @() -TopNCount 50 -EncodingName 'UTF8'
 
         $content = Get-Content -Path (Join-Path $script:pumlDir 'contributors_summary.puml') -Raw
@@ -939,7 +939,7 @@ Describe 'Write-PlantUmlFile' {
     }
 
     It 'cochange puml contains network edges' {
-        $couplings = @([pscustomobject]@{ FileA='X.cs'; FileB='Y.cs'; CoChangeCount=2; Jaccard=0.75 })
+        $couplings = @([pscustomobject]@{ 'ファイルA'='X.cs'; 'ファイルB'='Y.cs'; '共変更回数'=2; 'Jaccard'=0.75 })
         Write-PlantUmlFile -OutDirectory $script:pumlDir -Committers @() -Files @() -Couplings $couplings -TopNCount 50 -EncodingName 'UTF8'
 
         $content = Get-Content -Path (Join-Path $script:pumlDir 'cochange_network.puml') -Raw

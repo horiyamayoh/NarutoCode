@@ -171,22 +171,22 @@ PowerShell 内で扱う主要構造（擬似定義）。
 ### 7.1 ベース指標（量・範囲・頻度）
 | 指標 | 定義 | 取得方法 |
 |---|---|---|
-| CommitCount | 対象範囲のコミット数 | log から author で count |
-| ActiveDays | コミットした日数（distinct date） | commit date の日付で distinct |
-| FilesTouched | 触ったユニークファイル数 | diff でファイル集合 |
-| DirsTouched | 触ったユニークディレクトリ数 | path から親 dir 抽出 |
-| AddedLines / DeletedLines | 追加/削除行数合計（テキストのみ） | diff パース（+/- 行数） |
-| NetLines | Added - Deleted | 算術 |
-| TotalChurn | Added + Deleted | 算術 |
-| Avg/MedianCommitChurn | 1コミット当たり churn | per commit churn を統計 |
-| BinaryChangeCount | バイナリ変更ファイル数（合計） | diff バイナリ検出 |
-| ActionsA/M/D/R | A/M/D/R の回数 | log paths action 集計 |
+| コミット数 | 対象範囲のコミット数 | log から author で count |
+| 活動日数 | コミットした日数（distinct date） | commit date の日付で distinct |
+| 変更ファイル数 | 触ったユニークファイル数 | diff でファイル集合 |
+| 変更ディレクトリ数 | 触ったユニークディレクトリ数 | path から親 dir 抽出 |
+| 追加行数 / 削除行数 | 追加/削除行数合計（テキストのみ） | diff パース（+/- 行数） |
+| 純増行数 | 追加行数 - 削除行数 | 算術 |
+| 総チャーン | 追加行数 + 削除行数 | 算術 |
+| Avg/Medianコミットチャーン | 1コミット当たり churn | per commit churn を統計 |
+| バイナリ変更回数 | バイナリ変更ファイル数（合計） | diff バイナリ検出 |
+| アクションA/M/D/R | A/M/D/R の回数 | log paths action 集計 |
 
 ### 7.2 チャーン比（要求：チャーン比）
 **ChurnRatio** を複数形で出す（閾値判定せず数値そのものを提供）：
-- `ChurnPerCommit = TotalChurn / CommitCount`
-- `ChurnToNetRatio = TotalChurn / max(1, abs(NetLines))`（net が小さいと増える傾向を可視化）
-- `DeletedToAddedRatio = DeletedLines / max(1, AddedLines)`
+- `コミットあたりチャーン = 総チャーン / コミット数`
+- `チャーン対純増比 = 総チャーン / max(1, abs(純増行数))`（net が小さいと増える傾向を可視化）
+- `削除対追加比 = 削除行数 / max(1, 追加行数)`
 
 ### 7.3 自己相殺（要求：自己相殺）
 **定義（カウント主体）**
@@ -198,7 +198,7 @@ PowerShell 内で扱う主要構造（擬似定義）。
    - deleted 行の `contentHash`
 2. author ごとに
    - `AddedHashSet[author]` に追加
-   - 同 author の後続 commit で deletedHash が一致したら `SelfCancelLineCount++`
+   - 同 author の後続 commit で deletedHash が一致したら `自己相殺行数++`
 
 **注意**
 - 内容 hash だけだと偶然一致のリスクがあるため、可能なら `filePath + contentHash` でキー化。
@@ -220,7 +220,7 @@ PowerShell 内で扱う主要構造（擬似定義）。
 **算出**
 - `EditCountByAuthorHunk[author, file, ContextHash]++`
 - コミッター指標としては
-  - `RepeatedSameHunkEdits = Σ max(0, count-1)`（同一 hunk を2回以上触った「追加分」）
+  - `同一箇所反復編集数 = Σ max(0, count-1)`（同一 hunk を2回以上触った「追加分」）
   - または `SameHunkEditEvents = Σ count`（単純回数）
 
 ### 7.5 反転・往復（要求：反転・往復）
@@ -228,15 +228,15 @@ PowerShell 内で扱う主要構造（擬似定義）。
 
 **A) 反転（Self Revert / Cross Revert）**
 - ある commit で追加した行 hash が、後続 commit で削除される
-  - 同 author → SelfRevertLines（自己反転）
-  - 別 author → CrossRevertLines（他者による反転）
+  - 同 author → 自己差戻行数（自己反転）
+  - 別 author → 他者差戻行数（他者による反転）
 
 **B) 往復（Ping-Pong）**
 - 同一 hunk（ContextHash）に対し、author が **A→B→A** の順に編集イベントが発生した回数
 
 算出（hunk 時系列）：
 - `events = [(rev, author)]` を hunk ごとに並べ
-- 3 連続ウィンドウで `a!=b && a==c` を検出 → `PingPongCount++`
+- 3 連続ウィンドウで `a!=b && a==c` を検出 → `ピンポン回数++`
 
 > 閾値不要（回数のみ）。
 
@@ -246,24 +246,24 @@ PowerShell 内で扱う主要構造（擬似定義）。
 **(1) diff 追跡による「自分が追加→他人が削除」量**
 - `AddedBy(author, file, hash)` を記録
 - 後続 commit の deleted hash が一致し、削除者が別 author なら
-  - `RemovedByOthersLines(author)++`
+  - `被他者削除行数(author)++`
 
 **(2) blame による ToRev 時点の所有行（ownership）からの差分**
 - `SurvivedLines(author)`（後述）を計測
 - `AddedLines(author) - SurvivedLines(author)` を「生存しなかった追加」の近似
   - 誰が消したかは不明だが「他人に修正された/自分で消した」を含む
-  - ここは補助指標として `DeadAddedLinesApprox` として出す
+  - ここは補助指標として `消滅追加行数 (概算)` として出す
 
 ### 7.7 ToRev まで生き残った物量 / 結局消えた物量（要求）
-**(a) SurvivedLinesToToRev（生存量）**
+**(a) 生存行数（生存量）**
 - 対象範囲の各 revision に対して、ToRev 時点で blame がその revision を指している行数をカウント
 - author に紐付ける：`surviveLines(author) += surviveLines(rev)`
 
 **(b) DeadLinesByToRev（結局消えた量）**
-- `DeadAddedLines = AddedLines - SurvivedLines`（大まかな近似）
-- さらに `SelfCancelLineCount` を持っていれば内訳化可能：
-  - `DeadBySelf = min(SelfCancelLineCount, DeadAddedLines)`
-  - `DeadByOthersApprox = max(0, DeadAddedLines - DeadBySelf)`
+- `消滅追加行数 (概算) = 追加行数 - 生存行数`（大まかな近似）
+- さらに `自己相殺行数` を持っていれば内訳化可能：
+  - `自己消滅行数 (概算) = min(自己相殺行数, 消滅追加行数 (概算))`
+  - `被他者消滅行数 (概算) = max(0, 消滅追加行数 (概算) - 自己消滅行数 (概算))`
 
 > blame を使うことで「ToRev まで残る」を実現（静的解析不要）。
 
@@ -283,23 +283,23 @@ PowerShell 内で扱う主要構造（擬似定義）。
 ### 7.9 協業指標（共同編集 / 所有権）
 **File Co-Author Count（author 側）**
 - author が触った各ファイルについて、そのファイルを触った distinct author 数を集め、
-  - `AvgCoAuthorsPerTouchedFile`
-  - `MaxCoAuthorsPerTouchedFile`
+  - `平均共同作者数`
+  - `最大共同作者数`
 
 **Ownership（ToRev 時点）**
 - blame から author が最終的に所有する行数（変更対象ファイル集合に限定）
-  - `OwnedLinesToToRev`
-  - `OwnershipShare = OwnedLines / TotalLines`
+  - `所有行数`
+  - `所有割合 = OwnedLines / TotalLines`
 
 > 「自分が最終的に面倒を見る領域がどれだけあるか」の傾向。
 
 ### 7.10 コミットメッセージ指標（ラベル化しない、回数化）
-- `MsgLenChars`（合計 / 平均）
+- `メッセージ文字数`（合計 / 平均）
 - 正規表現カウント
-  - `IssueIdMentionCount`（例: `#123`, `PROJ-123` など）
-  - `FixKeywordCount`（fix/bug/hotfix 等）
-  - `RevertKeywordCount`（revert/backout 等）
-  - `MergeKeywordCount`（merge 等。SVN では merge 記録がメッセージに出る場合がある）
+  - `課題ID言及数`（例: `#123`, `PROJ-123` など）
+  - `修正キーワード数`（fix/bug/hotfix 等）
+  - `差戻キーワード数`（revert/backout 等）
+  - `マージキーワード数`（merge 等。SVN では merge 記録がメッセージに出る場合がある）
 
 > 「良い/悪い」の判定はせず、回数のみ提示。
 
@@ -309,16 +309,16 @@ PowerShell 内で扱う主要構造（擬似定義）。
 ### 8.1 ベース指標
 | 指標 | 定義 | 取得方法 |
 |---|---|---|
-| FileCommitCount | 対象範囲内でそのファイルに変更があったコミット数 | diff で rev 集計 |
-| FileAuthors | 変更した distinct author 数 | commit×file から distinct |
-| Added/Deleted/Churn/Net | 行数系 | diff |
-| BinaryChangeCount | バイナリとして変更された回数 | diff |
-| Create/Delete/ReplaceCount | A/D/R 回数 | log paths |
-| FirstChangeRev / LastChangeRev | 範囲内で最初/最後の変更 | 集計 |
-| AvgDaysBetweenChanges | 変更間隔の平均（日） | commit date 差分 |
+| コミット数 | 対象範囲内でそのファイルに変更があったコミット数 | diff で rev 集計 |
+| 作者数 | 変更した distinct author 数 | commit×file から distinct |
+| 追加行数/削除行数/チャーン/純増行数 | 行数系 | diff |
+| バイナリ変更回数 | バイナリとして変更された回数 | diff |
+| 作成回数/削除回数/置換回数 | A/D/R 回数 | log paths |
+| 初回変更リビジョン / 最終変更リビジョン | 範囲内で最初/最後の変更 | 集計 |
+| 平均変更間隔日数 | 変更間隔の平均（日） | commit date 差分 |
 
 ### 8.2 変更の集中（Ownership concentration / Knowledge）
-**TopAuthorShare（ToRev 時点 or 変更範囲内）**
+**最多作者占有率（ToRev 時点 or 変更範囲内）**
 - blame が使えるなら：ToRev 時点の所有行の author 別割合の最大値
 - blame なしなら：範囲内の churn を author 別割合にして最大値
 
@@ -328,14 +328,14 @@ PowerShell 内で扱う主要構造（擬似定義）。
 > Bus factor 的な判断はせず、数値を出す。
 
 ### 8.3 反復・往復・不安定さ（ファイル側）
-- `RepeatedSameHunkEditsTotal`（同一 hunk の edit 繰り返し総数）
-- `PingPongCountTotal`（hunk 単位の AB A 往復総数）
-- `SelfCancelLinesTotal`（ファイル内で自己相殺された行数）
-- `CrossRevertLinesTotal`（他者により反転された行数）
+- `同一箇所反復編集数 (合計)`（同一 hunk の edit 繰り返し総数）
+- `ピンポン回数 (合計)`（hunk 単位の AB A 往復総数）
+- `自己相殺行数 (合計)`（ファイル内で自己相殺された行数）
+- `他者差戻行数 (合計)`（他者により反転された行数）
 
 ### 8.4 生存量（ファイル側）
-- `SurvivedLinesFromRangeToToRev`：ToRev blame で、範囲内 revision に属する行数合計
-- `DeadAddedLinesApprox = AddedLinesInRange - SurvivedLinesFromRangeToToRev`
+- `生存行数 (範囲指定)`：ToRev blame で、範囲内 revision に属する行数合計
+- `消滅追加行数 (概算) = 追加行数 - 生存行数 (範囲指定)`
 
 ### 8.5 ホットスポット（Hotspot）
 外部の複雑度が無いので、
@@ -344,8 +344,8 @@ PowerShell 内で扱う主要構造（擬似定義）。
 を組み合わせた「ホットスポット指数」を **ランキング用途の数値**として出す。
 
 例：
-- `HotspotScore = FileCommitCount * (AddedLines + DeletedLines)`
-- 併せて `RankByHotspot` を出力（相対比較用）
+- `ホットスポットスコア = コミット数 * (追加行数 + 削除行数)`
+- 併せて `ホットスポット順位` を出力（相対比較用）
 
 > 閾値判定せず、単なるスコア・順位。
 
@@ -365,7 +365,7 @@ PowerShell 内で扱う主要構造（擬似定義）。
 
 ### 9.3 出力
 - `couplings.csv`
-  - fileA, fileB, coChangeCount, jaccard, lift
+  - ファイルA, ファイルB, 共変更回数, Jaccard, リフト値
 
 ---
 
@@ -377,71 +377,71 @@ PowerShell 内で扱う主要構造（擬似定義）。
 ### 10.1 committers.csv（コミッター集計）
 
 **Phase 1 で出力する列：**
-- Author
-- CommitCount
-- ActiveDays
-- FilesTouched
-- DirsTouched
-- AddedLines
-- DeletedLines
-- NetLines
-- TotalChurn
-- ChurnPerCommit
-- DeletedToAddedRatio
-- ChurnToNetRatio
-- BinaryChangeCount
-- ActionAddCount / ActionModCount / ActionDelCount / ActionRepCount
-- SurvivedLinesToToRev（※NoBlame 時は空）
-- DeadAddedLinesApprox（※NoBlame 時は空。算術: AddedLines - SurvivedLines）
-- OwnedLinesToToRev（※NoBlame 時は空）
-- OwnershipShareToToRev（※同上）
-- AuthorChangeEntropy
-- AvgCoAuthorsPerTouchedFile
-- MaxCoAuthorsPerTouchedFile
-- MsgLenTotalChars / MsgLenAvgChars
-- IssueIdMentionCount / FixKeywordCount / RevertKeywordCount / MergeKeywordCount
+- 作者
+- コミット数
+- 活動日数
+- 変更ファイル数
+- 変更ディレクトリ数
+- 追加行数
+- 削除行数
+- 純増行数
+- 総チャーン
+- コミットあたりチャーン
+- 削除対追加比
+- チャーン対純増比
+- バイナリ変更回数
+- 追加アクション数 / 変更アクション数 / 削除アクション数 / 置換アクション数
+- 生存行数（※NoBlame 時は空）
+- 消滅追加行数 (概算)（※NoBlame 時は空。算術: 追加行数 - 生存行数）
+- 所有行数（※NoBlame 時は空）
+- 所有割合（※同上）
+- 変更エントロピー
+- 平均共同作者数
+- 最大共同作者数
+- メッセージ総文字数 / メッセージ平均文字数
+- 課題ID言及数 / 修正キーワード数 / 差戻キーワード数 / マージキーワード数
 
 **Phase 2 で追加する列：**
-- SelfCancelLineCount
-- SelfRevertLines
-- CrossRevertLines
-- RemovedByOthersLines
-- RepeatedSameHunkEdits
-- PingPongCount
-- DeadBySelfApprox / DeadByOthersApprox（SelfCancel に基づく内訳）
+- 自己相殺行数
+- 自己差戻行数
+- 他者差戻行数
+- 被他者削除行数
+- 同一箇所反復編集数
+- ピンポン回数
+- 自己消滅行数 (概算) / 被他者消滅行数 (概算)（SelfCancel に基づく内訳）
 
 ### 10.2 files.csv（ファイル集計）
 
 **Phase 1 で出力する列：**
-- FilePath
-- FileCommitCount
-- FileAuthors
-- AddedLines
-- DeletedLines
-- NetLines
-- TotalChurn
-- BinaryChangeCount
-- CreateCount / DeleteCount / ReplaceCount
-- FirstChangeRev / LastChangeRev
-- AvgDaysBetweenChanges
-- SurvivedLinesFromRangeToToRev（※NoBlame 時は空）
-- DeadAddedLinesApprox（※NoBlame 時は空）
-- TopAuthorShareByChurn
-- TopAuthorShareByBlame（※NoBlame 時は空）
-- HotspotScore
-- RankByHotspot
+- ファイルパス
+- コミット数
+- 作者数
+- 追加行数
+- 削除行数
+- 純増行数
+- 総チャーン
+- バイナリ変更回数
+- 作成回数 / 削除回数 / 置換回数
+- 初回変更リビジョン / 最終変更リビジョン
+- 平均変更間隔日数
+- 生存行数 (範囲指定)（※NoBlame 時は空）
+- 消滅追加行数 (概算)（※NoBlame 時は空）
+- 最多作者チャーン占有率
+- 最多作者blame占有率（※NoBlame 時は空）
+- ホットスポットスコア
+- ホットスポット順位
 
 **Phase 2 で追加する列：**
-- RepeatedSameHunkEditsTotal
-- PingPongCountTotal
-- SelfCancelLinesTotal
-- CrossRevertLinesTotal
+- 同一箇所反復編集数 (合計)
+- ピンポン回数 (合計)
+- 自己相殺行数 (合計)
+- 他者差戻行数 (合計)
 
 ### 10.3 commits.csv（生ログの整形：デバッグ＆他ツール連携用）
-- Revision, Date, Author, MsgLen, Message (短縮), FilesChangedCount, AddedLines, DeletedLines, Churn, Entropy
+- リビジョン, 日時, 作者, メッセージ文字数, メッセージ (短縮), 変更ファイル数, 追加行数, 削除行数, チャーン, エントロピー
 
 ### 10.4 couplings.csv（共変更）
-- FileA, FileB, CoChangeCount, Jaccard, Lift
+- ファイルA, ファイルB, 共変更回数, Jaccard, リフト値
 
 ---
 
@@ -451,13 +451,13 @@ PowerShell 内で扱う主要構造（擬似定義）。
 ### 11.1 出力候補
 1) `contributors_summary.puml`
 - `@startuml` + `salt` テーブルで
-  - 上位 N 人の主要指標（CommitCount/Churn/SelfCancel/PingPong/Survive 等）
+  - 上位 N 人の主要指標（コミット数/チャーン/自己相殺行数/ピンポン回数/生存行数 等）
 
 2) `hotspots.puml`
-- 上位 N ファイル（HotspotScore 順）の表
+- 上位 N ファイル（ホットスポットスコア順）の表
 
 3) `cochange_network.puml`
-- 上位 N 結合（CoChangeCount or Jaccard 上位）をネットワーク図
+- 上位 N 結合（共変更回数 or Jaccard 上位）をネットワーク図
 - ノード：ファイル
 - エッジ：共変更（ラベルに count）
 
@@ -743,17 +743,17 @@ Index: trunk/src/Main.cs
 #### L2: 集計テスト
 | テスト名 | 入力 | 期待結果 |
 |---|---|---|
-| CommitCount by author | 6 commits | alice=3, bob=2, (unknown)=1 |
-| ActiveDays | alice の 3 commit | 3日（1/10, 1/12, 1/13 ではなく 1/10, 1/12 = 2日） |
-| FilesTouched | alice の全 commit | distinct ファイル集合のサイズ |
-| ChurnPerCommit | TotalChurn / CommitCount | 算術結果一致 |
-| Change Entropy | 2ファイル churn (10, 10) | Entropy = 1.0 |
-| Change Entropy | 1ファイルのみ | Entropy = 0.0 |
-| Co-change | r102 で Main.cs + Helper.cs | CoChangeCount = 1, Jaccard 計算一致 |
-| HotspotScore | FileCommitCount × Churn | 算術結果一致 |
-| Ownership (blame) | モック blame | alice: 4行, bob: 1行 |
-| Msg keyword count | "feat: ... (#42)" | IssueIdMentionCount=1 |
-| Msg keyword count | "fix: null check" | FixKeywordCount=1 |
+| コミット数 by author | 6 commits | alice=3, bob=2, (unknown)=1 |
+| 活動日数 | alice の 3 commit | 3日（1/10, 1/12, 1/13 ではなく 1/10, 1/12 = 2日） |
+| 変更ファイル数 | alice の全 commit | distinct ファイル集合のサイズ |
+| コミットあたりチャーン | 総チャーン / コミット数 | 算術結果一致 |
+| 変更エントロピー | 2ファイル churn (10, 10) | エントロピー = 1.0 |
+| 変更エントロピー | 1ファイルのみ | エントロピー = 0.0 |
+| Co-change | r102 で Main.cs + Helper.cs | 共変更回数 = 1, Jaccard 計算一致 |
+| ホットスポットスコア | コミット数 × チャーン | 算術結果一致 |
+| 所有行数 (blame) | モック blame | alice: 4行, bob: 1行 |
+| メッセージキーワードカウント | "feat: ... (#42)" | 課題ID言及数=1 |
+| メッセージキーワードカウント | "fix: null check" | 修正キーワード数=1 |
 
 #### L3: 出力テスト
 | テスト名 | 入力 | 期待結果 |
@@ -769,10 +769,10 @@ Index: trunk/src/Main.cs
 #### 追加 L2 テスト（行 hash 系）
 | テスト名 | 入力 | 期待結果 |
 |---|---|---|
-| SelfCancel | alice が r100 で追加した行を r101 で削除 | SelfCancelLineCount >= 1 |
-| CrossRevert | alice 追加 → bob 削除 | CrossRevertLines >= 1 |
-| PingPong | hunk events: alice→bob→alice | PingPongCount >= 1 |
-| RepeatedHunkEdits | 同一 ContextHash に 3 回 edit | RepeatedSameHunkEdits = 2 |
+| 自己相殺 | alice が r100 で追加した行を r101 で削除 | 自己相殺行数 >= 1 |
+| 他者差戻 | alice 追加 → bob 削除 | 他者差戻行数 >= 1 |
+| ピンポン | hunk events: alice→bob→alice | ピンポン回数 >= 1 |
+| 同一箇所反復編集 | 同一 ContextHash に 3 回 edit | 同一箇所反復編集数 = 2 |
 | 偽陽性制御 | `}` のみの行が複数ファイルに存在 | ファイルが異なれば別カウント |
 
 ### 15.6 テスト実装パターン（Pester 5.x）
@@ -880,16 +880,16 @@ Index: trunk/src/Main.cs
 - Co-change カウント・Jaccard・Lift（同一コミット内のファイル集合から一意に決まる）
 - コミットメッセージ指標（正規表現マッチの回数）
 - Blame 由来の生存量・所有権（`svn blame` の出力は確定的）
-- DeadAddedLinesApprox（= AddedLines − SurvivedLines、算術のみ）
-- ホットスポットスコア（CommitCount × Churn、算術のみ）
+- 消滅追加行数 (概算)（= 追加行数 − 生存行数、算術のみ）
+- ホットスポットスコア（コミット数 × チャーン、算術のみ）
 
 **Phase 2 に含まれるもの（推定的）：**
-- SelfCancelLineCount — 行内容 hash の一致に依存（`}` 等の頻出行で偽陽性）
-- SelfRevertLines / CrossRevertLines — 同上
-- RemovedByOthersLines — 同上
-- RepeatedSameHunkEdits — hunk 指紋（ContextHash）の安定性に依存
-- PingPongCount — hunk 指紋 + 時系列の組み合わせ
-- DeadBySelf / DeadByOthersApprox — SelfCancel に依存する内訳
+- 自己相殺行数 — 行内容 hash の一致に依存（`}` 等の頻出行で偽陽性）
+- 自己差戻行数 / 他者差戻行数 — 同上
+- 被他者削除行数 — 同上
+- 同一箇所反復編集数 — hunk 指紋（ContextHash）の安定性に依存
+- ピンポン回数 — hunk 指紋 + 時系列の組み合わせ
+- 自己消滅行数 (概算) / 被他者消滅行数 (概算) — SelfCancel に依存する内訳
 
 ---
 
@@ -944,43 +944,43 @@ Index: trunk/src/Main.cs
 - **完了条件**: キャッシュが生成・再利用される。並列取得で結果が直列と一致する
 
 #### Step 1-5: コミッター単位メトリクス計算
-- **ベース指標（§7.1）**: CommitCount, ActiveDays, FilesTouched, DirsTouched,
-  AddedLines, DeletedLines, NetLines, TotalChurn, Avg/MedianCommitChurn,
-  BinaryChangeCount, ActionsA/M/D/R
-- **チャーン比（§7.2）**: ChurnPerCommit, ChurnToNetRatio, DeletedToAddedRatio
-- **Change Entropy（§7.8）**: AuthorChangeEntropy
-- **協業指標（§7.9、blame 不要部分）**: AvgCoAuthorsPerTouchedFile, MaxCoAuthorsPerTouchedFile
-- **メッセージ指標（§7.10）**: MsgLenTotalChars, MsgLenAvgChars,
-  IssueIdMentionCount, FixKeywordCount, RevertKeywordCount, MergeKeywordCount
+- **ベース指標（§7.1）**: コミット数, 活動日数, 変更ファイル数, 変更ディレクトリ数,
+  追加行数, 削除行数, 純増行数, 総チャーン, Avg/Medianコミットチャーン,
+  バイナリ変更回数, ActionsA/M/D/R
+- **チャーン比（§7.2）**: コミットあたりチャーン, チャーン対純増比, 削除対追加比
+- **Change Entropy（§7.8）**: 変更エントロピー
+- **協業指標（§7.9、blame 不要部分）**: 平均共同作者数, 最大共同作者数
+- **メッセージ指標（§7.10）**: メッセージ総文字数, メッセージ平均文字数,
+  課題ID言及数, 修正キーワード数, 差戻キーワード数, マージキーワード数
 - **完了条件**: モックデータに対する集計テストで全指標の値が期待通り
 
 #### Step 1-6: ファイル単位メトリクス計算
-- **ベース指標（§8.1）**: FileCommitCount, FileAuthors, Added/Deleted/Churn/Net,
-  BinaryChangeCount, Create/Delete/ReplaceCount, FirstChangeRev, LastChangeRev,
-  AvgDaysBetweenChanges
-- **TopAuthorShareByChurn（§8.2、blame 不要版）**
-- **ホットスポット（§8.5）**: HotspotScore, RankByHotspot
+- **ベース指標（§8.1）**: コミット数, 作者数, 追加行数/削除行数/チャーン/純増行数,
+  バイナリ変更回数, 作成回数/削除回数/置換回数, 初回変更リビジョン, 最終変更リビジョン,
+  平均変更間隔日数
+- **最多作者チャーン占有率（§8.2、blame 不要版）**
+- **ホットスポット（§8.5）**: ホットスポットスコア, ホットスポット順位
 - **完了条件**: モックデータに対する集計テストで全指標の値が期待通り
 
 #### Step 1-7: Blame 解析（生存量・所有権）
 - **`Get-SvnBlameSummary` 関数の実装**
   - `svn blame --xml -r {ToRev} {fullUrl}` の取得・パース
   - `BlameSummary` 構造: LineCountTotal, LineCountByRevision
-- **生存量（§7.7a）**: SurvivedLinesToToRev（author 紐付け）
-- **消滅量（§7.7b）**: DeadAddedLinesApprox = AddedLines − SurvivedLines
-- **所有権（§7.9）**: OwnedLinesToToRev, OwnershipShareToToRev
-- **TopAuthorShareByBlame（§8.2、blame 版）**
+- **生存量（§7.7a）**: 生存行数（author 紐付け）
+- **消滅量（§7.7b）**: 消滅追加行数 (概算) = 追加行数 − 生存行数
+- **所有権（§7.9）**: 所有行数, 所有割合
+- **最多作者blame占有率（§8.2、blame 版）**
 - **`-NoBlame` 指定時のスキップ処理**
 - **blame の並列取得**（Step 1-4 の RunspacePool を再利用）
 - **完了条件**: モック blame XML に対するテスト通過。NoBlame 時に該当列が空
 
 #### Step 1-8: Co-change 解析
 - **ペア集計（§9.1）**: commit ごとの変更ファイルからペアを列挙
-- **Jaccard / Lift（§9.2）** の算出
+- **Jaccard / リフト値（§9.2）** の算出
 - **大量ペア対策**: 1 コミットの変更ファイル数が閾値（例: 100）を超える場合はスキップ
   （大規模マージは coupling 分析のノイズになるため）
 - **`-TopN` による出力上限**
-- **完了条件**: 3ファイル × 3コミットのモックデータで CoChangeCount/Jaccard/Lift が正しい
+- **完了条件**: 3ファイル × 3コミットのモックデータで 共変更回数/Jaccard/リフト値 が正しい
 
 #### Step 1-9: 出力（CSV / PlantUML / run_meta.json）
 - **CSV 出力**
@@ -1015,24 +1015,24 @@ Index: trunk/src/Main.cs
 #### Step 2-2: SelfCancel / CrossRevert / RemovedByOthers
 - **SelfCancel（§7.3）**: 自分が追加 → 自分が削除
 - **SelfRevert / CrossRevert（§7.5A）**: 追加行 hash が後続で削除される
-- **RemovedByOthersLines（§7.6(1)）**: 自分が追加 → 他人が削除
-- **ファイル側**: SelfCancelLinesTotal, CrossRevertLinesTotal
+- **被他者削除行数（§7.6(1)）**: 自分が追加 → 他人が削除
+- **ファイル側**: 自己相殺行数 (合計), 他者差戻行数 (合計)
 - **完了条件**: 「alice 追加 → alice 削除」「alice 追加 → bob 削除」のモックデータで正しくカウント
 
 #### Step 2-3: hunk 指紋と反復・往復
 - **ContextHash の実装（§12.2）**
   - hunk の context 行から `filePath|firstK|lastK` で SHA1
-- **RepeatedSameHunkEdits（§7.4）**
+- **同一箇所反復編集数（§7.4）**
   - `EditCountByAuthorHunk[author, file, ContextHash]` の集計
-- **PingPong（§7.5B, §12.4）**
+- **ピンポン回数（§7.5B, §12.4）**
   - hunk イベント時系列から A→B→A パターンの検出
-- **完了条件**: 3 コミットのモックデータで RepeatedSameHunkEdits と PingPong が正しくカウント
+- **完了条件**: 3 コミットのモックデータで 同一箇所反復編集数 と ピンポン回数 が正しくカウント
 
 #### Step 2-4: DeadBySelf / DeadByOthers の内訳化
-- **DeadBySelfApprox（§7.7b）**: min(SelfCancelLineCount, DeadAddedLines)
-- **DeadByOthersApprox**: max(0, DeadAddedLines − DeadBySelf)
+- **自己消滅行数 (概算)（§7.7b）**: min(自己相殺行数, 消滅追加行数 (概算))
+- **被他者消滅行数 (概算)**: max(0, 消滅追加行数 (概算) − 自己消滅行数 (概算))
 - **CSV 列の追加**: committers.csv / files.csv の Phase 2 列
-- **完了条件**: Phase 1 の DeadAddedLinesApprox との整合性テスト通過
+- **完了条件**: Phase 1 の 消滅追加行数 (概算) との整合性テスト通過
 
 ---
 

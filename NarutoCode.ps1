@@ -987,50 +987,50 @@ function Get-CommitterMetric
             0
         }
         $rows.Add([pscustomobject][ordered]@{
-                Author = [string]$s.Author
-                CommitCount = [int]$s.CommitCount
-                ActiveDays = [int]$s.ActiveDays.Count
-                FilesTouched = [int]$s.Files.Count
-                DirsTouched = [int]$s.Dirs.Count
-                AddedLines = [int]$s.Added
-                DeletedLines = [int]$s.Deleted
-                NetLines = $net
-                TotalChurn = $ch
-                ChurnPerCommit = Get-RoundedNumber -Value $churnPerCommit
-                DeletedToAddedRatio = Get-RoundedNumber -Value ([int]$s.Deleted / [double][Math]::Max(1, [int]$s.Added))
-                ChurnToNetRatio = Get-RoundedNumber -Value ($ch / [double][Math]::Max(1, [Math]::Abs($net)))
-                BinaryChangeCount = [int]$s.Binary
-                ActionAddCount = [int]$s.ActA
-                ActionModCount = [int]$s.ActM
-                ActionDelCount = [int]$s.ActD
-                ActionRepCount = [int]$s.ActR
-                SurvivedLinesToToRev = $null
-                DeadAddedLinesApprox = $null
-                OwnedLinesToToRev = $null
-                OwnershipShareToToRev = $null
-                SelfCancelLineCount = $null
-                SelfRevertLines = $null
-                CrossRevertLines = $null
-                RemovedByOthersLines = $null
-                RepeatedSameHunkEdits = $null
-                PingPongCount = $null
-                InternalMoveLineCount = $null
-                DeadBySelfApprox = $null
-                DeadByOthersApprox = $null
-                AuthorChangeEntropy = Get-RoundedNumber -Value $entropy
-                AvgCoAuthorsPerTouchedFile = Get-RoundedNumber -Value $coAvg
-                MaxCoAuthorsPerTouchedFile = [int]$coMax
-                MsgLenTotalChars = [int]$s.MsgLen
-                MsgLenAvgChars = Get-RoundedNumber -Value $msgLenAvg
-                IssueIdMentionCount = [int]$s.Issue
-                FixKeywordCount = [int]$s.Fix
-                RevertKeywordCount = [int]$s.Revert
-                MergeKeywordCount = [int]$s.Merge
+                '作者' = [string]$s.Author
+                'コミット数' = [int]$s.CommitCount
+                '活動日数' = [int]$s.ActiveDays.Count
+                '変更ファイル数' = [int]$s.Files.Count
+                '変更ディレクトリ数' = [int]$s.Dirs.Count
+                '追加行数' = [int]$s.Added
+                '削除行数' = [int]$s.Deleted
+                '純増行数' = $net
+                '総チャーン' = $ch
+                'コミットあたりチャーン' = Get-RoundedNumber -Value $churnPerCommit
+                '削除対追加比' = Get-RoundedNumber -Value ([int]$s.Deleted / [double][Math]::Max(1, [int]$s.Added))
+                'チャーン対純増比' = Get-RoundedNumber -Value ($ch / [double][Math]::Max(1, [Math]::Abs($net)))
+                'バイナリ変更回数' = [int]$s.Binary
+                '追加アクション数' = [int]$s.ActA
+                '変更アクション数' = [int]$s.ActM
+                '削除アクション数' = [int]$s.ActD
+                '置換アクション数' = [int]$s.ActR
+                '生存行数' = $null
+                '消滅追加行数 (概算)' = $null
+                '所有行数' = $null
+                '所有割合' = $null
+                '自己相殺行数' = $null
+                '自己差戻行数' = $null
+                '他者差戻行数' = $null
+                '被他者削除行数' = $null
+                '同一箇所反復編集数' = $null
+                'ピンポン回数' = $null
+                '内部移動行数' = $null
+                '自己消滅行数 (概算)' = $null
+                '被他者消滅行数 (概算)' = $null
+                '変更エントロピー' = Get-RoundedNumber -Value $entropy
+                '平均共同作者数' = Get-RoundedNumber -Value $coAvg
+                '最大共同作者数' = [int]$coMax
+                'メッセージ総文字数' = [int]$s.MsgLen
+                'メッセージ平均文字数' = Get-RoundedNumber -Value $msgLenAvg
+                '課題ID言及数' = [int]$s.Issue
+                '修正キーワード数' = [int]$s.Fix
+                '差戻キーワード数' = [int]$s.Revert
+                'マージキーワード数' = [int]$s.Merge
             }) | Out-Null
     }
-    return @($rows.ToArray() | Sort-Object -Property @{Expression = 'TotalChurn'
+    return @($rows.ToArray() | Sort-Object -Property @{Expression = '総チャーン'
             Descending = $true
-        }, Author)
+        }, '作者')
 }
 function Get-FileMetric
 {
@@ -1148,43 +1148,43 @@ function Get-FileMetric
             $topShare = $mx / [double]$ch
         }
         $rows.Add([pscustomobject][ordered]@{
-                FilePath = [string]$s.FilePath
-                FileCommitCount = $cc
-                FileAuthors = [int]$s.Authors.Count
-                AddedLines = $add
-                DeletedLines = $del
-                NetLines = ($add - $del)
-                TotalChurn = $ch
-                BinaryChangeCount = [int]$s.Binary
-                CreateCount = [int]$s.Create
-                DeleteCount = [int]$s.Delete
-                ReplaceCount = [int]$s.Replace
-                FirstChangeRev = $first
-                LastChangeRev = $last
-                AvgDaysBetweenChanges = Get-RoundedNumber -Value $avg
-                SurvivedLinesFromRangeToToRev = $null
-                DeadAddedLinesApprox = $null
-                TopAuthorShareByChurn = Get-RoundedNumber -Value $topShare
-                TopAuthorShareByBlame = $null
-                SelfCancelLinesTotal = $null
-                CrossRevertLinesTotal = $null
-                RepeatedSameHunkEditsTotal = $null
-                PingPongCountTotal = $null
-                InternalMoveLinesTotal = $null
-                HotspotScore = ($cc * $ch)
-                RankByHotspot = 0
+                'ファイルパス' = [string]$s.FilePath
+                'コミット数' = $cc
+                '作者数' = [int]$s.Authors.Count
+                '追加行数' = $add
+                '削除行数' = $del
+                '純増行数' = ($add - $del)
+                '総チャーン' = $ch
+                'バイナリ変更回数' = [int]$s.Binary
+                '作成回数' = [int]$s.Create
+                '削除回数' = [int]$s.Delete
+                '置換回数' = [int]$s.Replace
+                '初回変更リビジョン' = $first
+                '最終変更リビジョン' = $last
+                '平均変更間隔日数' = Get-RoundedNumber -Value $avg
+                '生存行数 (範囲指定)' = $null
+                '消滅追加行数 (概算)' = $null
+                '最多作者チャーン占有率' = Get-RoundedNumber -Value $topShare
+                '最多作者blame占有率' = $null
+                '自己相殺行数 (合計)' = $null
+                '他者差戻行数 (合計)' = $null
+                '同一箇所反復編集数 (合計)' = $null
+                'ピンポン回数 (合計)' = $null
+                '内部移動行数 (合計)' = $null
+                'ホットスポットスコア' = ($cc * $ch)
+                'ホットスポット順位' = 0
             }) | Out-Null
     }
-    $sorted = @($rows.ToArray() | Sort-Object -Property @{Expression = 'HotspotScore'
+    $sorted = @($rows.ToArray() | Sort-Object -Property @{Expression = 'ホットスポットスコア'
             Descending = $true
-        }, @{Expression = 'TotalChurn'
+        }, @{Expression = '総チャーン'
             Descending = $true
-        }, FilePath)
+        }, 'ファイルパス')
     $rank = 0
     foreach ($r in $sorted)
     {
         $rank++
-        $r.RankByHotspot = $rank
+        $r.'ホットスポット順位' = $rank
     }
     return $sorted
 }
@@ -1264,20 +1264,20 @@ function Get-CoChangeMetric
                 $lift = $pab / ($pa * $pb)
             }
         }
-        $rows.Add([pscustomobject][ordered]@{ FileA = $a
-                FileB = $b
-                CoChangeCount = $co
-                Jaccard = Get-RoundedNumber -Value $j
-                Lift = Get-RoundedNumber -Value $lift
+        $rows.Add([pscustomobject][ordered]@{ 'ファイルA' = $a
+                'ファイルB' = $b
+                '共変更回数' = $co
+                'Jaccard' = Get-RoundedNumber -Value $j
+                'リフト値' = Get-RoundedNumber -Value $lift
             }) | Out-Null
     }
-    $sorted = @($rows.ToArray() | Sort-Object -Property @{Expression = 'CoChangeCount'
+    $sorted = @($rows.ToArray() | Sort-Object -Property @{Expression = '共変更回数'
             Descending = $true
         }, @{Expression = 'Jaccard'
             Descending = $true
-        }, @{Expression = 'Lift'
+        }, @{Expression = 'リフト値'
             Descending = $true
-        }, FileA, FileB)
+        }, 'ファイルA', 'ファイルB')
     if ($TopNCount -gt 0)
     {
         return @($sorted | Select-Object -First $TopNCount)
@@ -1287,11 +1287,11 @@ function Get-CoChangeMetric
 function Write-PlantUmlFile
 {
     param([string]$OutDirectory, [object[]]$Committers, [object[]]$Files, [object[]]$Couplings, [int]$TopNCount, [string]$EncodingName)
-    $topCommitters = @($Committers | Sort-Object -Property @{Expression = 'TotalChurn'
+    $topCommitters = @($Committers | Sort-Object -Property @{Expression = '総チャーン'
             Descending = $true
-        }, Author | Select-Object -First $TopNCount)
-    $topFiles = @($Files | Sort-Object -Property RankByHotspot | Select-Object -First $TopNCount)
-    $topCouplings = @($Couplings | Sort-Object -Property @{Expression = 'CoChangeCount'
+        }, '作者' | Select-Object -First $TopNCount)
+    $topFiles = @($Files | Sort-Object -Property 'ホットスポット順位' | Select-Object -First $TopNCount)
+    $topCouplings = @($Couplings | Sort-Object -Property @{Expression = '共変更回数'
             Descending = $true
         }, @{Expression = 'Jaccard'
             Descending = $true
@@ -1302,10 +1302,10 @@ function Write-PlantUmlFile
     [void]$sb1.AppendLine('salt')
     [void]$sb1.AppendLine('{')
     [void]$sb1.AppendLine('{T')
-    [void]$sb1.AppendLine('+ Author | CommitCount | TotalChurn')
+    [void]$sb1.AppendLine('+ 作者 | コミット数 | 総チャーン')
     foreach ($r in $topCommitters)
     {
-        [void]$sb1.AppendLine(("| {0} | {1} | {2}" -f ([string]$r.Author).Replace('|', '\|'), $r.CommitCount, $r.TotalChurn))
+        [void]$sb1.AppendLine(("| {0} | {1} | {2}" -f ([string]$r.'作者').Replace('|', '\|'), $r.'コミット数', $r.'総チャーン'))
     }
     [void]$sb1.AppendLine('}')
     [void]$sb1.AppendLine('}')
@@ -1317,10 +1317,10 @@ function Write-PlantUmlFile
     [void]$sb2.AppendLine('salt')
     [void]$sb2.AppendLine('{')
     [void]$sb2.AppendLine('{T')
-    [void]$sb2.AppendLine('+ Rank | FilePath | HotspotScore')
+    [void]$sb2.AppendLine('+ ホットスポット順位 | ファイルパス | ホットスポットスコア')
     foreach ($r in $topFiles)
     {
-        [void]$sb2.AppendLine(("| {0} | {1} | {2}" -f $r.RankByHotspot, ([string]$r.FilePath).Replace('|', '\|'), $r.HotspotScore))
+        [void]$sb2.AppendLine(("| {0} | {1} | {2}" -f $r.'ホットスポット順位', ([string]$r.'ファイルパス').Replace('|', '\|'), $r.'ホットスポットスコア'))
     }
     [void]$sb2.AppendLine('}')
     [void]$sb2.AppendLine('}')
@@ -1333,7 +1333,7 @@ function Write-PlantUmlFile
     [void]$sb3.AppendLine('skinparam linetype ortho')
     foreach ($r in $topCouplings)
     {
-        [void]$sb3.AppendLine(('"{0}" -- "{1}" : co={2}\nj={3}' -f ([string]$r.FileA).Replace('"', '\"'), ([string]$r.FileB).Replace('"', '\"'), $r.CoChangeCount, $r.Jaccard))
+        [void]$sb3.AppendLine(('"{0}" -- "{1}" : co={2}\nj={3}' -f ([string]$r.'ファイルA').Replace('"', '\"'), ([string]$r.'ファイルB').Replace('"', '\"'), $r.'共変更回数', $r.'Jaccard'))
     }
     [void]$sb3.AppendLine('@enduml')
     Write-TextFile -FilePath (Join-Path $OutDirectory 'cochange_network.puml') -Content $sb3.ToString() -EncodingName $EncodingName
@@ -1838,8 +1838,8 @@ try
     $commitRows = @(
         $commits | Sort-Object Revision | ForEach-Object {
             [pscustomobject][ordered]@{
-                Revision = [int]$_.Revision
-                Date = if ($_.Date)
+                'リビジョン' = [int]$_.Revision
+                '日時' = if ($_.Date)
                 {
                     ([datetime]$_.Date).ToString('o')
                 }
@@ -1847,14 +1847,14 @@ try
                 {
                     $null
                 }
-                Author = [string]$_.Author
-                MsgLen = [int]$_.MsgLen
-                Message = [string]$_.MessageShort
-                FilesChangedCount = @($_.FilesChanged).Count
-                AddedLines = [int]$_.AddedLines
-                DeletedLines = [int]$_.DeletedLines
-                Churn = [int]$_.Churn
-                Entropy = (Get-RoundedNumber -Value ([double]$_.Entropy))
+                '作者' = [string]$_.Author
+                'メッセージ文字数' = [int]$_.MsgLen
+                'メッセージ' = [string]$_.MessageShort
+                '変更ファイル数' = @($_.FilesChanged).Count
+                '追加行数' = [int]$_.AddedLines
+                '削除行数' = [int]$_.DeletedLines
+                'チャーン' = [int]$_.Churn
+                'エントロピー' = (Get-RoundedNumber -Value ([double]$_.Entropy))
             }
         }
     )
@@ -1874,7 +1874,7 @@ try
         $fileMap = @{}
         foreach ($r in $fileRows)
         {
-            $fileMap[[string]$r.FilePath] = $r
+            $fileMap[[string]$r.'ファイルパス'] = $r
         }
         foreach ($file in @($fileMap.Keys))
         {
@@ -1917,13 +1917,13 @@ try
                 $authorSurvived[$sa] += $cnt
             }
             $fr = $fileMap[$file]
-            $fr.SurvivedLinesFromRangeToToRev = $surv
-            $dead = [int]$fr.AddedLines - $surv
+            $fr.'生存行数 (範囲指定)' = $surv
+            $dead = [int]$fr.'追加行数' - $surv
             if ($dead -lt 0)
             {
                 $dead = 0
             }
-            $fr.DeadAddedLinesApprox = $dead
+            $fr.'消滅追加行数 (概算)' = $dead
             $mx = 0
             if ($b.LineCountByAuthor.Count -gt 0)
             {
@@ -1937,11 +1937,11 @@ try
             {
                 0
             }
-            $fr.TopAuthorShareByBlame = Get-RoundedNumber -Value $topBlameShare
+            $fr.'最多作者blame占有率' = Get-RoundedNumber -Value $topBlameShare
         }
         foreach ($r in $committerRows)
         {
-            $a = [string]$r.Author
+            $a = [string]$r.'作者'
             $sur = if ($authorSurvived.ContainsKey($a))
             {
                 [int]$authorSurvived[$a]
@@ -1958,14 +1958,14 @@ try
             {
                 0
             }
-            $r.SurvivedLinesToToRev = $sur
-            $dead = [int]$r.AddedLines - $sur
+            $r.'生存行数' = $sur
+            $dead = [int]$r.'追加行数' - $sur
             if ($dead -lt 0)
             {
                 $dead = 0
             }
-            $r.DeadAddedLinesApprox = $dead
-            $r.OwnedLinesToToRev = $own
+            $r.'消滅追加行数 (概算)' = $dead
+            $r.'所有行数' = $own
             $ownShare = if ($ownedTotal -gt 0)
             {
                 $own / [double]$ownedTotal
@@ -1974,7 +1974,7 @@ try
             {
                 0
             }
-            $r.OwnershipShareToToRev = Get-RoundedNumber -Value $ownShare
+            $r.'所有割合' = Get-RoundedNumber -Value $ownShare
             if ($null -ne $deadDetail)
             {
                 $sc = if ($deadDetail.AuthorSelfCancel.ContainsKey($a))
@@ -2025,30 +2025,30 @@ try
                 {
                     0
                 }
-                $r.SelfCancelLineCount = $sc
-                $r.SelfRevertLines = $sc
-                $r.CrossRevertLines = $cr
-                $r.RemovedByOthersLines = $rbo
-                $r.RepeatedSameHunkEdits = $rh
-                $r.PingPongCount = $pp
-                $r.InternalMoveLineCount = $im
-                $adjDead = [Math]::Max(0, [int]$r.DeadAddedLinesApprox - $im)
+                $r.'自己相殺行数' = $sc
+                $r.'自己差戻行数' = $sc
+                $r.'他者差戻行数' = $cr
+                $r.'被他者削除行数' = $rbo
+                $r.'同一箇所反復編集数' = $rh
+                $r.'ピンポン回数' = $pp
+                $r.'内部移動行数' = $im
+                $adjDead = [Math]::Max(0, [int]$r.'消滅追加行数 (概算)' - $im)
                 $dbs = [Math]::Min($sc, $adjDead)
-                $r.DeadBySelfApprox = $dbs
-                $r.DeadByOthersApprox = [Math]::Max(0, $adjDead - $dbs)
+                $r.'自己消滅行数 (概算)' = $dbs
+                $r.'被他者消滅行数 (概算)' = [Math]::Max(0, $adjDead - $dbs)
             }
         }
         foreach ($r in $fileRows)
         {
-            if ($null -eq $r.SurvivedLinesFromRangeToToRev)
+            if ($null -eq $r.'生存行数 (範囲指定)')
             {
-                $r.SurvivedLinesFromRangeToToRev = 0
-                $r.DeadAddedLinesApprox = [int]$r.AddedLines
-                $r.TopAuthorShareByBlame = 0.0
+                $r.'生存行数 (範囲指定)' = 0
+                $r.'消滅追加行数 (概算)' = [int]$r.'追加行数'
+                $r.'最多作者blame占有率' = 0.0
             }
             if ($null -ne $deadDetail)
             {
-                $fp = [string]$r.FilePath
+                $fp = [string]$r.'ファイルパス'
                 $resolvedFp = $fp
                 if ($renameMap.ContainsKey($fp))
                 {
@@ -2087,19 +2087,19 @@ try
                     $fsc = [Math]::Min($fsc, [Math]::Max(1, $fsc))
                     $fcr = [Math]::Min($fcr, [Math]::Max(1, $fcr))
                 }
-                $r.SelfCancelLinesTotal = $fsc
-                $r.CrossRevertLinesTotal = $fcr
-                $r.RepeatedSameHunkEditsTotal = $frh
-                $r.PingPongCountTotal = $fpp
-                $r.InternalMoveLinesTotal = $fim
+                $r.'自己相殺行数 (合計)' = $fsc
+                $r.'他者差戻行数 (合計)' = $fcr
+                $r.'同一箇所反復編集数 (合計)' = $frh
+                $r.'ピンポン回数 (合計)' = $fpp
+                $r.'内部移動行数 (合計)' = $fim
             }
         }
     }
 
-    $headersCommitter = @('Author', 'CommitCount', 'ActiveDays', 'FilesTouched', 'DirsTouched', 'AddedLines', 'DeletedLines', 'NetLines', 'TotalChurn', 'ChurnPerCommit', 'DeletedToAddedRatio', 'ChurnToNetRatio', 'BinaryChangeCount', 'ActionAddCount', 'ActionModCount', 'ActionDelCount', 'ActionRepCount', 'SurvivedLinesToToRev', 'DeadAddedLinesApprox', 'OwnedLinesToToRev', 'OwnershipShareToToRev', 'SelfCancelLineCount', 'SelfRevertLines', 'CrossRevertLines', 'RemovedByOthersLines', 'RepeatedSameHunkEdits', 'PingPongCount', 'InternalMoveLineCount', 'DeadBySelfApprox', 'DeadByOthersApprox', 'AuthorChangeEntropy', 'AvgCoAuthorsPerTouchedFile', 'MaxCoAuthorsPerTouchedFile', 'MsgLenTotalChars', 'MsgLenAvgChars', 'IssueIdMentionCount', 'FixKeywordCount', 'RevertKeywordCount', 'MergeKeywordCount')
-    $headersFile = @('FilePath', 'FileCommitCount', 'FileAuthors', 'AddedLines', 'DeletedLines', 'NetLines', 'TotalChurn', 'BinaryChangeCount', 'CreateCount', 'DeleteCount', 'ReplaceCount', 'FirstChangeRev', 'LastChangeRev', 'AvgDaysBetweenChanges', 'SurvivedLinesFromRangeToToRev', 'DeadAddedLinesApprox', 'TopAuthorShareByChurn', 'TopAuthorShareByBlame', 'SelfCancelLinesTotal', 'CrossRevertLinesTotal', 'RepeatedSameHunkEditsTotal', 'PingPongCountTotal', 'InternalMoveLinesTotal', 'HotspotScore', 'RankByHotspot')
-    $headersCommit = @('Revision', 'Date', 'Author', 'MsgLen', 'Message', 'FilesChangedCount', 'AddedLines', 'DeletedLines', 'Churn', 'Entropy')
-    $headersCoupling = @('FileA', 'FileB', 'CoChangeCount', 'Jaccard', 'Lift')
+    $headersCommitter = @('作者', 'コミット数', '活動日数', '変更ファイル数', '変更ディレクトリ数', '追加行数', '削除行数', '純増行数', '総チャーン', 'コミットあたりチャーン', '削除対追加比', 'チャーン対純増比', 'バイナリ変更回数', '追加アクション数', '変更アクション数', '削除アクション数', '置換アクション数', '生存行数', '消滅追加行数 (概算)', '所有行数', '所有割合', '自己相殺行数', '自己差戻行数', '他者差戻行数', '被他者削除行数', '同一箇所反復編集数', 'ピンポン回数', '内部移動行数', '自己消滅行数 (概算)', '被他者消滅行数 (概算)', '変更エントロピー', '平均共同作者数', '最大共同作者数', 'メッセージ総文字数', 'メッセージ平均文字数', '課題ID言及数', '修正キーワード数', '差戻キーワード数', 'マージキーワード数')
+    $headersFile = @('ファイルパス', 'コミット数', '作者数', '追加行数', '削除行数', '純増行数', '総チャーン', 'バイナリ変更回数', '作成回数', '削除回数', '置換回数', '初回変更リビジョン', '最終変更リビジョン', '平均変更間隔日数', '生存行数 (範囲指定)', '消滅追加行数 (概算)', '最多作者チャーン占有率', '最多作者blame占有率', '自己相殺行数 (合計)', '他者差戻行数 (合計)', '同一箇所反復編集数 (合計)', 'ピンポン回数 (合計)', '内部移動行数 (合計)', 'ホットスポットスコア', 'ホットスポット順位')
+    $headersCommit = @('リビジョン', '日時', '作者', 'メッセージ文字数', 'メッセージ', '変更ファイル数', '追加行数', '削除行数', 'チャーン', 'エントロピー')
+    $headersCoupling = @('ファイルA', 'ファイルB', '共変更回数', 'Jaccard', 'リフト値')
 
     Write-CsvFile -FilePath (Join-Path $OutDir 'committers.csv') -Rows $committerRows -Headers $headersCommitter -EncodingName $Encoding
     Write-CsvFile -FilePath (Join-Path $OutDir 'files.csv') -Rows $fileRows -Headers $headersFile -EncodingName $Encoding
