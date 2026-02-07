@@ -1,0 +1,16 @@
+﻿Index: src/calculator.cpp
+===================================================================
+--- src/calculator.cpp	(revision 13)
++++ src/calculator.cpp	(revision 14)
+@@ -8,9 +8,7 @@
+ 
+ Calculator::~Calculator() {}
+ 
+-double Calculator::evaluate(const std::string& expression) {
+-    // Log the expression for debugging
+-    std::cerr << "[DEBUG] Evaluating: " << expression << std::endl;
++double Calculator::evaluate(const std::string& expression) {
+     Parser parser;
+     auto tokens = parser.tokenize(expression);
+     double result = parser.parse(tokens);
+

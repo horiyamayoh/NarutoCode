@@ -18,7 +18,7 @@ C++ プロジェクト風の履歴を持つローカル SVN リポジトリを�
 
 .EXAMPLE
 .\Create-TestSvnRepo.ps1
-.\Create-TestSvnRepo.ps1 -RepoDir C:\temp\test_svn_repo -WcDir C:\temp\test_svn_wc
+.\Create-TestSvnRepo.ps1 -RepoDir C:\temp\svn_repo -WcDir C:\temp\svn_wc
 #>
 [CmdletBinding()]
 param(
@@ -1095,7 +1095,7 @@ Write-Host "リポジトリ URL: $repoUrl" -ForegroundColor Cyan
 Write-Host "リビジョン範囲: r1 〜 r20" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "NarutoCode で分析するには:" -ForegroundColor Yellow
-Write-Host "  .\NarutoCode.ps1 -RepoUrl '$repoUrl' -FromRev 1 -ToRev 20 -OutDir .\test_output -EmitPlantUml" -ForegroundColor White
+Write-Host "  .\NarutoCode.ps1 -RepoUrl '$repoUrl' -FromRev 1 -ToRev 20 -OutDir .\tests\fixtures\expected_output -EmitPlantUml" -ForegroundColor White
 Write-Host ""
 Write-Host "コミッター:" -ForegroundColor Yellow
 Write-Host "  alice   - 8 commits (r1,r3,r5,r8,r11,r14,r17,r20)" -ForegroundColor White

@@ -1,0 +1,42 @@
+﻿Index: .gitignore
+===================================================================
+--- .gitignore	(nonexistent)
++++ .gitignore	(revision 17)
+@@ -0,0 +1,7 @@
++﻿build/
++*.o
++*.exe
++CMakeCache.txt
++CMakeFiles/
++cmake_install.cmake
++Makefile
+\ No newline at end of file
+Index: CMakeLists.txt
+===================================================================
+--- CMakeLists.txt	(revision 16)
++++ CMakeLists.txt	(revision 17)
+@@ -1,5 +1,5 @@
+ ﻿cmake_minimum_required(VERSION 3.16)
+-project(NinjaCalc VERSION 1.0.0 LANGUAGES CXX)
++project(NinjaCalc VERSION 1.1.0 LANGUAGES CXX)
+ 
+ set(CMAKE_CXX_STANDARD 17)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+@@ -10,4 +10,13 @@
+     src/parser.cpp
+     src/utils.cpp
+ )
+-target_include_directories(ninja_calc PRIVATE include)
+\ No newline at end of file
++target_include_directories(ninja_calc PRIVATE include)
++# Tests
++enable_testing()
++add_executable(test_calculator tests/test_calculator.cpp src/calculator.cpp src/parser.cpp)
++target_include_directories(test_calculator PRIVATE include)
++add_test(NAME calculator_tests COMMAND test_calculator)
++
++add_executable(test_parser tests/test_parser.cpp src/parser.cpp)
++target_include_directories(test_parser PRIVATE include)
++add_test(NAME parser_tests COMMAND test_parser)
+\ No newline at end of file
+

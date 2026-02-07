@@ -1,0 +1,47 @@
+﻿Index: src/parser.cpp
+===================================================================
+--- src/parser.cpp	(revision 15)
++++ src/parser.cpp	(revision 16)
+@@ -27,7 +27,7 @@
+                 case '%': t.type = Token::MODULO; break;
+                 case '(': t.type = Token::LPAREN; break;
+                 case ')': t.type = Token::RPAREN; break;
+-                default: throw std::runtime_error("Unknown character");
++                default: throw std::runtime_error("Unknown character in expression");
+             }
+             tokens.push_back(t);
+             ++i;
+@@ -67,11 +67,11 @@
+         } else if (tokens[pos].type == Token::DIVIDE) {
+             ++pos;
+             double divisor = parseFactor(tokens, pos);
+-            if (divisor == 0) throw std::runtime_error("Division by zero");            result /= divisor;
++            if (divisor == 0) throw std::runtime_error("Division by zero: divisor must not be zero");            result /= divisor;
+         } else if (tokens[pos].type == Token::MODULO) {
+             ++pos;
+             double divisor = parseFactor(tokens, pos);
+-            if (divisor == 0) throw std::runtime_error("Modulo by zero");
++            if (divisor == 0) throw std::runtime_error("Modulo by zero: divisor must not be zero");
+             result = static_cast<double>(static_cast<long long>(result) % static_cast<long long>(divisor));
+         } else {
+             break;
+@@ -88,7 +88,7 @@
+         ++pos;
+         double result = parseExpression(tokens, pos);
+         if (tokens[pos].type != Token::RPAREN) {
+-            throw std::runtime_error("Missing closing parenthesis");
++            throw std::runtime_error("Syntax error: missing closing parenthesis");
+         }
+         ++pos;
+         return result;
+@@ -97,7 +97,7 @@
+         ++pos;
+         return -parseFactor(tokens, pos);
+     }
+-    throw std::runtime_error("Unexpected token");
++    throw std::runtime_error("Syntax error: unexpected token");
+ }
+ 
+ } // namespace ninja
+\ No newline at end of file
+

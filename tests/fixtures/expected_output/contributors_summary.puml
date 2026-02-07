@@ -1,0 +1,11 @@
+@startuml
+salt
+{
+{T
++ 作者 | コミット数 | 総チャーン
+| alice | 8 | 402
+| bob | 7 | 253
+| charlie | 5 | 174
+}
+}
+@enduml

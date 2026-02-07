@@ -1,0 +1,14 @@
+﻿Index: src/parser.cpp
+===================================================================
+--- src/parser.cpp	(revision 8)
++++ src/parser.cpp	(revision 9)
+@@ -10,7 +10,7 @@
+     size_t i = 0;
+     while (i < input.size()) {
+         if (std::isspace(input[i])) { ++i; continue; }
+-        if (std::isdigit(input[i]) || input[i] == '.') {
++        if (std::isdigit(input[i]) || (input[i] == '.' && i + 1 < input.size() && std::isdigit(input[i+1]))) {
+             std::string num;
+             while (i < input.size() && (std::isdigit(input[i]) || input[i] == '.')) {
+                 num += input[i++];
+

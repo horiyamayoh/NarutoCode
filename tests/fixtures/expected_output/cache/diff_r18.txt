@@ -1,0 +1,14 @@
+﻿Index: src/calculator.cpp
+===================================================================
+--- src/calculator.cpp	(revision 17)
++++ src/calculator.cpp	(revision 18)
+@@ -20,6 +20,8 @@
+ void Calculator::reset() {
+     lastResult_ = 0.0;
+     history_.clear();
++    // Notify reset event
++    std::cerr << "[INFO] Calculator reset" << std::endl;
+ }
+ 
+ double Calculator::getLastResult() const {
+

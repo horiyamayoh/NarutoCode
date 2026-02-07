@@ -1,0 +1,43 @@
+{
+    "StartTime":  "2026-02-07T16:30:30.2578106+09:00",
+    "EndTime":  "2026-02-07T16:30:32.0738687+09:00",
+    "DurationSeconds":  1.816,
+    "RepoUrl":  "file:///C:/Users/dhuru/Documents/10.%20NarutoCode/NarutoCode/test_svn_repo/repo",
+    "FromRev":  1,
+    "ToRev":  20,
+    "AuthorFilter":  "",
+    "SvnExecutable":  "C:\\Program Files\\SlikSvn\\bin\\svn.exe",
+    "SvnVersion":  "1.14.2-SlikSvn",
+    "NoBlame":  false,
+    "DeadDetailLevel":  0,
+    "Parallel":  16,
+    "TopN":  50,
+    "Encoding":  "UTF8",
+    "CommitCount":  20,
+    "FileCount":  23,
+    "OutputDirectory":  "C:\\Users\\dhuru\\Documents\\10. NarutoCode\\NarutoCode\\test_output",
+    "Parameters":  {
+                       "IncludePaths":  null,
+                       "ExcludePaths":  null,
+                       "IncludeExtensions":  null,
+                       "ExcludeExtensions":  null,
+                       "EmitPlantUml":  true,
+                       "NonInteractive":  false,
+                       "TrustServerCert":  false,
+                       "IgnoreSpaceChange":  false,
+                       "IgnoreAllSpace":  false,
+                       "IgnoreEolStyle":  false,
+                       "IncludeProperties":  false,
+                       "ForceBinary":  false
+                   },
+    "Outputs":  {
+                    "CommittersCsv":  "committers.csv",
+                    "FilesCsv":  "files.csv",
+                    "CommitsCsv":  "commits.csv",
+                    "CouplingsCsv":  "couplings.csv",
+                    "RunMetaJson":  "run_meta.json",
+                    "ContributorsPlantUml":  "contributors_summary.puml",
+                    "HotspotsPlantUml":  "hotspots.puml",
+                    "CoChangePlantUml":  "cochange_network.puml"
+                }
+}

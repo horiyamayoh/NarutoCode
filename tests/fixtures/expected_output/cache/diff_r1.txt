@@ -1,0 +1,343 @@
+﻿Index: CMakeLists.txt
+===================================================================
+--- CMakeLists.txt	(nonexistent)
++++ CMakeLists.txt	(revision 1)
+@@ -0,0 +1,13 @@
++﻿cmake_minimum_required(VERSION 3.16)
++project(NinjaCalc VERSION 1.0.0 LANGUAGES CXX)
++
++set(CMAKE_CXX_STANDARD 17)
++set(CMAKE_CXX_STANDARD_REQUIRED ON)
++
++add_executable(ninja_calc
++    src/main.cpp
++    src/calculator.cpp
++    src/parser.cpp
++    src/utils.cpp
++)
++target_include_directories(ninja_calc PRIVATE include)
+\ No newline at end of file
+Index: README.md
+===================================================================
+--- README.md	(nonexistent)
++++ README.md	(revision 1)
+@@ -0,0 +1,21 @@
++﻿# NinjaCalc
++
++A simple command-line calculator written in C++17.
++
++## Build
++
++```bash
++mkdir build && cd build
++cmake ..
++make
++```
++
++## Usage
++
++```bash
++./ninja_calc
++> 2 + 3
++= 5
++> (10 - 2) * 3
++= 24
++```
+\ No newline at end of file
+Index: include/calculator.h
+===================================================================
+--- include/calculator.h	(nonexistent)
++++ include/calculator.h	(revision 1)
+@@ -0,0 +1,25 @@
++﻿#ifndef CALCULATOR_H
++#define CALCULATOR_H
++
++#include <string>
++#include <vector>
++
++namespace ninja {
++
++class Calculator {
++public:
++    Calculator();
++    ~Calculator();
++
++    double evaluate(const std::string& expression);
++    void reset();
++    double getLastResult() const;
++
++private:
++    double lastResult_;
++    std::vector<double> history_;
++};
++
++} // namespace ninja
++
++#endif // CALCULATOR_H
+\ No newline at end of file
+Index: include/parser.h
+===================================================================
+--- include/parser.h	(nonexistent)
++++ include/parser.h	(revision 1)
+@@ -0,0 +1,28 @@
++﻿#ifndef PARSER_H
++#define PARSER_H
++
++#include <string>
++#include <vector>
++
++namespace ninja {
++
++struct Token {
++    enum Type { NUMBER, PLUS, MINUS, MULTIPLY, DIVIDE, LPAREN, RPAREN, END };
++    Type type;
++    double value;
++};
++
++class Parser {
++public:
++    std::vector<Token> tokenize(const std::string& input);
++    double parse(const std::vector<Token>& tokens);
++
++private:
++    double parseExpression(const std::vector<Token>& tokens, size_t& pos);
++    double parseTerm(const std::vector<Token>& tokens, size_t& pos);
++    double parseFactor(const std::vector<Token>& tokens, size_t& pos);
++};
++
++} // namespace ninja
++
++#endif // PARSER_H
+\ No newline at end of file
+Index: include/utils.h
+===================================================================
+--- include/utils.h	(nonexistent)
++++ include/utils.h	(revision 1)
+@@ -0,0 +1,16 @@
++﻿#ifndef UTILS_H
++#define UTILS_H
++
++#include <string>
++
++namespace ninja {
++namespace utils {
++
++std::string trim(const std::string& str);
++bool isNumeric(const std::string& str);
++void printBanner();
++
++} // namespace utils
++} // namespace ninja
++
++#endif // UTILS_H
+\ No newline at end of file
+Index: src/calculator.cpp
+===================================================================
+--- src/calculator.cpp	(nonexistent)
++++ src/calculator.cpp	(revision 1)
+@@ -0,0 +1,29 @@
++﻿#include "calculator.h"
++#include "parser.h"
++#include <stdexcept>
++
++namespace ninja {
++
++Calculator::Calculator() : lastResult_(0.0) {}
++
++Calculator::~Calculator() {}
++
++double Calculator::evaluate(const std::string& expression) {
++    Parser parser;
++    auto tokens = parser.tokenize(expression);
++    double result = parser.parse(tokens);
++    lastResult_ = result;
++    history_.push_back(result);
++    return result;
++}
++
++void Calculator::reset() {
++    lastResult_ = 0.0;
++    history_.clear();
++}
++
++double Calculator::getLastResult() const {
++    return lastResult_;
++}
++
++} // namespace ninja
+\ No newline at end of file
+Index: src/main.cpp
+===================================================================
+--- src/main.cpp	(nonexistent)
++++ src/main.cpp	(revision 1)
+@@ -0,0 +1,27 @@
++﻿#include "calculator.h"
++#include "utils.h"
++#include <iostream>
++#include <string>
++
++int main() {
++    ninja::utils::printBanner();
++    ninja::Calculator calc;
++
++    std::string line;
++    while (true) {
++        std::cout << "> ";
++        if (!std::getline(std::cin, line)) break;
++
++        line = ninja::utils::trim(line);
++        if (line == "quit" || line == "exit") break;
++        if (line.empty()) continue;
++
++        try {
++            double result = calc.evaluate(line);
++            std::cout << "= " << result << std::endl;
++        } catch (const std::exception& e) {
++            std::cerr << "Error: " << e.what() << std::endl;
++        }
++    }
++    return 0;
++}
+\ No newline at end of file
+Index: src/parser.cpp
+===================================================================
+--- src/parser.cpp	(nonexistent)
++++ src/parser.cpp	(revision 1)
+@@ -0,0 +1,98 @@
++﻿#include "parser.h"
++#include <stdexcept>
++#include <cctype>
++#include <sstream>
++
++namespace ninja {
++
++std::vector<Token> Parser::tokenize(const std::string& input) {
++    std::vector<Token> tokens;
++    size_t i = 0;
++    while (i < input.size()) {
++        if (std::isspace(input[i])) { ++i; continue; }
++        if (std::isdigit(input[i]) || input[i] == '.') {
++            std::string num;
++            while (i < input.size() && (std::isdigit(input[i]) || input[i] == '.')) {
++                num += input[i++];
++            }
++            tokens.push_back({Token::NUMBER, std::stod(num)});
++        } else {
++            Token t;
++            t.value = 0;
++            switch (input[i]) {
++                case '+': t.type = Token::PLUS; break;
++                case '-': t.type = Token::MINUS; break;
++                case '*': t.type = Token::MULTIPLY; break;
++                case '/': t.type = Token::DIVIDE; break;
++                case '(': t.type = Token::LPAREN; break;
++                case ')': t.type = Token::RPAREN; break;
++                default: throw std::runtime_error("Unknown character");
++            }
++            tokens.push_back(t);
++            ++i;
++        }
++    }
++    tokens.push_back({Token::END, 0});
++    return tokens;
++}
++
++double Parser::parse(const std::vector<Token>& tokens) {
++    size_t pos = 0;
++    return parseExpression(tokens, pos);
++}
++
++double Parser::parseExpression(const std::vector<Token>& tokens, size_t& pos) {
++    double result = parseTerm(tokens, pos);
++    while (pos < tokens.size()) {
++        if (tokens[pos].type == Token::PLUS) {
++            ++pos;
++            result += parseTerm(tokens, pos);
++        } else if (tokens[pos].type == Token::MINUS) {
++            ++pos;
++            result -= parseTerm(tokens, pos);
++        } else {
++            break;
++        }
++    }
++    return result;
++}
++
++double Parser::parseTerm(const std::vector<Token>& tokens, size_t& pos) {
++    double result = parseFactor(tokens, pos);
++    while (pos < tokens.size()) {
++        if (tokens[pos].type == Token::MULTIPLY) {
++            ++pos;
++            result *= parseFactor(tokens, pos);
++        } else if (tokens[pos].type == Token::DIVIDE) {
++            ++pos;
++            double divisor = parseFactor(tokens, pos);
++            if (divisor == 0) throw std::runtime_error("Division by zero");
++            result /= divisor;
++        } else {
++            break;
++        }
++    }
++    return result;
++}
++
++double Parser::parseFactor(const std::vector<Token>& tokens, size_t& pos) {
++    if (tokens[pos].type == Token::NUMBER) {
++        return tokens[pos++].value;
++    }
++    if (tokens[pos].type == Token::LPAREN) {
++        ++pos;
++        double result = parseExpression(tokens, pos);
++        if (tokens[pos].type != Token::RPAREN) {
++            throw std::runtime_error("Missing closing parenthesis");
++        }
++        ++pos;
++        return result;
++    }
++    if (tokens[pos].type == Token::MINUS) {
++        ++pos;
++        return -parseFactor(tokens, pos);
++    }
++    throw std::runtime_error("Unexpected token");
++}
++
++} // namespace ninja
+\ No newline at end of file
+Index: src/utils.cpp
+===================================================================
+--- src/utils.cpp	(nonexistent)
++++ src/utils.cpp	(revision 1)
+@@ -0,0 +1,31 @@
++﻿#include "utils.h"
++#include <algorithm>
++#include <iostream>
++
++namespace ninja {
++namespace utils {
++
++std::string trim(const std::string& str) {
++    auto start = str.find_first_not_of(" \t\n\r");
++    if (start == std::string::npos) return "";
++    auto end = str.find_last_not_of(" \t\n\r");
++    return str.substr(start, end - start + 1);
++}
++
++bool isNumeric(const std::string& str) {
++    if (str.empty()) return false;
++    for (char c : str) {
++        if (!std::isdigit(c) && c != '.' && c != '-') return false;
++    }
++    return true;
++}
++
++void printBanner() {
++    std::cout << "================================" << std::endl;
++    std::cout << "  NinjaCalc v1.0" << std::endl;
++    std::cout << "  Type 'quit' to exit" << std::endl;
++    std::cout << "================================" << std::endl;
++}
++
++} // namespace utils
++} // namespace ninja
+\ No newline at end of file
+

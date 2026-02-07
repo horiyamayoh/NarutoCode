@@ -1,0 +1,84 @@
+﻿Index: include/utils.h
+===================================================================
+--- include/utils.h	(revision 7)
++++ include/utils.h	(revision 8)
+@@ -8,7 +8,9 @@
+ 
+ std::string trim(const std::string& str);
+ bool isNumeric(const std::string& str);
++std::string toLower(const std::string& str);
+ void printBanner();
++void printHelp();
+ 
+ } // namespace utils
+ } // namespace ninja
+Index: src/utils.cpp
+===================================================================
+--- src/utils.cpp	(revision 7)
++++ src/utils.cpp	(revision 8)
+@@ -1,31 +1,51 @@
+ ﻿#include "utils.h"
+ #include <algorithm>
+ #include <iostream>
++#include <cctype>
++#include <sstream>
+ 
+ namespace ninja {
+ namespace utils {
+ 
+ std::string trim(const std::string& str) {
+-    auto start = str.find_first_not_of(" \t\n\r");
+-    if (start == std::string::npos) return "";
+-    auto end = str.find_last_not_of(" \t\n\r");
+-    return str.substr(start, end - start + 1);
++    if (str.empty()) return str;
++    auto start = std::find_if(str.begin(), str.end(),
++        [](unsigned char c) { return !std::isspace(c); });
++    auto end = std::find_if(str.rbegin(), str.rend(),
++        [](unsigned char c) { return !std::isspace(c); }).base();
++    return (start < end) ? std::string(start, end) : std::string();
+ }
+ 
+ bool isNumeric(const std::string& str) {
+     if (str.empty()) return false;
+-    for (char c : str) {
+-        if (!std::isdigit(c) && c != '.' && c != '-') return false;
+-    }
+-    return true;
++    std::istringstream iss(str);
++    double d;
++    iss >> std::noskipws >> d;
++    return iss.eof() && !iss.fail();
+ }
+ 
++std::string toLower(const std::string& str) {
++    std::string result = str;
++    std::transform(result.begin(), result.end(), result.begin(),
++        [](unsigned char c) { return std::tolower(c); });
++    return result;
++}
++
+ void printBanner() {
+-    std::cout << "================================" << std::endl;
+-    std::cout << "  NinjaCalc v1.0" << std::endl;
+-    std::cout << "  Type 'quit' to exit" << std::endl;
+-    std::cout << "================================" << std::endl;
++    std::cout << "+================================+" << std::endl;
++    std::cout << "|       NinjaCalc v1.1           |" << std::endl;
++    std::cout << "|   Type 'quit' to exit          |" << std::endl;
++    std::cout << "|   Type 'help' for commands     |" << std::endl;
++    std::cout << "+================================+" << std::endl;
+ }
+ 
++void printHelp() {
++    std::cout << "Commands:" << std::endl;
++    std::cout << "  <expression>  Evaluate math expression" << std::endl;
++    std::cout << "  help          Show this help" << std::endl;
++    std::cout << "  history       Show calculation history" << std::endl;
++    std::cout << "  quit/exit     Exit the program" << std::endl;
++}
++
+ } // namespace utils
+ } // namespace ninja
+\ No newline at end of file
+

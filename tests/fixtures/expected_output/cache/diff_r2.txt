@@ -1,0 +1,74 @@
+﻿Index: tests/test_calculator.cpp
+===================================================================
+--- tests/test_calculator.cpp	(nonexistent)
++++ tests/test_calculator.cpp	(revision 2)
+@@ -0,0 +1,33 @@
++﻿#include "calculator.h"
++#include <cassert>
++#include <iostream>
++#include <cmath>
++
++void testBasicAdd() {
++    ninja::Calculator calc;
++    double r = calc.evaluate("2 + 3");
++    assert(std::abs(r - 5.0) < 1e-9);
++    std::cout << "PASS: testBasicAdd" << std::endl;
++}
++
++void testMultiply() {
++    ninja::Calculator calc;
++    double r = calc.evaluate("4 * 5");
++    assert(std::abs(r - 20.0) < 1e-9);
++    std::cout << "PASS: testMultiply" << std::endl;
++}
++
++void testParentheses() {
++    ninja::Calculator calc;
++    double r = calc.evaluate("(2 + 3) * 4");
++    assert(std::abs(r - 20.0) < 1e-9);
++    std::cout << "PASS: testParentheses" << std::endl;
++}
++
++int main() {
++    testBasicAdd();
++    testMultiply();
++    testParentheses();
++    std::cout << "All tests passed!" << std::endl;
++    return 0;
++}
+\ No newline at end of file
+Index: tests/test_parser.cpp
+===================================================================
+--- tests/test_parser.cpp	(nonexistent)
++++ tests/test_parser.cpp	(revision 2)
+@@ -0,0 +1,28 @@
++﻿#include "parser.h"
++#include <cassert>
++#include <iostream>
++
++void testTokenize() {
++    ninja::Parser parser;
++    auto tokens = parser.tokenize("1 + 2");
++    assert(tokens.size() == 4);
++    assert(tokens[0].type == ninja::Token::NUMBER);
++    assert(tokens[1].type == ninja::Token::PLUS);
++    assert(tokens[2].type == ninja::Token::NUMBER);
++    std::cout << "PASS: testTokenize" << std::endl;
++}
++
++void testEmptyInput() {
++    ninja::Parser parser;
++    auto tokens = parser.tokenize("");
++    assert(tokens.size() == 1);
++    assert(tokens[0].type == ninja::Token::END);
++    std::cout << "PASS: testEmptyInput" << std::endl;
++}
++
++int main() {
++    testTokenize();
++    testEmptyInput();
++    std::cout << "All parser tests passed!" << std::endl;
++    return 0;
++}
+\ No newline at end of file
+

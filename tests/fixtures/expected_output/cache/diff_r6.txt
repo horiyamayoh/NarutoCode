@@ -1,0 +1,66 @@
+﻿Index: include/parser.h
+===================================================================
+--- include/parser.h	(revision 5)
++++ include/parser.h	(revision 6)
+@@ -7,7 +7,7 @@
+ namespace ninja {
+ 
+ struct Token {
+-    enum Type { NUMBER, PLUS, MINUS, MULTIPLY, DIVIDE, LPAREN, RPAREN, END };
++    enum Type { NUMBER, PLUS, MINUS, MULTIPLY, DIVIDE, MODULO, LPAREN, RPAREN, END };
+     Type type;
+     double value;
+ };
+Index: src/parser.cpp
+===================================================================
+--- src/parser.cpp	(revision 5)
++++ src/parser.cpp	(revision 6)
+@@ -24,6 +24,7 @@
+                 case '-': t.type = Token::MINUS; break;
+                 case '*': t.type = Token::MULTIPLY; break;
+                 case '/': t.type = Token::DIVIDE; break;
++                case '%': t.type = Token::MODULO; break;
+                 case '(': t.type = Token::LPAREN; break;
+                 case ')': t.type = Token::RPAREN; break;
+                 default: throw std::runtime_error("Unknown character");
+@@ -66,8 +67,12 @@
+         } else if (tokens[pos].type == Token::DIVIDE) {
+             ++pos;
+             double divisor = parseFactor(tokens, pos);
+-            if (divisor == 0) throw std::runtime_error("Division by zero");
+-            result /= divisor;
++            if (divisor == 0) throw std::runtime_error("Division by zero");            result /= divisor;
++        } else if (tokens[pos].type == Token::MODULO) {
++            ++pos;
++            double divisor = parseFactor(tokens, pos);
++            if (divisor == 0) throw std::runtime_error("Modulo by zero");
++            result = static_cast<double>(static_cast<long long>(result) % static_cast<long long>(divisor));
+         } else {
+             break;
+         }
+Index: tests/test_calculator.cpp
+===================================================================
+--- tests/test_calculator.cpp	(revision 5)
++++ tests/test_calculator.cpp	(revision 6)
+@@ -24,10 +24,18 @@
+     std::cout << "PASS: testParentheses" << std::endl;
+ }
+ 
++void testModulo() {
++    ninja::Calculator calc;
++    double r = calc.evaluate("10 % 3");
++    assert(std::abs(r - 1.0) < 1e-9);
++    std::cout << "PASS: testModulo" << std::endl;
++}
++
+ int main() {
+     testBasicAdd();
+     testMultiply();
+-    testParentheses();
++    testParentheses();
++    testModulo();
+     std::cout << "All tests passed!" << std::endl;
+     return 0;
+ }
+\ No newline at end of file
+

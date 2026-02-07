@@ -1,0 +1,31 @@
+@startuml
+salt
+{
+{T
++ ホットスポット順位 | ファイルパス | ホットスポットスコア
+| 1 | src/parser.cpp | 476
+| 2 | src/utils.cpp | 378
+| 3 | src/calculator.cpp | 364
+| 4 | src/main.cpp | 114
+| 5 | src/logger.cpp | 112
+| 6 | include/utils.h | 108
+| 7 | tests/test_calculator.cpp | 86
+| 8 | include/logger.h | 80
+| 9 | README.md | 78
+| 10 | src/formatter.cpp | 73
+| 11 | include/parser.h | 60
+| 12 | include/calculator.h | 54
+| 13 | CMakeLists.txt | 52
+| 14 | src/string_utils.cpp | 51
+| 15 | tests/test_parser.cpp | 28
+| 16 | include/formatter.h | 20
+| 17 | include/string_utils.h | 18
+| 18 | .gitignore | 7
+| 19 | assets | 0
+| 20 | assets/logo.png | 0
+| 21 | include | 0
+| 22 | src | 0
+| 23 | tests | 0
+}
+}
+@enduml

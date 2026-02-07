@@ -1,0 +1,61 @@
+﻿Index: include/logger.h
+===================================================================
+--- include/logger.h	(revision 11)
++++ include/logger.h	(nonexistent)
+@@ -1,20 +0,0 @@
+-﻿#ifndef LOGGER_H
+-#define LOGGER_H
+-
+-#include <string>
+-
+-namespace ninja {
+-
+-class Logger {
+-public:
+-    static Logger& instance();
+-    void log(const std::string& msg);
+-    void setFile(const std::string& path);
+-
+-private:
+-    Logger() = default;
+-};
+-
+-} // namespace ninja
+-
+-#endif // LOGGER_H
+\ No newline at end of file
+Index: src/logger.cpp
+===================================================================
+--- src/logger.cpp	(revision 11)
++++ src/logger.cpp	(nonexistent)
+@@ -1,28 +0,0 @@
+-﻿#include <iostream>
+-#include <fstream>
+-#include <ctime>
+-
+-namespace ninja {
+-
+-class Logger {
+-public:
+-    static Logger& instance() {
+-        static Logger logger;
+-        return logger;
+-    }
+-
+-    void log(const std::string& msg) {
+-        auto now = std::time(nullptr);
+-        std::cerr << "[" << now << "] " << msg << std::endl;
+-    }
+-
+-    void setFile(const std::string& path) {
+-        logFile_.open(path, std::ios::app);
+-    }
+-
+-private:
+-    Logger() = default;
+-    std::ofstream logFile_;
+-};
+-
+-} // namespace ninja
+\ No newline at end of file
+

@@ -1399,3 +1399,144 @@ Describe 'NarutoCode.ps1 parameter definition — Phase 2' {
         $script:cmd.Parameters['DeadDetailLevel'].ParameterType.Name | Should -Be 'Int32'
     }
 }
+
+# ---------------------------------------------------------------------------
+#  Integration test: run NarutoCode.ps1 against the test SVN repository
+#  and compare CSV / PlantUML output with the expected baseline files.
+# ---------------------------------------------------------------------------
+$script:skipReason = $null   # initialise before Describe so -Skip expressions work during discovery
+Describe 'Integration — test SVN repo output matches baseline' -Tag 'Integration' {
+    BeforeAll {
+        # ----- Locate svn executable -----
+        $script:svnExe = $null
+        foreach ($candidate in @(
+                'svn',
+                'svn.exe',
+                'C:\Program Files\SlikSvn\bin\svn.exe',
+                'C:\Program Files\TortoiseSVN\bin\svn.exe',
+                'C:\Program Files (x86)\SlikSvn\bin\svn.exe'
+            )) {
+            if (Get-Command $candidate -ErrorAction SilentlyContinue) {
+                $script:svnExe = (Get-Command $candidate).Source
+                break
+            }
+            if (Test-Path $candidate) {
+                $script:svnExe = $candidate
+                break
+            }
+        }
+
+        $script:skipReason = $null
+        if (-not $script:svnExe) {
+            $script:skipReason = 'svn executable not found — skipping integration tests'
+        }
+
+        # ----- Paths -----
+        $here = Split-Path -Parent $PSCommandPath
+        $script:projectRoot = Split-Path -Parent $here
+        $script:fixturesDir = Join-Path (Join-Path $script:projectRoot 'tests') 'fixtures'
+        $script:repoDir = Join-Path (Join-Path $script:fixturesDir 'svn_repo') 'repo'
+        $script:expectedDir = Join-Path $script:fixturesDir 'expected_output'
+        $script:actualDir = Join-Path $env:TEMP ('narutocode_integ_' + [guid]::NewGuid().ToString('N'))
+
+        if (-not $script:skipReason -and -not (Test-Path $script:repoDir)) {
+            $script:skipReason = 'tests/fixtures/svn_repo/repo not found — skipping integration tests'
+        }
+
+        # ----- Run NarutoCode.ps1 -----
+        if (-not $script:skipReason) {
+            $repoUrl = 'file:///' + ($script:repoDir -replace '\\', '/')
+            & $script:ScriptPath `
+                -RepoUrl $repoUrl `
+                -FromRev 1 -ToRev 20 `
+                -OutDir $script:actualDir `
+                -SvnExecutable $script:svnExe `
+                -EmitPlantUml `
+                -Encoding UTF8 `
+                -ErrorAction Stop
+        }
+
+        # ---- Helper: compare two CSV files cell-by-cell ----
+        function script:Assert-CsvEqual {
+            param(
+                [string]$ActualPath,
+                [string]$ExpectedPath,
+                [string]$Label
+            )
+            $actual   = @(Import-Csv -Path $ActualPath   -Encoding UTF8)
+            $expected = @(Import-Csv -Path $ExpectedPath  -Encoding UTF8)
+
+            $actual.Count | Should -Be $expected.Count -Because "$Label row count"
+
+            $headers = ($expected[0].PSObject.Properties | ForEach-Object { $_.Name })
+            for ($i = 0; $i -lt $expected.Count; $i++) {
+                foreach ($h in $headers) {
+                    $actual[$i].$h | Should -Be $expected[$i].$h `
+                        -Because "$Label row $i column '$h'"
+                }
+            }
+        }
+    }
+
+    AfterAll {
+        if ($script:actualDir -and (Test-Path $script:actualDir)) {
+            Remove-Item -Path $script:actualDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'produces commits.csv identical to baseline' -Skip:($null -ne $script:skipReason) {
+        Assert-CsvEqual `
+            -ActualPath   (Join-Path $script:actualDir 'commits.csv') `
+            -ExpectedPath (Join-Path $script:expectedDir 'commits.csv') `
+            -Label 'commits.csv'
+    }
+
+    It 'produces committers.csv identical to baseline' -Skip:($null -ne $script:skipReason) {
+        Assert-CsvEqual `
+            -ActualPath   (Join-Path $script:actualDir 'committers.csv') `
+            -ExpectedPath (Join-Path $script:expectedDir 'committers.csv') `
+            -Label 'committers.csv'
+    }
+
+    It 'produces files.csv identical to baseline' -Skip:($null -ne $script:skipReason) {
+        Assert-CsvEqual `
+            -ActualPath   (Join-Path $script:actualDir 'files.csv') `
+            -ExpectedPath (Join-Path $script:expectedDir 'files.csv') `
+            -Label 'files.csv'
+    }
+
+    It 'produces couplings.csv identical to baseline' -Skip:($null -ne $script:skipReason) {
+        Assert-CsvEqual `
+            -ActualPath   (Join-Path $script:actualDir 'couplings.csv') `
+            -ExpectedPath (Join-Path $script:expectedDir 'couplings.csv') `
+            -Label 'couplings.csv'
+    }
+
+    It 'produces contributors_summary.puml identical to baseline' -Skip:($null -ne $script:skipReason) {
+        $actual   = (Get-Content (Join-Path $script:actualDir   'contributors_summary.puml') -Raw).TrimEnd()
+        $expected = (Get-Content (Join-Path $script:expectedDir 'contributors_summary.puml') -Raw).TrimEnd()
+        $actual | Should -Be $expected -Because 'contributors_summary.puml content'
+    }
+
+    It 'produces hotspots.puml identical to baseline' -Skip:($null -ne $script:skipReason) {
+        $actual   = (Get-Content (Join-Path $script:actualDir   'hotspots.puml') -Raw).TrimEnd()
+        $expected = (Get-Content (Join-Path $script:expectedDir 'hotspots.puml') -Raw).TrimEnd()
+        $actual | Should -Be $expected -Because 'hotspots.puml content'
+    }
+
+    It 'produces cochange_network.puml identical to baseline' -Skip:($null -ne $script:skipReason) {
+        $actual   = (Get-Content (Join-Path $script:actualDir   'cochange_network.puml') -Raw).TrimEnd()
+        $expected = (Get-Content (Join-Path $script:expectedDir 'cochange_network.puml') -Raw).TrimEnd()
+        $actual | Should -Be $expected -Because 'cochange_network.puml content'
+    }
+
+    It 'produces run_meta.json with correct summary fields' -Skip:($null -ne $script:skipReason) {
+        $meta = Get-Content (Join-Path $script:actualDir 'run_meta.json') -Raw | ConvertFrom-Json
+        $meta.FromRev       | Should -Be 1
+        $meta.ToRev         | Should -Be 20
+        $meta.CommitCount   | Should -Be 20
+        $meta.FileCount     | Should -Be 23
+        $meta.NoBlame       | Should -BeFalse
+        $meta.Encoding      | Should -Be 'UTF8'
+    }
+}

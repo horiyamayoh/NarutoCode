@@ -1,0 +1,56 @@
+﻿Index: README.md
+===================================================================
+--- README.md	(revision 19)
++++ README.md	(revision 20)
+@@ -1,7 +1,13 @@
+-﻿# NinjaCalc
++﻿# NinjaCalc v1.1
+ 
+ A simple command-line calculator written in C++17.
+ 
++## Features
++- Basic arithmetic: +, -, *, /, %
++- Parentheses grouping
++- Calculation history
++- Multiple output formats
++
+ ## Build
+ 
+ ```bash
+@@ -18,4 +24,12 @@
+ = 5
+ > (10 - 2) * 3
+ = 24
+-```
+\ No newline at end of file
++> 10 % 3
++= 1
++> help
++> history
++> quit
++```
++
++## License
++MIT
+\ No newline at end of file
+Index: src/main.cpp
+===================================================================
+--- src/main.cpp	(revision 19)
++++ src/main.cpp	(revision 20)
+@@ -16,6 +16,15 @@
+         if (line == "quit" || line == "exit") break;
+         if (line.empty()) continue;
+ 
++        if (line == "help") {
++            ninja::utils::printHelp();
++            continue;
++        }
++        if (line == "history") {
++            calc.printHistory();
++            continue;
++        }
++
+         try {
+             double result = calc.evaluate(line);
+             std::cout << "= " << result << std::endl;
+
