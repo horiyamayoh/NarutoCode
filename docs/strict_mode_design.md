@@ -58,6 +58,8 @@
 | 10 | 生存行数 (範囲指定) | files | B | G1: per-revision blame |
 | 11 | 所有行数 | committers | B | G2: 全ファイル blame |
 | 12 | 所有割合 | committers | B | G2: 全ファイル blame |
+| 13 | 他者コード変更行数 | committers | — | G1: per-revision blame |
+| 14 | 他者コード変更生存行数 | committers | — | G1 + G2: per-revision blame + 全ファイル blame |
 | 13 | 最多作者blame占有率 | files | B | G1: per-revision blame |
 | 14 | 同一箇所反復編集数 | committers / files | B | G3: 正準行範囲追跡 |
 | 15 | ピンポン回数 | committers / files | B | G3: 正準行範囲追跡 |

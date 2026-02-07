@@ -25,7 +25,7 @@ CSV / PlantUML の見出しを日本語化した際の対訳一覧です。
 | Churn | チャーン | |
 | Entropy | エントロピー | |
 
-## committers.csv（39 列）
+## committers.csv（41 列）
 
 ### Phase 1（基本指標 — 30 列）
 
@@ -62,7 +62,7 @@ CSV / PlantUML の見出しを日本語化した際の対訳一覧です。
 | RevertKeywordCount | 差戻キーワード数 | |
 | MergeKeywordCount | マージキーワード数 | |
 
-### Phase 2（dead-detail 指標 — 9 列）
+### Phase 2（dead-detail 指標 — 11 列）
 
 | 英語（旧） | 日本語（新） | 備考 |
 |---|---|---|
@@ -75,6 +75,8 @@ CSV / PlantUML の見出しを日本語化した際の対訳一覧です。
 | InternalMoveLineCount | 内部移動行数 | ファイル内の行移動 |
 | DeadBySelfApprox | 自己消滅行数 (概算) | SelfCancel ベースの内訳 |
 | DeadByOthersApprox | 被他者消滅行数 (概算) | 残差。「被」＝受身 |
+| ModifiedOthersCodeLines | 他者コード変更行数 | 他者が書いた行を自分が削除した行数。blame 由来 |
+| ModifiedOthersCodeSurvivedLines | 他者コード変更生存行数 | 他者コード変更コミットで追加した行のうち ToRev 時点で生存している行数。blame 由来 |
 
 ## files.csv（25 列）
 

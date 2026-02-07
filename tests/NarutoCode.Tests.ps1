@@ -930,6 +930,8 @@ Describe 'Strict-only behavior' {
         $row.PSObject.Properties.Name -contains '消滅追加行数' | Should -BeTrue
         $row.PSObject.Properties.Name -contains '自己消滅行数' | Should -BeTrue
         $row.PSObject.Properties.Name -contains '被他者消滅行数' | Should -BeTrue
+        $row.PSObject.Properties.Name -contains '他者コード変更行数' | Should -BeTrue
+        $row.PSObject.Properties.Name -contains '他者コード変更生存行数' | Should -BeTrue
     }
 }
 

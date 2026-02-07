@@ -387,6 +387,44 @@ flowchart LR
 
 > これらは**回数のみ**を提供し、「良い／悪い」の判定は行いません。
 
+### 2.9 他者コード変更指標（blame 由来）
+
+各コミットの blame 情報を前後比較し、**他人が書いた行を自分が削除・置換した規模**と、**その置換行が最終版に残ったか**を誤差ゼロで計測します。
+
+```mermaid
+flowchart TB
+    subgraph COMMIT["コミット r105 (作者: charlie)"]
+        direction TB
+        BEFORE["blame@r104\n行10: alice 'int x = 0;'\n行11: alice 'int y = 1;'\n行12: bob 'return x;'"]
+        AFTER["blame@r105\n行10: charlie 'int x = calc();'\n行11: charlie 'int y = calc2();'\n行12: bob 'return x;'"]
+        BEFORE -->|差分比較| AFTER
+    end
+
+    AFTER --> KILLED["削除された他者の行:\nalice の行10, 行11\n→ 他者コード変更行数 += 2"]
+    AFTER --> BORN["追加された charlie の行:\n行10, 行11\n→ ToRev の blame で生存確認"]
+
+    subgraph FINAL["ToRev 時点の blame"]
+        SURV["行10: charlie 'int x = calc();' → 生存 ✓\n行11: charlie 'int y = calc2();' → 生存 ✓"]
+    end
+
+    BORN --> FINAL
+    FINAL --> RESULT["他者コード変更生存行数 += 2"]
+
+    style KILLED fill:#ffcdd2,color:#000
+    style BORN fill:#c8e6c9,color:#000
+    style SURV fill:#a5d6a7,color:#000
+```
+
+| 列名 | 意味 | 読み方 |
+|---|---|---|
+| **他者コード変更行数** | 他者が書いた行を自分が削除した行数（blame で原著者を厳密特定） | 大きいと他者のコードを積極的に修正している（レビュー・リファクタの指標） |
+| **他者コード変更生存行数** | 他者コード変更コミットで自分が追加した行のうち ToRev 時点で生存している行数 | 大きいと他者コード修正の成果が定着している（修正品質の指標） |
+
+> **アルゴリズム：**
+> 1. 各コミットで `svn blame` の前後差分を取り、KilledLines（消えた行）の原著者が自分以外なら「他者コード変更行数」をカウント
+> 2. その（リビジョン, 作者）ペアを記録し、ToRev 時点の最終 blame で該当ペアの行数を「他者コード変更生存行数」としてカウント
+> 3. 全て blame の行単位で集計するため**誤差ゼロ**
+
 ---
 
 ## 3. files.csv — ファイル単位の指標
