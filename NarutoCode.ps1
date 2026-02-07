@@ -1,6 +1,16 @@
 ﻿<#
 .SYNOPSIS
-NarutoCode Phase 1 + Phase 2 implementation.
+    SVN リポジトリの履歴を解析し、コミット品質・変更傾向のメトリクスを生成する。
+.DESCRIPTION
+    NarutoCode は指定リビジョン範囲（FromRev〜ToRev）の SVN 履歴を、
+    svn log / diff / blame のみで分析し、以下のメトリクスを算出する：
+    - コードチャーンと生存分析（svn blame による）
+    - 自己相殺・他者差戻の検出（行ハッシュ追跡による）
+    - ホットスポットスコアリング（コミット頻度 × チャーン）
+    - 共変更カップリング（Jaccard / Lift）
+    - Strict 死亡帰属（リビジョン横断の行単位 birth/death 追跡）
+
+    出力は CSV レポートおよびオプションの PlantUML 可視化。
 #>
 [CmdletBinding()]
 param(
@@ -38,25 +48,33 @@ if ($NoProgress)
     $ProgressPreference = 'SilentlyContinue'
 }
 
-# region Utility
 $script:StrictModeEnabled = $true
-$script:ColDeadAdded = '消滅追加行数'
-$script:ColSelfDead = '自己消滅行数'
-$script:ColOtherDead = '被他者消滅行数'
+$script:ColDeadAdded = '消滅追加行数'       # 追加されたが ToRev 時点で生存していない行数
+$script:ColSelfDead = '自己消滅行数'         # 追加した本人が後のコミットで削除した行数
+$script:ColOtherDead = '被他者消滅行数'      # 別の作者によって削除された行数
 $script:StrictBlameCacheHits = 0
 $script:StrictBlameCacheMisses = 0
 
+# region 初期化
 function Initialize-StrictModeContext
 {
+    <#
+    .SYNOPSIS
+        Strict モード実行に必要なスクリプト状態を初期化する。
+    #>
     $script:StrictModeEnabled = $true
     $script:StrictBlameCacheHits = 0
     $script:StrictBlameCacheMisses = 0
-    $script:ColDeadAdded = '消滅追加行数'
-    $script:ColSelfDead = '自己消滅行数'
-    $script:ColOtherDead = '被他者消滅行数'
+    $script:ColDeadAdded = '消滅追加行数'       # 追加されたが ToRev 時点で生存していない行数
+    $script:ColSelfDead = '自己消滅行数'         # 追加した本人が後のコミットで削除した行数
+    $script:ColOtherDead = '被他者消滅行数'      # 別の作者によって削除された行数
 }
 function ConvertTo-NormalizedExtension
 {
+    <#
+    .SYNOPSIS
+        拡張子フィルタ入力を比較可能な小文字形式に正規化する。
+    #>
     param([string[]]$Extensions)
     if (-not $Extensions)
     {
@@ -84,6 +102,10 @@ function ConvertTo-NormalizedExtension
 }
 function ConvertTo-NormalizedPatternList
 {
+    <#
+    .SYNOPSIS
+        パスパターン入力を重複なしの正規化済み配列に整形する。
+    #>
     param([string[]]$Patterns)
     if (-not $Patterns)
     {
@@ -104,8 +126,14 @@ function ConvertTo-NormalizedPatternList
     }
     return $list.ToArray() | Select-Object -Unique
 }
+# endregion 初期化
+# region エンコーディングと入出力
 function ConvertTo-PlainText
 {
+    <#
+    .SYNOPSIS
+        SecureString を SVN 引数で扱える平文文字列に変換する。
+    #>
     param([securestring]$SecureValue)
     if ($null -eq $SecureValue)
     {
@@ -126,6 +154,10 @@ function ConvertTo-PlainText
 }
 function Get-TextEncoding
 {
+    <#
+    .SYNOPSIS
+        出力指定名から対応するテキストエンコーディングを取得する。
+    #>
     param([string]$Name)
     switch ($Name.ToLowerInvariant())
     {
@@ -153,6 +185,16 @@ function Get-TextEncoding
 }
 function Write-TextFile
 {
+    <#
+    .SYNOPSIS
+        指定エンコーディングでテキストファイルを安全に書き出す。
+    .PARAMETER FilePath
+        処理対象のファイルパスを指定する。
+    .PARAMETER Content
+        解析対象のテキスト入力を指定する。
+    .PARAMETER EncodingName
+        出力時に使用する文字エンコーディングを指定する。
+    #>
     param([string]$FilePath, [string]$Content, [string]$EncodingName = 'UTF8')
     # Resolve to absolute path so .NET WriteAllText uses the correct base directory
     # (PowerShell $PWD and .NET Environment.CurrentDirectory can diverge)
@@ -166,6 +208,18 @@ function Write-TextFile
 }
 function Write-CsvFile
 {
+    <#
+    .SYNOPSIS
+        ヘッダー順を固定した CSV レポートを出力する。
+    .PARAMETER FilePath
+        処理対象のファイルパスを指定する。
+    .PARAMETER Rows
+        更新対象となる出力行オブジェクト配列を指定する。
+    .PARAMETER Headers
+        Headers の値を指定する。
+    .PARAMETER EncodingName
+        出力時に使用する文字エンコーディングを指定する。
+    #>
     param([string]$FilePath, [object[]]$Rows, [string[]]$Headers, [string]$EncodingName = 'UTF8')
     $lines = @()
     if (@($Rows).Count -gt 0)
@@ -196,20 +250,52 @@ function Write-CsvFile
 }
 function Write-JsonFile
 {
+    <#
+    .SYNOPSIS
+        実行メタデータや集計結果を JSON 形式で保存する。
+    .PARAMETER Data
+        Data の値を指定する。
+    .PARAMETER FilePath
+        処理対象のファイルパスを指定する。
+    .PARAMETER Depth
+        Depth の値を指定する。
+    .PARAMETER EncodingName
+        出力時に使用する文字エンコーディングを指定する。
+    #>
     param($Data, [string]$FilePath, [int]$Depth = 12, [string]$EncodingName = 'UTF8')
     Write-TextFile -FilePath $FilePath -Content ($Data | ConvertTo-Json -Depth $Depth) -EncodingName $EncodingName
 }
+# endregion エンコーディングと入出力
+# region 数値と書式
 function Get-RoundedNumber
 {
+    <#
+    .SYNOPSIS
+        指標表示用の数値を指定桁数で丸める。
+    #>
     param([double]$Value, [int]$Digits = 4) [Math]::Round($Value, $Digits)
 }
 function Format-MetricValue
 {
+    <#
+    .SYNOPSIS
+        Strict 設定に応じて指標値の丸め有無を切り替える。
+    #>
     param([double]$Value)
     return $Value
 }
 function Add-Count
 {
+    <#
+    .SYNOPSIS
+        ハッシュテーブルのカウンター項目を加算更新する。
+    .PARAMETER Table
+        更新対象のハッシュテーブルを指定する。
+    .PARAMETER Key
+        更新または参照に使用するキーを指定する。
+    .PARAMETER Delta
+        加算または移動量として反映する差分値を指定する。
+    #>
     param([hashtable]$Table, [string]$Key, [int]$Delta = 1)
     if ([string]::IsNullOrWhiteSpace($Key))
     {
@@ -221,18 +307,29 @@ function Add-Count
     }
     $Table[$Key] = [int]$Table[$Key] + $Delta
 }
+# endregion 数値と書式
+# region 並列実行
 function Invoke-ParallelWork
 {
     <#
     .SYNOPSIS
-        Executes a scriptblock in parallel across a collection of items using a RunspacePool.
+        RunspacePool を使って入力項目ごとの処理を並列実行する。
     .DESCRIPTION
-        When MaxParallel > 1, the WorkerScript is serialized to text via .ToString() and
-        re-created inside each runspace with [scriptblock]::Create(). This means closures
-        over outer-scope variables are NOT preserved; any external state the worker needs
-        must be passed via InputItems properties or SessionVariables. Functions from the
-        caller scope are injected via RequiredFunctions using SessionStateFunctionEntry.
-        Each worker receives two positional parameters: $Item and $Index.
+        MaxParallel が 1 を超える場合は WorkerScript をテキスト化し、各 runspace 内で再生成する。
+        そのため外側スコープのクロージャは保持されず、必要な値は InputItems または SessionVariables で渡す。
+        RequiredFunctions で明示した関数だけを runspace 側へ注入し、実行環境の差異を抑える。
+    .PARAMETER InputItems
+        並列処理する入力項目配列を指定する。
+    .PARAMETER WorkerScript
+        各入力項目に対して実行する処理を指定する。
+    .PARAMETER MaxParallel
+        並列実行時の最大ワーカー数を指定する。
+    .PARAMETER RequiredFunctions
+        ワーカー runspace に注入する関数名一覧を指定する。
+    .PARAMETER SessionVariables
+        ワーカー runspace に注入する共有変数を指定する。
+    .PARAMETER ErrorContext
+        失敗時に付与するエラー文脈文字列を指定する。
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -480,8 +577,14 @@ catch
     }
     return @($results.ToArray())
 }
+# endregion 並列実行
+# region パスとキャッシュ
 function Get-NormalizedAuthorName
 {
+    <#
+    .SYNOPSIS
+        作者名の空値や余分な空白を正規化して比較可能にする。
+    #>
     param([string]$Author)
     if ([string]::IsNullOrWhiteSpace($Author))
     {
@@ -491,6 +594,10 @@ function Get-NormalizedAuthorName
 }
 function ConvertTo-PathKey
 {
+    <#
+    .SYNOPSIS
+        SVN パスを比較とキー参照に適した正規化文字列へ変換する。
+    #>
     param([string]$Path)
     if ([string]::IsNullOrWhiteSpace($Path))
     {
@@ -510,6 +617,10 @@ function ConvertTo-PathKey
 }
 function Get-Sha1Hex
 {
+    <#
+    .SYNOPSIS
+        文字列の SHA1 ハッシュを16進小文字で取得する。
+    #>
     param([string]$Text)
     if ($null -eq $Text)
     {
@@ -529,23 +640,57 @@ function Get-Sha1Hex
 }
 function Get-PathCacheHash
 {
+    <#
+    .SYNOPSIS
+        パス文字列からキャッシュファイル名用ハッシュを生成する。
+    #>
     param([string]$FilePath)
     return Get-Sha1Hex -Text (ConvertTo-PathKey -Path $FilePath)
 }
 function Get-BlameCachePath
 {
+    <#
+    .SYNOPSIS
+        blame XML キャッシュの保存先パスを組み立てる。
+    .PARAMETER CacheDir
+        キャッシュディレクトリのパスを指定する。
+    .PARAMETER Revision
+        処理対象のリビジョン値を指定する。
+    .PARAMETER FilePath
+        処理対象のファイルパスを指定する。
+    #>
     param([string]$CacheDir, [int]$Revision, [string]$FilePath)
     $dir = Join-Path (Join-Path $CacheDir 'blame') ("r{0}" -f $Revision)
     return Join-Path $dir ((Get-PathCacheHash -FilePath $FilePath) + '.xml')
 }
 function Get-CatCachePath
 {
+    <#
+    .SYNOPSIS
+        cat テキストキャッシュの保存先パスを組み立てる。
+    .PARAMETER CacheDir
+        キャッシュディレクトリのパスを指定する。
+    .PARAMETER Revision
+        処理対象のリビジョン値を指定する。
+    .PARAMETER FilePath
+        処理対象のファイルパスを指定する。
+    #>
     param([string]$CacheDir, [int]$Revision, [string]$FilePath)
     $dir = Join-Path (Join-Path $CacheDir 'cat') ("r{0}" -f $Revision)
     return Join-Path $dir ((Get-PathCacheHash -FilePath $FilePath) + '.txt')
 }
 function Read-BlameCacheFile
 {
+    <#
+    .SYNOPSIS
+        blame XML キャッシュを読み込んで再利用する。
+    .PARAMETER CacheDir
+        キャッシュディレクトリのパスを指定する。
+    .PARAMETER Revision
+        処理対象のリビジョン値を指定する。
+    .PARAMETER FilePath
+        処理対象のファイルパスを指定する。
+    #>
     param([string]$CacheDir, [int]$Revision, [string]$FilePath)
     if ([string]::IsNullOrWhiteSpace($CacheDir))
     {
@@ -560,6 +705,18 @@ function Read-BlameCacheFile
 }
 function Write-BlameCacheFile
 {
+    <#
+    .SYNOPSIS
+        blame XML をキャッシュとして保存する。
+    .PARAMETER CacheDir
+        キャッシュディレクトリのパスを指定する。
+    .PARAMETER Revision
+        処理対象のリビジョン値を指定する。
+    .PARAMETER FilePath
+        処理対象のファイルパスを指定する。
+    .PARAMETER Content
+        解析対象のテキスト入力を指定する。
+    #>
     param([string]$CacheDir, [int]$Revision, [string]$FilePath, [string]$Content)
     if ([string]::IsNullOrWhiteSpace($CacheDir))
     {
@@ -575,6 +732,16 @@ function Write-BlameCacheFile
 }
 function Read-CatCacheFile
 {
+    <#
+    .SYNOPSIS
+        cat テキストキャッシュを読み込んで再利用する。
+    .PARAMETER CacheDir
+        キャッシュディレクトリのパスを指定する。
+    .PARAMETER Revision
+        処理対象のリビジョン値を指定する。
+    .PARAMETER FilePath
+        処理対象のファイルパスを指定する。
+    #>
     param([string]$CacheDir, [int]$Revision, [string]$FilePath)
     if ([string]::IsNullOrWhiteSpace($CacheDir))
     {
@@ -589,6 +756,18 @@ function Read-CatCacheFile
 }
 function Write-CatCacheFile
 {
+    <#
+    .SYNOPSIS
+        cat テキストをキャッシュとして保存する。
+    .PARAMETER CacheDir
+        キャッシュディレクトリのパスを指定する。
+    .PARAMETER Revision
+        処理対象のリビジョン値を指定する。
+    .PARAMETER FilePath
+        処理対象のファイルパスを指定する。
+    .PARAMETER Content
+        解析対象のテキスト入力を指定する。
+    #>
     param([string]$CacheDir, [int]$Revision, [string]$FilePath, [string]$Content)
     if ([string]::IsNullOrWhiteSpace($CacheDir))
     {
@@ -604,6 +783,10 @@ function Write-CatCacheFile
 }
 function ConvertTo-TextLine
 {
+    <#
+    .SYNOPSIS
+        入力文字列を改行区切りの行配列へ正規化する。
+    #>
     param([string]$Text)
     if ($null -eq $Text)
     {
@@ -622,6 +805,10 @@ function ConvertTo-TextLine
 }
 function Resolve-PathByRenameMap
 {
+    <#
+    .SYNOPSIS
+        リネーム履歴をたどって最新側の論理パスへ解決する。
+    #>
     param([string]$FilePath, [hashtable]$RenameMap)
     $resolved = ConvertTo-PathKey -Path $FilePath
     if ($null -eq $RenameMap -or -not $resolved)
@@ -643,6 +830,10 @@ function Resolve-PathByRenameMap
 }
 function Get-DiffLineStat
 {
+    <#
+    .SYNOPSIS
+        Unified diff テキストから追加削除行数を高速に集計する。
+    #>
     param([string]$DiffText)
     $added = 0
     $deleted = 0
@@ -676,6 +867,22 @@ function Get-DiffLineStat
 }
 function Get-AllRepositoryFile
 {
+    <#
+    .SYNOPSIS
+        対象リビジョンのリポジトリ内ファイル一覧を条件付きで取得する。
+    .PARAMETER Repo
+        対象 SVN リポジトリ URL を指定する。
+    .PARAMETER Revision
+        処理対象のリビジョン値を指定する。
+    .PARAMETER IncludeExt
+        対象を絞り込むための包含または除外条件を指定する。
+    .PARAMETER ExcludeExt
+        対象を絞り込むための包含または除外条件を指定する。
+    .PARAMETER IncludePathPatterns
+        対象を絞り込むための包含または除外条件を指定する。
+    .PARAMETER ExcludePathPatterns
+        対象を絞り込むための包含または除外条件を指定する。
+    #>
     [CmdletBinding()]
     [OutputType([object[]])]
     param([string]$Repo, [int]$Revision, [string[]]$IncludeExt, [string[]]$ExcludeExt, [string[]]$IncludePathPatterns, [string[]]$ExcludePathPatterns)
@@ -716,10 +923,18 @@ function Get-AllRepositoryFile
 }
 function Initialize-CanonicalOffsetMap
 {
+    <#
+    .SYNOPSIS
+        正準行番号変換に使うオフセットイベント表を初期化する。
+    #>
     return (New-Object 'System.Collections.Generic.List[object]')
 }
 function Get-CanonicalLineNumber
 {
+    <#
+    .SYNOPSIS
+        現在のオフセット情報から正準行番号を算出する。
+    #>
     param([object[]]$OffsetEvents, [int]$LineNumber)
     $sum = 0
     foreach ($ev in @($OffsetEvents))
@@ -733,6 +948,16 @@ function Get-CanonicalLineNumber
 }
 function Add-CanonicalOffsetEvent
 {
+    <#
+    .SYNOPSIS
+        行番号シフトを正準オフセットイベントとして登録する。
+    .PARAMETER OffsetEvents
+        OffsetEvents の値を指定する。
+    .PARAMETER ThresholdLine
+        ThresholdLine の値を指定する。
+    .PARAMETER ShiftDelta
+        加算または移動量として反映する差分値を指定する。
+    #>
     param([System.Collections.Generic.List[object]]$OffsetEvents, [int]$ThresholdLine, [int]$ShiftDelta)
     if ($null -eq $OffsetEvents)
     {
@@ -746,6 +971,18 @@ function Add-CanonicalOffsetEvent
 }
 function Test-RangeOverlap
 {
+    <#
+    .SYNOPSIS
+        2つの行範囲が重なっているかを判定する。
+    .PARAMETER StartA
+        StartA の値を指定する。
+    .PARAMETER EndA
+        EndA の値を指定する。
+    .PARAMETER StartB
+        StartB の値を指定する。
+    .PARAMETER EndB
+        EndB の値を指定する。
+    #>
     param([int]$StartA, [int]$EndA, [int]$StartB, [int]$EndB)
     $left = [Math]::Max($StartA, $StartB)
     $right = [Math]::Min($EndA, $EndB)
@@ -753,6 +990,22 @@ function Test-RangeOverlap
 }
 function Test-RangeTripleOverlap
 {
+    <#
+    .SYNOPSIS
+        3つの行範囲に共通重複があるかを判定する。
+    .PARAMETER StartA
+        StartA の値を指定する。
+    .PARAMETER EndA
+        EndA の値を指定する。
+    .PARAMETER StartB
+        StartB の値を指定する。
+    .PARAMETER EndB
+        EndB の値を指定する。
+    .PARAMETER StartC
+        StartC の値を指定する。
+    .PARAMETER EndC
+        EndC の値を指定する。
+    #>
     param([int]$StartA, [int]$EndA, [int]$StartB, [int]$EndB, [int]$StartC, [int]$EndC)
     $left = [Math]::Max([Math]::Max($StartA, $StartB), $StartC)
     $right = [Math]::Min([Math]::Min($EndA, $EndB), $EndC)
@@ -760,6 +1013,23 @@ function Test-RangeTripleOverlap
 }
 function Test-ShouldCountFile
 {
+    <#
+    .SYNOPSIS
+        拡張子とパス条件から解析対象ファイルかを判定する。
+    .DESCRIPTION
+        拡張子条件とパスパターン条件を順序立てて評価し、解析対象の一貫性を維持する。
+        この判定を共通化することで diff・blame・集計の対象ずれを防ぐ。
+    .PARAMETER FilePath
+        処理対象のファイルパスを指定する。
+    .PARAMETER IncludeExt
+        対象を絞り込むための包含または除外条件を指定する。
+    .PARAMETER ExcludeExt
+        対象を絞り込むための包含または除外条件を指定する。
+    .PARAMETER IncludePathPatterns
+        対象を絞り込むための包含または除外条件を指定する。
+    .PARAMETER ExcludePathPatterns
+        対象を絞り込むための包含または除外条件を指定する。
+    #>
     param([string]$FilePath, [string[]]$IncludeExt, [string[]]$ExcludeExt, [string[]]$IncludePathPatterns, [string[]]$ExcludePathPatterns)
     if ([string]::IsNullOrWhiteSpace($FilePath))
     {
@@ -816,8 +1086,14 @@ function Test-ShouldCountFile
     }
     return $true
 }
+# endregion パスとキャッシュ
+# region SVN コマンド
 function Join-CommandArgument
 {
+    <#
+    .SYNOPSIS
+        コマンド引数配列をログ用の安全な表示文字列へ結合する。
+    #>
     param([string[]]$Arguments)
     $parts = New-Object 'System.Collections.Generic.List[string]'
     foreach ($a in $Arguments)
@@ -840,6 +1116,10 @@ function Join-CommandArgument
 }
 function Invoke-SvnCommand
 {
+    <#
+    .SYNOPSIS
+        SVN コマンドを実行して標準出力と失敗情報を統一処理する。
+    #>
     [CmdletBinding()]param([string[]]$Arguments, [string]$ErrorContext = 'SVN command')
     $all = New-Object 'System.Collections.Generic.List[string]'
     foreach ($a in $Arguments)
@@ -886,6 +1166,10 @@ function Invoke-SvnCommand
 }
 function ConvertFrom-SvnXmlText
 {
+    <#
+    .SYNOPSIS
+        SVN XML 出力を前処理して安全に XML オブジェクト化する。
+    #>
     param([string]$Text, [string]$ContextLabel = 'svn output')
     $idx = $Text.IndexOf('<?xml')
     if ($idx -lt 0)
@@ -919,6 +1203,10 @@ function ConvertFrom-SvnXmlText
 }
 function Resolve-SvnTargetUrl
 {
+    <#
+    .SYNOPSIS
+        入力 URL を SVN 実行用の正規化ターゲットに確定する。
+    #>
     param([string]$Target)
     if (-not ($Target -match '^(https?|svn|file)://'))
     {
@@ -932,8 +1220,18 @@ function Resolve-SvnTargetUrl
     }
     return $url.TrimEnd('/')
 }
+# endregion SVN コマンド
+# region ログ・差分パース
 function ConvertFrom-SvnLogXml
 {
+    <#
+    .SYNOPSIS
+        SVN log XML をコミットオブジェクト配列へ変換する。
+    .DESCRIPTION
+        logentry と path ノードを走査し、リビジョン単位のコミット情報を正規化して構築する。
+        作者欠損や copyfrom 情報も吸収し、後段の差分解析で扱える構造へ揃える。
+        取得順に依存しないよう変更パスを整形し、集計パイプラインの入力を安定化する。
+    #>
     [CmdletBinding()]param([string]$XmlText)
     $xml = ConvertFrom-SvnXmlText -Text $XmlText -ContextLabel 'svn log'
     $entries = @()
@@ -1073,6 +1371,10 @@ function ConvertFrom-SvnLogXml
 }
 function ConvertTo-LineHash
 {
+    <#
+    .SYNOPSIS
+        行内容をファイル文脈付きの比較用ハッシュに変換する。
+    #>
     param([string]$FilePath, [string]$Content)
     $norm = $Content -replace '\s+', ' '
     $norm = $norm.Trim()
@@ -1091,6 +1393,10 @@ function ConvertTo-LineHash
 }
 function Test-IsTrivialLine
 {
+    <#
+    .SYNOPSIS
+        誤判定を避けるため比較対象外の自明行かを判定する。
+    #>
     param([string]$Content)
     $t = $Content.Trim()
     if ($t.Length -le 3)
@@ -1106,6 +1412,16 @@ function Test-IsTrivialLine
 }
 function ConvertTo-ContextHash
 {
+    <#
+    .SYNOPSIS
+        hunk 周辺文脈から位置識別用のコンテキストハッシュを作成する。
+    .PARAMETER FilePath
+        処理対象のファイルパスを指定する。
+    .PARAMETER ContextLines
+        ContextLines の値を指定する。
+    .PARAMETER K
+        K の値を指定する。
+    #>
     param([string]$FilePath, [string[]]$ContextLines, [int]$K = 3)
     $first = @()
     $last = @()
@@ -1139,6 +1455,14 @@ function ConvertTo-ContextHash
 }
 function ConvertFrom-SvnUnifiedDiff
 {
+    <#
+    .SYNOPSIS
+        Unified diff をファイル別差分統計と hunk 情報へ変換する。
+    .DESCRIPTION
+        Index 行でファイル境界を確定し、hunk の確定漏れを防ぎながら順次パースする。
+        hunk ヘッダーを基点に追加・削除・文脈行を収集し、必要時は行ハッシュも同時に構築する。
+        バイナリ兆候を検出したファイルはテキスト行追跡対象から外し、誤集計を避ける。
+    #>
     [CmdletBinding()]param([string]$DiffText, [int]$DetailLevel = 0)
     $result = @{}
     if ([string]::IsNullOrEmpty($DiffText))
@@ -1154,6 +1478,7 @@ function ConvertFrom-SvnUnifiedDiff
     $hunkDeletedHashes = $null
     foreach ($line in $lines)
     {
+        # ファイル境界を先に確定し、前hunkの確定漏れを防ぐ。
         if ($line -like 'Index: *')
         {
             if ($DetailLevel -ge 1 -and $null -ne $currentHunk -and $null -ne $currentFile)
@@ -1189,6 +1514,7 @@ function ConvertFrom-SvnUnifiedDiff
         {
             continue
         }
+        # hunk単位で位置情報を持ち、後段の行追跡精度を担保する。
         if ($line -match '^@@\s*-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s*@@')
         {
             if ($DetailLevel -ge 1 -and $null -ne $currentHunk -and $null -ne $currentFile)
@@ -1230,6 +1556,7 @@ function ConvertFrom-SvnUnifiedDiff
             }
             continue
         }
+        # バイナリは行追跡不能なため早期にテキスト解析対象から外す。
         if ($line -match '^Cannot display: file marked as a binary type\.' -or $line -match '^Binary files .* differ' -or $line -match '(?i)mime-type\s*=\s*application/octet-stream')
         {
             $current.IsBinary = $true
@@ -1286,8 +1613,18 @@ function ConvertFrom-SvnUnifiedDiff
     }
     return $result
 }
+# endregion ログ・差分パース
+# region Blame パース
 function ConvertFrom-SvnBlameXml
 {
+    <#
+    .SYNOPSIS
+        SVN blame XML とファイル内容を結合して行単位情報へ変換する。
+    .DESCRIPTION
+        blame XML の行帰属情報と cat 由来の実テキストを突き合わせ、行単位の解析基盤を作る。
+        リビジョン別・作者別の件数を同時集計し、所有率計算と strict 帰属の双方で再利用する。
+        XML 欠損や行数差異を吸収し、後段で扱いやすい統一形式を返す。
+    #>
     [CmdletBinding()]param([string]$XmlText, [string[]]$ContentLines)
     $xml = ConvertFrom-SvnXmlText -Text $XmlText -ContextLabel 'svn blame'
     $entries = @()
@@ -1392,6 +1729,10 @@ function ConvertFrom-SvnBlameXml
 }
 function Get-Entropy
 {
+    <#
+    .SYNOPSIS
+        値分布の偏りを示すエントロピーを算出する。
+    #>
     param([double[]]$Values)
     if (-not $Values -or $Values.Count -eq 0)
     {
@@ -1421,6 +1762,10 @@ function Get-Entropy
 }
 function Get-MessageMetricCount
 {
+    <#
+    .SYNOPSIS
+        コミットメッセージ中のキーワード出現数を集計する。
+    #>
     param([string]$Message)
     if ($null -eq $Message)
     {
@@ -1435,6 +1780,18 @@ function Get-MessageMetricCount
 }
 function Get-SvnBlameSummary
 {
+    <#
+    .SYNOPSIS
+        指定ファイルの blame 情報を取得して集計オブジェクト化する。
+    .PARAMETER Repo
+        対象 SVN リポジトリ URL を指定する。
+    .PARAMETER FilePath
+        処理対象のファイルパスを指定する。
+    .PARAMETER ToRevision
+        処理対象のリビジョン値を指定する。
+    .PARAMETER CacheDir
+        キャッシュディレクトリのパスを指定する。
+    #>
     [CmdletBinding()]param([string]$Repo, [string]$FilePath, [int]$ToRevision, [string]$CacheDir)
     $url = $Repo.TrimEnd('/') + '/' + (ConvertTo-PathKey -Path $FilePath).TrimStart('/') + '@' + [string]$ToRevision
     $text = Read-BlameCacheFile -CacheDir $CacheDir -Revision $ToRevision -FilePath $FilePath
@@ -1452,6 +1809,18 @@ function Get-SvnBlameSummary
 }
 function Get-SvnBlameLine
 {
+    <#
+    .SYNOPSIS
+        指定リビジョンの blame 行情報をキャッシュ付きで取得する。
+    .PARAMETER Repo
+        対象 SVN リポジトリ URL を指定する。
+    .PARAMETER FilePath
+        処理対象のファイルパスを指定する。
+    .PARAMETER Revision
+        処理対象のリビジョン値を指定する。
+    .PARAMETER CacheDir
+        キャッシュディレクトリのパスを指定する。
+    #>
     [CmdletBinding()]
     param([string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir)
     $path = (ConvertTo-PathKey -Path $FilePath).TrimStart('/')
@@ -1480,6 +1849,18 @@ function Get-SvnBlameLine
 }
 function Initialize-SvnBlameLineCache
 {
+    <#
+    .SYNOPSIS
+        blame XML と cat を統合した行情報キャッシュを構築する。
+    .PARAMETER Repo
+        対象 SVN リポジトリ URL を指定する。
+    .PARAMETER FilePath
+        処理対象のファイルパスを指定する。
+    .PARAMETER Revision
+        処理対象のリビジョン値を指定する。
+    .PARAMETER CacheDir
+        キャッシュディレクトリのパスを指定する。
+    #>
     [CmdletBinding()]
     [OutputType([object])]
     param([string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir)
@@ -1526,8 +1907,14 @@ function Initialize-SvnBlameLineCache
         CacheMisses = $misses
     }
 }
+# endregion Blame パース
+# region LCS・Blame 比較
 function Get-LineIdentityKey
 {
+    <#
+    .SYNOPSIS
+        blame 行の同一性比較に使う識別キーを生成する。
+    #>
     param([object]$Line)
     if ($null -eq $Line)
     {
@@ -1554,6 +1941,22 @@ function Get-LineIdentityKey
 }
 function Get-LcsMatchedPair
 {
+    <#
+    .SYNOPSIS
+        LCS で2系列の一致インデックス対応を抽出する。
+    .DESCRIPTION
+        ロック済み要素を除外した2系列に対して DP で最長共通部分列を計算する。
+        一致長テーブルを逆方向にたどり、順序を保った一致インデックスのみを復元する。
+        identity 比較と content 比較の両段で使える共通 LCS 実装として設計する。
+    .PARAMETER PreviousKeys
+        PreviousKeys の値を指定する。
+    .PARAMETER CurrentKeys
+        CurrentKeys の値を指定する。
+    .PARAMETER PreviousLocked
+        PreviousLocked の値を指定する。
+    .PARAMETER CurrentLocked
+        CurrentLocked の値を指定する。
+    #>
     [CmdletBinding()]
     [OutputType([object[]])]
     param(
@@ -1603,6 +2006,7 @@ function Get-LcsMatchedPair
         return @()
     }
 
+    # 未一致区間のみでDPを組み、既知一致を再計算しないため。
     $dp = New-Object 'int[,]' ($m + 1), ($n + 1)
     for ($i = 1
         $i -le $m
@@ -1632,6 +2036,7 @@ function Get-LcsMatchedPair
     $pairs = New-Object 'System.Collections.Generic.List[object]'
     $i = $m
     $j = $n
+    # 後ろから復元して順序を保った一致ペアだけを採用するため。
     while ($i -gt 0 -and $j -gt 0)
     {
         $iPrev = $i - 1
@@ -1665,6 +2070,14 @@ function Get-LcsMatchedPair
 }
 function Compare-BlameOutput
 {
+    <#
+    .SYNOPSIS
+        前後 blame を照合して born・dead・move・再帰属を分類する。
+    .DESCRIPTION
+        まず identity LCS で帰属が連続する行を優先一致させ、移動検出の土台を作る。
+        次に content LCS へフォールバックし、帰属変更で identity が崩れた行を救済する。
+        未一致残余を born/dead として確定し、move・再帰属を分離して返す。
+    #>
     [CmdletBinding()]
     param([object[]]$PreviousLines, [object[]]$CurrentLines)
 
@@ -1696,6 +2109,7 @@ function Compare-BlameOutput
     $prevMatched = New-Object 'bool[]' $m
     $currMatched = New-Object 'bool[]' $n
 
+    # まず identity LCS で帰属が同じ行を優先一致させる。
     foreach ($pair in @(Get-LcsMatchedPair -PreviousKeys $prevIdentity -CurrentKeys $currIdentity -PreviousLocked $prevMatched -CurrentLocked $currMatched))
     {
         $prevIdx = [int]$pair.PrevIndex
@@ -1762,6 +2176,7 @@ function Compare-BlameOutput
         $movedPairs.Add($pair) | Out-Null
     }
 
+    # 次に content LCS で帰属変更行を救済し誤検出を減らす。
     foreach ($pair in @(Get-LcsMatchedPair -PreviousKeys $prevContent -CurrentKeys $currContent -PreviousLocked $prevMatched -CurrentLocked $currMatched))
     {
         $prevIdx = [int]$pair.PrevIndex
@@ -1781,6 +2196,7 @@ function Compare-BlameOutput
             }) | Out-Null
     }
 
+    # 最後に未一致残余を born/dead として確定する。
     $killed = New-Object 'System.Collections.Generic.List[object]'
     for ($pi = 0
         $pi -lt $m
@@ -1827,8 +2243,18 @@ function Compare-BlameOutput
         ReattributedPairs = @($reattributed.ToArray())
     }
 }
+# endregion LCS・Blame 比較
+# region Strict 帰属
 function Get-CommitFileTransition
 {
+    <#
+    .SYNOPSIS
+        コミット内のパス変化から before/after 遷移ペアを構築する。
+    .DESCRIPTION
+        変更パスと copyfrom 情報を突き合わせ、削除+追加を rename 遷移として復元する。
+        before/after の遷移ペアを構築し、strict blame 比較で参照するファイル状態を確定する。
+        rename で消費済みの旧パスを除外し、同一コミット内の重複遷移を抑止する。
+    #>
     [CmdletBinding()]
     [OutputType([object[]])]
     param([object]$Commit)
@@ -1956,6 +2382,20 @@ function Get-CommitFileTransition
 }
 function Get-StrictHunkDetail
 {
+    <#
+    .SYNOPSIS
+        hunk の正準行範囲を追跡して反復編集とピンポンを集計する。
+    .DESCRIPTION
+        各 hunk の old 範囲を正準行番号空間へ写像し、行番号ずれの影響を吸収する。
+        重複範囲の重なり判定で同一作者の反復編集を集計し、局所的手戻りを可視化する。
+        A→B→A の三者重なりを抽出してピンポン編集を数え、協業摩擦の兆候を捉える。
+    .PARAMETER Commits
+        解析対象のコミット配列を指定する。
+    .PARAMETER RevToAuthor
+        リビジョン番号と作者の対応表を指定する。
+    .PARAMETER RenameMap
+        RenameMap の値を指定する。
+    #>
     [CmdletBinding()]
     param([object[]]$Commits, [hashtable]$RevToAuthor, [hashtable]$RenameMap)
 
@@ -2020,6 +2460,7 @@ function Get-StrictHunkDetail
 
             $offset = $offsetByFile[$resolved]
             $pending = New-Object 'System.Collections.Generic.List[object]'
+            # 行番号ずれを吸収するため、先に正準範囲へ写像して記録する。
             foreach ($h in @($hunks.ToArray() | Sort-Object OldStart, NewStart))
             {
                 $oldStart = [int]$h.OldStart
@@ -2076,6 +2517,7 @@ function Get-StrictHunkDetail
     foreach ($file in $eventsByFile.Keys)
     {
         $events = @($eventsByFile[$file].ToArray() | Sort-Object Revision)
+        # 同一作者の重なりを数え、反復編集の密度を可視化するため。
         for ($i = 0
             $i -lt $events.Count
             $i++)
@@ -2097,6 +2539,7 @@ function Get-StrictHunkDetail
                 }
             }
         }
+        # A→B→A の往復を重なり範囲で絞り、偶然一致を減らすため。
         for ($i = 0
             $i -lt ($events.Count - 2)
             $i++)
@@ -2143,6 +2586,21 @@ function Get-StrictHunkDetail
 }
 function Get-StrictBlamePrefetchTarget
 {
+    <#
+    .SYNOPSIS
+        Strict blame の事前取得対象をリビジョン単位で列挙する。
+    .DESCRIPTION
+        コミット遷移ごとに比較対象となる before/after の blame 取得点を列挙する。
+        同一 revision/path の重複を除去し、事前キャッシュの取得量を最小化する。
+    .PARAMETER Commits
+        解析対象のコミット配列を指定する。
+    .PARAMETER FromRevision
+        処理対象のリビジョン値を指定する。
+    .PARAMETER ToRevision
+        処理対象のリビジョン値を指定する。
+    .PARAMETER CacheDir
+        キャッシュディレクトリのパスを指定する。
+    #>
     [CmdletBinding()]
     [OutputType([object[]])]
     param(
@@ -2223,6 +2681,21 @@ function Get-StrictBlamePrefetchTarget
 }
 function Invoke-StrictBlameCachePrefetch
 {
+    <#
+    .SYNOPSIS
+        Strict blame 解析に必要なキャッシュを並列事前構築する。
+    .DESCRIPTION
+        事前算出したターゲット一覧を並列処理し、blame/cat キャッシュを先行構築する。
+        実測のヒット/ミス件数を集約し、run_meta へ反映する統計値を更新する。
+    .PARAMETER Targets
+        Targets の値を指定する。
+    .PARAMETER TargetUrl
+        対象 SVN リポジトリ URL を指定する。
+    .PARAMETER CacheDir
+        キャッシュディレクトリのパスを指定する。
+    .PARAMETER Parallel
+        並列実行時の最大ワーカー数を指定する。
+    #>
     [CmdletBinding()]
     param(
         [object[]]$Targets,
@@ -2307,6 +2780,30 @@ function Invoke-StrictBlameCachePrefetch
 }
 function Get-ExactDeathAttribution
 {
+    <#
+    .SYNOPSIS
+        行単位の誕生と消滅を追跡して厳密帰属メトリクスを算出する。
+    .DESCRIPTION
+        コミットごとに before/after blame を比較し、行の誕生・消滅・内部移動を直接観測する。
+        born/dead と self/other 分類を同時更新し、作者別とファイル別の strict 指標を整合させる。
+        最後に hunk 正準範囲解析を統合し、反復編集・ピンポンを含む詳細結果を返す。
+    .PARAMETER Commits
+        解析対象のコミット配列を指定する。
+    .PARAMETER RevToAuthor
+        リビジョン番号と作者の対応表を指定する。
+    .PARAMETER TargetUrl
+        対象 SVN リポジトリ URL を指定する。
+    .PARAMETER FromRevision
+        処理対象のリビジョン値を指定する。
+    .PARAMETER ToRevision
+        処理対象のリビジョン値を指定する。
+    .PARAMETER CacheDir
+        キャッシュディレクトリのパスを指定する。
+    .PARAMETER RenameMap
+        RenameMap の値を指定する。
+    .PARAMETER Parallel
+        並列実行時の最大ワーカー数を指定する。
+    #>
     [CmdletBinding()]
     param(
         [object[]]$Commits,
@@ -2434,6 +2931,7 @@ function Get-ExactDeathAttribution
                     Add-Count -Table $fileInternalMove -Key $metricFile -Delta $moveCount
                 }
 
+                # bornは範囲内追加のみ加算し、初期生存行として保持する。
                 foreach ($born in @($cmp.BornLines))
                 {
                     $line = $born.Line
@@ -2461,6 +2959,7 @@ function Get-ExactDeathAttribution
                     Add-Count -Table $fileSurvived -Key $metricFile
                 }
 
+                # deadは生存減算と自己/他者分類を同時更新し整合を保つ。
                 foreach ($killed in @($cmp.KilledLines))
                 {
                     $line = $killed.Line
@@ -2536,8 +3035,18 @@ function Get-ExactDeathAttribution
         RevsWhereKilledOthers = $revsWhereKilledOthers
     }
 }
+# endregion Strict 帰属
+# region メトリクス計算
 function Get-CommitterMetric
 {
+    <#
+    .SYNOPSIS
+        コミッター単位の基本メトリクスを集計して行オブジェクト化する。
+    .DESCRIPTION
+        コミット単位データから作者別に活動量・チャーン・行動属性を集約する。
+        比率、エントロピー、共同編集者数など派生指標を算出し、比較可能な行形式へ整える。
+        strict で後から上書きする列は null で初期化し、更新フローを分離する。
+    #>
     [CmdletBinding()]
     [OutputType([object[]])]
     param([object[]]$Commits)
@@ -2755,6 +3264,14 @@ function Get-CommitterMetric
 }
 function Get-FileMetric
 {
+    <#
+    .SYNOPSIS
+        ファイル単位の基本メトリクスを集計して行オブジェクト化する。
+    .DESCRIPTION
+        コミット履歴をファイル軸で集約し、量・頻度・作者分散の基本指標を算出する。
+        変更間隔や最多作者占有率、ホットスポットスコアを算出して優先度付けに備える。
+        strict で補完する blame 依存列は null 初期化し、後段更新との整合を保つ。
+    #>
     [CmdletBinding()]param([object[]]$Commits)
     $states = @{}
     foreach ($c in $Commits)
@@ -2911,6 +3428,13 @@ function Get-FileMetric
 }
 function Get-CoChangeMetric
 {
+    <#
+    .SYNOPSIS
+        共変更ペアの回数と関連度指標を算出する。
+    .DESCRIPTION
+        各コミットの一意ファイル集合から共変更ペア回数を集計し、周辺頻度も同時に保持する。
+        Jaccard と Lift を算出して関連度を数値化し、順位付け可能な行データへ整形する。
+    #>
     [CmdletBinding()]
     [OutputType([object[]])]
     param([object[]]$Commits, [int]$TopNCount = 50)
@@ -3001,8 +3525,29 @@ function Get-CoChangeMetric
     }
     return $sorted
 }
+# endregion メトリクス計算
+# region PlantUML 出力
 function Write-PlantUmlFile
 {
+    <#
+    .SYNOPSIS
+        集計結果の上位データを PlantUML 可視化ファイルとして出力する。
+    .DESCRIPTION
+        コミッター・ホットスポット・共変更ネットワークの3種類の puml を生成する。
+        TopN 抽出結果を可視化しつつ、CSV が完全データであることを注記で明示する。
+    .PARAMETER OutDirectory
+        出力先ディレクトリを指定する。
+    .PARAMETER Committers
+        Committers の値を指定する。
+    .PARAMETER Files
+        Files の値を指定する。
+    .PARAMETER Couplings
+        Couplings の値を指定する。
+    .PARAMETER TopNCount
+        上位抽出件数を指定する。
+    .PARAMETER EncodingName
+        出力時に使用する文字エンコーディングを指定する。
+    #>
     param([string]$OutDirectory, [object[]]$Committers, [object[]]$Files, [object[]]$Couplings, [int]$TopNCount, [string]$EncodingName)
     $topCommitters = @($Committers | Sort-Object -Property @{Expression = '総チャーン'
             Descending = $true
@@ -3061,8 +3606,26 @@ function Write-PlantUmlFile
     [void]$sb3.AppendLine('@enduml')
     Write-TextFile -FilePath (Join-Path $OutDirectory 'cochange_network.puml') -Content $sb3.ToString() -EncodingName $EncodingName
 }
+# endregion PlantUML 出力
+# region 消滅行詳細
 function Get-DeadLineDetail
 {
+    <#
+    .SYNOPSIS
+        差分ハッシュを使って行の自己相殺と他者差戻を詳細集計する。
+    .DESCRIPTION
+        diff 行ハッシュと hunk 文脈を用いて、自己相殺や他者差戻の詳細イベントを近似抽出する。
+        リネーム解決と同一 hunk 追跡を組み合わせ、作者別・ファイル別の詳細統計を構築する。
+        strict 計算が使えない場面でも比較可能な補助指標を提供する。
+    .PARAMETER Commits
+        解析対象のコミット配列を指定する。
+    .PARAMETER RevToAuthor
+        リビジョン番号と作者の対応表を指定する。
+    .PARAMETER DetailLevel
+        DetailLevel の値を指定する。
+    .PARAMETER RenameMap
+        RenameMap の値を指定する。
+    #>
     [CmdletBinding()]
     param(
         [object[]]$Commits,
@@ -3315,6 +3878,16 @@ function Get-DeadLineDetail
 }
 function Get-HashtableIntValue
 {
+    <#
+    .SYNOPSIS
+        ハッシュテーブルから未定義時既定値付きで整数値を取得する。
+    .PARAMETER Table
+        更新対象のハッシュテーブルを指定する。
+    .PARAMETER Key
+        更新または参照に使用するキーを指定する。
+    .PARAMETER Default
+        値が存在しない場合の既定値を指定する。
+    #>
     param([hashtable]$Table, [string]$Key, [int]$Default = 0)
     if ($null -eq $Table -or [string]::IsNullOrWhiteSpace($Key))
     {
@@ -3326,8 +3899,22 @@ function Get-HashtableIntValue
     }
     return $Default
 }
+# endregion 消滅行詳細
+# region SVN 引数ヘルパー
 function Get-SvnGlobalArgumentList
 {
+    <#
+    .SYNOPSIS
+        認証と対話制御を含む共通 SVN 引数配列を構築する。
+    .PARAMETER Username
+        Username の値を指定する。
+    .PARAMETER Password
+        Password の値を指定する。
+    .PARAMETER NonInteractive
+        NonInteractive の値を指定する。
+    .PARAMETER TrustServerCert
+        TrustServerCert の値を指定する。
+    #>
     [CmdletBinding()]
     [OutputType([string[]])]
     param([string]$Username, [securestring]$Password, [switch]$NonInteractive, [switch]$TrustServerCert)
@@ -3358,6 +3945,10 @@ function Get-SvnGlobalArgumentList
 }
 function Get-SvnVersionSafe
 {
+    <#
+    .SYNOPSIS
+        利用中の SVN クライアントバージョンを安全に取得する。
+    #>
     [CmdletBinding()]
     [OutputType([string])]
     param()
@@ -3372,6 +3963,20 @@ function Get-SvnVersionSafe
 }
 function Get-SvnDiffArgumentList
 {
+    <#
+    .SYNOPSIS
+        差分取得オプションから svn diff 引数配列を構築する。
+    .PARAMETER IncludeProperties
+        対象を絞り込むための包含または除外条件を指定する。
+    .PARAMETER ForceBinary
+        ForceBinary の値を指定する。
+    .PARAMETER IgnoreAllSpace
+        IgnoreAllSpace の値を指定する。
+    .PARAMETER IgnoreSpaceChange
+        IgnoreSpaceChange の値を指定する。
+    .PARAMETER IgnoreEolStyle
+        IgnoreEolStyle の値を指定する。
+    #>
     [CmdletBinding()]
     [OutputType([string[]])]
     param([switch]$IncludeProperties, [switch]$ForceBinary, [switch]$IgnoreAllSpace, [switch]$IgnoreSpaceChange, [switch]$IgnoreEolStyle)
@@ -3408,6 +4013,18 @@ function Get-SvnDiffArgumentList
 }
 function Get-CachedOrFetchDiffText
 {
+    <#
+    .SYNOPSIS
+        差分キャッシュを優先して必要時のみ svn diff を取得する。
+    .PARAMETER CacheDir
+        キャッシュディレクトリのパスを指定する。
+    .PARAMETER Revision
+        処理対象のリビジョン値を指定する。
+    .PARAMETER TargetUrl
+        対象 SVN リポジトリ URL を指定する。
+    .PARAMETER DiffArguments
+        svn diff 実行時に付与する追加引数配列を指定する。
+    #>
     [CmdletBinding()]
     [OutputType([string])]
     param([string]$CacheDir, [int]$Revision, [string]$TargetUrl, [string[]]$DiffArguments)
@@ -3429,8 +4046,24 @@ function Get-CachedOrFetchDiffText
     Set-Content -Path $cacheFile -Value $diffText -Encoding UTF8
     return $diffText
 }
+# endregion SVN 引数ヘルパー
+# region 差分処理パイプライン
 function Get-FilteredChangedPathEntry
 {
+    <#
+    .SYNOPSIS
+        変更パス一覧を拡張子とパターン条件で絞り込む。
+    .PARAMETER ChangedPaths
+        ChangedPaths の値を指定する。
+    .PARAMETER IncludeExtensions
+        対象を絞り込むための包含または除外条件を指定する。
+    .PARAMETER ExcludeExtensions
+        対象を絞り込むための包含または除外条件を指定する。
+    .PARAMETER IncludePathPatterns
+        対象を絞り込むための包含または除外条件を指定する。
+    .PARAMETER ExcludePathPatterns
+        対象を絞り込むための包含または除外条件を指定する。
+    #>
     [CmdletBinding()]
     [OutputType([object[]])]
     param([object[]]$ChangedPaths, [string[]]$IncludeExtensions, [string[]]$ExcludeExtensions, [string[]]$IncludePathPatterns, [string[]]$ExcludePathPatterns)
@@ -3465,6 +4098,21 @@ function Get-FilteredChangedPathEntry
 }
 function Set-DiffStatCollectionProperty
 {
+    <#
+    .SYNOPSIS
+        差分統計コレクション項目を指定プロパティで統一設定する。
+    .DESCRIPTION
+        辞書や配列で保持した差分統計に対して、指定プロパティを一括設定する。
+        構造差を吸収して更新処理を共通化し、補正ロジックの重複を減らす。
+    .PARAMETER TargetStat
+        TargetStat の値を指定する。
+    .PARAMETER SourceStat
+        SourceStat の値を指定する。
+    .PARAMETER PropertyName
+        PropertyName の値を指定する。
+    .PARAMETER AsString
+        AsString の値を指定する。
+    #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     param([object]$TargetStat, [object]$SourceStat, [string]$PropertyName, [switch]$AsString)
@@ -3527,6 +4175,10 @@ function Set-DiffStatCollectionProperty
 }
 function Clear-DiffStatCollectionProperty
 {
+    <#
+    .SYNOPSIS
+        差分統計コレクション項目の指定プロパティをクリアする。
+    #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     param([object]$TargetStat, [string]$PropertyName)
@@ -3546,6 +4198,10 @@ function Clear-DiffStatCollectionProperty
 }
 function Set-DiffStatFromSource
 {
+    <#
+    .SYNOPSIS
+        差分統計オブジェクトを別ソース値で上書き反映する。
+    #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     param([object]$TargetStat, [object]$SourceStat)
@@ -3561,6 +4217,10 @@ function Set-DiffStatFromSource
 }
 function Reset-DiffStatForRemovedPath
 {
+    <#
+    .SYNOPSIS
+        削除扱いパスの差分統計を空変更状態へ初期化する。
+    #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     param([object]$DiffStat)
@@ -3572,6 +4232,24 @@ function Reset-DiffStatForRemovedPath
 }
 function Update-RenamePairDiffStat
 {
+    <#
+    .SYNOPSIS
+        リネーム対の実差分を取得して二重計上を補正する。
+    .DESCRIPTION
+        rename ペアの実差分を old@copyfrom と new@rev で再取得し、実際の変更量を求める。
+        ナイーブ集計との差分をコミット統計へ反映し、追加削除の二重計上を補正する。
+        必要時は hunk と行ハッシュも置き換え、後段の詳細解析精度を維持する。
+    .PARAMETER Commit
+        解析対象のコミット情報を指定する。
+    .PARAMETER Revision
+        処理対象のリビジョン値を指定する。
+    .PARAMETER TargetUrl
+        対象 SVN リポジトリ URL を指定する。
+    .PARAMETER DiffArguments
+        svn diff 実行時に付与する追加引数配列を指定する。
+    .PARAMETER DeadDetailLevel
+        DeadDetailLevel の値を指定する。
+    #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     param([object]$Commit, [int]$Revision, [string]$TargetUrl, [string[]]$DiffArguments, [int]$DeadDetailLevel)
@@ -3654,6 +4332,10 @@ function Update-RenamePairDiffStat
 }
 function Set-CommitDerivedMetric
 {
+    <#
+    .SYNOPSIS
+        コミット単位の派生指標と短縮メッセージを設定する。
+    #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     param([object]$Commit)
@@ -3688,6 +4370,34 @@ function Set-CommitDerivedMetric
 }
 function Initialize-CommitDiffData
 {
+    <#
+    .SYNOPSIS
+        diff 取得・フィルタ・補正を実行してコミット差分データを初期化する。
+    .DESCRIPTION
+        コミット一覧に対して diff の取得・パースを並列実行し、リビジョン差分を初期化する。
+        拡張子とパス条件で対象を絞り、ログ情報との突合で最終的な FilesChanged を確定する。
+        rename 補正と派生指標計算を含め、後続集計が使う基礎データを完成させる。
+    .PARAMETER Commits
+        解析対象のコミット配列を指定する。
+    .PARAMETER CacheDir
+        キャッシュディレクトリのパスを指定する。
+    .PARAMETER TargetUrl
+        対象 SVN リポジトリ URL を指定する。
+    .PARAMETER DiffArguments
+        svn diff 実行時に付与する追加引数配列を指定する。
+    .PARAMETER DeadDetailLevel
+        DeadDetailLevel の値を指定する。
+    .PARAMETER IncludeExtensions
+        対象を絞り込むための包含または除外条件を指定する。
+    .PARAMETER ExcludeExtensions
+        対象を絞り込むための包含または除外条件を指定する。
+    .PARAMETER IncludePathPatterns
+        対象を絞り込むための包含または除外条件を指定する。
+    .PARAMETER ExcludePathPatterns
+        対象を絞り込むための包含または除外条件を指定する。
+    .PARAMETER Parallel
+        並列実行時の最大ワーカー数を指定する。
+    #>
     [CmdletBinding()]
     [OutputType([hashtable])]
     param(
@@ -3796,8 +4506,14 @@ function Initialize-CommitDiffData
     }
     return $revToAuthor
 }
+# endregion 差分処理パイプライン
+# region Strict メトリクス更新
 function New-CommitRowFromCommit
 {
+    <#
+    .SYNOPSIS
+        コミット配列から commits.csv 出力行を生成する。
+    #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -3828,6 +4544,18 @@ function New-CommitRowFromCommit
 }
 function Get-AuthorModifiedOthersSurvivedCount
 {
+    <#
+    .SYNOPSIS
+        他者コード変更行のうち最終版で生存した行数を作者別に集計する。
+    .PARAMETER BlameByFile
+        ファイルごとの blame 結果キャッシュを指定する。
+    .PARAMETER RevsWhereKilledOthers
+        RevsWhereKilledOthers の値を指定する。
+    .PARAMETER FromRevision
+        処理対象のリビジョン値を指定する。
+    .PARAMETER ToRevision
+        処理対象のリビジョン値を指定する。
+    #>
     [CmdletBinding()]
     [OutputType([hashtable])]
     param([hashtable]$BlameByFile, [System.Collections.Generic.HashSet[string]]$RevsWhereKilledOthers, [int]$FromRevision, [int]$ToRevision)
@@ -3866,6 +4594,30 @@ function Get-AuthorModifiedOthersSurvivedCount
 }
 function Update-FileRowWithStrictMetric
 {
+    <#
+    .SYNOPSIS
+        Strict 詳細値と blame 結果で files 行メトリクスを更新する。
+    .DESCRIPTION
+        strict 詳細集計と blame 結果を使って files.csv 行へ厳密値を反映する。
+        rename 別名や存在有無を考慮した段階的 lookup で blame 取得の失敗を抑える。
+        生存・消滅・反復・所有率を一括更新し、可視化に使う列整合を保つ。
+    .PARAMETER FileRows
+        更新対象となる出力行オブジェクト配列を指定する。
+    .PARAMETER RenameMap
+        RenameMap の値を指定する。
+    .PARAMETER StrictDetail
+        StrictDetail の値を指定する。
+    .PARAMETER ExistingFileSet
+        ExistingFileSet の値を指定する。
+    .PARAMETER BlameByFile
+        ファイルごとの blame 結果キャッシュを指定する。
+    .PARAMETER TargetUrl
+        対象 SVN リポジトリ URL を指定する。
+    .PARAMETER ToRevision
+        処理対象のリビジョン値を指定する。
+    .PARAMETER CacheDir
+        キャッシュディレクトリのパスを指定する。
+    #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     param(
@@ -3979,6 +4731,25 @@ function Update-FileRowWithStrictMetric
 }
 function Update-CommitterRowWithStrictMetric
 {
+    <#
+    .SYNOPSIS
+        Strict 詳細値と所有情報で committers 行メトリクスを更新する。
+    .DESCRIPTION
+        strict 詳細結果と所有情報を突き合わせ、committers.csv 行へ厳密値を反映する。
+        自己/他者消滅や反復編集など関連列を同時更新し、相互整合を維持する。
+    .PARAMETER CommitterRows
+        更新対象となる出力行オブジェクト配列を指定する。
+    .PARAMETER AuthorSurvived
+        AuthorSurvived の値を指定する。
+    .PARAMETER AuthorOwned
+        AuthorOwned の値を指定する。
+    .PARAMETER OwnedTotal
+        OwnedTotal の値を指定する。
+    .PARAMETER StrictDetail
+        StrictDetail の値を指定する。
+    .PARAMETER AuthorModifiedOthersSurvived
+        AuthorModifiedOthersSurvived の値を指定する。
+    #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     param(
@@ -4030,6 +4801,40 @@ function Update-CommitterRowWithStrictMetric
 }
 function Update-StrictAttributionMetric
 {
+    <#
+    .SYNOPSIS
+        Strict 帰属解析を実行しファイル行と作者行へ反映する。
+    .DESCRIPTION
+        strict 帰属解析の実行と所有率計算をオーケストレーションし、更新順序を統制する。
+        rename map、line death detail、ownership blame を統合して作者行とファイル行を更新する。
+        並列取得時も単一集約経路でカウントを反映し、再現可能な出力を保証する。
+    .PARAMETER Commits
+        解析対象のコミット配列を指定する。
+    .PARAMETER RevToAuthor
+        リビジョン番号と作者の対応表を指定する。
+    .PARAMETER TargetUrl
+        対象 SVN リポジトリ URL を指定する。
+    .PARAMETER FromRevision
+        処理対象のリビジョン値を指定する。
+    .PARAMETER ToRevision
+        処理対象のリビジョン値を指定する。
+    .PARAMETER CacheDir
+        キャッシュディレクトリのパスを指定する。
+    .PARAMETER IncludeExtensions
+        対象を絞り込むための包含または除外条件を指定する。
+    .PARAMETER ExcludeExtensions
+        対象を絞り込むための包含または除外条件を指定する。
+    .PARAMETER IncludePaths
+        対象を絞り込むための包含または除外条件を指定する。
+    .PARAMETER ExcludePaths
+        対象を絞り込むための包含または除外条件を指定する。
+    .PARAMETER FileRows
+        更新対象となる出力行オブジェクト配列を指定する。
+    .PARAMETER CommitterRows
+        更新対象となる出力行オブジェクト配列を指定する。
+    .PARAMETER Parallel
+        並列実行時の最大ワーカー数を指定する。
+    #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     param(
@@ -4152,8 +4957,14 @@ function Update-StrictAttributionMetric
     Update-FileRowWithStrictMetric -FileRows $FileRows -RenameMap $renameMap -StrictDetail $strictDetail -ExistingFileSet $existingFileSet -BlameByFile $blameByFile -TargetUrl $TargetUrl -ToRevision $ToRevision -CacheDir $CacheDir
     Update-CommitterRowWithStrictMetric -CommitterRows $CommitterRows -AuthorSurvived $authorSurvived -AuthorOwned $authorOwned -OwnedTotal $ownedTotal -StrictDetail $strictDetail -AuthorModifiedOthersSurvived $authorModifiedOthersSurvived
 }
+# endregion Strict メトリクス更新
+# region ヘッダーとメタデータ
 function Get-MetricHeader
 {
+    <#
+    .SYNOPSIS
+        CSV 出力に使う列ヘッダー定義を返す。
+    #>
     [CmdletBinding()]
     [OutputType([object])]
     param()
@@ -4166,6 +4977,68 @@ function Get-MetricHeader
 }
 function New-RunMetaData
 {
+    <#
+    .SYNOPSIS
+        実行条件・集計件数・環境情報を run_meta 用構造にまとめる。
+    .DESCRIPTION
+        実行条件、フィルタ設定、成果物件数、処理時間を run_meta 用に集約する。
+        strict キャッシュ統計や非厳密指標の注記を含め、再実行可能な監査情報を残す。
+        CSV と可視化の出力先をまとめ、実行結果の追跡性を高める。
+    .PARAMETER StartTime
+        StartTime の値を指定する。
+    .PARAMETER EndTime
+        EndTime の値を指定する。
+    .PARAMETER TargetUrl
+        対象 SVN リポジトリ URL を指定する。
+    .PARAMETER FromRevision
+        処理対象のリビジョン値を指定する。
+    .PARAMETER ToRevision
+        処理対象のリビジョン値を指定する。
+    .PARAMETER AuthorFilter
+        AuthorFilter の値を指定する。
+    .PARAMETER SvnVersion
+        SvnVersion の値を指定する。
+    .PARAMETER NoBlame
+        NoBlame の値を指定する。
+    .PARAMETER DeadDetailLevel
+        DeadDetailLevel の値を指定する。
+    .PARAMETER Parallel
+        並列実行時の最大ワーカー数を指定する。
+    .PARAMETER TopN
+        上位抽出件数を指定する。
+    .PARAMETER Encoding
+        出力時に使用する文字エンコーディングを指定する。
+    .PARAMETER Commits
+        解析対象のコミット配列を指定する。
+    .PARAMETER FileRows
+        更新対象となる出力行オブジェクト配列を指定する。
+    .PARAMETER OutDir
+        出力先ディレクトリを指定する。
+    .PARAMETER IncludePaths
+        対象を絞り込むための包含または除外条件を指定する。
+    .PARAMETER ExcludePaths
+        対象を絞り込むための包含または除外条件を指定する。
+    .PARAMETER IncludeExtensions
+        対象を絞り込むための包含または除外条件を指定する。
+    .PARAMETER ExcludeExtensions
+        対象を絞り込むための包含または除外条件を指定する。
+    .PARAMETER EmitPlantUml
+        EmitPlantUml の値を指定する。
+    .PARAMETER NonInteractive
+        NonInteractive の値を指定する。
+    .PARAMETER TrustServerCert
+        TrustServerCert の値を指定する。
+    .PARAMETER IgnoreSpaceChange
+        IgnoreSpaceChange の値を指定する。
+    .PARAMETER IgnoreAllSpace
+        IgnoreAllSpace の値を指定する。
+    .PARAMETER IgnoreEolStyle
+        IgnoreEolStyle の値を指定する。
+    .PARAMETER IncludeProperties
+        対象を絞り込むための包含または除外条件を指定する。
+    .PARAMETER ForceBinary
+        ForceBinary の値を指定する。
+    #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     [OutputType([hashtable])]
@@ -4271,6 +5144,22 @@ function New-RunMetaData
 }
 function Write-RunSummary
 {
+    <#
+    .SYNOPSIS
+        実行サマリーをコンソールへ整形表示する。
+    .PARAMETER TargetUrl
+        対象 SVN リポジトリ URL を指定する。
+    .PARAMETER FromRevision
+        処理対象のリビジョン値を指定する。
+    .PARAMETER ToRevision
+        処理対象のリビジョン値を指定する。
+    .PARAMETER Commits
+        解析対象のコミット配列を指定する。
+    .PARAMETER FileRows
+        更新対象となる出力行オブジェクト配列を指定する。
+    .PARAMETER OutDir
+        出力先ディレクトリを指定する。
+    #>
     [CmdletBinding()]
     param([string]$TargetUrl, [int]$FromRevision, [int]$ToRevision, [object[]]$Commits, [object[]]$FileRows, [string]$OutDir)
     $phaseLabel = 'StrictMode'
@@ -4284,6 +5173,13 @@ function Write-RunSummary
 }
 function Get-RenameMap
 {
+    <#
+    .SYNOPSIS
+        コミット履歴から旧パスと新パスの対応表を構築する。
+    .DESCRIPTION
+        コミット履歴を時系列で走査し、旧パスから最新パスへの対応を段階的に構築する。
+        連鎖リネームを伝播更新して、後段の path 解決が一意になるよう整備する。
+    #>
     [CmdletBinding()]
     param([object[]]$Commits)
     $map = @{}
@@ -4316,10 +5212,11 @@ function Get-RenameMap
     }
     return $map
 }
-# endregion Utility
 
+# endregion ヘッダーとメタデータ
 try
 {
+    # --- ステップ 1: パラメータの初期化と検証 ---
     $startedAt = Get-Date
     Initialize-StrictModeContext
     if ($NoBlame)
@@ -4367,6 +5264,7 @@ try
     $targetUrl = Resolve-SvnTargetUrl -Target $RepoUrl
     $svnVersion = Get-SvnVersionSafe
 
+    # --- ステップ 2: SVN ログの取得とパース ---
     $logText = Invoke-SvnCommand -Arguments @('log', '--xml', '--verbose', '-r', "$FromRev`:$ToRev", $targetUrl) -ErrorContext 'svn log'
     $commits = @(ConvertFrom-SvnLogXml -XmlText $logText)
     if ($Author)
@@ -4381,26 +5279,32 @@ try
         }
     }
 
+    # --- ステップ 3: 差分の取得とコミット単位の差分統計構築 ---
     $diffArgs = Get-SvnDiffArgumentList -IncludeProperties:$IncludeProperties -ForceBinary:$ForceBinary -IgnoreAllSpace:$IgnoreAllSpace -IgnoreSpaceChange:$IgnoreSpaceChange -IgnoreEolStyle:$IgnoreEolStyle
     $revToAuthor = Initialize-CommitDiffData -Commits $commits -CacheDir $cacheDir -TargetUrl $targetUrl -DiffArguments $diffArgs -DeadDetailLevel $DeadDetailLevel -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePaths -ExcludePathPatterns $ExcludePaths -Parallel $Parallel
 
+    # --- ステップ 4: 基本メトリクス算出（コミッター / ファイル / カップリング / コミット） ---
     $committerRows = @(Get-CommitterMetric -Commits $commits)
     $fileRows = @(Get-FileMetric -Commits $commits)
     $couplingRows = @(Get-CoChangeMetric -Commits $commits -TopNCount $TopN)
     $commitRows = @(New-CommitRowFromCommit -Commits $commits)
 
+    # --- ステップ 5: Strict 死亡帰属（blame ベースの行追跡） ---
     Update-StrictAttributionMetric -Commits $commits -RevToAuthor $revToAuthor -TargetUrl $targetUrl -FromRevision $FromRev -ToRevision $ToRev -CacheDir $cacheDir -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -FileRows $fileRows -CommitterRows $committerRows -Parallel $Parallel
 
+    # --- ステップ 6: CSV レポート出力 ---
     $headers = Get-MetricHeader
     Write-CsvFile -FilePath (Join-Path $OutDir 'committers.csv') -Rows $committerRows -Headers $headers.Committer -EncodingName $Encoding
     Write-CsvFile -FilePath (Join-Path $OutDir 'files.csv') -Rows $fileRows -Headers $headers.File -EncodingName $Encoding
     Write-CsvFile -FilePath (Join-Path $OutDir 'commits.csv') -Rows $commitRows -Headers $headers.Commit -EncodingName $Encoding
     Write-CsvFile -FilePath (Join-Path $OutDir 'couplings.csv') -Rows $couplingRows -Headers $headers.Coupling -EncodingName $Encoding
+    # --- ステップ 7: PlantUML 出力（指定時のみ） ---
     if ($EmitPlantUml)
     {
         Write-PlantUmlFile -OutDirectory $OutDir -Committers $committerRows -Files $fileRows -Couplings $couplingRows -TopNCount $TopN -EncodingName $Encoding
     }
 
+    # --- ステップ 8: 実行メタデータとサマリーの書き出し ---
     $finishedAt = Get-Date
     $meta = New-RunMetaData -StartTime $startedAt -EndTime $finishedAt -TargetUrl $targetUrl -FromRevision $FromRev -ToRevision $ToRev -AuthorFilter $Author -SvnVersion $svnVersion -NoBlame:$NoBlame -DeadDetailLevel $DeadDetailLevel -Parallel $Parallel -TopN $TopN -Encoding $Encoding -Commits $commits -FileRows $fileRows -OutDir $OutDir -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -EmitPlantUml:$EmitPlantUml -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -IgnoreSpaceChange:$IgnoreSpaceChange -IgnoreAllSpace:$IgnoreAllSpace -IgnoreEolStyle:$IgnoreEolStyle -IncludeProperties:$IncludeProperties -ForceBinary:$ForceBinary
     Write-JsonFile -Data $meta -FilePath (Join-Path $OutDir 'run_meta.json') -Depth 12 -EncodingName $Encoding
