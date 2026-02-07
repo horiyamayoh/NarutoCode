@@ -53,7 +53,9 @@ $formatted = Invoke-Formatter -ScriptDefinition $code `
 Set-Content -Path .\NarutoCode.ps1 -Value $formatted -NoNewline -Encoding UTF8
 ```
 
-- フォーマット後は必ず `Invoke-ScriptAnalyzer` で違反が 0 件であることを確認する
+- **コード変更後は必ず `Format.ps1` を実行してフォーマットを適用すること**
+  - `Format.ps1` はフォーマット適用後に `Invoke-ScriptAnalyzer` も自動実行し、違反を報告する
+  - 違反が 0 件になるまで修正すること
 - `Invoke-Formatter` は AST ベースのため、セミコロン連結文の分離は行わない。必要に応じて手動で分離する
 
 ## フォルダ構成
@@ -63,6 +65,7 @@ NarutoCode/
 ├── docs/                              # 設計メモ・仕様書・使い方ガイド
 ├── tests/                             # Pester テストファイル
 ├── NarutoCode.ps1                     # スクリプト本体（唯一の実行ファイル）
+├── Format.ps1                         # フォーマット適用 & 静的解析スクリプト
 ├── .PSScriptAnalyzerSettings.psd1     # 静的解析 & フォーマッター設定
 ├── README.md                          # プロジェクト概要・使い方
 ├── AGENTS.md                          # 本ファイル（AI エージェント向けルール）
