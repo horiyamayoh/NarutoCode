@@ -23,11 +23,7 @@ salt
 | 16 | .gitignore | 7
 | 17 | include/string_utils.h | 6
 | 18 | src/string_utils.cpp | 2
-| 19 | assets | 0
-| 20 | assets/logo.png | 0
-| 21 | include | 0
-| 22 | src | 0
-| 23 | tests | 0
+| 19 | assets/logo.png | 0
 }
 }
 @enduml

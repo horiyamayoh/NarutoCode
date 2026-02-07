@@ -1225,6 +1225,37 @@ Describe 'Get-RenameMap' {
     }
 }
 
+Describe 'Compare-BlameOutput' {
+    It 'does not misattribute killed line when duplicate contents exist' {
+        $prev = @(
+            [pscustomobject]@{ LineNumber = 1; Content = 'dup'; Revision = 2; Author = 'bob' },
+            [pscustomobject]@{ LineNumber = 2; Content = 'dup'; Revision = 1; Author = 'alice' }
+        )
+        $curr = @(
+            [pscustomobject]@{ LineNumber = 1; Content = 'dup'; Revision = 2; Author = 'bob' }
+        )
+
+        $cmp = Compare-BlameOutput -PreviousLines $prev -CurrentLines $curr
+        $cmp.KilledLines.Count | Should -Be 1
+        $cmp.KilledLines[0].Line.Author | Should -Be 'alice'
+        $cmp.BornLines.Count | Should -Be 0
+    }
+
+    It 'classifies same-content attribution change as reattribution' {
+        $prev = @(
+            [pscustomobject]@{ LineNumber = 1; Content = 'value'; Revision = 10; Author = 'alice' }
+        )
+        $curr = @(
+            [pscustomobject]@{ LineNumber = 1; Content = 'value'; Revision = 11; Author = 'bob' }
+        )
+
+        $cmp = Compare-BlameOutput -PreviousLines $prev -CurrentLines $curr
+        $cmp.KilledLines.Count | Should -Be 0
+        $cmp.BornLines.Count | Should -Be 0
+        $cmp.ReattributedPairs.Count | Should -Be 1
+    }
+}
+
 Describe 'Get-DeadLineDetail — SelfCancel and CrossRevert' {
     BeforeAll {
         # Simulate: alice adds 2 lines in r100, alice deletes 1 in r101, bob deletes 1 in r102
@@ -1639,7 +1670,7 @@ Describe 'Integration — test SVN repo output matches baseline' -Tag 'Integrati
         $meta.FromRev       | Should -Be 1
         $meta.ToRev         | Should -Be 20
         $meta.CommitCount   | Should -Be 20
-        $meta.FileCount     | Should -Be 23
+        $meta.FileCount     | Should -Be 19
         $meta.NoBlame       | Should -BeFalse
         $meta.Encoding      | Should -Be 'UTF8'
     }

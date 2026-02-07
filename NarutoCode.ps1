@@ -769,11 +769,28 @@ function ConvertFrom-SvnLogXml
                     $null = $_
                 }
             }
+            $isDirectory = $false
+            if ($p.HasAttribute('kind'))
+            {
+                $kind = [string]$p.GetAttribute('kind')
+                if ($kind -ieq 'dir')
+                {
+                    $isDirectory = $true
+                }
+                elseif ($kind -ieq 'file')
+                {
+                    $isDirectory = $false
+                }
+            }
+            if (-not $isDirectory -and $raw.Trim().EndsWith('/'))
+            {
+                $isDirectory = $true
+            }
             $paths.Add([pscustomobject]@{ Path = $path
                     Action = [string]$p.action
                     CopyFromPath = $copyPath
                     CopyFromRev = $copyRev
-                    IsDirectory = $raw.Trim().EndsWith('/')
+                    IsDirectory = $isDirectory
                 }) | Out-Null
         }
         $list.Add([pscustomobject]@{
@@ -1228,29 +1245,55 @@ function Get-LineIdentityKey
     }
     return ($rev + [char]31 + $author + [char]31 + $content)
 }
-function Compare-BlameOutput
+function Get-LcsMatchedPair
 {
     [CmdletBinding()]
-    param([object[]]$PreviousLines, [object[]]$CurrentLines)
+    [OutputType([object[]])]
+    param(
+        [string[]]$PreviousKeys,
+        [string[]]$CurrentKeys,
+        [bool[]]$PreviousLocked,
+        [bool[]]$CurrentLocked
+    )
 
-    $prev = @($PreviousLines)
-    $curr = @($CurrentLines)
-    $m = $prev.Count
-    $n = $curr.Count
-
-    $prevContent = New-Object 'string[]' $m
-    $currContent = New-Object 'string[]' $n
+    $prev = @($PreviousKeys)
+    $curr = @($CurrentKeys)
+    $prevIdx = New-Object 'System.Collections.Generic.List[int]'
     for ($i = 0
-        $i -lt $m
+        $i -lt $prev.Count
         $i++)
     {
-        $prevContent[$i] = [string]$prev[$i].Content
+        $isLocked = $false
+        if ($null -ne $PreviousLocked -and $i -lt $PreviousLocked.Length)
+        {
+            $isLocked = [bool]$PreviousLocked[$i]
+        }
+        if (-not $isLocked)
+        {
+            $prevIdx.Add($i) | Out-Null
+        }
     }
+    $currIdx = New-Object 'System.Collections.Generic.List[int]'
     for ($j = 0
-        $j -lt $n
+        $j -lt $curr.Count
         $j++)
     {
-        $currContent[$j] = [string]$curr[$j].Content
+        $isLocked = $false
+        if ($null -ne $CurrentLocked -and $j -lt $CurrentLocked.Length)
+        {
+            $isLocked = [bool]$CurrentLocked[$j]
+        }
+        if (-not $isLocked)
+        {
+            $currIdx.Add($j) | Out-Null
+        }
+    }
+
+    $m = $prevIdx.Count
+    $n = $currIdx.Count
+    if ($m -eq 0 -or $n -eq 0)
+    {
+        return @()
     }
 
     $dp = New-Object 'int[,]' ($m + 1), ($n + 1)
@@ -1264,7 +1307,9 @@ function Compare-BlameOutput
         {
             $iPrev = $i - 1
             $jPrev = $j - 1
-            if ($prevContent[$i - 1] -ceq $currContent[$j - 1])
+            $leftPrev = [int]$prevIdx[$iPrev]
+            $leftCurr = [int]$currIdx[$jPrev]
+            if ($prev[$leftPrev] -ceq $curr[$leftCurr])
             {
                 $dp[$i, $j] = $dp[$iPrev, $jPrev] + 1
             }
@@ -1277,25 +1322,20 @@ function Compare-BlameOutput
         }
     }
 
-    $matchedPairs = New-Object 'System.Collections.Generic.List[object]'
-    $prevMatched = New-Object 'bool[]' $m
-    $currMatched = New-Object 'bool[]' $n
+    $pairs = New-Object 'System.Collections.Generic.List[object]'
     $i = $m
     $j = $n
     while ($i -gt 0 -and $j -gt 0)
     {
-        if ($prevContent[$i - 1] -ceq $currContent[$j - 1])
+        $iPrev = $i - 1
+        $jPrev = $j - 1
+        $prevPos = [int]$prevIdx[$iPrev]
+        $currPos = [int]$currIdx[$jPrev]
+        if ($prev[$prevPos] -ceq $curr[$currPos])
         {
-            $prevIdx = $i - 1
-            $currIdx = $j - 1
-            $prevMatched[$prevIdx] = $true
-            $currMatched[$currIdx] = $true
-            $matchedPairs.Add([pscustomobject]@{
-                    PrevIndex = $prevIdx
-                    CurrIndex = $currIdx
-                    PrevLine = $prev[$prevIdx]
-                    CurrLine = $curr[$currIdx]
-                    MatchType = 'Lcs'
+            $pairs.Add([pscustomobject]@{
+                    PrevIndex = $prevPos
+                    CurrIndex = $currPos
                 }) | Out-Null
             $i--
             $j--
@@ -1304,9 +1344,7 @@ function Compare-BlameOutput
         {
             $iPrev = $i - 1
             $jPrev = $j - 1
-            $left = $dp[$iPrev, $j]
-            $up = $dp[$i, $jPrev]
-            if ($left -ge $up)
+            if ($dp[$iPrev, $j] -ge $dp[$i, $jPrev])
             {
                 $i--
             }
@@ -1315,6 +1353,55 @@ function Compare-BlameOutput
                 $j--
             }
         }
+    }
+    return @($pairs.ToArray() | Sort-Object PrevIndex, CurrIndex)
+}
+function Compare-BlameOutput
+{
+    [CmdletBinding()]
+    param([object[]]$PreviousLines, [object[]]$CurrentLines)
+
+    $prev = @($PreviousLines)
+    $curr = @($CurrentLines)
+    $m = $prev.Count
+    $n = $curr.Count
+
+    $prevIdentity = New-Object 'string[]' $m
+    $currIdentity = New-Object 'string[]' $n
+    $prevContent = New-Object 'string[]' $m
+    $currContent = New-Object 'string[]' $n
+    for ($i = 0
+        $i -lt $m
+        $i++)
+    {
+        $prevIdentity[$i] = Get-LineIdentityKey -Line $prev[$i]
+        $prevContent[$i] = [string]$prev[$i].Content
+    }
+    for ($j = 0
+        $j -lt $n
+        $j++)
+    {
+        $currIdentity[$j] = Get-LineIdentityKey -Line $curr[$j]
+        $currContent[$j] = [string]$curr[$j].Content
+    }
+
+    $matchedPairs = New-Object 'System.Collections.Generic.List[object]'
+    $prevMatched = New-Object 'bool[]' $m
+    $currMatched = New-Object 'bool[]' $n
+
+    foreach ($pair in @(Get-LcsMatchedPair -PreviousKeys $prevIdentity -CurrentKeys $currIdentity -PreviousLocked $prevMatched -CurrentLocked $currMatched))
+    {
+        $prevIdx = [int]$pair.PrevIndex
+        $currIdx = [int]$pair.CurrIndex
+        $prevMatched[$prevIdx] = $true
+        $currMatched[$currIdx] = $true
+        $matchedPairs.Add([pscustomobject]@{
+                PrevIndex = $prevIdx
+                CurrIndex = $currIdx
+                PrevLine = $prev[$prevIdx]
+                CurrLine = $curr[$currIdx]
+                MatchType = 'LcsIdentity'
+            }) | Out-Null
     }
 
     $unmatchedPrevByKey = @{}
@@ -1366,6 +1453,25 @@ function Compare-BlameOutput
         }
         $matchedPairs.Add($pair) | Out-Null
         $movedPairs.Add($pair) | Out-Null
+    }
+
+    foreach ($pair in @(Get-LcsMatchedPair -PreviousKeys $prevContent -CurrentKeys $currContent -PreviousLocked $prevMatched -CurrentLocked $currMatched))
+    {
+        $prevIdx = [int]$pair.PrevIndex
+        $currIdx = [int]$pair.CurrIndex
+        if ($prevMatched[$prevIdx] -or $currMatched[$currIdx])
+        {
+            continue
+        }
+        $prevMatched[$prevIdx] = $true
+        $currMatched[$currIdx] = $true
+        $matchedPairs.Add([pscustomobject]@{
+                PrevIndex = $prevIdx
+                CurrIndex = $currIdx
+                PrevLine = $prev[$prevIdx]
+                CurrLine = $curr[$currIdx]
+                MatchType = 'LcsContent'
+            }) | Out-Null
     }
 
     $killed = New-Object 'System.Collections.Generic.List[object]'
@@ -1835,28 +1941,14 @@ function Get-ExactDeathAttribution
                 $prevLines = @()
                 if ($beforePath)
                 {
-                    try
-                    {
-                        $prevBlame = Get-SvnBlameLine -Repo $TargetUrl -FilePath $beforePath -Revision ($rev - 1) -CacheDir $CacheDir
-                        $prevLines = @($prevBlame.Lines)
-                    }
-                    catch
-                    {
-                        $prevLines = @()
-                    }
+                    $prevBlame = Get-SvnBlameLine -Repo $TargetUrl -FilePath $beforePath -Revision ($rev - 1) -CacheDir $CacheDir
+                    $prevLines = @($prevBlame.Lines)
                 }
                 $currLines = @()
                 if ($afterPath)
                 {
-                    try
-                    {
-                        $currBlame = Get-SvnBlameLine -Repo $TargetUrl -FilePath $afterPath -Revision $rev -CacheDir $CacheDir
-                        $currLines = @($currBlame.Lines)
-                    }
-                    catch
-                    {
-                        $currLines = @()
-                    }
+                    $currBlame = Get-SvnBlameLine -Repo $TargetUrl -FilePath $afterPath -Revision $rev -CacheDir $CacheDir
+                    $currLines = @($currBlame.Lines)
                 }
 
                 $cmp = Compare-BlameOutput -PreviousLines $prevLines -CurrentLines $currLines
@@ -2939,7 +3031,6 @@ try
             }
         }
         $c.FileDiffStats = $filtered
-        $c.FilesChanged = @($filtered.Keys | Sort-Object)
 
         $fpaths = New-Object 'System.Collections.Generic.List[object]'
         foreach ($p in @($c.ChangedPaths))
@@ -2968,6 +3059,25 @@ try
             }
         }
         $c.ChangedPathsFiltered = $fpaths.ToArray()
+        $allowedFilePaths = New-Object 'System.Collections.Generic.HashSet[string]'
+        foreach ($fp in @($c.ChangedPathsFiltered))
+        {
+            $path = ConvertTo-PathKey -Path ([string]$fp.Path)
+            if ($path)
+            {
+                $null = $allowedFilePaths.Add($path)
+            }
+        }
+        $filteredByLog = @{}
+        foreach ($key in $c.FileDiffStats.Keys)
+        {
+            if ($allowedFilePaths.Contains([string]$key))
+            {
+                $filteredByLog[$key] = $c.FileDiffStats[$key]
+            }
+        }
+        $c.FileDiffStats = $filteredByLog
+        $c.FilesChanged = @($c.FileDiffStats.Keys | Sort-Object)
 
         $deletedSet = New-Object 'System.Collections.Generic.HashSet[string]'
         foreach ($p in @($c.ChangedPathsFiltered))
@@ -3008,34 +3118,169 @@ try
             $cmpArgs.Add(($targetUrl.TrimEnd('/') + '/' + $oldPath + '@' + [string]$copyRev)) | Out-Null
             $cmpArgs.Add(($targetUrl.TrimEnd('/') + '/' + $newPath + '@' + [string]$rev)) | Out-Null
             $realDiff = Invoke-SvnCommand -Arguments $cmpArgs.ToArray() -ErrorContext ("svn diff rename pair r{0} {1}->{2}" -f $rev, $oldPath, $newPath)
-            $realStats = Get-DiffLineStat -DiffText $realDiff
+            $realParsed = ConvertFrom-SvnUnifiedDiff -DiffText $realDiff -DetailLevel $DeadDetailLevel
+            $realStat = $null
+            if ($realParsed.ContainsKey($newPath))
+            {
+                $realStat = $realParsed[$newPath]
+            }
+            elseif ($realParsed.ContainsKey($oldPath))
+            {
+                $realStat = $realParsed[$oldPath]
+            }
+            elseif ($realParsed.Keys.Count -gt 0)
+            {
+                $firstKey = @($realParsed.Keys | Sort-Object | Select-Object -First 1)[0]
+                $realStat = $realParsed[$firstKey]
+            }
+            if ($null -eq $realStat)
+            {
+                $realStat = [pscustomobject]@{
+                    AddedLines = 0
+                    DeletedLines = 0
+                    Hunks = @()
+                    IsBinary = $false
+                    AddedLineHashes = @()
+                    DeletedLineHashes = @()
+                }
+            }
 
             $newStat = $c.FileDiffStats[$newPath]
             $oldStat = $c.FileDiffStats[$oldPath]
-            $newStat.AddedLines = [int]$realStats.AddedLines
-            $newStat.DeletedLines = [int]$realStats.DeletedLines
+            $newStat.AddedLines = [int]$realStat.AddedLines
+            $newStat.DeletedLines = [int]$realStat.DeletedLines
+            if ($newStat.PSObject.Properties.Match('Hunks').Count -gt 0)
+            {
+                $srcHunks = New-Object 'System.Collections.Generic.List[object]'
+                if ($realStat.PSObject.Properties.Match('Hunks').Count -gt 0 -and $null -ne $realStat.Hunks)
+                {
+                    if ($realStat.Hunks -is [System.Collections.IEnumerable] -and -not ($realStat.Hunks -is [string]))
+                    {
+                        foreach ($h in $realStat.Hunks)
+                        {
+                            $srcHunks.Add($h) | Out-Null
+                        }
+                    }
+                    else
+                    {
+                        $srcHunks.Add($realStat.Hunks) | Out-Null
+                    }
+                }
+                $dstHunks = $newStat.Hunks
+                if ($dstHunks -is [System.Collections.IList])
+                {
+                    $dstHunks.Clear()
+                    foreach ($h in $srcHunks.ToArray())
+                    {
+                        $dstHunks.Add($h) | Out-Null
+                    }
+                }
+                else
+                {
+                    $newStat.Hunks = $srcHunks.ToArray()
+                }
+            }
             if ($newStat.PSObject.Properties.Match('AddedLineHashes').Count -gt 0)
             {
-                $newStat.AddedLineHashes = @()
+                $srcAddedHashes = New-Object 'System.Collections.Generic.List[string]'
+                if ($realStat.PSObject.Properties.Match('AddedLineHashes').Count -gt 0 -and $null -ne $realStat.AddedLineHashes)
+                {
+                    if ($realStat.AddedLineHashes -is [System.Collections.IEnumerable] -and -not ($realStat.AddedLineHashes -is [string]))
+                    {
+                        foreach ($h in $realStat.AddedLineHashes)
+                        {
+                            $srcAddedHashes.Add([string]$h) | Out-Null
+                        }
+                    }
+                    else
+                    {
+                        $srcAddedHashes.Add([string]$realStat.AddedLineHashes) | Out-Null
+                    }
+                }
+                $dstAddedHashes = $newStat.AddedLineHashes
+                if ($dstAddedHashes -is [System.Collections.IList])
+                {
+                    $dstAddedHashes.Clear()
+                    foreach ($h in $srcAddedHashes.ToArray())
+                    {
+                        $dstAddedHashes.Add($h) | Out-Null
+                    }
+                }
+                else
+                {
+                    $newStat.AddedLineHashes = $srcAddedHashes.ToArray()
+                }
             }
             if ($newStat.PSObject.Properties.Match('DeletedLineHashes').Count -gt 0)
             {
-                $newStat.DeletedLineHashes = @()
+                $srcDeletedHashes = New-Object 'System.Collections.Generic.List[string]'
+                if ($realStat.PSObject.Properties.Match('DeletedLineHashes').Count -gt 0 -and $null -ne $realStat.DeletedLineHashes)
+                {
+                    if ($realStat.DeletedLineHashes -is [System.Collections.IEnumerable] -and -not ($realStat.DeletedLineHashes -is [string]))
+                    {
+                        foreach ($h in $realStat.DeletedLineHashes)
+                        {
+                            $srcDeletedHashes.Add([string]$h) | Out-Null
+                        }
+                    }
+                    else
+                    {
+                        $srcDeletedHashes.Add([string]$realStat.DeletedLineHashes) | Out-Null
+                    }
+                }
+                $dstDeletedHashes = $newStat.DeletedLineHashes
+                if ($dstDeletedHashes -is [System.Collections.IList])
+                {
+                    $dstDeletedHashes.Clear()
+                    foreach ($h in $srcDeletedHashes.ToArray())
+                    {
+                        $dstDeletedHashes.Add($h) | Out-Null
+                    }
+                }
+                else
+                {
+                    $newStat.DeletedLineHashes = $srcDeletedHashes.ToArray()
+                }
+            }
+            if ($newStat.PSObject.Properties.Match('IsBinary').Count -gt 0 -and $realStat.PSObject.Properties.Match('IsBinary').Count -gt 0)
+            {
+                $newStat.IsBinary = [bool]$realStat.IsBinary
             }
 
             $oldStat.AddedLines = 0
             $oldStat.DeletedLines = 0
             if ($oldStat.PSObject.Properties.Match('Hunks').Count -gt 0)
             {
-                $oldStat.Hunks = @()
+                if ($oldStat.Hunks -is [System.Collections.IList])
+                {
+                    $oldStat.Hunks.Clear()
+                }
+                else
+                {
+                    $oldStat.Hunks = @()
+                }
             }
             if ($oldStat.PSObject.Properties.Match('AddedLineHashes').Count -gt 0)
             {
-                $oldStat.AddedLineHashes = @()
+                if ($oldStat.AddedLineHashes -is [System.Collections.IList])
+                {
+                    $oldStat.AddedLineHashes.Clear()
+                }
+                else
+                {
+                    $oldStat.AddedLineHashes = @()
+                }
             }
             if ($oldStat.PSObject.Properties.Match('DeletedLineHashes').Count -gt 0)
             {
-                $oldStat.DeletedLineHashes = @()
+                if ($oldStat.DeletedLineHashes -is [System.Collections.IList])
+                {
+                    $oldStat.DeletedLineHashes.Clear()
+                }
+                else
+                {
+                    $oldStat.DeletedLineHashes = @()
+                }
             }
         }
 
@@ -3113,6 +3358,11 @@ try
 
         $blameByFile = @{}
         $ownershipTargets = @(Get-AllRepositoryFile -Repo $targetUrl -Revision $ToRev -IncludeExt $IncludeExtensions -ExcludeExt $ExcludeExtensions -IncludePathPatterns $IncludePaths -ExcludePathPatterns $ExcludePaths)
+        $existingFileSet = New-Object 'System.Collections.Generic.HashSet[string]'
+        foreach ($f in $ownershipTargets)
+        {
+            $null = $existingFileSet.Add([string]$f)
+        }
         foreach ($file in $ownershipTargets)
         {
             try
@@ -3121,7 +3371,7 @@ try
             }
             catch
             {
-                continue
+                throw ("Strict ownership blame failed for '{0}' at r{1}: {2}" -f $file, $ToRev, $_.Exception.Message)
             }
             $blameByFile[$file] = $b
             $ownedTotal += [int]$b.LineCountTotal
@@ -3181,7 +3431,20 @@ try
             }
 
             $b = $null
-            $lookupCandidates = @($metricKey, $fp, $resolvedFp)
+            $existsAtToRev = $false
+            if ($metricKey)
+            {
+                $existsAtToRev = $existingFileSet.Contains([string]$metricKey)
+            }
+            $lookupCandidates = if ($existsAtToRev)
+            {
+                @($metricKey, $fp, $resolvedFp)
+            }
+            else
+            {
+                @()
+            }
+            $lookupErrors = New-Object 'System.Collections.Generic.List[string]'
             foreach ($lookup in $lookupCandidates)
             {
                 if (-not $lookup)
@@ -3202,8 +3465,12 @@ try
                 }
                 catch
                 {
-                    $null = $_
+                    $lookupErrors.Add(([string]$lookup + ': ' + $_.Exception.Message)) | Out-Null
                 }
+            }
+            if ($null -eq $b -and $existsAtToRev)
+            {
+                throw ("Strict file blame lookup failed for '{0}' at r{1}. Attempts: {2}" -f $metricKey, $ToRev, ($lookupErrors.ToArray() -join ' | '))
             }
 
             $sur = if ($metricKey -and $strictDetail.FileSurvived.ContainsKey($metricKey))
@@ -3502,6 +3769,6 @@ try
 }
 catch
 {
-    Write-Error $_
+    Write-Error ("{0}`n{1}" -f $_.Exception.Message, $_.ScriptStackTrace)
     exit 1
 }
