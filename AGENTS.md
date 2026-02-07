@@ -39,15 +39,33 @@ PowerShell 5.1 を対象としています。
   - 除外ルールは `.PSScriptAnalyzerSettings.psd1` に定義されたもののみ許可
 - 実行コマンド: `Invoke-ScriptAnalyzer -Path .\NarutoCode.ps1 -Settings .\.PSScriptAnalyzerSettings.psd1`
 
+## コードフォーマット（Invoke-Formatter）
+
+- フォーマッターは **PSScriptAnalyzer の `Invoke-Formatter`** を使用する
+- 設定ファイルは静的解析と共通: `.PSScriptAnalyzerSettings.psd1`
+- スタイル: **厳密な Allman スタイル**（1行ブロックも展開、波括弧は必ず独立行）
+- フォーマット適用コマンド:
+
+```powershell
+$code = Get-Content -Path .\NarutoCode.ps1 -Raw
+$formatted = Invoke-Formatter -ScriptDefinition $code `
+    -Settings .\.PSScriptAnalyzerSettings.psd1
+Set-Content -Path .\NarutoCode.ps1 -Value $formatted -NoNewline -Encoding UTF8
+```
+
+- フォーマット後は必ず `Invoke-ScriptAnalyzer` で違反が 0 件であることを確認する
+- `Invoke-Formatter` は AST ベースのため、セミコロン連結文の分離は行わない。必要に応じて手動で分離する
+
 ## フォルダ構成
 
 ```
 NarutoCode/
-├── docs/                    # 設計メモ・仕様書・使い方ガイド
-├── tests/                   # Pester テストファイル
-├── NarutoCode.ps1           # スクリプト本体（唯一の実行ファイル）
-├── README.md                # プロジェクト概要・使い方
-├── AGENTS.md                # 本ファイル（AI エージェント向けルール）
+├── docs/                              # 設計メモ・仕様書・使い方ガイド
+├── tests/                             # Pester テストファイル
+├── NarutoCode.ps1                     # スクリプト本体（唯一の実行ファイル）
+├── .PSScriptAnalyzerSettings.psd1     # 静的解析 & フォーマッター設定
+├── README.md                          # プロジェクト概要・使い方
+├── AGENTS.md                          # 本ファイル（AI エージェント向けルール）
 └── .gitignore
 ```
 
