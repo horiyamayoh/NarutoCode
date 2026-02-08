@@ -402,6 +402,7 @@ function Invoke-ParallelWork
     }
 
     $effectiveParallel = [Math]::Max(1, [Math]::Min([int]$MaxParallel, $items.Count))
+    $progressId = [Math]::Abs($ErrorContext.GetHashCode()) % 10000 + 10
     if ($effectiveParallel -le 1)
     {
         $sequentialResults = [System.Collections.Generic.List[object]]::new()
@@ -409,6 +410,8 @@ function Invoke-ParallelWork
             $i -lt $items.Count
             $i++)
         {
+            $pct = [Math]::Min(100, [int](($i / $items.Count) * 100))
+            Write-Progress -Id $progressId -Activity $ErrorContext -Status ('{0}/{1}' -f ($i + 1), $items.Count) -PercentComplete $pct
             try
             {
                 [void]$sequentialResults.Add((& $WorkerScript -Item $items[$i] -Index $i))
@@ -418,6 +421,7 @@ function Invoke-ParallelWork
                 throw ("{0} failed at item index {1}: {2}" -f $ErrorContext, $i, $_.Exception.Message)
             }
         }
+        Write-Progress -Id $progressId -Activity $ErrorContext -Completed
         return @($sequentialResults.ToArray())
     }
 
@@ -501,8 +505,12 @@ catch
                 })
         }
 
+        $jobTotal = @($jobs.ToArray()).Count
+        $jobDone = 0
         foreach ($job in @($jobs.ToArray()))
         {
+            $pct = [Math]::Min(100, [int](($jobDone / [Math]::Max(1, $jobTotal)) * 100))
+            Write-Progress -Id $progressId -Activity $ErrorContext -Status ('{0}/{1}' -f ($jobDone + 1), $jobTotal) -PercentComplete $pct
             if ($null -eq $job -or $null -eq $job.PowerShell)
             {
                 [void]$wrappedResults.Add([pscustomobject]@{
@@ -559,7 +567,9 @@ catch
                 }
             }
             [void]$wrappedResults.Add($wrapped)
+            $jobDone++
         }
+        Write-Progress -Id $progressId -Activity $ErrorContext -Completed
     }
     catch
     {
@@ -2840,8 +2850,12 @@ function Invoke-StrictBlameCachePrefetch
 
     if ($Parallel -le 1)
     {
+        $prefetchTotal = $items.Count
+        $prefetchIdx = 0
         foreach ($item in $items)
         {
+            $pct = [Math]::Min(100, [int](($prefetchIdx / [Math]::Max(1, $prefetchTotal)) * 100))
+            Write-Progress -Id 4 -Activity 'blame キャッシュ構築' -Status ('{0}/{1}' -f ($prefetchIdx + 1), $prefetchTotal) -PercentComplete $pct
             try
             {
                 $prefetchStats = Initialize-SvnBlameLineCache -Repo $TargetUrl -FilePath ([string]$item.FilePath) -Revision ([int]$item.Revision) -CacheDir $CacheDir
@@ -2852,7 +2866,9 @@ function Invoke-StrictBlameCachePrefetch
             {
                 throw ("Strict blame prefetch failed for '{0}' at r{1}: {2}" -f [string]$item.FilePath, [int]$item.Revision, $_.Exception.Message)
             }
+            $prefetchIdx++
         }
+        Write-Progress -Id 4 -Activity 'blame キャッシュ構築' -Completed
         return
     }
 
@@ -2971,8 +2987,13 @@ function Get-ExactDeathAttribution
     $prefetchTargets = @(Get-StrictBlamePrefetchTarget -Commits $Commits -FromRevision $FromRevision -ToRevision $ToRevision -CacheDir $CacheDir)
     Invoke-StrictBlameCachePrefetch -Targets $prefetchTargets -TargetUrl $TargetUrl -CacheDir $CacheDir -Parallel $Parallel
 
-    foreach ($c in @($Commits | Sort-Object Revision))
+    $sortedCommits = @($Commits | Sort-Object Revision)
+    $deathTotal = $sortedCommits.Count
+    $deathIdx = 0
+    foreach ($c in $sortedCommits)
     {
+        $pct = [Math]::Min(100, [int](($deathIdx / [Math]::Max(1, $deathTotal)) * 100))
+        Write-Progress -Id 3 -Activity '行単位の帰属解析' -Status ('r{0} ({1}/{2})' -f [int]$c.Revision, ($deathIdx + 1), $deathTotal) -PercentComplete $pct
         $rev = [int]$c.Revision
         if ($rev -lt $FromRevision -or $rev -gt $ToRevision)
         {
@@ -3134,7 +3155,9 @@ function Get-ExactDeathAttribution
                 throw ("Strict blame attribution failed at r{0} (before='{1}', after='{2}'): {3}" -f $rev, [string]$t.BeforePath, [string]$t.AfterPath, $_.Exception.Message)
             }
         }
+        $deathIdx++
     }
+    Write-Progress -Id 3 -Activity '行単位の帰属解析' -Completed
 
     try
     {
@@ -7248,8 +7271,12 @@ function Initialize-CommitDiffData
         $rawDiffByRevision[[int]$result.Revision] = $result.RawDiffByPath
     }
 
+    $commitTotal = @($Commits).Count
+    $commitIdx = 0
     foreach ($commit in @($Commits))
     {
+        $pct = [Math]::Min(100, [int](($commitIdx / [Math]::Max(1, $commitTotal)) * 100))
+        Write-Progress -Id 2 -Activity 'コミット差分の統合' -Status ('{0}/{1}' -f ($commitIdx + 1), $commitTotal) -PercentComplete $pct
         $revision = [int]$commit.Revision
         $rawDiffByPath = @{}
         if ($rawDiffByRevision.ContainsKey($revision))
@@ -7291,7 +7318,9 @@ function Initialize-CommitDiffData
 
         Update-RenamePairDiffStat -Commit $commit -Revision $revision -TargetUrl $TargetUrl -DiffArguments $DiffArguments -DeadDetailLevel $DeadDetailLevel
         Set-CommitDerivedMetric -Commit $commit
+        $commitIdx++
     }
+    Write-Progress -Id 2 -Activity 'コミット差分の統合' -Completed
     return $revToAuthor
 }
 # endregion 差分処理パイプライン
@@ -7685,8 +7714,12 @@ function Update-StrictAttributionMetric
     }
     if ($Parallel -le 1)
     {
+        $ownerTotal = $ownershipTargets.Count
+        $ownerIdx = 0
         foreach ($file in $ownershipTargets)
         {
+            $pct = [Math]::Min(100, [int](($ownerIdx / [Math]::Max(1, $ownerTotal)) * 100))
+            Write-Progress -Id 5 -Activity '所有権 blame 解析' -Status ('{0}/{1}' -f ($ownerIdx + 1), $ownerTotal) -PercentComplete $pct
             try
             {
                 $blame = Get-SvnBlameSummary -Repo $TargetUrl -FilePath $file -ToRevision $ToRevision -CacheDir $CacheDir
@@ -7701,7 +7734,9 @@ function Update-StrictAttributionMetric
             {
                 Add-Count -Table $authorOwned -Key ([string]$author) -Delta ([int]$blame.LineCountByAuthor[$author])
             }
+            $ownerIdx++
         }
+        Write-Progress -Id 5 -Activity '所有権 blame 解析' -Completed
     }
     else
     {
@@ -8122,6 +8157,7 @@ try
     $svnVersion = Get-SvnVersionSafe
 
     # --- ステップ 2: SVN ログの取得とパース ---
+    Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 2/8: SVN ログの取得' -PercentComplete 5
     $logText = Invoke-SvnCommand -Arguments @('log', '--xml', '--verbose', '-r', "$FromRev`:$ToRev", $targetUrl) -ErrorContext 'svn log'
     $commits = @(ConvertFrom-SvnLogXml -XmlText $logText)
     if ($Author)
@@ -8137,25 +8173,30 @@ try
     }
 
     # --- ステップ 3: 差分の取得とコミット単位の差分統計構築 ---
+    Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 3/8: 差分の取得と統計構築' -PercentComplete 15
     $diffArgs = Get-SvnDiffArgumentList -IncludeProperties:$IncludeProperties -ForceBinary:$ForceBinary -IgnoreAllSpace:$IgnoreAllSpace -IgnoreSpaceChange:$IgnoreSpaceChange -IgnoreEolStyle:$IgnoreEolStyle
     $revToAuthor = Initialize-CommitDiffData -Commits $commits -CacheDir $cacheDir -TargetUrl $targetUrl -DiffArguments $diffArgs -DeadDetailLevel $DeadDetailLevel -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePaths -ExcludePathPatterns $ExcludePaths -Parallel $Parallel
 
     # --- ステップ 4: 基本メトリクス算出（コミッター / ファイル / カップリング / コミット） ---
+    Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 4/8: 基本メトリクス算出' -PercentComplete 35
     $committerRows = @(Get-CommitterMetric -Commits $commits)
     $fileRows = @(Get-FileMetric -Commits $commits)
     $couplingRows = @(Get-CoChangeMetric -Commits $commits -TopNCount $TopN)
     $commitRows = @(New-CommitRowFromCommit -Commits $commits)
 
     # --- ステップ 5: Strict 死亡帰属（blame ベースの行追跡） ---
+    Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 5/8: Strict 帰属解析' -PercentComplete 45
     Update-StrictAttributionMetric -Commits $commits -RevToAuthor $revToAuthor -TargetUrl $targetUrl -FromRevision $FromRev -ToRevision $ToRev -CacheDir $cacheDir -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -FileRows $fileRows -CommitterRows $committerRows -Parallel $Parallel
 
     # --- ステップ 6: CSV レポート出力 ---
+    Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 6/8: CSV レポート出力' -PercentComplete 80
     $headers = Get-MetricHeader
     Write-CsvFile -FilePath (Join-Path $OutDir 'committers.csv') -Rows $committerRows -Headers $headers.Committer -EncodingName $Encoding
     Write-CsvFile -FilePath (Join-Path $OutDir 'files.csv') -Rows $fileRows -Headers $headers.File -EncodingName $Encoding
     Write-CsvFile -FilePath (Join-Path $OutDir 'commits.csv') -Rows $commitRows -Headers $headers.Commit -EncodingName $Encoding
     Write-CsvFile -FilePath (Join-Path $OutDir 'couplings.csv') -Rows $couplingRows -Headers $headers.Coupling -EncodingName $Encoding
     # --- ステップ 7: 可視化出力（指定時のみ） ---
+    Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 7/8: 可視化出力' -PercentComplete 88
     if ($EmitPlantUml)
     {
         Write-PlantUmlFile -OutDirectory $OutDir -Committers $committerRows -Files $fileRows -Couplings $couplingRows -TopNCount $TopN -EncodingName $Encoding
@@ -8170,10 +8211,12 @@ try
     }
 
     # --- ステップ 8: 実行メタデータとサマリーの書き出し ---
+    Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 8/8: メタデータ出力' -PercentComplete 95
     $finishedAt = Get-Date
     $meta = New-RunMetaData -StartTime $startedAt -EndTime $finishedAt -TargetUrl $targetUrl -FromRevision $FromRev -ToRevision $ToRev -AuthorFilter $Author -SvnVersion $svnVersion -NoBlame:$NoBlame -DeadDetailLevel $DeadDetailLevel -Parallel $Parallel -TopN $TopN -Encoding $Encoding -Commits $commits -FileRows $fileRows -OutDir $OutDir -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -EmitPlantUml:$EmitPlantUml -EmitCharts:$EmitCharts -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -IgnoreSpaceChange:$IgnoreSpaceChange -IgnoreAllSpace:$IgnoreAllSpace -IgnoreEolStyle:$IgnoreEolStyle -IncludeProperties:$IncludeProperties -ForceBinary:$ForceBinary
     Write-JsonFile -Data $meta -FilePath (Join-Path $OutDir 'run_meta.json') -Depth 12 -EncodingName $Encoding
 
+    Write-Progress -Id 0 -Activity 'NarutoCode' -Completed
     Write-RunSummary -TargetUrl $targetUrl -FromRevision $FromRev -ToRevision $ToRev -Commits $commits -FileRows $fileRows -OutDir $OutDir
 
     [pscustomobject]@{
