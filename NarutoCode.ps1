@@ -3641,6 +3641,108 @@ function Write-PlantUmlFile
     [void]$sb3.AppendLine('@enduml')
     Write-TextFile -FilePath (Join-Path $OutDirectory 'cochange_network.puml') -Content $sb3.ToString() -EncodingName $EncodingName
 }
+function Get-SafeFileName
+{
+    <#
+    .SYNOPSIS
+        Windows 互換の安全なファイル名を生成する。
+    .DESCRIPTION
+        無効文字の除去、予約デバイス名の正規化、長さ制限を適用し、
+        Windows 環境で確実に使用可能なファイル名を返す。
+    .PARAMETER BaseName
+        サニタイズ対象の基本名を指定する。
+    .PARAMETER Extension
+        ファイル拡張子を指定する（ドットを含む、例: ".svg"）。
+    .PARAMETER MaxLength
+        ファイル名の最大長を指定する（拡張子を含む）。デフォルトは 100 文字。
+    .OUTPUTS
+        System.String
+        サニタイズされた安全なファイル名を返す。
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$BaseName,
+        [Parameter(Mandatory = $false)]
+        [string]$Extension = '',
+        [Parameter(Mandatory = $false)]
+        [int]$MaxLength = 100
+    )
+
+    $safe = [string]$BaseName
+    if ([string]::IsNullOrWhiteSpace($safe))
+    {
+        $safe = '(unknown)'
+    }
+    $safe = $safe.Trim()
+
+    # 無効な文字を置換
+    # GetInvalidFileNameChars() はプラットフォーム依存のため、Windows 固有の無効文字を明示的に処理
+    $windowsInvalidChars = [char[]]@('<', '>', ':', '"', '/', '\', '|', '?', '*')
+    foreach ($invalidChar in $windowsInvalidChars)
+    {
+        $safe = $safe.Replace([string]$invalidChar, '_')
+    }
+    # プラットフォームの無効文字も処理（制御文字など）
+    foreach ($invalidChar in [System.IO.Path]::GetInvalidFileNameChars())
+    {
+        $safe = $safe.Replace([string]$invalidChar, '_')
+    }
+
+    # 末尾のドットとスペースを除去（Windows では問題となる）
+    $safe = $safe.TrimEnd('. ')
+
+    # Windows 予約デバイス名のチェックと正規化
+    # 予約名: CON, PRN, AUX, NUL, COM1-9, LPT1-9
+    $reservedNames = @(
+        'CON', 'PRN', 'AUX', 'NUL',
+        'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9',
+        'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9'
+    )
+
+    # 予約名は大文字小文字を区別しない
+    $upperSafe = $safe.ToUpperInvariant()
+    foreach ($reserved in $reservedNames)
+    {
+        if ($upperSafe -eq $reserved)
+        {
+            # 予約名の場合はアンダースコアを接頭辞として付与
+            $safe = "_$safe"
+            break
+        }
+    }
+
+    # 空になった場合のフォールバック
+    if ([string]::IsNullOrWhiteSpace($safe))
+    {
+        $safe = '(unknown)'
+    }
+
+    # 最大長の制限（拡張子を含む）
+    $extLen = $Extension.Length
+    $maxBaseLen = $MaxLength - $extLen
+    if ($maxBaseLen -lt 1)
+    {
+        $maxBaseLen = 1
+    }
+
+    if ($safe.Length -gt $maxBaseLen)
+    {
+        # 長すぎる場合は切り詰めてハッシュを付与
+        # NOTE: MD5 はセキュリティ目的ではなく、ファイル名の一意性確保のみに使用
+        $hash = [BitConverter]::ToString([System.Security.Cryptography.MD5]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($safe))).Replace('-', '').Substring(0, 8).ToLowerInvariant()
+        $truncLen = $maxBaseLen - 9
+        if ($truncLen -lt 1)
+        {
+            $truncLen = 1
+        }
+        $safe = $safe.Substring(0, $truncLen) + '_' + $hash
+    }
+
+    return $safe + $Extension
+}
 function Write-CommitterRadarChart
 {
     <#
@@ -3875,29 +3977,24 @@ function Write-CommitterRadarChart
             $authorTitle = '(unknown)'
         }
 
-        $fileAuthor = [string]$row.Author
-        if ([string]::IsNullOrWhiteSpace($fileAuthor))
+        $authorName = [string]$row.Author
+        if ([string]::IsNullOrWhiteSpace($authorName))
         {
-            $fileAuthor = '(unknown)'
-        }
-        $fileAuthor = $fileAuthor.Trim()
-        foreach ($invalidChar in [System.IO.Path]::GetInvalidFileNameChars())
-        {
-            $fileAuthor = $fileAuthor.Replace([string]$invalidChar, '_')
-        }
-        $fileAuthor = $fileAuthor.TrimEnd('.')
-        if ([string]::IsNullOrWhiteSpace($fileAuthor))
-        {
-            $fileAuthor = '(unknown)'
+            $authorName = '(unknown)'
         }
 
-        $fileName = "committer_radar_{0}.svg" -f $fileAuthor
+        # 安全なファイル名を生成（予約名・長さ制限対応）
+        # 著者名のみを先にサニタイズ（予約名処理のため、長さ制限なし）
+        $safeAuthor = Get-SafeFileName -BaseName $authorName -Extension '' -MaxLength 999
+        # フルファイル名を生成し、長さ制限を適用
+        $fileName = Get-SafeFileName -BaseName "committer_radar_$safeAuthor" -Extension '.svg' -MaxLength 100
         if (-not $usedNames.Add($fileName))
         {
             $index = 2
             while ($true)
             {
-                $candidate = "committer_radar_{0}_{1}.svg" -f $fileAuthor, $index
+                $candidateBase = "committer_radar_{0}_{1}" -f $safeAuthor, $index
+                $candidate = Get-SafeFileName -BaseName $candidateBase -Extension '.svg' -MaxLength 100
                 if ($usedNames.Add($candidate))
                 {
                     $fileName = $candidate
