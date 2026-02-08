@@ -8,8 +8,12 @@ BeforeAll {
     $script:ScriptPath = Join-Path (Join-Path $here '..') 'NarutoCode.ps1'
 
     $scriptContent = Get-Content -Path $script:ScriptPath -Raw -Encoding UTF8
-    $regionPattern = '(?s)(# region Utility.*?# endregion Utility)'
-    if ($scriptContent -match $regionPattern) {
+    # Extract the script-scope variables and all region blocks (functions) from
+    # NarutoCode.ps1, skipping the param() block at the top and the try/catch
+    # execution body at the bottom.
+    $regionPattern = '(?s)(\$script:StrictModeEnabled\b.*# endregion [^\r\n]+)'
+    if ($scriptContent -match $regionPattern)
+    {
         $functionBlock = $Matches[1]
         $script:SvnExecutable = 'svn'
         $script:SvnGlobalArguments = @()
@@ -18,8 +22,9 @@ BeforeAll {
         . $tempFile
         Remove-Item $tempFile -ErrorAction SilentlyContinue
     }
-    else {
-        throw 'Could not extract utility functions from NarutoCode.ps1.'
+    else
+    {
+        throw 'Could not extract function regions from NarutoCode.ps1.'
     }
 }
 
@@ -233,7 +238,7 @@ Describe 'NarutoCode.ps1 parameter definition' {
     }
 
     It 'contains new Phase 1 parameters' {
-        $names = @('OutDir','Username','Password','NonInteractive','TrustServerCert','NoBlame','Parallel','IncludePaths','EmitPlantUml','TopN','Encoding')
+        $names = @('OutDir','Username','Password','NonInteractive','TrustServerCert','NoBlame','Parallel','IncludePaths','EmitPlantUml','EmitCharts','TopN','Encoding')
         foreach ($name in $names) {
             $script:cmd.Parameters[$name] | Should -Not -BeNullOrEmpty
         }
@@ -1033,6 +1038,97 @@ Describe 'Write-PlantUmlFile' {
         $content | Should -Match 'X\.cs'
         $content | Should -Match 'Y\.cs'
         $content | Should -Match 'co=2'
+    }
+}
+
+Describe 'Write-CommitterRadarChart' {
+    BeforeEach {
+        $script:chartDir = Join-Path $env:TEMP ('narutocode_chart_' + [guid]::NewGuid().ToString('N'))
+        New-Item -Path $script:chartDir -ItemType Directory -Force | Out-Null
+    }
+    AfterEach {
+        Remove-Item -Path $script:chartDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'creates committer radar svg files for top committers' {
+        $committers = @(
+            [pscustomobject]@{
+                '作者' = 'alice'
+                '総チャーン' = 200
+                '追加行数' = 100
+                '生存行数' = 80
+                'チャーン対純増比' = 2.5
+                '自己相殺行数' = 10
+                '被他者削除行数' = 5
+                '他者コード変更行数' = 20
+                '他者コード変更生存行数' = 12
+                'ピンポン回数' = 2
+                'コミット数' = 10
+                '課題ID言及数' = 8
+            },
+            [pscustomobject]@{
+                '作者' = 'bob'
+                '総チャーン' = 150
+                '追加行数' = 80
+                '生存行数' = 40
+                'チャーン対純増比' = 4.0
+                '自己相殺行数' = 20
+                '被他者削除行数' = 10
+                '他者コード変更行数' = 0
+                '他者コード変更生存行数' = 0
+                'ピンポン回数' = 3
+                'コミット数' = 12
+                '課題ID言及数' = 6
+            },
+            [pscustomobject]@{
+                '作者' = 'binary-only'
+                '総チャーン' = 999
+                '追加行数' = 0
+                '生存行数' = 0
+                'チャーン対純増比' = 0
+                '自己相殺行数' = 0
+                '被他者削除行数' = 0
+                '他者コード変更行数' = 0
+                '他者コード変更生存行数' = 0
+                'ピンポン回数' = 0
+                'コミット数' = 1
+                '課題ID言及数' = 0
+            }
+        )
+
+        Write-CommitterRadarChart -OutDirectory $script:chartDir -Committers $committers -TopNCount 2 -EncodingName 'UTF8'
+
+        Test-Path (Join-Path $script:chartDir 'committer_radar_alice.svg') | Should -BeTrue
+        Test-Path (Join-Path $script:chartDir 'committer_radar_bob.svg') | Should -BeTrue
+        Test-Path (Join-Path $script:chartDir 'committer_radar_binary-only.svg') | Should -BeFalse
+    }
+
+    It 'svg contains expected tags, author, and axis labels' {
+        $committers = @(
+            [pscustomobject]@{
+                '作者' = 'charlie'
+                '総チャーン' = 10
+                '追加行数' = 20
+                '生存行数' = 15
+                'チャーン対純増比' = 1.5
+                '自己相殺行数' = 1
+                '被他者削除行数' = 2
+                '他者コード変更行数' = 4
+                '他者コード変更生存行数' = 3
+                'ピンポン回数' = 1
+                'コミット数' = 5
+                '課題ID言及数' = 3
+            }
+        )
+
+        Write-CommitterRadarChart -OutDirectory $script:chartDir -Committers $committers -TopNCount 1 -EncodingName 'UTF8'
+
+        $content = Get-Content -Path (Join-Path $script:chartDir 'committer_radar_charlie.svg') -Raw -Encoding UTF8
+        $content | Should -Match '<svg'
+        $content | Should -Match '</svg>'
+        $content | Should -Match 'charlie'
+        $content | Should -Match 'コード生存率'
+        $content | Should -Match 'プロセス遵守'
     }
 }
 
