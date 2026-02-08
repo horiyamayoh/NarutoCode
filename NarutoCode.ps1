@@ -3674,7 +3674,7 @@ function Write-CommitterRadarChart
     }
     if (-not (Test-Path -LiteralPath $OutDirectory))
     {
-        $null = New-Item -Path $OutDirectory -ItemType Directory -Force
+        $null = New-Item -LiteralPath $OutDirectory -ItemType Directory -Force
     }
 
     $axisDefinitions = @(
