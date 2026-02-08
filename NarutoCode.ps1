@@ -3650,29 +3650,55 @@ function ConvertTo-SvgColor
     <#
     .SYNOPSIS
         ホットスポット順位を赤から緑のグラデーション色に変換する。
+    .DESCRIPTION
+        順位が低い（1位）ほど赤色、順位が高い（悪い）ほど緑色のグラデーションを返す。
+        赤: 高リスク（頻繁に変更されるホットスポット）
+        緑: 低リスク（安定したファイル）
     .PARAMETER Rank
-        対象ファイルのホットスポット順位を指定する。
+        対象ファイルのホットスポット順位を指定する（1以上の整数）。
     .PARAMETER MaxRank
-        可視化対象における最下位のホットスポット順位を指定する。
+        可視化対象における最下位のホットスポット順位を指定する（1以上の整数）。
+    .OUTPUTS
+        System.String
+        #RRGGBB 形式のカラーコードを返す。
+    .EXAMPLE
+        ConvertTo-SvgColor -Rank 1 -MaxRank 10
+        最もリスクの高い赤色を返す。
     #>
-    param([int]$Rank, [int]$MaxRank)
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$Rank,
+        [Parameter(Mandatory = $true)]
+        [int]$MaxRank
+    )
+
+    # 入力値を正の範囲にクランプ
     $clampedRank = [Math]::Max(1, $Rank)
     $clampedMaxRank = [Math]::Max(1, $MaxRank)
+
+    # 0.0〜1.0 の正規化比率を計算
     $ratio = 0.0
     if ($clampedMaxRank -gt 1)
     {
         $ratio = ($clampedRank - 1) / [double]($clampedMaxRank - 1)
     }
     $ratio = [Math]::Max(0.0, [Math]::Min(1.0, $ratio))
+
+    # グラデーション定義: 赤（高リスク）→ 緑（低リスク）
     $startR = 230
     $startG = 57
     $startB = 70
     $endR = 46
     $endG = 160
     $endB = 67
+
+    # 線形補間で RGB 値を算出
     $r = [int][Math]::Round($startR + (($endR - $startR) * $ratio))
     $g = [int][Math]::Round($startG + (($endG - $startG) * $ratio))
     $b = [int][Math]::Round($startB + (($endB - $startB) * $ratio))
+
     return ('#{0:X2}{1:X2}{2:X2}' -f $r, $g, $b)
 }
 function Write-FileBubbleChart
@@ -3683,16 +3709,45 @@ function Write-FileBubbleChart
     .DESCRIPTION
         TopN のファイルをホットスポット順位順で選び、コミット数と作者数を軸に配置する。
         バブル面積は総チャーンに比例させ、色はホットスポット順位を赤から緑で表現する。
+        X軸: コミット数、Y軸: 作者数、バブルサイズ: 総チャーン、色: ホットスポット順位
     .PARAMETER OutDirectory
-        出力先ディレクトリを指定する。
+        出力先ディレクトリを指定する（必須）。
     .PARAMETER Files
-        Get-FileMetric が返したファイル行データを指定する。
+        Get-FileMetric が返したファイル行データを指定する（必須）。
     .PARAMETER TopNCount
-        可視化対象とする上位件数を指定する。
+        可視化対象とする上位件数を指定する（0以下の場合は全件）。
     .PARAMETER EncodingName
         出力時に使用する文字エンコーディングを指定する。
+    .EXAMPLE
+        Write-FileBubbleChart -OutDirectory '.\output' -Files $fileMetrics -TopNCount 50 -EncodingName 'UTF8'
     #>
-    param([string]$OutDirectory, [object[]]$Files, [int]$TopNCount, [string]$EncodingName)
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$OutDirectory,
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [object[]]$Files,
+        [Parameter(Mandatory = $false)]
+        [int]$TopNCount = 0,
+        [Parameter(Mandatory = $false)]
+        [string]$EncodingName = 'UTF-8'
+    )
+
+    # 入力検証
+    if ([string]::IsNullOrWhiteSpace($OutDirectory))
+    {
+        Write-Warning 'Write-FileBubbleChart: OutDirectory が空です。'
+        return
+    }
+
+    if (-not $Files -or @($Files).Count -eq 0)
+    {
+        Write-Verbose 'Write-FileBubbleChart: Files が空です。SVG を生成しません。'
+        return
+    }
     $topFiles = @(
         $Files |
             Where-Object {
@@ -3784,19 +3839,27 @@ function Write-FileBubbleChart
         'UTF-8'
     }
 
+    # SVG 構築開始
     $sb = New-Object System.Text.StringBuilder
+
+    # XML 宣言と SVG ルート要素
     [void]$sb.AppendLine(('<?xml version="1.0" encoding="{0}"?>' -f $xmlEncoding))
     $titleX = $svgWidth / 2.0
     [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {0} {1}">' -f $svgWidth, $svgHeight))
+
+    # グラデーション定義（凡例用）
     [void]$sb.AppendLine('  <defs>')
     [void]$sb.AppendLine('    <linearGradient id="rankGradient" x1="0%" y1="0%" x2="100%" y2="0%">')
     [void]$sb.AppendLine(('      <stop offset="0%" stop-color="{0}" />' -f $rankStartColor))
     [void]$sb.AppendLine(('      <stop offset="100%" stop-color="{0}" />' -f $rankEndColor))
     [void]$sb.AppendLine('    </linearGradient>')
     [void]$sb.AppendLine('  </defs>')
+
+    # 背景とタイトル
     [void]$sb.AppendLine(('  <rect x="0" y="0" width="{0}" height="{1}" fill="#FFFFFF" />' -f $svgWidth, $svgHeight))
     [void]$sb.AppendLine(('  <text x="{0}" y="28" font-size="20" font-weight="bold" text-anchor="middle" fill="#222222">ファイル別ホットスポット バブルチャート</text>' -f $titleX))
 
+    # X軸グリッド線とラベル（コミット数）
     for ($i = 0
         $i -le $tickCount
         $i++)
@@ -3808,6 +3871,7 @@ function Write-FileBubbleChart
         [void]$sb.AppendLine(('  <line x1="{0}" y1="{1}" x2="{0}" y2="{2}" stroke="#DDDDDD" stroke-width="1" stroke-dasharray="4 4" />' -f $xRounded, $plotTop, $plotBottom))
         [void]$sb.AppendLine(('  <text x="{0}" y="{1}" font-size="12" text-anchor="middle" fill="#555555">{2}</text>' -f $xRounded, ($plotBottom + 22.0), $xLabel))
     }
+    # Y軸グリッド線とラベル（作者数）
     for ($i = 0
         $i -le $tickCount
         $i++)
@@ -3820,11 +3884,15 @@ function Write-FileBubbleChart
         [void]$sb.AppendLine(('  <text x="{0}" y="{1}" font-size="12" text-anchor="end" fill="#555555">{2}</text>' -f ($plotLeft - 10.0), ($yRounded + 4.0), $yLabel))
     }
 
+    # 座標軸の描画
     [void]$sb.AppendLine(('  <line x1="{0}" y1="{1}" x2="{2}" y2="{1}" stroke="#333333" stroke-width="2" />' -f $plotLeft, $plotBottom, $plotRight))
     [void]$sb.AppendLine(('  <line x1="{0}" y1="{1}" x2="{0}" y2="{2}" stroke="#333333" stroke-width="2" />' -f $plotLeft, $plotTop, $plotBottom))
+
+    # 軸ラベル
     [void]$sb.AppendLine(('  <text x="{0}" y="{1}" font-size="16" text-anchor="middle" fill="#222222">コミット数</text>' -f ($plotLeft + ($plotWidth / 2.0)), ($svgHeight - 14.0)))
     [void]$sb.AppendLine(('  <text x="{0}" y="{1}" font-size="16" text-anchor="middle" fill="#222222" transform="rotate(-90 {0} {1})">作者数</text>' -f 36, ($plotTop + ($plotHeight / 2.0))))
 
+    # 凡例エリアの描画
     $legendX = $plotRight - 240.0
     $legendY = $plotTop + 10.0
     [void]$sb.AppendLine(('  <rect x="{0}" y="{1}" width="220" height="170" rx="8" ry="8" fill="#F8F8F8" stroke="#DDDDDD" />' -f $legendX, $legendY))
@@ -3841,6 +3909,7 @@ function Write-FileBubbleChart
     [void]$sb.AppendLine(('  <text x="{0}" y="{1}" font-size="11" fill="#555555">1位</text>' -f ($legendX + 12.0), ($legendY + 176.0)))
     [void]$sb.AppendLine(('  <text x="{0}" y="{1}" font-size="11" text-anchor="end" fill="#555555">{2}位</text>' -f ($legendX + 132.0), ($legendY + 176.0), $maxRank))
 
+    # バブルの描画順序: 大きいバブルを背面に配置（総チャーン降順）
     $drawOrder = @(
         $topFiles |
             Sort-Object -Property @{Expression = {
@@ -3851,6 +3920,8 @@ function Write-FileBubbleChart
                 Descending = $false
             }, 'ファイルパス'
     )
+
+    # 各ファイルをバブルとして描画
     foreach ($f in $drawOrder)
     {
         $filePath = [string]$f.'ファイルパス'
@@ -3911,17 +3982,47 @@ function Write-FileHeatMap
         ホットスポット順位の上位ファイルを行、比較可能なメトリクスを列として
         0-1 正規化したヒートマップを SVG で生成する。
         Phase 2 の追加列が存在する場合は、同一ヒートマップへ列を拡張して描画する。
+        セルの色は白（最小値）から赤（最大値）のグラデーションで表現される。
     .PARAMETER OutDirectory
-        出力先ディレクトリを指定する。
+        出力先ディレクトリを指定する（必須）。
     .PARAMETER Files
-        Get-FileMetric が返すファイル別メトリクス行を指定する。
+        Get-FileMetric が返すファイル別メトリクス行を指定する（必須）。
     .PARAMETER TopNCount
-        ヒートマップ対象にする上位件数を指定する。
+        ヒートマップ対象にする上位件数を指定する（0以下の場合は全件）。
     .PARAMETER EncodingName
         出力時に使用する文字エンコーディングを指定する。
+    .EXAMPLE
+        Write-FileHeatMap -OutDirectory '.\output' -Files $fileMetrics -TopNCount 30 -EncodingName 'UTF8'
     #>
     [CmdletBinding()]
-    param([string]$OutDirectory, [object[]]$Files, [int]$TopNCount, [string]$EncodingName)
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$OutDirectory,
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [object[]]$Files,
+        [Parameter(Mandatory = $false)]
+        [int]$TopNCount = 0,
+        [Parameter(Mandatory = $false)]
+        [string]$EncodingName = 'UTF-8'
+    )
+
+    # 入力検証
+    if ([string]::IsNullOrWhiteSpace($OutDirectory))
+    {
+        Write-Warning 'Write-FileHeatMap: OutDirectory が空です。'
+        return
+    }
+
+    if (-not $Files -or @($Files).Count -eq 0)
+    {
+        Write-Verbose 'Write-FileHeatMap: Files が空です。SVG を生成しません。'
+        return
+    }
+
+    # 可視化対象のメトリクス定義（基本 + Phase 2 オプショナル）
     $metrics = @(
         'コミット数',
         '作者数',
@@ -4088,6 +4189,7 @@ function Write-FileHeatMap
         }
     }
 
+    # SVG キャンバスのサイズ計算
     $cellWidth = 120
     $cellHeight = 30
     $leftMargin = 250
@@ -4104,9 +4206,11 @@ function Write-FileHeatMap
     $rowHeaderX = $leftMargin - 8
     $gridRight = $leftMargin + $gridWidth
 
+    # SVG 構築開始
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine('<?xml version="1.0"?>')
     [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {0} {1}" width="{0}" height="{1}">' -f $totalWidth, $totalHeight))
+    # CSS スタイル定義
     [void]$sb.AppendLine('  <defs>')
     [void]$sb.AppendLine('    <style><![CDATA[')
     [void]$sb.AppendLine('      text { font-family: "Segoe UI", "Meiryo", sans-serif; fill: #333333; }')
@@ -4117,6 +4221,7 @@ function Write-FileHeatMap
     [void]$sb.AppendLine('  </defs>')
     [void]$sb.AppendLine(('  <rect x="0" y="0" width="{0}" height="{1}" fill="#ffffff" />' -f $totalWidth, $totalHeight))
 
+    # 列ヘッダー（メトリクス名）の描画（45度回転）
     for ($columnIndex = 0
         $columnIndex -lt $columnCount
         $columnIndex++)
@@ -4127,6 +4232,7 @@ function Write-FileHeatMap
         [void]$sb.AppendLine(('  <text class="col-header" x="{0}" y="{1}" transform="rotate(-45 {0} {1})">{2}</text>' -f $headerX, $headerY, (& $escapeXml $metric)))
     }
 
+    # 水平グリッド線の描画
     for ($rowIndex = 0
         $rowIndex -le $rowCount
         $rowIndex++)
@@ -4135,6 +4241,7 @@ function Write-FileHeatMap
         [void]$sb.AppendLine(('  <line x1="{0}" y1="{1}" x2="{2}" y2="{1}" stroke="#e6e6e6" stroke-width="1" />' -f $leftMargin, $lineY, $gridRight))
     }
 
+    # 各行（ファイル）とセル（メトリクス値）の描画
     for ($rowIndex = 0
         $rowIndex -lt $rowCount
         $rowIndex++)
@@ -4144,6 +4251,8 @@ function Write-FileHeatMap
         $displayPath = & $toDisplayPath $filePath $rowHeaderMaxLength
         $rowY = $topMargin + ($rowIndex * $cellHeight)
         $rowTextY = $rowY + [Math]::Round($cellHeight / 2.0)
+
+        # 行ヘッダー（ファイルパス）
         [void]$sb.AppendLine(('  <text class="row-header" x="{0}" y="{1}">{2}</text>' -f $rowHeaderX, $rowTextY, (& $escapeXml $displayPath)))
 
         for ($columnIndex = 0
@@ -4292,33 +4401,75 @@ function Write-CommitterRadarChart
     .DESCRIPTION
         追加行数が 0 を超えるコミッターを対象に品質指標を算出し、
         全コミッター間で min-max 正規化した値を作者別 SVG として保存する。
+        各軸の意味:
+        - コード生存率: 追加したコードが最終的に残っている割合
+        - 削除対追加比: 追加に対する削除の割合（低いほど良い）
+        - 自己相殺率: 自分で追加したコードを自分で削除した割合（低いほど良い）
+        - 被削除率: 他者に削除されたコードの割合（低いほど良い）
+        - 他者コード変更生存率: 他者のコードを変更した後の生存率（高いほど良い）
+        - コミットあたりピンポン: 反復編集の頻度（低いほど良い）
+        - 所有集中度: コードベースへの貢献割合（高いほど良い）
     .PARAMETER OutDirectory
-        SVG ファイルを保存する出力先ディレクトリを指定する。
+        SVG ファイルを保存する出力先ディレクトリを指定する（必須）。
     .PARAMETER Committers
-        Get-CommitterMetric が返すコミッター行配列を指定する。
+        Get-CommitterMetric が返すコミッター行配列を指定する（必須）。
     .PARAMETER TopNCount
-        総チャーン上位として SVG を生成する件数を指定する。
+        総チャーン上位として SVG を生成する件数を指定する（0以下の場合は出力しない）。
     .PARAMETER EncodingName
         出力時に使用する文字エンコーディング名を指定する。
+    .EXAMPLE
+        Write-CommitterRadarChart -OutDirectory '.\output' -Committers $committers -TopNCount 10 -EncodingName 'UTF8'
     #>
     [CmdletBinding()]
-    param([string]$OutDirectory, [object[]]$Committers, [int]$TopNCount, [string]$EncodingName)
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$OutDirectory,
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [object[]]$Committers,
+        [Parameter(Mandatory = $false)]
+        [ValidateRange(0, [int]::MaxValue)]
+        [int]$TopNCount = 0,
+        [Parameter(Mandatory = $false)]
+        [string]$EncodingName = 'UTF-8'
+    )
+
+    # 入力検証
     if ([string]::IsNullOrWhiteSpace($OutDirectory))
     {
+        Write-Warning 'Write-CommitterRadarChart: OutDirectory が空です。'
         return
     }
+
     if ($TopNCount -le 0)
     {
+        Write-Verbose 'Write-CommitterRadarChart: TopNCount が 0 以下のため、出力しません。'
         return
     }
+
     if (-not $Committers -or @($Committers).Count -eq 0)
     {
+        Write-Verbose 'Write-CommitterRadarChart: Committers が空です。SVG を生成しません。'
         return
     }
+
+    # 出力ディレクトリの作成
     if (-not (Test-Path -LiteralPath $OutDirectory))
     {
-        $null = New-Item -LiteralPath $OutDirectory -ItemType Directory -Force
+        try
+        {
+            $null = New-Item -LiteralPath $OutDirectory -ItemType Directory -Force -ErrorAction Stop
+        }
+        catch
+        {
+            Write-Warning "Write-CommitterRadarChart: 出力ディレクトリの作成に失敗しました: $_"
+            return
+        }
     }
+
+    # レーダーチャートの 7 軸定義（Invert は値が小さいほど良い場合に true）
 
     $axisDefinitions = @(
         [pscustomobject][ordered]@{
