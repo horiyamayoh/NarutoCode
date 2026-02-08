@@ -245,7 +245,7 @@ Describe 'NarutoCode.ps1 parameter definition' {
     }
 
     It 'contains new Phase 1 parameters' {
-        $names = @('OutDir','Username','Password','NonInteractive','TrustServerCert','NoBlame','Parallel','IncludePaths','EmitPlantUml','EmitCharts','TopN','Encoding')
+        $names = @('OutDir','Username','Password','NonInteractive','TrustServerCert','Parallel','IncludePaths','IgnoreWhitespace','TopN','Encoding')
         foreach ($name in $names) {
             $script:cmd.Parameters[$name] | Should -Not -BeNullOrEmpty
         }
@@ -1337,23 +1337,7 @@ Describe 'NarutoCode.ps1 execution' {
         }
     }
 
-    It 'fails when NoBlame is specified in strict-only mode' {
-        $tempOut = Join-Path $env:TEMP ('narutocode_test_' + [guid]::NewGuid().ToString('N'))
-        try {
-            {
-                & $script:ScriptPath `
-                    -RepoUrl 'https://svn.example.com/repos/proj/trunk' `
-                    -FromRev 1 -ToRev 2 `
-                    -OutDir $tempOut `
-                    -SvnExecutable 'nonexistent_svn_command_xyz' `
-                    -NoBlame `
-                    -ErrorAction Stop
-            } | Should -Throw -ExpectedMessage '*strict-only mode*'
-        }
-        finally {
-            Remove-Item -Path $tempOut -Recurse -Force -ErrorAction SilentlyContinue
-        }
-    }
+
 }
 
 # ===== Phase 2 Tests =====
@@ -1812,9 +1796,9 @@ Describe 'NarutoCode.ps1 parameter definition — Phase 2' {
         $script:cmd = Get-Command $script:ScriptPath
     }
 
-    It 'has DeadDetailLevel parameter with range 0-2' {
-        $script:cmd.Parameters['DeadDetailLevel'] | Should -Not -BeNullOrEmpty
-        $script:cmd.Parameters['DeadDetailLevel'].ParameterType.Name | Should -Be 'Int32'
+    It 'has IgnoreWhitespace switch parameter' {
+        $script:cmd.Parameters['IgnoreWhitespace'] | Should -Not -BeNullOrEmpty
+        $script:cmd.Parameters['IgnoreWhitespace'].ParameterType.Name | Should -Be 'SwitchParameter'
     }
 }
 
@@ -1869,7 +1853,6 @@ Describe 'Integration — test SVN repo output matches baseline' -Tag 'Integrati
                 -FromRev 1 -ToRev 20 `
                 -OutDir $script:actualDir `
                 -SvnExecutable $script:svnExe `
-                -EmitPlantUml `
                 -Encoding UTF8 `
                 -ErrorAction Stop
         }
@@ -1954,7 +1937,7 @@ Describe 'Integration — test SVN repo output matches baseline' -Tag 'Integrati
         $meta.ToRev         | Should -Be 20
         $meta.CommitCount   | Should -Be 20
         $meta.FileCount     | Should -Be 19
-        $meta.NoBlame       | Should -BeFalse
+        $meta.StrictMode    | Should -BeTrue
         $meta.Encoding      | Should -Be 'UTF8'
     }
 }
@@ -2026,8 +2009,8 @@ Index: trunk/src/file$Revision.txt
         $commitsSeq = & $script:commitFactory
         $commitsPar = & $script:commitFactory
 
-        $mapSeq = Initialize-CommitDiffData -Commits $commitsSeq -CacheDir 'dummy' -TargetUrl 'https://example.invalid/svn/repo' -DiffArguments @('diff') -DeadDetailLevel 2 -IncludeExtensions @() -ExcludeExtensions @() -IncludePathPatterns @() -ExcludePathPatterns @() -Parallel 1
-        $mapPar = Initialize-CommitDiffData -Commits $commitsPar -CacheDir 'dummy' -TargetUrl 'https://example.invalid/svn/repo' -DiffArguments @('diff') -DeadDetailLevel 2 -IncludeExtensions @() -ExcludeExtensions @() -IncludePathPatterns @() -ExcludePathPatterns @() -Parallel 4
+        $mapSeq = Initialize-CommitDiffData -Commits $commitsSeq -CacheDir 'dummy' -TargetUrl 'https://example.invalid/svn/repo' -DiffArguments @('diff') -IncludeExtensions @() -ExcludeExtensions @() -IncludePathPatterns @() -ExcludePathPatterns @() -Parallel 1
+        $mapPar = Initialize-CommitDiffData -Commits $commitsPar -CacheDir 'dummy' -TargetUrl 'https://example.invalid/svn/repo' -DiffArguments @('diff') -IncludeExtensions @() -ExcludeExtensions @() -IncludePathPatterns @() -ExcludePathPatterns @() -Parallel 4
 
         @($mapSeq.Keys | Sort-Object) | Should -Be @($mapPar.Keys | Sort-Object)
         foreach ($rev in @($mapSeq.Keys)) {

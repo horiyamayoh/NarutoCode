@@ -17,30 +17,21 @@ param(
     [Parameter(Mandatory = $true)][Alias('Path')][string]$RepoUrl,
     [Parameter(Mandatory = $true)][Alias('FromRevision', 'Pre', 'Start', 'StartRevision', 'From')][int]$FromRev,
     [Parameter(Mandatory = $true)][Alias('ToRevision', 'Post', 'End', 'EndRevision', 'To')][int]$ToRev,
-    [Alias('Name', 'User')][string]$Author,
     [string]$SvnExecutable = 'svn',
-    [string]$OutDir,
-    [string]$Username,
-    [securestring]$Password,
+    [string]$OutDir = '',
+    [string]$Username = '',
+    [securestring]$Password = $null,
     [switch]$NonInteractive,
     [switch]$TrustServerCert,
-    [switch]$NoBlame,
     [ValidateRange(1, 128)][int]$Parallel = [Math]::Max(1, [Environment]::ProcessorCount),
-    [string[]]$IncludePaths,
-    [string[]]$ExcludePaths,
-    [string[]]$IncludeExtensions,
-    [string[]]$ExcludeExtensions,
-    [switch]$EmitPlantUml,
-    [switch]$EmitCharts,
+    [string[]]$IncludePaths = @(),
+    [string[]]$ExcludePaths = @(),
+    [string[]]$IncludeExtensions = @(),
+    [string[]]$ExcludeExtensions = @(),
     [ValidateRange(1, 5000)][int]$TopN = 50,
     [ValidateSet('UTF8', 'UTF8BOM', 'Unicode', 'ASCII')][string]$Encoding = 'UTF8',
-    [switch]$IgnoreSpaceChange,
-    [switch]$IgnoreAllSpace,
-    [switch]$IgnoreEolStyle,
-    [switch]$IncludeProperties,
-    [switch]$ForceBinary,
-    [switch]$NoProgress,
-    [ValidateRange(0, 2)][int]$DeadDetailLevel = 0
+    [switch]$IgnoreWhitespace,
+    [switch]$NoProgress
 )
 
 # Suppress progress output when -NoProgress is specified
@@ -6777,48 +6768,20 @@ function Get-SvnDiffArgumentList
     <#
     .SYNOPSIS
         差分取得オプションから svn diff 引数配列を構築する。
-    .PARAMETER IncludeProperties
-        対象を絞り込むための包含または除外条件を指定する。
-    .PARAMETER ForceBinary
-        ForceBinary の値を指定する。
-    .PARAMETER IgnoreAllSpace
-        IgnoreAllSpace の値を指定する。
-    .PARAMETER IgnoreSpaceChange
-        IgnoreSpaceChange の値を指定する。
-    .PARAMETER IgnoreEolStyle
-        IgnoreEolStyle の値を指定する。
+    .PARAMETER IgnoreWhitespace
+        指定時は空白・改行コード差分を無視する。
     #>
     [CmdletBinding()]
     [OutputType([string[]])]
-    param([switch]$IncludeProperties, [switch]$ForceBinary, [switch]$IgnoreAllSpace, [switch]$IgnoreSpaceChange, [switch]$IgnoreEolStyle)
+    param([switch]$IgnoreWhitespace)
     $diffArgs = New-Object 'System.Collections.Generic.List[string]'
     $null = $diffArgs.Add('diff')
     $null = $diffArgs.Add('--internal-diff')
-    if (-not $IncludeProperties)
-    {
-        $null = $diffArgs.Add('--ignore-properties')
-    }
-    if ($ForceBinary)
-    {
-        $null = $diffArgs.Add('--force')
-    }
-    $extensions = New-Object 'System.Collections.Generic.List[string]'
-    if ($IgnoreAllSpace)
-    {
-        $null = $extensions.Add('--ignore-all-space')
-    }
-    elseif ($IgnoreSpaceChange)
-    {
-        $null = $extensions.Add('--ignore-space-change')
-    }
-    if ($IgnoreEolStyle)
-    {
-        $null = $extensions.Add('--ignore-eol-style')
-    }
-    if ($extensions.Count -gt 0)
+    $null = $diffArgs.Add('--ignore-properties')
+    if ($IgnoreWhitespace)
     {
         $null = $diffArgs.Add('--extensions')
-        $null = $diffArgs.Add(($extensions.ToArray() -join ' '))
+        $null = $diffArgs.Add('--ignore-space-change --ignore-eol-style')
     }
     return $diffArgs.ToArray()
 }
@@ -7058,12 +7021,10 @@ function Update-RenamePairDiffStat
         対象 SVN リポジトリ URL を指定する。
     .PARAMETER DiffArguments
         svn diff 実行時に付与する追加引数配列を指定する。
-    .PARAMETER DeadDetailLevel
-        DeadDetailLevel の値を指定する。
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
-    param([object]$Commit, [int]$Revision, [string]$TargetUrl, [string[]]$DiffArguments, [int]$DeadDetailLevel)
+    param([object]$Commit, [int]$Revision, [string]$TargetUrl, [string[]]$DiffArguments)
     $deletedSet = New-Object 'System.Collections.Generic.HashSet[string]'
     foreach ($pathEntry in @($Commit.ChangedPathsFiltered))
     {
@@ -7107,7 +7068,7 @@ function Update-RenamePairDiffStat
         $compareArguments.Add(($TargetUrl.TrimEnd('/') + '/' + $newPath + '@' + [string]$Revision)) | Out-Null
 
         $realDiff = Invoke-SvnCommand -Arguments $compareArguments.ToArray() -ErrorContext ("svn diff rename pair r{0} {1}->{2}" -f $Revision, $oldPath, $newPath)
-        $realParsed = ConvertFrom-SvnUnifiedDiff -DiffText $realDiff -DetailLevel $DeadDetailLevel
+        $realParsed = ConvertFrom-SvnUnifiedDiff -DiffText $realDiff -DetailLevel 2
 
         $realStat = $null
         if ($realParsed.ContainsKey($newPath))
@@ -7196,8 +7157,6 @@ function Initialize-CommitDiffData
         対象 SVN リポジトリ URL を指定する。
     .PARAMETER DiffArguments
         svn diff 実行時に付与する追加引数配列を指定する。
-    .PARAMETER DeadDetailLevel
-        DeadDetailLevel の値を指定する。
     .PARAMETER IncludeExtensions
         対象を絞り込むための包含または除外条件を指定する。
     .PARAMETER ExcludeExtensions
@@ -7216,7 +7175,6 @@ function Initialize-CommitDiffData
         [string]$CacheDir,
         [string]$TargetUrl,
         [string[]]$DiffArguments,
-        [int]$DeadDetailLevel,
         [string[]]$IncludeExtensions,
         [string[]]$ExcludeExtensions,
         [string[]]$IncludePathPatterns,
@@ -7234,7 +7192,6 @@ function Initialize-CommitDiffData
                 CacheDir = $CacheDir
                 TargetUrl = $TargetUrl
                 DiffArguments = @($DiffArguments)
-                DeadDetailLevel = $DeadDetailLevel
             })
     }
 
@@ -7245,7 +7202,7 @@ function Initialize-CommitDiffData
             param($Item, $Index)
             $null = $Index # Required by Invoke-ParallelWork contract
             $diffText = Get-CachedOrFetchDiffText -CacheDir $Item.CacheDir -Revision ([int]$Item.Revision) -TargetUrl $Item.TargetUrl -DiffArguments @($Item.DiffArguments)
-            $rawDiffByPath = ConvertFrom-SvnUnifiedDiff -DiffText $diffText -DetailLevel ([int]$Item.DeadDetailLevel)
+            $rawDiffByPath = ConvertFrom-SvnUnifiedDiff -DiffText $diffText -DetailLevel 2
             [pscustomobject]@{
                 Revision = [int]$Item.Revision
                 RawDiffByPath = $rawDiffByPath
@@ -7316,7 +7273,7 @@ function Initialize-CommitDiffData
         $commit.FileDiffStats = $filteredByLog
         $commit.FilesChanged = @($commit.FileDiffStats.Keys | Sort-Object)
 
-        Update-RenamePairDiffStat -Commit $commit -Revision $revision -TargetUrl $TargetUrl -DiffArguments $DiffArguments -DeadDetailLevel $DeadDetailLevel
+        Update-RenamePairDiffStat -Commit $commit -Revision $revision -TargetUrl $TargetUrl -DiffArguments $DiffArguments
         Set-CommitDerivedMetric -Commit $commit
         $commitIdx++
     }
@@ -7841,14 +7798,8 @@ function New-RunMetaData
         処理対象のリビジョン値を指定する。
     .PARAMETER ToRevision
         処理対象のリビジョン値を指定する。
-    .PARAMETER AuthorFilter
-        AuthorFilter の値を指定する。
     .PARAMETER SvnVersion
         SvnVersion の値を指定する。
-    .PARAMETER NoBlame
-        NoBlame の値を指定する。
-    .PARAMETER DeadDetailLevel
-        DeadDetailLevel の値を指定する。
     .PARAMETER Parallel
         並列実行時の最大ワーカー数を指定する。
     .PARAMETER TopN
@@ -7869,24 +7820,12 @@ function New-RunMetaData
         対象を絞り込むための包含または除外条件を指定する。
     .PARAMETER ExcludeExtensions
         対象を絞り込むための包含または除外条件を指定する。
-    .PARAMETER EmitPlantUml
-        EmitPlantUml の値を指定する。
-    .PARAMETER EmitCharts
-        EmitCharts の値を指定する。
     .PARAMETER NonInteractive
         NonInteractive の値を指定する。
     .PARAMETER TrustServerCert
         TrustServerCert の値を指定する。
-    .PARAMETER IgnoreSpaceChange
-        IgnoreSpaceChange の値を指定する。
-    .PARAMETER IgnoreAllSpace
-        IgnoreAllSpace の値を指定する。
-    .PARAMETER IgnoreEolStyle
-        IgnoreEolStyle の値を指定する。
-    .PARAMETER IncludeProperties
-        対象を絞り込むための包含または除外条件を指定する。
-    .PARAMETER ForceBinary
-        ForceBinary の値を指定する。
+    .PARAMETER IgnoreWhitespace
+        指定時は空白・改行コード差分を無視する。
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
@@ -7897,10 +7836,7 @@ function New-RunMetaData
         [string]$TargetUrl,
         [int]$FromRevision,
         [int]$ToRevision,
-        [string]$AuthorFilter,
         [string]$SvnVersion,
-        [switch]$NoBlame,
-        [int]$DeadDetailLevel,
         [int]$Parallel,
         [int]$TopN,
         [string]$Encoding,
@@ -7911,15 +7847,9 @@ function New-RunMetaData
         [string[]]$ExcludePaths,
         [string[]]$IncludeExtensions,
         [string[]]$ExcludeExtensions,
-        [switch]$EmitPlantUml,
-        [switch]$EmitCharts,
         [switch]$NonInteractive,
         [switch]$TrustServerCert,
-        [switch]$IgnoreSpaceChange,
-        [switch]$IgnoreAllSpace,
-        [switch]$IgnoreEolStyle,
-        [switch]$IncludeProperties,
-        [switch]$ForceBinary
+        [switch]$IgnoreWhitespace
     )
     return [ordered]@{
         StartTime = $StartTime.ToString('o')
@@ -7928,12 +7858,9 @@ function New-RunMetaData
         RepoUrl = $TargetUrl
         FromRev = $FromRevision
         ToRev = $ToRevision
-        AuthorFilter = $AuthorFilter
         SvnExecutable = $script:SvnExecutable
         SvnVersion = $SvnVersion
         StrictMode = $true
-        NoBlame = [bool]$NoBlame
-        DeadDetailLevel = $DeadDetailLevel
         Parallel = $Parallel
         TopN = $TopN
         Encoding = $Encoding
@@ -7950,15 +7877,9 @@ function New-RunMetaData
             ExcludePaths = $ExcludePaths
             IncludeExtensions = $IncludeExtensions
             ExcludeExtensions = $ExcludeExtensions
-            EmitPlantUml = [bool]$EmitPlantUml
-            EmitCharts = [bool]$EmitCharts
             NonInteractive = [bool]$NonInteractive
             TrustServerCert = [bool]$TrustServerCert
-            IgnoreSpaceChange = [bool]$IgnoreSpaceChange
-            IgnoreAllSpace = [bool]$IgnoreAllSpace
-            IgnoreEolStyle = [bool]$IgnoreEolStyle
-            IncludeProperties = [bool]$IncludeProperties
-            ForceBinary = [bool]$ForceBinary
+            IgnoreWhitespace = [bool]$IgnoreWhitespace
         }
         Outputs = [ordered]@{
             CommittersCsv = 'committers.csv'
@@ -7966,70 +7887,14 @@ function New-RunMetaData
             CommitsCsv = 'commits.csv'
             CouplingsCsv = 'couplings.csv'
             RunMetaJson = 'run_meta.json'
-            ContributorsPlantUml = if ($EmitPlantUml)
-            {
-                'contributors_summary.puml'
-            }
-            else
-            {
-                $null
-            }
-            HotspotsPlantUml = if ($EmitPlantUml)
-            {
-                'hotspots.puml'
-            }
-            else
-            {
-                $null
-            }
-            CoChangePlantUml = if ($EmitPlantUml)
-            {
-                'cochange_network.puml'
-            }
-            else
-            {
-                $null
-            }
-            FileBubbleSvg = if ($EmitCharts)
-            {
-                'file_bubble.svg'
-            }
-            else
-            {
-                $null
-            }
-            FileHeatMapSvg = if ($EmitCharts)
-            {
-                'file_heatmap.svg'
-            }
-            else
-            {
-                $null
-            }
-            CommitterRadarCharts = if ($EmitCharts)
-            {
-                'committer_radar_*.svg'
-            }
-            else
-            {
-                $null
-            }
-            CommitterRadarCombinedSvg = if ($EmitCharts)
-            {
-                'committer_radar_combined.svg'
-            }
-            else
-            {
-                $null
-            }
-            FileTreeMapSvg = if ($EmitCharts)
-            {
-                'file_treemap.svg'
-            }
-            else
-            {
-                $null
-            }
+            ContributorsPlantUml = 'contributors_summary.puml'
+            HotspotsPlantUml = 'hotspots.puml'
+            CoChangePlantUml = 'cochange_network.puml'
+            FileBubbleSvg = 'file_bubble.svg'
+            FileHeatMapSvg = 'file_heatmap.svg'
+            CommitterRadarCharts = 'committer_radar_*.svg'
+            CommitterRadarCombinedSvg = 'committer_radar_combined.svg'
+            FileTreeMapSvg = 'file_treemap.svg'
         }
     }
 }
@@ -8111,14 +7976,6 @@ try
     # --- ステップ 1: パラメータの初期化と検証 ---
     $startedAt = Get-Date
     Initialize-StrictModeContext
-    if ($NoBlame)
-    {
-        throw "-NoBlame is not supported in strict-only mode."
-    }
-    if ($DeadDetailLevel -lt 2)
-    {
-        $DeadDetailLevel = 2
-    }
     if ($FromRev -gt $ToRev)
     {
         $tmp = $FromRev
@@ -8127,7 +7984,7 @@ try
     }
     if (-not $OutDir)
     {
-        $OutDir = Join-Path (Get-Location) ("NarutoCode_out_{0}" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+        $OutDir = Join-Path (Get-Location) 'NarutoCode_out'
     }
 
     # Resolve relative OutDir to absolute path based on PowerShell $PWD
@@ -8139,10 +7996,6 @@ try
     $ExcludeExtensions = ConvertTo-NormalizedExtension -Extensions $ExcludeExtensions
     $IncludePaths = ConvertTo-NormalizedPatternList -Patterns $IncludePaths
     $ExcludePaths = ConvertTo-NormalizedPatternList -Patterns $ExcludePaths
-    if ($IgnoreAllSpace -and $IgnoreSpaceChange)
-    {
-        $IgnoreSpaceChange = $false
-    }
 
     $svnCmd = Get-Command $SvnExecutable -ErrorAction SilentlyContinue
     if (-not $svnCmd)
@@ -8160,22 +8013,11 @@ try
     Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 2/8: SVN ログの取得' -PercentComplete 5
     $logText = Invoke-SvnCommand -Arguments @('log', '--xml', '--verbose', '-r', "$FromRev`:$ToRev", $targetUrl) -ErrorContext 'svn log'
     $commits = @(ConvertFrom-SvnLogXml -XmlText $logText)
-    if ($Author)
-    {
-        if ($Author -match '[\*\?\[]')
-        {
-            $commits = @($commits | Where-Object { ([string]$_.Author) -like $Author })
-        }
-        else
-        {
-            $commits = @($commits | Where-Object { ([string]$_.Author) -ieq $Author })
-        }
-    }
 
     # --- ステップ 3: 差分の取得とコミット単位の差分統計構築 ---
     Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 3/8: 差分の取得と統計構築' -PercentComplete 15
-    $diffArgs = Get-SvnDiffArgumentList -IncludeProperties:$IncludeProperties -ForceBinary:$ForceBinary -IgnoreAllSpace:$IgnoreAllSpace -IgnoreSpaceChange:$IgnoreSpaceChange -IgnoreEolStyle:$IgnoreEolStyle
-    $revToAuthor = Initialize-CommitDiffData -Commits $commits -CacheDir $cacheDir -TargetUrl $targetUrl -DiffArguments $diffArgs -DeadDetailLevel $DeadDetailLevel -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePaths -ExcludePathPatterns $ExcludePaths -Parallel $Parallel
+    $diffArgs = Get-SvnDiffArgumentList -IgnoreWhitespace:$IgnoreWhitespace
+    $revToAuthor = Initialize-CommitDiffData -Commits $commits -CacheDir $cacheDir -TargetUrl $targetUrl -DiffArguments $diffArgs -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePaths -ExcludePathPatterns $ExcludePaths -Parallel $Parallel
 
     # --- ステップ 4: 基本メトリクス算出（コミッター / ファイル / カップリング / コミット） ---
     Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 4/8: 基本メトリクス算出' -PercentComplete 35
@@ -8195,25 +8037,19 @@ try
     Write-CsvFile -FilePath (Join-Path $OutDir 'files.csv') -Rows $fileRows -Headers $headers.File -EncodingName $Encoding
     Write-CsvFile -FilePath (Join-Path $OutDir 'commits.csv') -Rows $commitRows -Headers $headers.Commit -EncodingName $Encoding
     Write-CsvFile -FilePath (Join-Path $OutDir 'couplings.csv') -Rows $couplingRows -Headers $headers.Coupling -EncodingName $Encoding
-    # --- ステップ 7: 可視化出力（指定時のみ） ---
+    # --- ステップ 7: 可視化出力 ---
     Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 7/8: 可視化出力' -PercentComplete 88
-    if ($EmitPlantUml)
-    {
-        Write-PlantUmlFile -OutDirectory $OutDir -Committers $committerRows -Files $fileRows -Couplings $couplingRows -TopNCount $TopN -EncodingName $Encoding
-    }
-    if ($EmitCharts)
-    {
-        Write-FileBubbleChart -OutDirectory $OutDir -Files $fileRows -TopNCount $TopN -EncodingName $Encoding
-        Write-FileHeatMap -OutDirectory $OutDir -Files $fileRows -TopNCount $TopN -EncodingName $Encoding
-        Write-CommitterRadarChart -OutDirectory $OutDir -Committers $committerRows -TopNCount $TopN -EncodingName $Encoding
-        Write-CommitterRadarChartCombined -OutDirectory $OutDir -Committers $committerRows -TopNCount $TopN -EncodingName $Encoding
-        Write-FileTreeMap -OutDirectory $OutDir -Files $fileRows -EncodingName $Encoding
-    }
+    Write-PlantUmlFile -OutDirectory $OutDir -Committers $committerRows -Files $fileRows -Couplings $couplingRows -TopNCount $TopN -EncodingName $Encoding
+    Write-FileBubbleChart -OutDirectory $OutDir -Files $fileRows -TopNCount $TopN -EncodingName $Encoding
+    Write-FileHeatMap -OutDirectory $OutDir -Files $fileRows -TopNCount $TopN -EncodingName $Encoding
+    Write-CommitterRadarChart -OutDirectory $OutDir -Committers $committerRows -TopNCount $TopN -EncodingName $Encoding
+    Write-CommitterRadarChartCombined -OutDirectory $OutDir -Committers $committerRows -TopNCount $TopN -EncodingName $Encoding
+    Write-FileTreeMap -OutDirectory $OutDir -Files $fileRows -EncodingName $Encoding
 
     # --- ステップ 8: 実行メタデータとサマリーの書き出し ---
     Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 8/8: メタデータ出力' -PercentComplete 95
     $finishedAt = Get-Date
-    $meta = New-RunMetaData -StartTime $startedAt -EndTime $finishedAt -TargetUrl $targetUrl -FromRevision $FromRev -ToRevision $ToRev -AuthorFilter $Author -SvnVersion $svnVersion -NoBlame:$NoBlame -DeadDetailLevel $DeadDetailLevel -Parallel $Parallel -TopN $TopN -Encoding $Encoding -Commits $commits -FileRows $fileRows -OutDir $OutDir -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -EmitPlantUml:$EmitPlantUml -EmitCharts:$EmitCharts -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -IgnoreSpaceChange:$IgnoreSpaceChange -IgnoreAllSpace:$IgnoreAllSpace -IgnoreEolStyle:$IgnoreEolStyle -IncludeProperties:$IncludeProperties -ForceBinary:$ForceBinary
+    $meta = New-RunMetaData -StartTime $startedAt -EndTime $finishedAt -TargetUrl $targetUrl -FromRevision $FromRev -ToRevision $ToRev -SvnVersion $svnVersion -Parallel $Parallel -TopN $TopN -Encoding $Encoding -Commits $commits -FileRows $fileRows -OutDir $OutDir -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -IgnoreWhitespace:$IgnoreWhitespace
     Write-JsonFile -Data $meta -FilePath (Join-Path $OutDir 'run_meta.json') -Depth 12 -EncodingName $Encoding
 
     Write-Progress -Id 0 -Activity 'NarutoCode' -Completed

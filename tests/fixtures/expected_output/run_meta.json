@@ -35,11 +35,7 @@
                        "EmitPlantUml":  true,
                        "NonInteractive":  false,
                        "TrustServerCert":  false,
-                       "IgnoreSpaceChange":  false,
-                       "IgnoreAllSpace":  false,
-                       "IgnoreEolStyle":  false,
-                       "IncludeProperties":  false,
-                       "ForceBinary":  false
+                       "IgnoreWhitespace":  false
                    },
     "Outputs":  {
                     "CommittersCsv":  "committers.csv",
