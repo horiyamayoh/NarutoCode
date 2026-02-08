@@ -291,7 +291,12 @@ function ConvertTo-NormalizedScore
 {
     <#
     .SYNOPSIS
-        min-max 正規化により 0 から 1 のスコアへ変換する。
+        最優秀者を 1 とした正規化スコアへ変換する。
+    .DESCRIPTION
+        非反転軸は value / max で正規化する。最大値の人が 1.0 になり、
+        他の人は実値の比率に応じた位置に配置される。
+        反転軸（低いほど良い指標）は (max - value) / (max - min) で
+        最小値の人が 1.0 になる。
     .PARAMETER Value
         正規化対象の実測値を指定する。
     .PARAMETER Min
@@ -302,11 +307,22 @@ function ConvertTo-NormalizedScore
         指定時は正規化結果を反転し、低い値を高スコアとして扱う。
     #>
     param([double]$Value, [double]$Min, [double]$Max, [switch]$Invert)
-    if ($Max -eq $Min)
+    if ($Invert)
     {
-        return 0.0
+        if ($Max -eq $Min)
+        {
+            return 0.0
+        }
+        $normalized = ($Max - $Value) / ($Max - $Min)
     }
-    $normalized = ($Value - $Min) / ($Max - $Min)
+    else
+    {
+        if ($Max -le 0)
+        {
+            return 0.0
+        }
+        $normalized = $Value / $Max
+    }
     if ($normalized -lt 0)
     {
         $normalized = 0.0
@@ -314,10 +330,6 @@ function ConvertTo-NormalizedScore
     if ($normalized -gt 1)
     {
         $normalized = 1.0
-    }
-    if ($Invert)
-    {
-        return 1.0 - $normalized
     }
     return $normalized
 }
@@ -3285,7 +3297,7 @@ function Get-CommitterMetric
                 '他者コード変更行数' = $null
                 '他者コード変更生存行数' = $null
                 '他者コード変更生存率' = $null
-                'コミットあたりピンポン' = $null
+                'ピンポン率' = $null
                 '変更エントロピー' = Format-MetricValue -Value $entropy
                 '平均共同作者数' = Format-MetricValue -Value $coAvg
                 '最大共同作者数' = [int]$coMax
@@ -3760,15 +3772,15 @@ function Write-FileBubbleChart
         $topFiles = @($topFiles | Select-Object -First $TopNCount)
     }
 
-    $svgWidth = 1000.0
-    $svgHeight = 700.0
-    $plotLeft = 100.0
-    $plotTop = 40.0
-    $plotRight = $svgWidth - 40.0
-    $plotBottom = $svgHeight - 60.0
+    $svgWidth = 1280.0
+    $svgHeight = 760.0
+    $plotLeft = 110.0
+    $plotTop = 94.0
+    $plotRight = $svgWidth - 320.0
+    $plotBottom = $svgHeight - 108.0
     $plotWidth = $plotRight - $plotLeft
     $plotHeight = $plotBottom - $plotTop
-    $tickCount = 5
+    $tickCount = 6
 
     $maxCommit = 0.0
     $maxAuthors = 0.0
@@ -3810,8 +3822,8 @@ function Write-FileBubbleChart
         $maxRank = 1
     }
 
-    $minRadius = 8.0
-    $maxRadius = 60.0
+    $minRadius = 9.0
+    $maxRadius = 56.0
     $minArea = [Math]::PI * $minRadius * $minRadius
     $maxArea = [Math]::PI * $maxRadius * $maxRadius
     $radiusCalculator = {
@@ -3839,25 +3851,46 @@ function Write-FileBubbleChart
         'UTF-8'
     }
 
+    $legendX = $plotRight + 24.0
+    $legendY = $plotTop + 8.0
+    $legendWidth = [Math]::Max(180.0, ($svgWidth - $legendX) - 20.0)
+    $legendHeight = 206.0
+
     # SVG 構築開始
     $sb = New-Object System.Text.StringBuilder
 
     # XML 宣言と SVG ルート要素
     [void]$sb.AppendLine(('<?xml version="1.0" encoding="{0}"?>' -f $xmlEncoding))
     $titleX = $svgWidth / 2.0
-    [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {0} {1}">' -f $svgWidth, $svgHeight))
+    [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {0} {1}" width="{0}" height="{1}" role="img" aria-label="ファイル別ホットスポット バブルチャート">' -f $svgWidth, $svgHeight))
 
     # グラデーション定義（凡例用）
     [void]$sb.AppendLine('  <defs>')
+    [void]$sb.AppendLine('    <style><![CDATA[')
+    [void]$sb.AppendLine('      text { font-family: "Segoe UI", "Yu Gothic UI", "Meiryo", sans-serif; }')
+    [void]$sb.AppendLine('      .chart-title { font-size: 26px; font-weight: 700; fill: #1f2937; text-anchor: middle; }')
+    [void]$sb.AppendLine('      .axis-grid { stroke: #d1d5db; stroke-width: 1; stroke-dasharray: 4 4; }')
+    [void]$sb.AppendLine('      .axis-line { stroke: #1f2937; stroke-width: 1.8; }')
+    [void]$sb.AppendLine('      .axis-tick { font-size: 12px; fill: #475569; }')
+    [void]$sb.AppendLine('      .axis-label { font-size: 16px; fill: #0f172a; font-weight: 600; text-anchor: middle; }')
+    [void]$sb.AppendLine('      .legend-title { font-size: 13px; fill: #1f2937; font-weight: 700; }')
+    [void]$sb.AppendLine('      .legend-body { font-size: 12px; fill: #475569; }')
+    [void]$sb.AppendLine('      .bubble-marker { fill-opacity: 0.74; stroke: #1f2937; stroke-width: 1.1; filter: url(#bubbleShadow); }')
+    [void]$sb.AppendLine('      .bubble-label { font-size: 11px; fill: #0f172a; paint-order: stroke; stroke: #ffffff; stroke-width: 3; stroke-linejoin: round; }')
+    [void]$sb.AppendLine('    ]]></style>')
     [void]$sb.AppendLine('    <linearGradient id="rankGradient" x1="0%" y1="0%" x2="100%" y2="0%">')
     [void]$sb.AppendLine(('      <stop offset="0%" stop-color="{0}" />' -f $rankStartColor))
     [void]$sb.AppendLine(('      <stop offset="100%" stop-color="{0}" />' -f $rankEndColor))
     [void]$sb.AppendLine('    </linearGradient>')
+    [void]$sb.AppendLine('    <filter id="bubbleShadow" x="-20%" y="-20%" width="140%" height="140%">')
+    [void]$sb.AppendLine('      <feDropShadow dx="0" dy="1.5" stdDeviation="1.6" flood-color="#0f172a" flood-opacity="0.20" />')
+    [void]$sb.AppendLine('    </filter>')
     [void]$sb.AppendLine('  </defs>')
 
     # 背景とタイトル
-    [void]$sb.AppendLine(('  <rect x="0" y="0" width="{0}" height="{1}" fill="#FFFFFF" />' -f $svgWidth, $svgHeight))
-    [void]$sb.AppendLine(('  <text x="{0}" y="28" font-size="20" font-weight="bold" text-anchor="middle" fill="#222222">ファイル別ホットスポット バブルチャート</text>' -f $titleX))
+    [void]$sb.AppendLine(('  <rect x="0" y="0" width="{0}" height="{1}" fill="#f8fafc" />' -f $svgWidth, $svgHeight))
+    [void]$sb.AppendLine(('  <text class="chart-title" x="{0}" y="44">ファイル別ホットスポット バブルチャート</text>' -f $titleX))
+    [void]$sb.AppendLine(('  <rect x="{0}" y="{1}" width="{2}" height="{3}" rx="10" ry="10" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.2" />' -f $plotLeft, $plotTop, $plotWidth, $plotHeight))
 
     # X軸グリッド線とラベル（コミット数）
     for ($i = 0
@@ -3868,8 +3901,8 @@ function Write-FileBubbleChart
         $x = $plotLeft + (($plotWidth * $i) / [double]$tickCount)
         $xRounded = [Math]::Round($x, 2)
         $xLabel = [int][Math]::Round($xValue)
-        [void]$sb.AppendLine(('  <line x1="{0}" y1="{1}" x2="{0}" y2="{2}" stroke="#DDDDDD" stroke-width="1" stroke-dasharray="4 4" />' -f $xRounded, $plotTop, $plotBottom))
-        [void]$sb.AppendLine(('  <text x="{0}" y="{1}" font-size="12" text-anchor="middle" fill="#555555">{2}</text>' -f $xRounded, ($plotBottom + 22.0), $xLabel))
+        [void]$sb.AppendLine(('  <line class="axis-grid" x1="{0}" y1="{1}" x2="{0}" y2="{2}" />' -f $xRounded, $plotTop, $plotBottom))
+        [void]$sb.AppendLine(('  <text class="axis-tick" x="{0}" y="{1}" text-anchor="middle">{2}</text>' -f $xRounded, ($plotBottom + 24.0), $xLabel))
     }
     # Y軸グリッド線とラベル（作者数）
     for ($i = 0
@@ -3880,34 +3913,32 @@ function Write-FileBubbleChart
         $y = $plotBottom - (($plotHeight * $i) / [double]$tickCount)
         $yRounded = [Math]::Round($y, 2)
         $yLabel = [int][Math]::Round($yValue)
-        [void]$sb.AppendLine(('  <line x1="{0}" y1="{2}" x2="{1}" y2="{2}" stroke="#DDDDDD" stroke-width="1" stroke-dasharray="4 4" />' -f $plotLeft, $plotRight, $yRounded))
-        [void]$sb.AppendLine(('  <text x="{0}" y="{1}" font-size="12" text-anchor="end" fill="#555555">{2}</text>' -f ($plotLeft - 10.0), ($yRounded + 4.0), $yLabel))
+        [void]$sb.AppendLine(('  <line class="axis-grid" x1="{0}" y1="{2}" x2="{1}" y2="{2}" />' -f $plotLeft, $plotRight, $yRounded))
+        [void]$sb.AppendLine(('  <text class="axis-tick" x="{0}" y="{1}" text-anchor="end">{2}</text>' -f ($plotLeft - 12.0), ($yRounded + 4.0), $yLabel))
     }
 
     # 座標軸の描画
-    [void]$sb.AppendLine(('  <line x1="{0}" y1="{1}" x2="{2}" y2="{1}" stroke="#333333" stroke-width="2" />' -f $plotLeft, $plotBottom, $plotRight))
-    [void]$sb.AppendLine(('  <line x1="{0}" y1="{1}" x2="{0}" y2="{2}" stroke="#333333" stroke-width="2" />' -f $plotLeft, $plotTop, $plotBottom))
+    [void]$sb.AppendLine(('  <line class="axis-line" x1="{0}" y1="{1}" x2="{2}" y2="{1}" />' -f $plotLeft, $plotBottom, $plotRight))
+    [void]$sb.AppendLine(('  <line class="axis-line" x1="{0}" y1="{1}" x2="{0}" y2="{2}" />' -f $plotLeft, $plotTop, $plotBottom))
 
     # 軸ラベル
-    [void]$sb.AppendLine(('  <text x="{0}" y="{1}" font-size="16" text-anchor="middle" fill="#222222">コミット数</text>' -f ($plotLeft + ($plotWidth / 2.0)), ($svgHeight - 14.0)))
-    [void]$sb.AppendLine(('  <text x="{0}" y="{1}" font-size="16" text-anchor="middle" fill="#222222" transform="rotate(-90 {0} {1})">作者数</text>' -f 36, ($plotTop + ($plotHeight / 2.0))))
+    [void]$sb.AppendLine(('  <text class="axis-label" x="{0}" y="{1}">コミット数</text>' -f ($plotLeft + ($plotWidth / 2.0)), ($svgHeight - 40.0)))
+    [void]$sb.AppendLine(('  <text class="axis-label" x="{0}" y="{1}" transform="rotate(-90 {0} {1})">作者数</text>' -f 42, ($plotTop + ($plotHeight / 2.0))))
 
     # 凡例エリアの描画
-    $legendX = $plotRight - 240.0
-    $legendY = $plotTop + 10.0
-    [void]$sb.AppendLine(('  <rect x="{0}" y="{1}" width="220" height="170" rx="8" ry="8" fill="#F8F8F8" stroke="#DDDDDD" />' -f $legendX, $legendY))
-    [void]$sb.AppendLine(('  <text x="{0}" y="{1}" font-size="13" font-weight="bold" fill="#333333">凡例</text>' -f ($legendX + 12.0), ($legendY + 22.0)))
-    [void]$sb.AppendLine(('  <text x="{0}" y="{1}" font-size="12" fill="#555555">面積 ∝ 総チャーン</text>' -f ($legendX + 12.0), ($legendY + 42.0)))
+    [void]$sb.AppendLine(('  <rect x="{0}" y="{1}" width="{2}" height="{3}" rx="10" ry="10" fill="#ffffff" stroke="#d6dce5" stroke-width="1.1" />' -f $legendX, $legendY, $legendWidth, $legendHeight))
+    [void]$sb.AppendLine(('  <text class="legend-title" x="{0}" y="{1}">凡例</text>' -f ($legendX + 14.0), ($legendY + 24.0)))
+    [void]$sb.AppendLine(('  <text class="legend-body" x="{0}" y="{1}">面積 ∝ 総チャーン</text>' -f ($legendX + 14.0), ($legendY + 44.0)))
     $legendLargeRadius = & $radiusCalculator -ChurnValue $maxChurn
     $legendMediumRadius = & $radiusCalculator -ChurnValue ($maxChurn * 0.45)
     $legendSmallRadius = & $radiusCalculator -ChurnValue ($maxChurn * 0.15)
-    [void]$sb.AppendLine(('  <circle cx="{0}" cy="{1}" r="{2}" fill="#FFFFFF" stroke="#888888" />' -f ($legendX + 52.0), ($legendY + 108.0), [Math]::Round($legendLargeRadius, 2)))
-    [void]$sb.AppendLine(('  <circle cx="{0}" cy="{1}" r="{2}" fill="#FFFFFF" stroke="#888888" />' -f ($legendX + 112.0), ($legendY + 118.0), [Math]::Round($legendMediumRadius, 2)))
-    [void]$sb.AppendLine(('  <circle cx="{0}" cy="{1}" r="{2}" fill="#FFFFFF" stroke="#888888" />' -f ($legendX + 160.0), ($legendY + 126.0), [Math]::Round($legendSmallRadius, 2)))
-    [void]$sb.AppendLine(('  <text x="{0}" y="{1}" font-size="12" fill="#555555">色: ホットスポット順位</text>' -f ($legendX + 12.0), ($legendY + 154.0)))
-    [void]$sb.AppendLine(('  <rect x="{0}" y="{1}" width="120" height="10" fill="url(#rankGradient)" stroke="#BBBBBB" />' -f ($legendX + 12.0), ($legendY + 160.0)))
-    [void]$sb.AppendLine(('  <text x="{0}" y="{1}" font-size="11" fill="#555555">1位</text>' -f ($legendX + 12.0), ($legendY + 176.0)))
-    [void]$sb.AppendLine(('  <text x="{0}" y="{1}" font-size="11" text-anchor="end" fill="#555555">{2}位</text>' -f ($legendX + 132.0), ($legendY + 176.0), $maxRank))
+    [void]$sb.AppendLine(('  <circle cx="{0}" cy="{1}" r="{2}" fill="#ffffff" stroke="#64748b" />' -f ($legendX + 54.0), ($legendY + 114.0), [Math]::Round($legendLargeRadius, 2)))
+    [void]$sb.AppendLine(('  <circle cx="{0}" cy="{1}" r="{2}" fill="#ffffff" stroke="#64748b" />' -f ($legendX + 118.0), ($legendY + 124.0), [Math]::Round($legendMediumRadius, 2)))
+    [void]$sb.AppendLine(('  <circle cx="{0}" cy="{1}" r="{2}" fill="#ffffff" stroke="#64748b" />' -f ($legendX + 170.0), ($legendY + 132.0), [Math]::Round($legendSmallRadius, 2)))
+    [void]$sb.AppendLine(('  <text class="legend-body" x="{0}" y="{1}">色: ホットスポット順位</text>' -f ($legendX + 14.0), ($legendY + 168.0)))
+    [void]$sb.AppendLine(('  <rect x="{0}" y="{1}" width="{2}" height="10" fill="url(#rankGradient)" stroke="#aeb7c4" />' -f ($legendX + 14.0), ($legendY + 174.0), ($legendWidth - 32.0)))
+    [void]$sb.AppendLine(('  <text class="legend-body" x="{0}" y="{1}">1位</text>' -f ($legendX + 14.0), ($legendY + 192.0)))
+    [void]$sb.AppendLine(('  <text class="legend-body" x="{0}" y="{1}" text-anchor="end">{2}位</text>' -f ($legendX + $legendWidth - 18.0), ($legendY + 192.0), $maxRank))
 
     # バブルの描画順序: 大きいバブルを背面に配置（総チャーン降順）
     $drawOrder = @(
@@ -3930,44 +3961,72 @@ function Write-FileBubbleChart
         $churnCount = [double]$f.'総チャーン'
         $rank = [int]$f.'ホットスポット順位'
 
+        $radius = & $radiusCalculator -ChurnValue $churnCount
         $x = $plotLeft + (($commitCount / $maxCommit) * $plotWidth)
         $y = $plotBottom - (($authorCount / $maxAuthors) * $plotHeight)
-        $radius = & $radiusCalculator -ChurnValue $churnCount
+        $x = [Math]::Min($plotRight - $radius - 1.0, [Math]::Max($plotLeft + $radius + 1.0, $x))
+        $y = [Math]::Min($plotBottom - $radius - 1.0, [Math]::Max($plotTop + $radius + 1.0, $y))
         $bubbleColor = ConvertTo-SvgColor -Rank $rank -MaxRank $maxRank
         $label = Split-Path -Path $filePath -Leaf
         if ([string]::IsNullOrWhiteSpace($label))
         {
             $label = $filePath
         }
-        $safePath = [System.Security.SecurityElement]::Escape($filePath)
-        $safeLabel = [System.Security.SecurityElement]::Escape($label)
-        if ($null -eq $safePath)
+        $safePath = ConvertTo-SvgEscapedText -Text $filePath
+        if ([string]::IsNullOrEmpty($safePath))
         {
             $safePath = ''
-        }
-        if ($null -eq $safeLabel)
-        {
-            $safeLabel = ''
         }
         $tooltip = ('{0}&#10;コミット数={1}, 作者数={2}, 総チャーン={3}, 順位={4}' -f $safePath, [int][Math]::Round($commitCount), [int][Math]::Round($authorCount), [int][Math]::Round($churnCount), $rank)
 
         $xRounded = [Math]::Round($x, 2)
         $yRounded = [Math]::Round($y, 2)
         $radiusRounded = [Math]::Round($radius, 2)
-        [void]$sb.AppendLine(('  <circle cx="{0}" cy="{1}" r="{2}" fill="{3}" fill-opacity="0.74" stroke="#2F2F2F" stroke-width="1">' -f $xRounded, $yRounded, $radiusRounded, $bubbleColor))
+        [void]$sb.AppendLine(('  <circle class="bubble-marker" cx="{0}" cy="{1}" r="{2}" fill="{3}">' -f $xRounded, $yRounded, $radiusRounded, $bubbleColor))
         [void]$sb.AppendLine(('    <title>{0}</title>' -f $tooltip))
         [void]$sb.AppendLine('  </circle>')
 
         $labelX = $xRounded
         $labelY = [Math]::Round($yRounded + 4.0, 2)
         $labelAnchor = 'middle'
-        if ($radiusRounded -lt 20.0)
+        $labelFontSize = 11.0
+        $maxLabelWidth = [Math]::Max(18.0, ($radiusRounded * 2.0) - 10.0)
+        if ($radiusRounded -lt 24.0)
         {
-            $labelX = [Math]::Round($xRounded + $radiusRounded + 4.0, 2)
             $labelY = [Math]::Round($yRounded - $radiusRounded - 4.0, 2)
-            $labelAnchor = 'start'
+            if ($xRounded -lt ($plotLeft + ($plotWidth / 2.0)))
+            {
+                $labelX = [Math]::Round($xRounded + $radiusRounded + 8.0, 2)
+                $labelAnchor = 'start'
+                $maxLabelWidth = [Math]::Max(30.0, ($svgWidth - 12.0) - $labelX)
+            }
+            else
+            {
+                $labelX = [Math]::Round($xRounded - $radiusRounded - 8.0, 2)
+                $labelAnchor = 'end'
+                $maxLabelWidth = [Math]::Max(30.0, $labelX - 12.0)
+            }
         }
-        [void]$sb.AppendLine(('  <text x="{0}" y="{1}" font-size="11" text-anchor="{2}" fill="#1F1F1F">{3}</text>' -f $labelX, $labelY, $labelAnchor, $safeLabel))
+        $labelY = [Math]::Round([Math]::Min($plotBottom - 4.0, [Math]::Max($plotTop + 12.0, $labelY)), 2)
+        $fittedLabel = Get-SvgFittedText -Text $label -MaxWidth $maxLabelWidth -FontSize $labelFontSize
+        if (-not [string]::IsNullOrWhiteSpace($fittedLabel))
+        {
+            if ($labelAnchor -eq 'middle')
+            {
+                $halfWidth = (Measure-SvgTextWidth -Text $fittedLabel -FontSize $labelFontSize) / 2.0
+                $labelX = [Math]::Round([Math]::Min($svgWidth - 12.0 - $halfWidth, [Math]::Max(12.0 + $halfWidth, $labelX)), 2)
+            }
+            else
+            {
+                $labelX = [Math]::Round([Math]::Min($svgWidth - 12.0, [Math]::Max(12.0, $labelX)), 2)
+            }
+            $safeLabel = ConvertTo-SvgEscapedText -Text $fittedLabel
+            if ([string]::IsNullOrEmpty($safeLabel))
+            {
+                $safeLabel = ''
+            }
+            [void]$sb.AppendLine(('  <text class="bubble-label" x="{0}" y="{1}" text-anchor="{2}">{3}</text>' -f $labelX, $labelY, $labelAnchor, $safeLabel))
+        }
     }
 
     [void]$sb.AppendLine('</svg>')
@@ -4113,44 +4172,8 @@ function Write-FileHeatMap
     }
 
     $toDisplayPath = {
-        param([string]$Path, [int]$MaxLength)
-        if ([string]::IsNullOrWhiteSpace($Path))
-        {
-            return ''
-        }
-        $normalizedPath = [string]$Path -replace '\\', '/'
-        if ($normalizedPath.Length -le $MaxLength)
-        {
-            return $normalizedPath
-        }
-        $fileName = Split-Path -Path $normalizedPath -Leaf
-        if ([string]::IsNullOrWhiteSpace($fileName))
-        {
-            $parts = @($normalizedPath -split '/')
-            if ($parts.Count -gt 0)
-            {
-                $fileName = [string]$parts[$parts.Count - 1]
-            }
-        }
-        if ([string]::IsNullOrWhiteSpace($fileName))
-        {
-            $fileName = $normalizedPath
-        }
-        $shortPath = '…/' + $fileName
-        if ($shortPath.Length -le $MaxLength)
-        {
-            return $shortPath
-        }
-        if ($MaxLength -le 1)
-        {
-            return '…'
-        }
-        $tailLength = $MaxLength - 1
-        if ($fileName.Length -le $tailLength)
-        {
-            return '…' + $fileName
-        }
-        return '…' + $fileName.Substring($fileName.Length - $tailLength)
+        param([string]$Path, [double]$MaxWidth, [double]$FontSize)
+        return Get-SvgCompactPathLabel -Path $Path -MaxWidth $MaxWidth -FontSize $FontSize
     }
 
     $toCellColor = {
@@ -4190,55 +4213,101 @@ function Write-FileHeatMap
     }
 
     # SVG キャンバスのサイズ計算
-    $cellWidth = 120
-    $cellHeight = 30
-    $leftMargin = 250
-    $topMargin = 100
-    $rightMargin = 20
-    $bottomMargin = 20
+    $rowHeaderFontSize = 11.0
+    $columnHeaderFontSize = 11.0
+    $cellFontSize = 10.0
+    $columnHeaderAngle = -40.0
+    $cellWidth = 126
+    $cellHeight = 32
+    $rightMargin = 24
+    $bottomMargin = 24
+    $titleHeight = 34.0
+
+    $rowHeaderWidthEstimate = 200.0
+    foreach ($row in $targetFiles)
+    {
+        if ($null -eq $row)
+        {
+            continue
+        }
+        $pathForMeasure = [string]$row.'ファイルパス'
+        $samplePath = & $toDisplayPath $pathForMeasure 340.0 $rowHeaderFontSize
+        $sampleWidth = Measure-SvgTextWidth -Text $samplePath -FontSize $rowHeaderFontSize
+        if ($sampleWidth -gt $rowHeaderWidthEstimate)
+        {
+            $rowHeaderWidthEstimate = $sampleWidth
+        }
+    }
+
+    $leftMargin = [int][Math]::Ceiling([Math]::Max(220.0, $rowHeaderWidthEstimate + 28.0))
+    $maxMetricWidth = 0.0
+    foreach ($metric in $metrics)
+    {
+        $metricWidth = Measure-SvgTextWidth -Text ([string]$metric) -FontSize $columnHeaderFontSize
+        if ($metricWidth -gt $maxMetricWidth)
+        {
+            $maxMetricWidth = $metricWidth
+        }
+    }
+
+    $headerAngleRad = [Math]::Abs($columnHeaderAngle) * [Math]::PI / 180.0
+    $headerRise = $maxMetricWidth * [Math]::Sin($headerAngleRad)
+    $topMargin = [int][Math]::Ceiling([Math]::Max(108.0, $titleHeight + 22.0 + $headerRise))
+
     $rowCount = @($targetFiles).Count
     $columnCount = @($metrics).Count
     $gridWidth = $columnCount * $cellWidth
     $gridHeight = $rowCount * $cellHeight
     $totalWidth = $leftMargin + $gridWidth + $rightMargin
     $totalHeight = $topMargin + $gridHeight + $bottomMargin
-    $rowHeaderMaxLength = 34
-    $rowHeaderX = $leftMargin - 8
+    $rowHeaderX = $leftMargin - 10
+    $rowHeaderMaxWidth = [Math]::Max(40.0, $leftMargin - 20.0)
     $gridRight = $leftMargin + $gridWidth
 
     # SVG 構築開始
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine('<?xml version="1.0"?>')
-    [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {0} {1}" width="{0}" height="{1}">' -f $totalWidth, $totalHeight))
-    # CSS スタイル定義
+    [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {0} {1}" width="{0}" height="{1}" role="img" aria-label="ファイル別メトリクス ヒートマップ">' -f $totalWidth, $totalHeight))
     [void]$sb.AppendLine('  <defs>')
     [void]$sb.AppendLine('    <style><![CDATA[')
-    [void]$sb.AppendLine('      text { font-family: "Segoe UI", "Meiryo", sans-serif; fill: #333333; }')
-    [void]$sb.AppendLine('      .row-header { font-size: 11px; text-anchor: end; dominant-baseline: middle; }')
-    [void]$sb.AppendLine('      .col-header { font-size: 11px; text-anchor: start; dominant-baseline: middle; }')
-    [void]$sb.AppendLine('      .cell-text { font-size: 10px; text-anchor: middle; dominant-baseline: middle; fill: #222222; }')
+    [void]$sb.AppendLine('      text { font-family: "Segoe UI", "Yu Gothic UI", "Meiryo", sans-serif; fill: #334155; }')
+    [void]$sb.AppendLine('      .chart-title { font-size: 22px; font-weight: 700; text-anchor: middle; fill: #1e293b; }')
+    [void]$sb.AppendLine('      .row-header { font-size: 11px; text-anchor: end; dominant-baseline: middle; fill: #334155; }')
+    [void]$sb.AppendLine('      .col-header { font-size: 11px; text-anchor: middle; dominant-baseline: middle; fill: #334155; }')
+    [void]$sb.AppendLine('      .cell-text { font-size: 10px; text-anchor: middle; dominant-baseline: middle; fill: #1f2937; }')
+    [void]$sb.AppendLine('      .grid-line { stroke: #dce3ec; stroke-width: 1; }')
+    [void]$sb.AppendLine('      .cell-frame { stroke: #d0d7e2; stroke-width: 1; }')
     [void]$sb.AppendLine('    ]]></style>')
     [void]$sb.AppendLine('  </defs>')
-    [void]$sb.AppendLine(('  <rect x="0" y="0" width="{0}" height="{1}" fill="#ffffff" />' -f $totalWidth, $totalHeight))
+    [void]$sb.AppendLine(('  <rect x="0" y="0" width="{0}" height="{1}" fill="#f8fafc" />' -f $totalWidth, $totalHeight))
+    [void]$sb.AppendLine(('  <text class="chart-title" x="{0}" y="32">ファイル別メトリクス ヒートマップ</text>' -f ($totalWidth / 2.0)))
+    [void]$sb.AppendLine(('  <rect x="{0}" y="{1}" width="{2}" height="{3}" fill="#ffffff" stroke="#cfd8e3" stroke-width="1.1" />' -f $leftMargin, $topMargin, $gridWidth, $gridHeight))
 
-    # 列ヘッダー（メトリクス名）の描画（45度回転）
+    # 列ヘッダー（メトリクス名）の描画
     for ($columnIndex = 0
         $columnIndex -lt $columnCount
         $columnIndex++)
     {
         $metric = [string]$metrics[$columnIndex]
-        $headerX = $leftMargin + ($columnIndex * $cellWidth) + 10
+        $headerX = $leftMargin + ($columnIndex * $cellWidth) + ($cellWidth / 2.0)
         $headerY = $topMargin - 12
-        [void]$sb.AppendLine(('  <text class="col-header" x="{0}" y="{1}" transform="rotate(-45 {0} {1})">{2}</text>' -f $headerX, $headerY, (& $escapeXml $metric)))
+        [void]$sb.AppendLine(('  <text class="col-header" x="{0}" y="{1}" transform="rotate({2} {0} {1})">{3}</text>' -f $headerX, $headerY, $columnHeaderAngle, (& $escapeXml $metric)))
     }
 
-    # 水平グリッド線の描画
+    # グリッド線の描画
     for ($rowIndex = 0
         $rowIndex -le $rowCount
         $rowIndex++)
     {
         $lineY = $topMargin + ($rowIndex * $cellHeight)
-        [void]$sb.AppendLine(('  <line x1="{0}" y1="{1}" x2="{2}" y2="{1}" stroke="#e6e6e6" stroke-width="1" />' -f $leftMargin, $lineY, $gridRight))
+        [void]$sb.AppendLine(('  <line class="grid-line" x1="{0}" y1="{1}" x2="{2}" y2="{1}" />' -f $leftMargin, $lineY, $gridRight))
+    }
+    for ($columnIndex = 0
+        $columnIndex -le $columnCount
+        $columnIndex++)
+    {
+        $lineX = $leftMargin + ($columnIndex * $cellWidth)
+        [void]$sb.AppendLine(('  <line class="grid-line" x1="{0}" y1="{1}" x2="{0}" y2="{2}" />' -f $lineX, $topMargin, ($topMargin + $gridHeight)))
     }
 
     # 各行（ファイル）とセル（メトリクス値）の描画
@@ -4248,12 +4317,19 @@ function Write-FileHeatMap
     {
         $row = $targetFiles[$rowIndex]
         $filePath = [string]$row.'ファイルパス'
-        $displayPath = & $toDisplayPath $filePath $rowHeaderMaxLength
+        $displayPath = & $toDisplayPath $filePath $rowHeaderMaxWidth $rowHeaderFontSize
         $rowY = $topMargin + ($rowIndex * $cellHeight)
         $rowTextY = $rowY + [Math]::Round($cellHeight / 2.0)
 
-        # 行ヘッダー（ファイルパス）
-        [void]$sb.AppendLine(('  <text class="row-header" x="{0}" y="{1}">{2}</text>' -f $rowHeaderX, $rowTextY, (& $escapeXml $displayPath)))
+        if (($rowIndex % 2) -eq 1)
+        {
+            [void]$sb.AppendLine(('  <rect x="{0}" y="{1}" width="{2}" height="{3}" fill="#f8fafc" />' -f $leftMargin, $rowY, $gridWidth, $cellHeight))
+        }
+
+        [void]$sb.AppendLine('  <g>')
+        [void]$sb.AppendLine(('    <title>{0}</title>' -f (& $escapeXml $filePath)))
+        [void]$sb.AppendLine(('    <text class="row-header" x="{0}" y="{1}">{2}</text>' -f $rowHeaderX, $rowTextY, (& $escapeXml $displayPath)))
+        [void]$sb.AppendLine('  </g>')
 
         for ($columnIndex = 0
             $columnIndex -lt $columnCount
@@ -4279,11 +4355,12 @@ function Write-FileHeatMap
             $cellX = $leftMargin + ($columnIndex * $cellWidth)
             $cellTextX = $cellX + [Math]::Round($cellWidth / 2.0)
             $cellTextY = $rowY + [Math]::Round($cellHeight / 2.0)
+            $cellDisplay = Get-SvgFittedText -Text ([string]$displayValue) -MaxWidth ($cellWidth - 8.0) -FontSize $cellFontSize
             $title = '{0}: {1}={2}' -f $filePath, $metric, $displayValue
             [void]$sb.AppendLine('  <g>')
             [void]$sb.AppendLine(('    <title>{0}</title>' -f (& $escapeXml $title)))
-            [void]$sb.AppendLine(('    <rect x="{0}" y="{1}" width="{2}" height="{3}" fill="{4}" stroke="#d0d0d0" stroke-width="1" />' -f $cellX, $rowY, $cellWidth, $cellHeight, $cellColor))
-            [void]$sb.AppendLine(('    <text class="cell-text" x="{0}" y="{1}">{2}</text>' -f $cellTextX, $cellTextY, (& $escapeXml ([string]$displayValue))))
+            [void]$sb.AppendLine(('    <rect class="cell-frame" x="{0}" y="{1}" width="{2}" height="{3}" fill="{4}" />' -f $cellX, $rowY, $cellWidth, $cellHeight, $cellColor))
+            [void]$sb.AppendLine(('    <text class="cell-text" x="{0}" y="{1}">{2}</text>' -f $cellTextX, $cellTextY, (& $escapeXml $cellDisplay)))
             [void]$sb.AppendLine('  </g>')
         }
     }
@@ -4397,18 +4474,21 @@ function Write-CommitterRadarChart
 {
     <#
     .SYNOPSIS
-        コミッター品質を 7 軸レーダーチャート SVG として出力する。
+        コミッター品質を 9 軸レーダーチャート SVG として出力する。
     .DESCRIPTION
         追加行数が 0 を超えるコミッターを対象に品質指標を算出し、
         全コミッター間で min-max 正規化した値を作者別 SVG として保存する。
+        各データポイント付近に生値を表示し、下部パネルに計算式・表示方向を併記する。
         各軸の意味:
         - コード生存率: 追加したコードが最終的に残っている割合
-        - 削除対追加比: 追加に対する削除の割合（低いほど良い）
+        - 変更エントロピー: 変更がファイル間で分散している度合い（高いほど良い）
         - 自己相殺率: 自分で追加したコードを自分で削除した割合（低いほど良い）
         - 被削除率: 他者に削除されたコードの割合（低いほど良い）
         - 他者コード変更生存率: 他者のコードを変更した後の生存率（高いほど良い）
-        - コミットあたりピンポン: 反復編集の頻度（低いほど良い）
+        - ピンポン率: 反復編集の頻度（低いほど良い）
         - 所有集中度: コードベースへの貢献割合（高いほど良い）
+        - 定着コミット量: 1コミットあたりで最終的に残したコード量（高いほど良い）
+        - トータルコミット量: 追加+削除を合算したコミット総量（高いほど良い）
     .PARAMETER OutDirectory
         SVG ファイルを保存する出力先ディレクトリを指定する（必須）。
     .PARAMETER Committers
@@ -4469,35 +4549,61 @@ function Write-CommitterRadarChart
         }
     }
 
-    # レーダーチャートの 7 軸定義（Invert は値が小さいほど良い場合に true）
+    # レーダーチャートの 9 軸定義（Invert は値が小さいほど良い場合に true）
 
     $axisDefinitions = @(
         [pscustomobject][ordered]@{
             Label = 'コード生存率'
+            Formula = '生存行数 / 追加行数'
+            Unit = '率'
             Invert = $false
         },
         [pscustomobject][ordered]@{
-            Label = '削除対追加比'
-            Invert = $true
+            Label = '変更エントロピー'
+            Formula = 'ファイル別チャーンのエントロピー'
+            Unit = 'bit'
+            Invert = $false
         },
         [pscustomobject][ordered]@{
             Label = '自己相殺率'
+            Formula = '自己相殺行数 / 追加行数'
+            Unit = '率'
             Invert = $true
         },
         [pscustomobject][ordered]@{
             Label = '被削除率'
+            Formula = '被他者削除行数 / 追加行数'
+            Unit = '率'
             Invert = $true
         },
         [pscustomobject][ordered]@{
             Label = '他者コード変更生存率'
+            Formula = '他者コード変更生存行数 / 他者コード変更行数'
+            Unit = '率'
             Invert = $false
         },
         [pscustomobject][ordered]@{
-            Label = 'コミットあたりピンポン'
+            Label = 'ピンポン率'
+            Formula = 'ピンポン回数 / コミット数'
+            Unit = '率'
             Invert = $true
         },
         [pscustomobject][ordered]@{
             Label = '所有集中度'
+            Formula = '所有行数 / 全所有行数'
+            Unit = '率'
+            Invert = $false
+        },
+        [pscustomobject][ordered]@{
+            Label = '定着コミット量'
+            Formula = '生存行数 / コミット数'
+            Unit = '行'
+            Invert = $false
+        },
+        [pscustomobject][ordered]@{
+            Label = 'トータルコミット量'
+            Formula = '追加行数 + 削除行数'
+            Unit = '行'
             Invert = $false
         }
     )
@@ -4525,6 +4631,11 @@ function Write-CommitterRadarChart
         {
             $survivedLines = [double]$committer.'生存行数'
         }
+        $changeEntropy = 0.0
+        if ($null -ne $committer.'変更エントロピー')
+        {
+            $changeEntropy = [double]$committer.'変更エントロピー'
+        }
         $deletedLines = 0.0
         if ($null -ne $committer.'削除行数')
         {
@@ -4546,7 +4657,11 @@ function Write-CommitterRadarChart
             $otherChangeRate = [double]$committer.'他者コード変更生存率'
         }
         $pingPongPerCommit = 0.0
-        if ($null -ne $committer.'コミットあたりピンポン')
+        if ($null -ne $committer.'ピンポン率')
+        {
+            $pingPongPerCommit = [double]$committer.'ピンポン率'
+        }
+        elseif ($null -ne $committer.'コミットあたりピンポン')
         {
             $pingPongPerCommit = [double]$committer.'コミットあたりピンポン'
         }
@@ -4560,15 +4675,28 @@ function Write-CommitterRadarChart
         {
             $totalChurn = [double]$committer.'総チャーン'
         }
+        $commitCount = 0.0
+        if ($null -ne $committer.'コミット数')
+        {
+            $commitCount = [double]$committer.'コミット数'
+        }
+        $retainedVolumePerCommit = 0.0
+        if ($commitCount -gt 0.0)
+        {
+            $retainedVolumePerCommit = $survivedLines / $commitCount
+        }
+        $totalCommitVolume = $addedLines + $deletedLines
 
         $rawScores = [ordered]@{
             'コード生存率' = $survivedLines / $addedLines
-            '削除対追加比' = $deletedLines / $addedLines
+            '変更エントロピー' = $changeEntropy
             '自己相殺率' = $selfCancelLines / $addedLines
             '被削除率' = $removedByOthers / $addedLines
             '他者コード変更生存率' = $otherChangeRate
-            'コミットあたりピンポン' = $pingPongPerCommit
+            'ピンポン率' = $pingPongPerCommit
             '所有集中度' = $ownershipShare
+            '定着コミット量' = $retainedVolumePerCommit
+            'トータルコミット量' = $totalCommitVolume
         }
         $chartRows.Add([pscustomobject][ordered]@{
                 Author = (Get-NormalizedAuthorName -Author ([string]$committer.'作者'))
@@ -4602,12 +4730,22 @@ function Write-CommitterRadarChart
         return
     }
 
-    $centerX = 250.0
-    $centerY = 250.0
-    $radius = 200.0
     $axisCount = $axisDefinitions.Count
+    $svgWidth = 760.0
+    $metricPanelX = 20.0
+    $metricPanelY = 504.0
+    $metricPanelWidth = $svgWidth - ($metricPanelX * 2.0)
+    $metricBodyFontSize = 11.0
+    $metricRowHeight = 18.0
+    $metricPanelHeight = 52.0 + ($axisCount * $metricRowHeight)
+    $svgHeight = [Math]::Ceiling($metricPanelY + $metricPanelHeight + 16.0)
+    $centerX = $svgWidth / 2.0
+    $centerY = 272.0
+    $radius = 166.0
+    $titleFontSize = 24.0
+    $axisLabelFontSize = 13.0
     $guideLevels = @(0.25, 0.5, 0.75, 1.0)
-    $labelRadius = 228.0
+    $labelRadius = 202.0
     $usedNames = New-Object 'System.Collections.Generic.HashSet[string]'
 
     foreach ($row in $topChartRows)
@@ -4619,15 +4757,36 @@ function Write-CommitterRadarChart
             $angle = (((2.0 * [Math]::PI) * $i) / [double]$axisCount) - ([Math]::PI / 2.0)
             $xOuter = $centerX + ($radius * [Math]::Cos($angle))
             $yOuter = $centerY + ($radius * [Math]::Sin($angle))
+            $axisLabel = [string]$axisDefinitions[$i].Label
+            $rawValue = [double]$row.RawScores[$axisLabel]
+            # 生値の表示用フォーマット
+            $rawDisplayOuter = if ([string]$axisDefinitions[$i].Unit -eq '行')
+            {
+                if ($rawValue -ge 10000)
+                {
+                    '{0:N0}' -f $rawValue
+                }
+                else
+                {
+                    '{0:F1}' -f $rawValue
+                }
+            }
+            elseif ([string]$axisDefinitions[$i].Unit -eq 'bit')
+            {
+                '{0:F2} bit' -f $rawValue
+            }
+            else
+            {
+                '{0:P1}' -f $rawValue
+            }
             $outerPoints.Add([pscustomobject][ordered]@{
                     X = $xOuter
                     Y = $yOuter
                     Angle = $angle
-                    Label = [string]$axisDefinitions[$i].Label
+                    Label = $axisLabel
+                    Invert = [bool]$axisDefinitions[$i].Invert
+                    RawDisplay = $rawDisplayOuter
                 }) | Out-Null
-
-            $axisLabel = [string]$axisDefinitions[$i].Label
-            $rawValue = [double]$row.RawScores[$axisLabel]
             $normalized = ConvertTo-NormalizedScore -Value $rawValue -Min ([double]$axisMinMax[$axisLabel].Min) -Max ([double]$axisMinMax[$axisLabel].Max) -Invert:$axisDefinitions[$i].Invert
             $xData = $centerX + (($radius * $normalized) * [Math]::Cos($angle))
             $yData = $centerY + (($radius * $normalized) * [Math]::Sin($angle))
@@ -4639,16 +4798,16 @@ function Write-CommitterRadarChart
         }
 
         $dataPolygonPoints = @($dataPoints.ToArray() | ForEach-Object { '{0:F2},{1:F2}' -f $_.X, $_.Y }) -join ' '
-        $authorTitle = [System.Security.SecurityElement]::Escape([string]$row.Author)
-        if ([string]::IsNullOrEmpty($authorTitle))
-        {
-            $authorTitle = '(unknown)'
-        }
-
         $authorName = [string]$row.Author
         if ([string]::IsNullOrWhiteSpace($authorName))
         {
             $authorName = '(unknown)'
+        }
+        $fittedAuthorTitle = Get-SvgFittedText -Text $authorName -MaxWidth ($svgWidth - 64.0) -FontSize $titleFontSize
+        $authorTitle = ConvertTo-SvgEscapedText -Text $fittedAuthorTitle
+        if ([string]::IsNullOrEmpty($authorTitle))
+        {
+            $authorTitle = '(unknown)'
         }
 
         # 安全なファイル名を生成（予約名・長さ制限対応）
@@ -4673,9 +4832,28 @@ function Write-CommitterRadarChart
         }
 
         $sb = New-Object System.Text.StringBuilder
-        [void]$sb.AppendLine('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 500 500">')
-        [void]$sb.AppendLine('  <rect x="0" y="0" width="500" height="500" fill="white" />')
-        [void]$sb.AppendLine(("  <text x=""250"" y=""30"" text-anchor=""middle"" font-size=""24"" font-weight=""bold"" fill=""#1f2937"" font-family=""'Meiryo', 'Yu Gothic', sans-serif"">{0}</text>" -f $authorTitle))
+        [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {0} {1}" width="{0}" height="{1}" role="img" aria-label="コミッター品質レーダーチャート">' -f $svgWidth, $svgHeight))
+        [void]$sb.AppendLine('  <defs>')
+        [void]$sb.AppendLine('    <style><![CDATA[')
+        [void]$sb.AppendLine('      text { font-family: "Segoe UI", "Yu Gothic UI", "Meiryo", sans-serif; }')
+        [void]$sb.AppendLine('      .chart-title { font-size: 24px; font-weight: 700; fill: #1f2937; text-anchor: middle; }')
+        [void]$sb.AppendLine('      .chart-subtitle { font-size: 13px; font-weight: 600; fill: #475569; text-anchor: middle; }')
+        [void]$sb.AppendLine('      .guide-line { stroke: #d7dee9; stroke-width: 1; fill: none; }')
+        [void]$sb.AppendLine('      .axis-line { stroke: #d0d8e4; stroke-width: 1; }')
+        [void]$sb.AppendLine('      .axis-label { font-size: 13px; fill: #334155; dominant-baseline: middle; }')
+        [void]$sb.AppendLine('      .radar-area { fill: rgba(37, 99, 235, 0.25); stroke: #2563eb; stroke-width: 2.4; }')
+        [void]$sb.AppendLine('      .radar-point { fill: #1d4ed8; stroke: #ffffff; stroke-width: 1.2; }')
+        [void]$sb.AppendLine('      .raw-value { font-size: 10px; fill: #1e40af; font-weight: 600; }')
+        [void]$sb.AppendLine('      .metric-panel { fill: #ffffff; stroke: #d8e1eb; stroke-width: 1.1; }')
+        [void]$sb.AppendLine('      .metric-title { font-size: 15px; font-weight: 700; fill: #1f2937; }')
+        [void]$sb.AppendLine('      .metric-note { font-size: 11px; fill: #475569; }')
+        [void]$sb.AppendLine('      .metric-label { font-size: 11px; font-weight: 700; fill: #334155; }')
+        [void]$sb.AppendLine('      .metric-formula { font-size: 11px; fill: #475569; }')
+        [void]$sb.AppendLine('    ]]></style>')
+        [void]$sb.AppendLine('  </defs>')
+        [void]$sb.AppendLine(('  <rect x="0" y="0" width="{0}" height="{1}" fill="#f8fafc" />' -f $svgWidth, $svgHeight))
+        [void]$sb.AppendLine(('  <circle cx="{0}" cy="{1}" r="{2}" fill="#ffffff" stroke="#d9e2ee" stroke-width="1.1" />' -f $centerX, $centerY, ($radius + 28.0)))
+        [void]$sb.AppendLine(("  <text class=""chart-title"" x=""{0:F2}"" y=""44"">{1}</text>" -f $centerX, $authorTitle))
 
         foreach ($level in $guideLevels)
         {
@@ -4686,21 +4864,23 @@ function Write-CommitterRadarChart
                 $gy = $centerY + (($point.Y - $centerY) * $level)
                 $guidePoints += ('{0:F2},{1:F2}' -f $gx, $gy)
             }
-            [void]$sb.AppendLine(("  <polygon points=""{0}"" fill=""none"" stroke=""#d9d9d9"" stroke-width=""1"" />" -f ($guidePoints -join ' ')))
+            [void]$sb.AppendLine(("  <polygon class=""guide-line"" points=""{0}"" />" -f ($guidePoints -join ' ')))
         }
 
         foreach ($point in @($outerPoints.ToArray()))
         {
-            [void]$sb.AppendLine(("  <line x1=""{0:F2}"" y1=""{1:F2}"" x2=""{2:F2}"" y2=""{3:F2}"" stroke=""#e5e7eb"" stroke-width=""1"" />" -f $centerX, $centerY, $point.X, $point.Y))
+            [void]$sb.AppendLine(("  <line class=""axis-line"" x1=""{0:F2}"" y1=""{1:F2}"" x2=""{2:F2}"" y2=""{3:F2}"" />" -f $centerX, $centerY, $point.X, $point.Y))
         }
 
-        [void]$sb.AppendLine(("  <polygon points=""{0}"" fill=""rgba(54,162,235,0.3)"" stroke=""rgb(54,162,235)"" stroke-width=""2"" />" -f $dataPolygonPoints))
+        [void]$sb.AppendLine(("  <polygon class=""radar-area"" points=""{0}"" />" -f $dataPolygonPoints))
 
         foreach ($point in @($dataPoints.ToArray()))
         {
-            [void]$sb.AppendLine(("  <circle cx=""{0:F2}"" cy=""{1:F2}"" r=""4"" fill=""rgb(54,162,235)"" />" -f $point.X, $point.Y))
+            [void]$sb.AppendLine(("  <circle class=""radar-point"" cx=""{0:F2}"" cy=""{1:F2}"" r=""4.2"" />" -f $point.X, $point.Y))
         }
 
+        # 軸ラベルの初期座標を算出し、下部で重なるラベルを垂直方向に離す
+        $labelItems = New-Object 'System.Collections.Generic.List[object]'
         foreach ($point in @($outerPoints.ToArray()))
         {
             $labelX = $centerX + ($labelRadius * [Math]::Cos($point.Angle))
@@ -4715,14 +4895,586 @@ function Write-CommitterRadarChart
             {
                 $anchor = 'end'
             }
-            $escapedLabel = [System.Security.SecurityElement]::Escape([string]$point.Label)
-            [void]$sb.AppendLine(("  <text x=""{0:F2}"" y=""{1:F2}"" text-anchor=""{2}"" dominant-baseline=""middle"" font-size=""14"" fill=""#374151"" font-family=""'Meiryo', 'Yu Gothic', sans-serif"">{3}</text>" -f $labelX, $labelY, $anchor, $escapedLabel))
+            $labelItems.Add([pscustomobject][ordered]@{
+                    X = $labelX
+                    Y = $labelY
+                    Anchor = $anchor
+                    Label = [string]$point.Label
+                    Angle = $point.Angle
+                    Invert = [bool]$point.Invert
+                    RawDisplay = [string]$point.RawDisplay
+                }) | Out-Null
+        }
+
+        # Y が下半分 (center より下) のラベルを Y 昇順に並べ、近すぎるペアを離す
+        $minGap = 20.0
+        $bottomLabels = @($labelItems.ToArray() | Where-Object { $_.Y -gt $centerY })
+        $bottomSorted = @($bottomLabels | Sort-Object -Property Y)
+        for ($bi = 1; $bi -lt $bottomSorted.Count; $bi++)
+        {
+            $prev = $bottomSorted[$bi - 1]
+            $curr = $bottomSorted[$bi]
+            $gap = $curr.Y - $prev.Y
+            if ($gap -lt $minGap)
+            {
+                $curr.Y = $prev.Y + $minGap
+            }
+        }
+
+        # Y が上半分 (center より上) のラベルを Y 降順に並べ、近すぎるペアを離す
+        $topLabels = @($labelItems.ToArray() | Where-Object { $_.Y -lt $centerY })
+        $topSorted = @($topLabels | Sort-Object -Property Y -Descending)
+        for ($ti = 1; $ti -lt $topSorted.Count; $ti++)
+        {
+            $prev = $topSorted[$ti - 1]
+            $curr = $topSorted[$ti]
+            $gap = $prev.Y - $curr.Y
+            if ($gap -lt $minGap)
+            {
+                $curr.Y = $prev.Y - $minGap
+            }
+        }
+
+        foreach ($item in @($labelItems.ToArray()))
+        {
+            $maxLabelWidth = 0.0
+            if ($item.Anchor -eq 'start')
+            {
+                $maxLabelWidth = [Math]::Max(40.0, ($svgWidth - 14.0) - $item.X)
+            }
+            elseif ($item.Anchor -eq 'end')
+            {
+                $maxLabelWidth = [Math]::Max(40.0, $item.X - 14.0)
+            }
+            else
+            {
+                $maxLabelWidth = [Math]::Max(60.0, [Math]::Min($item.X - 14.0, ($svgWidth - 14.0) - $item.X) * 2.0)
+            }
+            $dirMark = if ([bool]$item.Invert)
+            {
+                '↕'
+            }
+            else
+            {
+                '↗'
+            }
+            $labelWithDir = '{0} {1}' -f [string]$item.Label, $dirMark
+            $fittedAxisLabel = Get-SvgFittedText -Text $labelWithDir -MaxWidth $maxLabelWidth -FontSize $axisLabelFontSize
+            $escapedLabel = ConvertTo-SvgEscapedText -Text $fittedAxisLabel
+            $escapedRawValue = ConvertTo-SvgEscapedText -Text ([string]$item.RawDisplay)
+            [void]$sb.AppendLine(("  <text class=""axis-label"" x=""{0:F2}"" y=""{1:F2}"" text-anchor=""{2}""><tspan>{3}</tspan><tspan x=""{0:F2}"" dy=""1.2em"" class=""raw-value"">{4}</tspan></text>" -f $item.X, $item.Y, $item.Anchor, $escapedLabel, $escapedRawValue))
+        }
+
+        [void]$sb.AppendLine(("  <rect class=""metric-panel"" x=""{0:F2}"" y=""{1:F2}"" width=""{2:F2}"" height=""{3:F2}"" rx=""10"" ry=""10"" />" -f $metricPanelX, $metricPanelY, $metricPanelWidth, $metricPanelHeight))
+        [void]$sb.AppendLine(("  <text class=""metric-title"" x=""{0:F2}"" y=""{1:F2}"">指標定義</text>" -f ($metricPanelX + 12.0), ($metricPanelY + 20.0)))
+        $panelNote = '※全軸とも外側ほど高評価。↕が付いた指標は低いほど良いため反転表示。'
+        $panelNoteFitted = Get-SvgFittedText -Text $panelNote -MaxWidth ($metricPanelWidth - 20.0) -FontSize 10.0
+        [void]$sb.AppendLine(("  <text class=""metric-note"" x=""{0:F2}"" y=""{1:F2}"">{2}</text>" -f ($metricPanelX + 12.0), ($metricPanelY + 36.0), (ConvertTo-SvgEscapedText -Text $panelNoteFitted)))
+        for ($metricIndex = 0
+            $metricIndex -lt $axisDefinitions.Count
+            $metricIndex++)
+        {
+            $axis = $axisDefinitions[$metricIndex]
+            $dirMark = if ([bool]$axis.Invert)
+            {
+                '↕'
+            }
+            else
+            {
+                '↗'
+            }
+            $metricLineRaw = '{0}. {1} {2} ＝ {3}' -f ($metricIndex + 1), [string]$axis.Label, $dirMark, [string]$axis.Formula
+            $lineY = $metricPanelY + 52.0 + ($metricIndex * $metricRowHeight)
+            $metricLine = Get-SvgFittedText -Text $metricLineRaw -MaxWidth ($metricPanelWidth - 20.0) -FontSize $metricBodyFontSize
+            [void]$sb.AppendLine(("  <text class=""metric-formula"" x=""{0:F2}"" y=""{1:F2}"">{2}</text>" -f ($metricPanelX + 12.0), $lineY, (ConvertTo-SvgEscapedText -Text $metricLine)))
         }
 
         [void]$sb.AppendLine('</svg>')
         Write-TextFile -FilePath (Join-Path $OutDirectory $fileName) -Content $sb.ToString() -EncodingName $EncodingName
     }
 }
+
+function Write-CommitterRadarChartCombined
+{
+    <#
+    .SYNOPSIS
+        全コミッターのレーダーチャートを横並びグリッドで 1 つの SVG にまとめて出力する。
+    .DESCRIPTION
+        TopN のコミッターごとに独立したレーダーチャートを描画し、
+        横並びのグリッドとして 1 枚の SVG に配置する。
+        各チャートの下部にレーダー面積スコア（総合指標）を併記し、
+        チーム全体の傾向を俯瞰できるようにする。
+        各指標は全コミッター間で min-max 正規化した相対評価値を使用する。
+    .PARAMETER OutDirectory
+        SVG ファイルを保存する出力先ディレクトリを指定する（必須）。
+    .PARAMETER Committers
+        Get-CommitterMetric が返すコミッター行配列を指定する（必須）。
+    .PARAMETER TopNCount
+        総チャーン上位として SVG に描画する件数を指定する（0以下の場合は出力しない）。
+    .PARAMETER EncodingName
+        出力時に使用する文字エンコーディング名を指定する。
+    .EXAMPLE
+        Write-CommitterRadarChartCombined -OutDirectory '.\output' -Committers $committers -TopNCount 10 -EncodingName 'UTF8'
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$OutDirectory,
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [object[]]$Committers,
+        [Parameter(Mandatory = $false)]
+        [ValidateRange(0, [int]::MaxValue)]
+        [int]$TopNCount = 0,
+        [Parameter(Mandatory = $false)]
+        [string]$EncodingName = 'UTF-8'
+    )
+
+    if ([string]::IsNullOrWhiteSpace($OutDirectory))
+    {
+        Write-Warning 'Write-CommitterRadarChartCombined: OutDirectory が空です。'
+        return
+    }
+
+    if ($TopNCount -le 0)
+    {
+        Write-Verbose 'Write-CommitterRadarChartCombined: TopNCount が 0 以下のため、出力しません。'
+        return
+    }
+
+    if (-not $Committers -or @($Committers).Count -eq 0)
+    {
+        Write-Verbose 'Write-CommitterRadarChartCombined: Committers が空です。SVG を生成しません。'
+        return
+    }
+
+    if (-not (Test-Path -LiteralPath $OutDirectory))
+    {
+        try
+        {
+            $null = New-Item -LiteralPath $OutDirectory -ItemType Directory -Force -ErrorAction Stop
+        }
+        catch
+        {
+            Write-Warning "Write-CommitterRadarChartCombined: 出力ディレクトリの作成に失敗しました: $_"
+            return
+        }
+    }
+
+    # 軸定義（個別チャートと同一）
+    $axisDefinitions = @(
+        [pscustomobject][ordered]@{ Label = 'コード生存率'; Formula = '生存行数 / 追加行数'; Unit = '率'; Invert = $false },
+        [pscustomobject][ordered]@{ Label = '変更エントロピー'; Formula = 'ファイル別チャーンのエントロピー'; Unit = 'bit'; Invert = $false },
+        [pscustomobject][ordered]@{ Label = '自己相殺率'; Formula = '自己相殺行数 / 追加行数'; Unit = '率'; Invert = $true },
+        [pscustomobject][ordered]@{ Label = '被削除率'; Formula = '被他者削除行数 / 追加行数'; Unit = '率'; Invert = $true },
+        [pscustomobject][ordered]@{ Label = '他者コード変更生存率'; Formula = '他者コード変更生存行数 / 他者コード変更行数'; Unit = '率'; Invert = $false },
+        [pscustomobject][ordered]@{ Label = 'ピンポン率'; Formula = 'ピンポン回数 / コミット数'; Unit = '率'; Invert = $true },
+        [pscustomobject][ordered]@{ Label = '所有集中度'; Formula = '所有行数 / 全所有行数'; Unit = '率'; Invert = $false },
+        [pscustomobject][ordered]@{ Label = '定着コミット量'; Formula = '生存行数 / コミット数'; Unit = '行'; Invert = $false },
+        [pscustomobject][ordered]@{ Label = 'トータルコミット量'; Formula = '追加行数 + 削除行数'; Unit = '行'; Invert = $false }
+    )
+
+    # データ収集
+    $chartRows = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($committer in @($Committers))
+    {
+        if ($null -eq $committer)
+        {
+            continue
+        }
+        $addedLines = 0.0
+        if ($null -ne $committer.'追加行数')
+        {
+            $addedLines = [double]$committer.'追加行数'
+        }
+        if ($addedLines -le 0)
+        {
+            continue
+        }
+        $survivedLines = 0.0
+        if ($null -ne $committer.'生存行数')
+        {
+            $survivedLines = [double]$committer.'生存行数'
+        }
+        $changeEntropy = 0.0
+        if ($null -ne $committer.'変更エントロピー')
+        {
+            $changeEntropy = [double]$committer.'変更エントロピー'
+        }
+        $deletedLines = 0.0
+        if ($null -ne $committer.'削除行数')
+        {
+            $deletedLines = [double]$committer.'削除行数'
+        }
+        $selfCancelLines = 0.0
+        if ($null -ne $committer.'自己相殺行数')
+        {
+            $selfCancelLines = [double]$committer.'自己相殺行数'
+        }
+        $removedByOthers = 0.0
+        if ($null -ne $committer.'被他者削除行数')
+        {
+            $removedByOthers = [double]$committer.'被他者削除行数'
+        }
+        $otherChangeRate = 0.0
+        if ($null -ne $committer.'他者コード変更生存率')
+        {
+            $otherChangeRate = [double]$committer.'他者コード変更生存率'
+        }
+        $pingPongPerCommit = 0.0
+        if ($null -ne $committer.'ピンポン率')
+        {
+            $pingPongPerCommit = [double]$committer.'ピンポン率'
+        }
+        elseif ($null -ne $committer.'コミットあたりピンポン')
+        {
+            $pingPongPerCommit = [double]$committer.'コミットあたりピンポン'
+        }
+        $ownershipShare = 0.0
+        if ($null -ne $committer.'所有割合')
+        {
+            $ownershipShare = [double]$committer.'所有割合'
+        }
+        $totalChurn = 0.0
+        if ($null -ne $committer.'総チャーン')
+        {
+            $totalChurn = [double]$committer.'総チャーン'
+        }
+        $commitCount = 0.0
+        if ($null -ne $committer.'コミット数')
+        {
+            $commitCount = [double]$committer.'コミット数'
+        }
+        $retainedVolumePerCommit = 0.0
+        if ($commitCount -gt 0.0)
+        {
+            $retainedVolumePerCommit = $survivedLines / $commitCount
+        }
+        $totalCommitVolume = $addedLines + $deletedLines
+
+        $rawScores = [ordered]@{
+            'コード生存率' = $survivedLines / $addedLines
+            '変更エントロピー' = $changeEntropy
+            '自己相殺率' = $selfCancelLines / $addedLines
+            '被削除率' = $removedByOthers / $addedLines
+            '他者コード変更生存率' = $otherChangeRate
+            'ピンポン率' = $pingPongPerCommit
+            '所有集中度' = $ownershipShare
+            '定着コミット量' = $retainedVolumePerCommit
+            'トータルコミット量' = $totalCommitVolume
+        }
+        $chartRows.Add([pscustomobject][ordered]@{
+                Author = (Get-NormalizedAuthorName -Author ([string]$committer.'作者'))
+                TotalChurn = $totalChurn
+                RawScores = $rawScores
+            }) | Out-Null
+    }
+
+    if ($chartRows.Count -eq 0)
+    {
+        return
+    }
+
+    # min-max 算出（全コミッター横断で相対評価）
+    $axisMinMax = @{}
+    foreach ($axis in $axisDefinitions)
+    {
+        $axisLabel = [string]$axis.Label
+        $axisValues = @($chartRows.ToArray() | ForEach-Object { [double]$_.RawScores[$axisLabel] })
+        $stats = $axisValues | Measure-Object -Minimum -Maximum
+        $axisMinMax[$axisLabel] = [pscustomobject][ordered]@{
+            Min = [double]$stats.Minimum
+            Max = [double]$stats.Maximum
+        }
+    }
+
+    $topChartRows = @($chartRows.ToArray() | Sort-Object -Property @{Expression = 'TotalChurn'
+            Descending = $true
+        }, 'Author')
+    if ($topChartRows.Count -eq 0)
+    {
+        return
+    }
+
+    # グリッドレイアウト定数
+    $axisCount = $axisDefinitions.Count
+    $gridColumns = [Math]::Min(3, $topChartRows.Count)
+    $gridRowCount = [Math]::Ceiling($topChartRows.Count / [double]$gridColumns)
+    $cellWidth = 420.0
+    $cellHeight = 440.0
+    $cellPadding = 16.0
+    $radius = 110.0
+    $labelRadius = 144.0
+    $axisLabelFontSize = 9.0
+    $titleFontSize = 13.0
+    $guideLevels = @(0.25, 0.5, 0.75, 1.0)
+    $headerHeight = 52.0
+    $svgWidth = ($cellWidth * $gridColumns) + ($cellPadding * ($gridColumns + 1))
+    $svgHeight = $headerHeight + ($cellHeight * $gridRowCount) + ($cellPadding * ($gridRowCount + 1))
+
+    # 各コミッターの正規化スコアとレーダー面積スコアを事前計算
+    $rowDataList = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($row in $topChartRows)
+    {
+        $normalizedValues = New-Object 'System.Collections.Generic.List[double]'
+        for ($i = 0; $i -lt $axisCount; $i++)
+        {
+            $axisLabel = [string]$axisDefinitions[$i].Label
+            $rawValue = [double]$row.RawScores[$axisLabel]
+            $normalized = ConvertTo-NormalizedScore -Value $rawValue -Min ([double]$axisMinMax[$axisLabel].Min) -Max ([double]$axisMinMax[$axisLabel].Max) -Invert:$axisDefinitions[$i].Invert
+            $normalizedValues.Add($normalized) | Out-Null
+        }
+        # レーダー面積スコア: Shoelace 公式による多角形面積 / 最大面積 * 100
+        $radarArea = 0.0
+        $angleStep = (2.0 * [Math]::PI) / [double]$axisCount
+        for ($i = 0; $i -lt $axisCount; $i++)
+        {
+            $j = ($i + 1) % $axisCount
+            $radarArea += $normalizedValues[$i] * $normalizedValues[$j] * [Math]::Sin($angleStep)
+        }
+        $radarArea = $radarArea / 2.0
+        # 最大面積 = 全軸が 1.0 の正 n 角形
+        $maxArea = ($axisCount / 2.0) * [Math]::Sin($angleStep)
+        $areaScore = 0.0
+        if ($maxArea -gt 0.0)
+        {
+            $areaScore = ($radarArea / $maxArea) * 100.0
+        }
+        $rowDataList.Add([pscustomobject][ordered]@{
+                Row = $row
+                NormalizedValues = $normalizedValues.ToArray()
+                AreaScore = $areaScore
+            }) | Out-Null
+    }
+
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {0} {1}" width="{0}" height="{1}" role="img" aria-label="チーム全体レーダーチャート（グリッド）">' -f $svgWidth, $svgHeight))
+    [void]$sb.AppendLine('  <defs>')
+    [void]$sb.AppendLine('    <style><![CDATA[')
+    [void]$sb.AppendLine('      text { font-family: "Segoe UI", "Yu Gothic UI", "Meiryo", sans-serif; }')
+    [void]$sb.AppendLine('      .page-title { font-size: 18px; font-weight: 700; fill: #1f2937; text-anchor: middle; }')
+    [void]$sb.AppendLine('      .page-subtitle { font-size: 11px; fill: #64748b; text-anchor: middle; }')
+    [void]$sb.AppendLine('      .cell-bg { fill: #ffffff; stroke: #e2e8f0; stroke-width: 1; rx: 8; ry: 8; }')
+    [void]$sb.AppendLine('      .cell-title { font-size: 13px; font-weight: 700; fill: #1f2937; text-anchor: middle; }')
+    [void]$sb.AppendLine('      .guide-line { stroke: #e2e8f0; stroke-width: 0.7; fill: none; }')
+    [void]$sb.AppendLine('      .axis-line { stroke: #d0d8e4; stroke-width: 0.7; }')
+    [void]$sb.AppendLine('      .axis-label { font-size: 9px; fill: #475569; dominant-baseline: middle; }')
+    [void]$sb.AppendLine('      .radar-area { fill: rgba(37, 99, 235, 0.25); stroke: #2563eb; stroke-width: 1.8; }')
+    [void]$sb.AppendLine('      .radar-point { fill: #1d4ed8; stroke: #ffffff; stroke-width: 0.8; }')
+    [void]$sb.AppendLine('      .raw-value { font-size: 9px; fill: #1e40af; font-weight: 600; }')
+    [void]$sb.AppendLine('      .area-score { font-size: 12px; font-weight: 700; fill: #1e40af; text-anchor: middle; }')
+    [void]$sb.AppendLine('      .area-label { font-size: 10px; fill: #64748b; text-anchor: middle; }')
+    [void]$sb.AppendLine('    ]]></style>')
+    [void]$sb.AppendLine('  </defs>')
+    [void]$sb.AppendLine(('  <rect x="0" y="0" width="{0}" height="{1}" fill="#f1f5f9" />' -f $svgWidth, $svgHeight))
+    [void]$sb.AppendLine(("  <text class=""page-title"" x=""{0:F2}"" y=""24"">チーム品質レーダーチャート</text>" -f ($svgWidth / 2.0)))
+    $subtitleText = '{0} 名 ─ 外側ほど高評価（相対比較）' -f $topChartRows.Count
+    [void]$sb.AppendLine(("  <text class=""page-subtitle"" x=""{0:F2}"" y=""42"">{1}</text>" -f ($svgWidth / 2.0), (ConvertTo-SvgEscapedText -Text $subtitleText)))
+
+    # 各セルの描画
+    for ($cellIdx = 0; $cellIdx -lt $topChartRows.Count; $cellIdx++)
+    {
+        $rowData = $rowDataList[$cellIdx]
+        $row = $rowData.Row
+        $normalizedValues = $rowData.NormalizedValues
+        $areaScore = $rowData.AreaScore
+
+        $colIdx = $cellIdx % $gridColumns
+        $gridRow = [Math]::Floor($cellIdx / [double]$gridColumns)
+        $cellX = $cellPadding + ($colIdx * ($cellWidth + $cellPadding))
+        $cellY = $headerHeight + $cellPadding + ($gridRow * ($cellHeight + $cellPadding))
+        $cellCenterX = $cellX + ($cellWidth / 2.0)
+        $cellCenterY = $cellY + 34.0 + $labelRadius + 10.0
+
+        # セル背景
+        [void]$sb.AppendLine(("  <rect class=""cell-bg"" x=""{0:F2}"" y=""{1:F2}"" width=""{2:F2}"" height=""{3:F2}"" />" -f $cellX, $cellY, $cellWidth, $cellHeight))
+
+        # 作者名タイトル
+        $authorName = [string]$row.Author
+        if ([string]::IsNullOrWhiteSpace($authorName))
+        {
+            $authorName = '(unknown)'
+        }
+        $fittedTitle = Get-SvgFittedText -Text $authorName -MaxWidth ($cellWidth - 40.0) -FontSize $titleFontSize
+        $escapedTitle = ConvertTo-SvgEscapedText -Text $fittedTitle
+        [void]$sb.AppendLine(("  <text class=""cell-title"" x=""{0:F2}"" y=""{1:F2}"">{2}</text>" -f $cellCenterX, ($cellY + 22.0), $escapedTitle))
+
+        # ガイドライン背景円
+        [void]$sb.AppendLine(("  <circle cx=""{0:F2}"" cy=""{1:F2}"" r=""{2:F2}"" fill=""#fafbfc"" stroke=""#e8ecf1"" stroke-width=""0.7"" />" -f $cellCenterX, $cellCenterY, ($radius + 6.0)))
+
+        # 外周ポイント計算
+        $outerPoints = New-Object 'System.Collections.Generic.List[object]'
+        for ($i = 0; $i -lt $axisCount; $i++)
+        {
+            $angle = (((2.0 * [Math]::PI) * $i) / [double]$axisCount) - ([Math]::PI / 2.0)
+            $xOuter = $cellCenterX + ($radius * [Math]::Cos($angle))
+            $yOuter = $cellCenterY + ($radius * [Math]::Sin($angle))
+            $axisLabel = [string]$axisDefinitions[$i].Label
+            $rawValue = [double]$row.RawScores[$axisLabel]
+            $rawDisplayCombined = if ([string]$axisDefinitions[$i].Unit -eq '行')
+            {
+                if ($rawValue -ge 10000)
+                {
+                    '{0:N0}' -f $rawValue
+                }
+                else
+                {
+                    '{0:F1}' -f $rawValue
+                }
+            }
+            elseif ([string]$axisDefinitions[$i].Unit -eq 'bit')
+            {
+                '{0:F2} bit' -f $rawValue
+            }
+            else
+            {
+                '{0:P1}' -f $rawValue
+            }
+            $outerPoints.Add([pscustomobject][ordered]@{
+                    X = $xOuter
+                    Y = $yOuter
+                    Angle = $angle
+                    Label = $axisLabel
+                    Invert = [bool]$axisDefinitions[$i].Invert
+                    RawDisplay = $rawDisplayCombined
+                }) | Out-Null
+        }
+
+        # ガイドライン（同心多角形）
+        foreach ($level in $guideLevels)
+        {
+            $guidePoints = @()
+            foreach ($point in @($outerPoints.ToArray()))
+            {
+                $gx = $cellCenterX + (($point.X - $cellCenterX) * $level)
+                $gy = $cellCenterY + (($point.Y - $cellCenterY) * $level)
+                $guidePoints += ('{0:F2},{1:F2}' -f $gx, $gy)
+            }
+            [void]$sb.AppendLine(("  <polygon class=""guide-line"" points=""{0}"" />" -f ($guidePoints -join ' ')))
+        }
+
+        # 軸線
+        foreach ($point in @($outerPoints.ToArray()))
+        {
+            [void]$sb.AppendLine(("  <line class=""axis-line"" x1=""{0:F2}"" y1=""{1:F2}"" x2=""{2:F2}"" y2=""{3:F2}"" />" -f $cellCenterX, $cellCenterY, $point.X, $point.Y))
+        }
+
+        # データポリゴン
+        $dataPoints = New-Object 'System.Collections.Generic.List[object]'
+        for ($i = 0; $i -lt $axisCount; $i++)
+        {
+            $angle = (((2.0 * [Math]::PI) * $i) / [double]$axisCount) - ([Math]::PI / 2.0)
+            $nv = $normalizedValues[$i]
+            $xData = $cellCenterX + (($radius * $nv) * [Math]::Cos($angle))
+            $yData = $cellCenterY + (($radius * $nv) * [Math]::Sin($angle))
+            $dataPoints.Add([pscustomobject][ordered]@{
+                    X = $xData
+                    Y = $yData
+                }) | Out-Null
+        }
+        $polygonPoints = @($dataPoints.ToArray() | ForEach-Object { '{0:F2},{1:F2}' -f $_.X, $_.Y }) -join ' '
+        [void]$sb.AppendLine(("  <polygon class=""radar-area"" points=""{0}"" />" -f $polygonPoints))
+        foreach ($point in @($dataPoints.ToArray()))
+        {
+            [void]$sb.AppendLine(("  <circle class=""radar-point"" cx=""{0:F2}"" cy=""{1:F2}"" r=""2.8"" />" -f $point.X, $point.Y))
+        }
+
+        # 軸ラベル（下部の重なり回避）
+        $labelItems2 = New-Object 'System.Collections.Generic.List[object]'
+        foreach ($point in @($outerPoints.ToArray()))
+        {
+            $labelX = $cellCenterX + ($labelRadius * [Math]::Cos($point.Angle))
+            $labelY = $cellCenterY + ($labelRadius * [Math]::Sin($point.Angle))
+            $anchor = 'middle'
+            $axisCos = [Math]::Cos($point.Angle)
+            if ($axisCos -gt 0.2)
+            {
+                $anchor = 'start'
+            }
+            elseif ($axisCos -lt -0.2)
+            {
+                $anchor = 'end'
+            }
+            $labelItems2.Add([pscustomobject][ordered]@{
+                    X = $labelX
+                    Y = $labelY
+                    Anchor = $anchor
+                    Label = [string]$point.Label
+                    Invert = [bool]$point.Invert
+                    RawDisplay = [string]$point.RawDisplay
+                }) | Out-Null
+        }
+
+        $minGap2 = 14.0
+        $bottomLabels2 = @($labelItems2.ToArray() | Where-Object { $_.Y -gt $cellCenterY })
+        $bottomSorted2 = @($bottomLabels2 | Sort-Object -Property Y)
+        for ($bi2 = 1; $bi2 -lt $bottomSorted2.Count; $bi2++)
+        {
+            $prev2 = $bottomSorted2[$bi2 - 1]
+            $curr2 = $bottomSorted2[$bi2]
+            $gap2 = $curr2.Y - $prev2.Y
+            if ($gap2 -lt $minGap2)
+            {
+                $curr2.Y = $prev2.Y + $minGap2
+            }
+        }
+
+        # Y が上半分のラベル重なり回避
+        $topLabels2 = @($labelItems2.ToArray() | Where-Object { $_.Y -lt $cellCenterY })
+        $topSorted2 = @($topLabels2 | Sort-Object -Property Y -Descending)
+        for ($ti2 = 1; $ti2 -lt $topSorted2.Count; $ti2++)
+        {
+            $prev2 = $topSorted2[$ti2 - 1]
+            $curr2 = $topSorted2[$ti2]
+            $gap2 = $prev2.Y - $curr2.Y
+            if ($gap2 -lt $minGap2)
+            {
+                $curr2.Y = $prev2.Y - $minGap2
+            }
+        }
+
+        foreach ($item2 in @($labelItems2.ToArray()))
+        {
+            $maxLabelWidth2 = 0.0
+            if ($item2.Anchor -eq 'start')
+            {
+                $maxLabelWidth2 = [Math]::Max(60.0, ($cellX + $cellWidth - 6.0) - $item2.X)
+            }
+            elseif ($item2.Anchor -eq 'end')
+            {
+                $maxLabelWidth2 = [Math]::Max(60.0, $item2.X - ($cellX + 6.0))
+            }
+            else
+            {
+                $maxLabelWidth2 = [Math]::Max(60.0, [Math]::Min($item2.X - ($cellX + 6.0), ($cellX + $cellWidth - 6.0) - $item2.X) * 2.0)
+            }
+            $dirMark2 = if ([bool]$item2.Invert)
+            {
+                '↕'
+            }
+            else
+            {
+                '↗'
+            }
+            $labelWithDir2 = '{0} {1}' -f [string]$item2.Label, $dirMark2
+            $fittedLabel = Get-SvgFittedText -Text $labelWithDir2 -MaxWidth $maxLabelWidth2 -FontSize $axisLabelFontSize
+            $escapedLabel = ConvertTo-SvgEscapedText -Text $fittedLabel
+            $escapedRawValue2 = ConvertTo-SvgEscapedText -Text ([string]$item2.RawDisplay)
+            [void]$sb.AppendLine(("  <text class=""axis-label"" x=""{0:F2}"" y=""{1:F2}"" text-anchor=""{2}""><tspan>{3}</tspan><tspan x=""{0:F2}"" dy=""1.1em"" class=""raw-value"">{4}</tspan></text>" -f $item2.X, $item2.Y, $item2.Anchor, $escapedLabel, $escapedRawValue2))
+        }
+
+        # レーダー面積スコア
+        $areaDisplayY = $cellY + $cellHeight - 28.0
+        [void]$sb.AppendLine(("  <text class=""area-label"" x=""{0:F2}"" y=""{1:F2}"">総合スコア（レーダー面積）</text>" -f $cellCenterX, $areaDisplayY))
+        [void]$sb.AppendLine(("  <text class=""area-score"" x=""{0:F2}"" y=""{1:F2}"">{2:F1}%</text>" -f $cellCenterX, ($areaDisplayY + 16.0), $areaScore))
+    }
+
+    [void]$sb.AppendLine('</svg>')
+    Write-TextFile -FilePath (Join-Path $OutDirectory 'committer_radar_combined.svg') -Content $sb.ToString() -EncodingName $EncodingName
+}
+
 # endregion PlantUML 出力
 # region SVG 出力
 function ConvertTo-SvgNumberString
@@ -4734,7 +5486,7 @@ function ConvertTo-SvgNumberString
     param([double]$Value)
     return $Value.ToString('0.###', [System.Globalization.CultureInfo]::InvariantCulture)
 }
-function ConvertTo-SvgColor
+function ConvertTo-SvgGradientColor
 {
     <#
     .SYNOPSIS
@@ -4798,6 +5550,224 @@ function ConvertTo-SvgEscapedText
         return ''
     }
     return $escaped
+}
+function Get-SvgCharacterWidth
+{
+    <#
+    .SYNOPSIS
+        SVG テキスト描画向けに 1 文字あたりの概算幅を返す。
+    #>
+    [CmdletBinding()]
+    [OutputType([double])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [char]$Character,
+        [Parameter(Mandatory = $false)]
+        [double]$FontSize = 12.0
+    )
+
+    $size = [Math]::Max(1.0, [double]$FontSize)
+    $codePoint = [int]$Character
+    $ratio = 0.56
+    if ([char]::IsWhiteSpace($Character))
+    {
+        $ratio = 0.33
+    }
+    elseif (
+        ($codePoint -ge 0x3000 -and $codePoint -le 0x303F) -or
+        ($codePoint -ge 0x3040 -and $codePoint -le 0x30FF) -or
+        ($codePoint -ge 0x3400 -and $codePoint -le 0x4DBF) -or
+        ($codePoint -ge 0x4E00 -and $codePoint -le 0x9FFF) -or
+        ($codePoint -ge 0xF900 -and $codePoint -le 0xFAFF) -or
+        ($codePoint -ge 0xAC00 -and $codePoint -le 0xD7AF) -or
+        ($codePoint -ge 0xFF01 -and $codePoint -le 0xFF60) -or
+        ($codePoint -ge 0xFFE0 -and $codePoint -le 0xFFE6)
+    )
+    {
+        $ratio = 1.00
+    }
+    elseif (
+        $Character -eq '.' -or
+        $Character -eq ',' -or
+        $Character -eq ':' -or
+        $Character -eq ';' -or
+        $Character -eq '|' -or
+        $Character -eq '!' -or
+        $Character -eq 'i' -or
+        $Character -eq 'l' -or
+        $Character -eq 'I'
+    )
+    {
+        $ratio = 0.34
+    }
+    elseif (
+        $Character -eq 'W' -or
+        $Character -eq 'M' -or
+        $Character -eq '@' -or
+        $Character -eq '#'
+    )
+    {
+        $ratio = 0.82
+    }
+
+    return [Math]::Round($ratio * $size, 2)
+}
+function Measure-SvgTextWidth
+{
+    <#
+    .SYNOPSIS
+        SVG テキストの概算描画幅をピクセルで返す。
+    #>
+    [CmdletBinding()]
+    [OutputType([double])]
+    param(
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [string]$Text,
+        [Parameter(Mandatory = $false)]
+        [double]$FontSize = 12.0
+    )
+
+    if ([string]::IsNullOrEmpty($Text))
+    {
+        return 0.0
+    }
+
+    $width = 0.0
+    foreach ($character in $Text.ToCharArray())
+    {
+        $width += Get-SvgCharacterWidth -Character $character -FontSize $FontSize
+    }
+    return [Math]::Round($width, 2)
+}
+function Get-SvgFittedText
+{
+    <#
+    .SYNOPSIS
+        指定幅に収まるように SVG ラベルを省略付きで調整する。
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [string]$Text,
+        [Parameter(Mandatory = $false)]
+        [double]$MaxWidth = 0.0,
+        [Parameter(Mandatory = $false)]
+        [double]$FontSize = 12.0,
+        [Parameter(Mandatory = $false)]
+        [string]$Ellipsis = '…'
+    )
+
+    if ([string]::IsNullOrEmpty($Text))
+    {
+        return ''
+    }
+
+    $allowedWidth = [Math]::Max(0.0, [double]$MaxWidth)
+    if ($allowedWidth -le 0.0)
+    {
+        return ''
+    }
+
+    if ((Measure-SvgTextWidth -Text $Text -FontSize $FontSize) -le $allowedWidth)
+    {
+        return $Text
+    }
+
+    $ellipsisText = $Ellipsis
+    if ([string]::IsNullOrEmpty($ellipsisText))
+    {
+        $ellipsisText = '…'
+    }
+    $ellipsisWidth = Measure-SvgTextWidth -Text $ellipsisText -FontSize $FontSize
+    if ($ellipsisWidth -ge $allowedWidth)
+    {
+        return $ellipsisText
+    }
+
+    $buffer = New-Object 'System.Collections.Generic.List[char]'
+    $currentWidth = 0.0
+    foreach ($character in $Text.ToCharArray())
+    {
+        $charWidth = Get-SvgCharacterWidth -Character $character -FontSize $FontSize
+        if (($currentWidth + $charWidth + $ellipsisWidth) -gt $allowedWidth)
+        {
+            break
+        }
+        $buffer.Add($character) | Out-Null
+        $currentWidth += $charWidth
+    }
+
+    if ($buffer.Count -eq 0)
+    {
+        return $ellipsisText
+    }
+
+    return ((-join $buffer.ToArray()) + $ellipsisText)
+}
+function Get-SvgCompactPathLabel
+{
+    <#
+    .SYNOPSIS
+        パス文字列を末尾優先で SVG 表示幅に収まるラベルへ変換する。
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [string]$Path,
+        [Parameter(Mandatory = $false)]
+        [double]$MaxWidth = 0.0,
+        [Parameter(Mandatory = $false)]
+        [double]$FontSize = 12.0
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path))
+    {
+        return ''
+    }
+
+    $normalizedPath = [string]$Path -replace '\\', '/'
+    $allowedWidth = [Math]::Max(0.0, [double]$MaxWidth)
+    if ($allowedWidth -le 0.0)
+    {
+        return ''
+    }
+    if ((Measure-SvgTextWidth -Text $normalizedPath -FontSize $FontSize) -le $allowedWidth)
+    {
+        return $normalizedPath
+    }
+
+    $fileName = Split-Path -Path $normalizedPath -Leaf
+    if ([string]::IsNullOrWhiteSpace($fileName))
+    {
+        $parts = @($normalizedPath -split '/')
+        if ($parts.Count -gt 0)
+        {
+            $fileName = [string]$parts[$parts.Count - 1]
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($fileName))
+    {
+        $fileName = $normalizedPath
+    }
+
+    $prefix = '…/'
+    $prefixWidth = Measure-SvgTextWidth -Text $prefix -FontSize $FontSize
+    $remainingWidth = $allowedWidth - $prefixWidth
+    if ($remainingWidth -gt 0.0)
+    {
+        $fittedFileName = Get-SvgFittedText -Text $fileName -MaxWidth $remainingWidth -FontSize $FontSize
+        if (-not [string]::IsNullOrWhiteSpace($fittedFileName))
+        {
+            return ($prefix + $fittedFileName)
+        }
+    }
+
+    return Get-SvgFittedText -Text $normalizedPath -MaxWidth $allowedWidth -FontSize $FontSize
 }
 function Get-TreemapWorstAspectRatio
 {
@@ -5216,13 +6186,13 @@ function Write-FileTreeMap
     }
 
     $sb = New-Object System.Text.StringBuilder
-    [void]$sb.AppendLine('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 800">')
+    [void]$sb.AppendLine('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 800" width="1200" height="800" role="img" aria-label="ファイル別ツリーマップ">')
     [void]$sb.AppendLine('  <style>')
-    [void]$sb.AppendLine('    .dir-frame { fill: none; stroke: #2c3e50; stroke-width: 2; }')
-    [void]$sb.AppendLine('    .dir-label { font-family: "Segoe UI", sans-serif; font-size: 13px; font-weight: 600; fill: #1f2d3d; }')
-    [void]$sb.AppendLine('    .file-label { font-family: "Segoe UI", sans-serif; font-size: 11px; fill: #17202a; pointer-events: none; }')
+    [void]$sb.AppendLine('    .dir-frame { fill: none; stroke: #334155; stroke-width: 1.5; }')
+    [void]$sb.AppendLine('    .dir-label { font-family: "Segoe UI", "Yu Gothic UI", "Meiryo", sans-serif; font-size: 13px; font-weight: 700; fill: #0f172a; }')
+    [void]$sb.AppendLine('    .file-label { font-family: "Segoe UI", "Yu Gothic UI", "Meiryo", sans-serif; font-size: 11px; fill: #0f172a; pointer-events: none; paint-order: stroke; stroke: #ffffff; stroke-width: 2; }')
     [void]$sb.AppendLine('  </style>')
-    [void]$sb.AppendLine('  <rect x="0" y="0" width="1200" height="800" fill="#f8f9fa" />')
+    [void]$sb.AppendLine('  <rect x="0" y="0" width="1200" height="800" fill="#f8fafc" />')
 
     if ($directoryMap.Count -eq 0)
     {
@@ -5270,8 +6240,13 @@ function Write-FileTreeMap
         {
             $headerXText = ConvertTo-SvgNumberString -Value ($dirX + 6.0)
             $headerYText = ConvertTo-SvgNumberString -Value ($dirY + 15.0)
-            $headerText = ConvertTo-SvgEscapedText -Text ([string]$group.DirectoryPath)
-            [void]$sb.AppendLine(("  <text class=""dir-label"" x=""{0}"" y=""{1}"">{2}</text>" -f $headerXText, $headerYText, $headerText))
+            $dirLabelMaxWidth = [Math]::Max(20.0, $dirWidth - 12.0)
+            $rawDirectoryLabel = Get-SvgCompactPathLabel -Path ([string]$group.DirectoryPath) -MaxWidth $dirLabelMaxWidth -FontSize 13.0
+            $headerText = ConvertTo-SvgEscapedText -Text $rawDirectoryLabel
+            if (-not [string]::IsNullOrWhiteSpace($headerText))
+            {
+                [void]$sb.AppendLine(("  <text class=""dir-label"" x=""{0}"" y=""{1}"">{2}</text>" -f $headerXText, $headerYText, $headerText))
+            }
         }
 
         $innerX = $dirX + $directoryPadding
@@ -5310,7 +6285,7 @@ function Write-FileTreeMap
                 continue
             }
 
-            $fillColor = ConvertTo-SvgColor -Score ([double]$fileData.Rank) -Min $minRank -Max $maxRank
+            $fillColor = ConvertTo-SvgGradientColor -Score ([double]$fileData.Rank) -Min $minRank -Max $maxRank
             $fileXText = ConvertTo-SvgNumberString -Value $fileX
             $fileYText = ConvertTo-SvgNumberString -Value $fileY
             $fileWidthText = ConvertTo-SvgNumberString -Value $fileWidth
@@ -5323,8 +6298,12 @@ function Write-FileTreeMap
             {
                 $fileLabelX = ConvertTo-SvgNumberString -Value ($fileX + 3.0)
                 $fileLabelY = ConvertTo-SvgNumberString -Value ($fileY + 13.0)
-                $fileLabel = ConvertTo-SvgEscapedText -Text ([string]$fileData.FileName)
-                [void]$sb.AppendLine(("  <text class=""file-label"" x=""{0}"" y=""{1}"">{2}</text>" -f $fileLabelX, $fileLabelY, $fileLabel))
+                $fileLabelRaw = Get-SvgFittedText -Text ([string]$fileData.FileName) -MaxWidth ([Math]::Max(20.0, $fileWidth - 8.0)) -FontSize 11.0
+                $fileLabel = ConvertTo-SvgEscapedText -Text $fileLabelRaw
+                if (-not [string]::IsNullOrWhiteSpace($fileLabel))
+                {
+                    [void]$sb.AppendLine(("  <text class=""file-label"" x=""{0}"" y=""{1}"">{2}</text>" -f $fileLabelX, $fileLabelY, $fileLabel))
+                }
             }
         }
     }
@@ -6543,7 +7522,7 @@ function Update-CommitterRowWithStrictMetric
         {
             0
         }
-        $row.'コミットあたりピンポン' = Format-MetricValue -Value $pingPongPerCommit
+        $row.'ピンポン率' = Format-MetricValue -Value $pingPongPerCommit
     }
 }
 function Update-StrictAttributionMetric
@@ -6716,7 +7695,7 @@ function Get-MetricHeader
     [OutputType([object])]
     param()
     return [pscustomobject]@{
-        Committer = @('作者', 'コミット数', '活動日数', '変更ファイル数', '変更ディレクトリ数', '追加行数', '削除行数', '純増行数', '総チャーン', 'コミットあたりチャーン', '削除対追加比', 'チャーン対純増比', 'バイナリ変更回数', '追加アクション数', '変更アクション数', '削除アクション数', '置換アクション数', '生存行数', $script:ColDeadAdded, '所有行数', '所有割合', '自己相殺行数', '自己差戻行数', '他者差戻行数', '被他者削除行数', '同一箇所反復編集数', 'ピンポン回数', '内部移動行数', $script:ColSelfDead, $script:ColOtherDead, '他者コード変更行数', '他者コード変更生存行数', '他者コード変更生存率', 'コミットあたりピンポン', '変更エントロピー', '平均共同作者数', '最大共同作者数', 'メッセージ総文字数', 'メッセージ平均文字数', '課題ID言及数', '修正キーワード数', '差戻キーワード数', 'マージキーワード数')
+        Committer = @('作者', 'コミット数', '活動日数', '変更ファイル数', '変更ディレクトリ数', '追加行数', '削除行数', '純増行数', '総チャーン', 'コミットあたりチャーン', '削除対追加比', 'チャーン対純増比', 'バイナリ変更回数', '追加アクション数', '変更アクション数', '削除アクション数', '置換アクション数', '生存行数', $script:ColDeadAdded, '所有行数', '所有割合', '自己相殺行数', '自己差戻行数', '他者差戻行数', '被他者削除行数', '同一箇所反復編集数', 'ピンポン回数', '内部移動行数', $script:ColSelfDead, $script:ColOtherDead, '他者コード変更行数', '他者コード変更生存行数', '他者コード変更生存率', 'ピンポン率', '変更エントロピー', '平均共同作者数', '最大共同作者数', 'メッセージ総文字数', 'メッセージ平均文字数', '課題ID言及数', '修正キーワード数', '差戻キーワード数', 'マージキーワード数')
         File = @('ファイルパス', 'コミット数', '作者数', '追加行数', '削除行数', '純増行数', '総チャーン', 'バイナリ変更回数', '作成回数', '削除回数', '置換回数', '初回変更リビジョン', '最終変更リビジョン', '平均変更間隔日数', '生存行数 (範囲指定)', $script:ColDeadAdded, '最多作者チャーン占有率', '最多作者blame占有率', '自己相殺行数 (合計)', '他者差戻行数 (合計)', '同一箇所反復編集数 (合計)', 'ピンポン回数 (合計)', '内部移動行数 (合計)', 'ホットスポットスコア', 'ホットスポット順位')
         Commit = @('リビジョン', '日時', '作者', 'メッセージ文字数', 'メッセージ', '変更ファイル数', '追加行数', '削除行数', 'チャーン', 'エントロピー')
         Coupling = @('ファイルA', 'ファイルB', '共変更回数', 'Jaccard', 'リフト値')
@@ -6914,6 +7893,14 @@ function New-RunMetaData
             {
                 $null
             }
+            CommitterRadarCombinedSvg = if ($EmitCharts)
+            {
+                'committer_radar_combined.svg'
+            }
+            else
+            {
+                $null
+            }
             FileTreeMapSvg = if ($EmitCharts)
             {
                 'file_treemap.svg'
@@ -7092,6 +8079,7 @@ try
         Write-FileBubbleChart -OutDirectory $OutDir -Files $fileRows -TopNCount $TopN -EncodingName $Encoding
         Write-FileHeatMap -OutDirectory $OutDir -Files $fileRows -TopNCount $TopN -EncodingName $Encoding
         Write-CommitterRadarChart -OutDirectory $OutDir -Committers $committerRows -TopNCount $TopN -EncodingName $Encoding
+        Write-CommitterRadarChartCombined -OutDirectory $OutDir -Committers $committerRows -TopNCount $TopN -EncodingName $Encoding
         Write-FileTreeMap -OutDirectory $OutDir -Files $fileRows -EncodingName $Encoding
     }
 

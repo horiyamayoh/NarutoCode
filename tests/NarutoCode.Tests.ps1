@@ -1206,7 +1206,7 @@ Describe 'Write-CommitterRadarChart' {
                 '自己相殺行数' = 10
                 '被他者削除行数' = 5
                 '他者コード変更生存率' = 0.6
-                'コミットあたりピンポン' = 0.2
+                'ピンポン率' = 0.2
                 '所有割合' = 0.5
                 'ピンポン回数' = 2
                 'コミット数' = 10
@@ -1220,7 +1220,7 @@ Describe 'Write-CommitterRadarChart' {
                 '自己相殺行数' = 20
                 '被他者削除行数' = 10
                 '他者コード変更生存率' = 0
-                'コミットあたりピンポン' = 0.25
+                'ピンポン率' = 0.25
                 '所有割合' = 0.3
                 'ピンポン回数' = 3
                 'コミット数' = 12
@@ -1234,7 +1234,7 @@ Describe 'Write-CommitterRadarChart' {
                 '自己相殺行数' = 0
                 '被他者削除行数' = 0
                 '他者コード変更生存率' = 0
-                'コミットあたりピンポン' = 0
+                'ピンポン率' = 0
                 '所有割合' = 0
                 'ピンポン回数' = 0
                 'コミット数' = 1
@@ -1259,7 +1259,7 @@ Describe 'Write-CommitterRadarChart' {
                 '自己相殺行数' = 1
                 '被他者削除行数' = 2
                 '他者コード変更生存率' = 0.75
-                'コミットあたりピンポン' = 0.2
+                'ピンポン率' = 0.2
                 '所有割合' = 0.4
                 'ピンポン回数' = 1
                 'コミット数' = 5
@@ -1274,8 +1274,15 @@ Describe 'Write-CommitterRadarChart' {
         $content | Should -Match 'charlie'
         $content | Should -Match 'コード生存率'
         $content | Should -Match '他者コード変更生存率'
-        $content | Should -Match 'コミットあたりピンポン'
+        $content | Should -Match 'ピンポン率'
         $content | Should -Match '所有集中度'
+        $content | Should -Match '定着コミット量'
+        $content | Should -Match 'トータルコミット量'
+        $content | Should -Match '指標定義'
+        $content | Should -Match '式: 生存行数 / コミット数'
+        $content | Should -Match '式: 追加行数 \+ 削除行数'
+        $content | Should -Match '式: 被他者削除行数 / 追加行数'
+        $content | Should -Match '低いほど良い指標のため反転'
     }
 }
 

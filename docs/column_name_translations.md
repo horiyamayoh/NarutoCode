@@ -83,7 +83,7 @@ CSV / PlantUML の見出しを日本語化した際の対訳一覧です。
 | 英語（旧） | 日本語（新） | 備考 |
 |---|---|---|
 | OtherCodeChangeSurvivalRate | 他者コード変更生存率 | 他者コード変更生存行数 ÷ 他者コード変更行数 |
-| PingPongPerCommit | コミットあたりピンポン | ピンポン回数 ÷ コミット数 |
+| PingPongPerCommit | ピンポン率 | ピンポン回数 ÷ コミット数 |
 
 ## files.csv（25 列）
 
