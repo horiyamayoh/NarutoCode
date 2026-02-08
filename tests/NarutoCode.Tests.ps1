@@ -8,11 +8,19 @@ BeforeAll {
     $script:ScriptPath = Join-Path (Join-Path $here '..') 'NarutoCode.ps1'
 
     $scriptContent = Get-Content -Path $script:ScriptPath -Raw -Encoding UTF8
-    $regionPattern = '(?s)(# region Utility.*?# endregion Utility)'
-    if ($scriptContent -match $regionPattern) {
-        $functionBlock = $Matches[1]
+    # Extract all region blocks (from first "# region" to last "# endregion") which contain all function definitions
+    $regionPattern = '(?s)(# region .+?# endregion [^\r\n]+)'
+    $allRegions = [regex]::Matches($scriptContent, $regionPattern)
+    if ($allRegions.Count -gt 0) {
+        $functionBlock = ($allRegions | ForEach-Object { $_.Value }) -join "`r`n"
         $script:SvnExecutable = 'svn'
         $script:SvnGlobalArguments = @()
+        $script:StrictModeEnabled = $true
+        $script:ColDeadAdded = '消滅追加行数'
+        $script:ColSelfDead = '自己消滅行数'
+        $script:ColOtherDead = '被他者消滅行数'
+        $script:StrictBlameCacheHits = 0
+        $script:StrictBlameCacheMisses = 0
         $tempFile = Join-Path $env:TEMP ('NarutoCode_functions_' + [guid]::NewGuid().ToString('N') + '.ps1')
         Set-Content -Path $tempFile -Value $functionBlock -Encoding UTF8
         . $tempFile
@@ -233,7 +241,7 @@ Describe 'NarutoCode.ps1 parameter definition' {
     }
 
     It 'contains new Phase 1 parameters' {
-        $names = @('OutDir','Username','Password','NonInteractive','TrustServerCert','NoBlame','Parallel','IncludePaths','EmitPlantUml','TopN','Encoding')
+        $names = @('OutDir','Username','Password','NonInteractive','TrustServerCert','NoBlame','Parallel','IncludePaths','EmitPlantUml','EmitCharts','TopN','Encoding')
         foreach ($name in $names) {
             $script:cmd.Parameters[$name] | Should -Not -BeNullOrEmpty
         }
@@ -1033,6 +1041,44 @@ Describe 'Write-PlantUmlFile' {
         $content | Should -Match 'X\.cs'
         $content | Should -Match 'Y\.cs'
         $content | Should -Match 'co=2'
+    }
+}
+
+Describe 'Write-FileBubbleChart' {
+    BeforeEach {
+        $script:svgDir = Join-Path $env:TEMP ('narutocode_svg_' + [guid]::NewGuid().ToString('N'))
+        New-Item -Path $script:svgDir -ItemType Directory -Force | Out-Null
+    }
+    AfterEach {
+        Remove-Item -Path $script:svgDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'creates svg file and includes circles and axis labels' {
+        $files = @(
+            [pscustomobject]@{
+                'ファイルパス' = 'src/A.cs'
+                'コミット数' = 12
+                '作者数' = 4
+                '総チャーン' = 180
+                'ホットスポット順位' = 1
+            },
+            [pscustomobject]@{
+                'ファイルパス' = 'src/B.cs'
+                'コミット数' = 8
+                '作者数' = 3
+                '総チャーン' = 90
+                'ホットスポット順位' = 2
+            }
+        )
+
+        Write-FileBubbleChart -OutDirectory $script:svgDir -Files $files -TopNCount 50 -EncodingName 'UTF8'
+
+        $svgPath = Join-Path $script:svgDir 'file_bubble.svg'
+        Test-Path $svgPath | Should -BeTrue
+        $content = Get-Content -Path $svgPath -Raw -Encoding UTF8
+        $content | Should -Match '<circle'
+        $content | Should -Match 'コミット数'
+        $content | Should -Match '作者数'
     }
 }
 

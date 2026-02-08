@@ -31,6 +31,7 @@ param(
     [string[]]$IncludeExtensions,
     [string[]]$ExcludeExtensions,
     [switch]$EmitPlantUml,
+    [switch]$EmitCharts,
     [ValidateRange(1, 5000)][int]$TopN = 50,
     [ValidateSet('UTF8', 'UTF8BOM', 'Unicode', 'ASCII')][string]$Encoding = 'UTF8',
     [switch]$IgnoreSpaceChange,
@@ -3606,6 +3607,252 @@ function Write-PlantUmlFile
     [void]$sb3.AppendLine('@enduml')
     Write-TextFile -FilePath (Join-Path $OutDirectory 'cochange_network.puml') -Content $sb3.ToString() -EncodingName $EncodingName
 }
+function ConvertTo-SvgColor
+{
+    <#
+    .SYNOPSIS
+        ホットスポット順位を赤から緑のグラデーション色に変換する。
+    .PARAMETER Rank
+        対象ファイルのホットスポット順位を指定する。
+    .PARAMETER MaxRank
+        可視化対象における最下位のホットスポット順位を指定する。
+    #>
+    param([int]$Rank, [int]$MaxRank)
+    $clampedRank = [Math]::Max(1, $Rank)
+    $clampedMaxRank = [Math]::Max(1, $MaxRank)
+    $ratio = 0.0
+    if ($clampedMaxRank -gt 1)
+    {
+        $ratio = ($clampedRank - 1) / [double]($clampedMaxRank - 1)
+    }
+    $ratio = [Math]::Max(0.0, [Math]::Min(1.0, $ratio))
+    $startR = 230
+    $startG = 57
+    $startB = 70
+    $endR = 46
+    $endG = 160
+    $endB = 67
+    $r = [int][Math]::Round($startR + (($endR - $startR) * $ratio))
+    $g = [int][Math]::Round($startG + (($endG - $startG) * $ratio))
+    $b = [int][Math]::Round($startB + (($endB - $startB) * $ratio))
+    return ('#{0:X2}{1:X2}{2:X2}' -f $r, $g, $b)
+}
+function Write-FileBubbleChart
+{
+    <#
+    .SYNOPSIS
+        ファイル別メトリクスをバブルチャート SVG として出力する。
+    .DESCRIPTION
+        TopN のファイルをホットスポット順位順で選び、コミット数と作者数を軸に配置する。
+        バブル面積は総チャーンに比例させ、色はホットスポット順位を赤から緑で表現する。
+    .PARAMETER OutDirectory
+        出力先ディレクトリを指定する。
+    .PARAMETER Files
+        Get-FileMetric が返したファイル行データを指定する。
+    .PARAMETER TopNCount
+        可視化対象とする上位件数を指定する。
+    .PARAMETER EncodingName
+        出力時に使用する文字エンコーディングを指定する。
+    #>
+    param([string]$OutDirectory, [object[]]$Files, [int]$TopNCount, [string]$EncodingName)
+    $topFiles = @(
+        $Files |
+            Where-Object {
+                $null -ne $_
+            } |
+            Sort-Object -Property 'ホットスポット順位', 'ファイルパス'
+    )
+    if ($TopNCount -gt 0)
+    {
+        $topFiles = @($topFiles | Select-Object -First $TopNCount)
+    }
+
+    $svgWidth = 1000.0
+    $svgHeight = 700.0
+    $plotLeft = 100.0
+    $plotTop = 40.0
+    $plotRight = $svgWidth - 40.0
+    $plotBottom = $svgHeight - 60.0
+    $plotWidth = $plotRight - $plotLeft
+    $plotHeight = $plotBottom - $plotTop
+    $tickCount = 5
+
+    $maxCommit = 0.0
+    $maxAuthors = 0.0
+    $maxChurn = 0.0
+    $maxRank = 1
+    foreach ($f in $topFiles)
+    {
+        $commitCount = [double]$f.'コミット数'
+        $authorCount = [double]$f.'作者数'
+        $churnCount = [double]$f.'総チャーン'
+        $rank = [int]$f.'ホットスポット順位'
+        if ($commitCount -gt $maxCommit)
+        {
+            $maxCommit = $commitCount
+        }
+        if ($authorCount -gt $maxAuthors)
+        {
+            $maxAuthors = $authorCount
+        }
+        if ($churnCount -gt $maxChurn)
+        {
+            $maxChurn = $churnCount
+        }
+        if ($rank -gt $maxRank)
+        {
+            $maxRank = $rank
+        }
+    }
+    if ($maxCommit -le 0.0)
+    {
+        $maxCommit = 1.0
+    }
+    if ($maxAuthors -le 0.0)
+    {
+        $maxAuthors = 1.0
+    }
+    if ($maxRank -le 0)
+    {
+        $maxRank = 1
+    }
+
+    $minRadius = 8.0
+    $maxRadius = 60.0
+    $minArea = [Math]::PI * $minRadius * $minRadius
+    $maxArea = [Math]::PI * $maxRadius * $maxRadius
+    $radiusCalculator = {
+        param([double]$ChurnValue)
+        if ($maxChurn -le 0.0)
+        {
+            return $minRadius
+        }
+        $ratio = $ChurnValue / $maxChurn
+        $ratio = [Math]::Max(0.0, [Math]::Min(1.0, $ratio))
+        $area = $minArea + (($maxArea - $minArea) * $ratio)
+        return [Math]::Sqrt($area / [Math]::PI)
+    }
+
+    $rankStartColor = ConvertTo-SvgColor -Rank 1 -MaxRank $maxRank
+    $rankEndColor = ConvertTo-SvgColor -Rank $maxRank -MaxRank $maxRank
+
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine('<?xml version="1.0" encoding="UTF-8"?>')
+    [void]$sb.AppendLine('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 700">')
+    [void]$sb.AppendLine('  <defs>')
+    [void]$sb.AppendLine('    <linearGradient id="rankGradient" x1="0%" y1="0%" x2="100%" y2="0%">')
+    [void]$sb.AppendLine(('      <stop offset="0%" stop-color="{0}" />' -f $rankStartColor))
+    [void]$sb.AppendLine(('      <stop offset="100%" stop-color="{0}" />' -f $rankEndColor))
+    [void]$sb.AppendLine('    </linearGradient>')
+    [void]$sb.AppendLine('  </defs>')
+    [void]$sb.AppendLine('  <rect x="0" y="0" width="1000" height="700" fill="#FFFFFF" />')
+    [void]$sb.AppendLine('  <text x="500" y="28" font-size="20" font-weight="bold" text-anchor="middle" fill="#222222">ファイル別ホットスポット バブルチャート</text>')
+
+    for ($i = 0
+        $i -le $tickCount
+        $i++)
+    {
+        $xValue = ($maxCommit * $i) / [double]$tickCount
+        $x = $plotLeft + (($plotWidth * $i) / [double]$tickCount)
+        $xRounded = [Math]::Round($x, 2)
+        $xLabel = [int][Math]::Round($xValue)
+        [void]$sb.AppendLine(('  <line x1="{0}" y1="{1}" x2="{0}" y2="{2}" stroke="#DDDDDD" stroke-width="1" stroke-dasharray="4 4" />' -f $xRounded, $plotTop, $plotBottom))
+        [void]$sb.AppendLine(('  <text x="{0}" y="{1}" font-size="12" text-anchor="middle" fill="#555555">{2}</text>' -f $xRounded, ($plotBottom + 22.0), $xLabel))
+    }
+    for ($i = 0
+        $i -le $tickCount
+        $i++)
+    {
+        $yValue = ($maxAuthors * $i) / [double]$tickCount
+        $y = $plotBottom - (($plotHeight * $i) / [double]$tickCount)
+        $yRounded = [Math]::Round($y, 2)
+        $yLabel = [int][Math]::Round($yValue)
+        [void]$sb.AppendLine(('  <line x1="{0}" y1="{2}" x2="{1}" y2="{2}" stroke="#DDDDDD" stroke-width="1" stroke-dasharray="4 4" />' -f $plotLeft, $plotRight, $yRounded))
+        [void]$sb.AppendLine(('  <text x="{0}" y="{1}" font-size="12" text-anchor="end" fill="#555555">{2}</text>' -f ($plotLeft - 10.0), ($yRounded + 4.0), $yLabel))
+    }
+
+    [void]$sb.AppendLine(('  <line x1="{0}" y1="{1}" x2="{2}" y2="{1}" stroke="#333333" stroke-width="2" />' -f $plotLeft, $plotBottom, $plotRight))
+    [void]$sb.AppendLine(('  <line x1="{0}" y1="{1}" x2="{0}" y2="{2}" stroke="#333333" stroke-width="2" />' -f $plotLeft, $plotTop, $plotBottom))
+    [void]$sb.AppendLine(('  <text x="{0}" y="{1}" font-size="16" text-anchor="middle" fill="#222222">コミット数</text>' -f ($plotLeft + ($plotWidth / 2.0)), ($svgHeight - 14.0)))
+    [void]$sb.AppendLine(('  <text x="{0}" y="{1}" font-size="16" text-anchor="middle" fill="#222222" transform="rotate(-90 {0} {1})">作者数</text>' -f 36, ($plotTop + ($plotHeight / 2.0))))
+
+    $legendX = $plotRight - 240.0
+    $legendY = $plotTop + 10.0
+    [void]$sb.AppendLine(('  <rect x="{0}" y="{1}" width="220" height="170" rx="8" ry="8" fill="#F8F8F8" stroke="#DDDDDD" />' -f $legendX, $legendY))
+    [void]$sb.AppendLine(('  <text x="{0}" y="{1}" font-size="13" font-weight="bold" fill="#333333">凡例</text>' -f ($legendX + 12.0), ($legendY + 22.0)))
+    [void]$sb.AppendLine(('  <text x="{0}" y="{1}" font-size="12" fill="#555555">面積 ∝ 総チャーン</text>' -f ($legendX + 12.0), ($legendY + 42.0)))
+    $legendLargeRadius = & $radiusCalculator -ChurnValue $maxChurn
+    $legendMediumRadius = & $radiusCalculator -ChurnValue ($maxChurn * 0.45)
+    $legendSmallRadius = & $radiusCalculator -ChurnValue ($maxChurn * 0.15)
+    [void]$sb.AppendLine(('  <circle cx="{0}" cy="{1}" r="{2}" fill="#FFFFFF" stroke="#888888" />' -f ($legendX + 52.0), ($legendY + 108.0), [Math]::Round($legendLargeRadius, 2)))
+    [void]$sb.AppendLine(('  <circle cx="{0}" cy="{1}" r="{2}" fill="#FFFFFF" stroke="#888888" />' -f ($legendX + 112.0), ($legendY + 118.0), [Math]::Round($legendMediumRadius, 2)))
+    [void]$sb.AppendLine(('  <circle cx="{0}" cy="{1}" r="{2}" fill="#FFFFFF" stroke="#888888" />' -f ($legendX + 160.0), ($legendY + 126.0), [Math]::Round($legendSmallRadius, 2)))
+    [void]$sb.AppendLine(('  <text x="{0}" y="{1}" font-size="12" fill="#555555">色: ホットスポット順位</text>' -f ($legendX + 12.0), ($legendY + 154.0)))
+    [void]$sb.AppendLine(('  <rect x="{0}" y="{1}" width="120" height="10" fill="url(#rankGradient)" stroke="#BBBBBB" />' -f ($legendX + 12.0), ($legendY + 160.0)))
+    [void]$sb.AppendLine(('  <text x="{0}" y="{1}" font-size="11" fill="#555555">1位</text>' -f ($legendX + 12.0), ($legendY + 176.0)))
+    [void]$sb.AppendLine(('  <text x="{0}" y="{1}" font-size="11" text-anchor="end" fill="#555555">{2}位</text>' -f ($legendX + 132.0), ($legendY + 176.0), $maxRank))
+
+    $drawOrder = @(
+        $topFiles |
+            Sort-Object -Property @{Expression = {
+                    [double]$_.'総チャーン'
+                }
+                Descending = $true
+            }, @{Expression = 'ホットスポット順位'
+                Descending = $false
+            }, 'ファイルパス'
+    )
+    foreach ($f in $drawOrder)
+    {
+        $filePath = [string]$f.'ファイルパス'
+        $commitCount = [double]$f.'コミット数'
+        $authorCount = [double]$f.'作者数'
+        $churnCount = [double]$f.'総チャーン'
+        $rank = [int]$f.'ホットスポット順位'
+
+        $x = $plotLeft + (($commitCount / $maxCommit) * $plotWidth)
+        $y = $plotBottom - (($authorCount / $maxAuthors) * $plotHeight)
+        $radius = & $radiusCalculator -ChurnValue $churnCount
+        $bubbleColor = ConvertTo-SvgColor -Rank $rank -MaxRank $maxRank
+        $label = Split-Path -Path $filePath -Leaf
+        if ([string]::IsNullOrWhiteSpace($label))
+        {
+            $label = $filePath
+        }
+        $safePath = [System.Security.SecurityElement]::Escape($filePath)
+        $safeLabel = [System.Security.SecurityElement]::Escape($label)
+        if ($null -eq $safePath)
+        {
+            $safePath = ''
+        }
+        if ($null -eq $safeLabel)
+        {
+            $safeLabel = ''
+        }
+        $tooltip = ('{0}&#10;コミット数={1}, 作者数={2}, 総チャーン={3}, 順位={4}' -f $safePath, [int][Math]::Round($commitCount), [int][Math]::Round($authorCount), [int][Math]::Round($churnCount), $rank)
+
+        $xRounded = [Math]::Round($x, 2)
+        $yRounded = [Math]::Round($y, 2)
+        $radiusRounded = [Math]::Round($radius, 2)
+        [void]$sb.AppendLine(('  <circle cx="{0}" cy="{1}" r="{2}" fill="{3}" fill-opacity="0.74" stroke="#2F2F2F" stroke-width="1">' -f $xRounded, $yRounded, $radiusRounded, $bubbleColor))
+        [void]$sb.AppendLine(('    <title>{0}</title>' -f $tooltip))
+        [void]$sb.AppendLine('  </circle>')
+
+        $labelX = $xRounded
+        $labelY = [Math]::Round($yRounded + 4.0, 2)
+        $labelAnchor = 'middle'
+        if ($radiusRounded -lt 20.0)
+        {
+            $labelX = [Math]::Round($xRounded + $radiusRounded + 4.0, 2)
+            $labelY = [Math]::Round($yRounded - $radiusRounded - 4.0, 2)
+            $labelAnchor = 'start'
+        }
+        [void]$sb.AppendLine(('  <text x="{0}" y="{1}" font-size="11" text-anchor="{2}" fill="#1F1F1F">{3}</text>' -f $labelX, $labelY, $labelAnchor, $safeLabel))
+    }
+
+    [void]$sb.AppendLine('</svg>')
+    Write-TextFile -FilePath (Join-Path $OutDirectory 'file_bubble.svg') -Content $sb.ToString() -EncodingName $EncodingName
+}
 # endregion PlantUML 出力
 # region 消滅行詳細
 function Get-DeadLineDetail
@@ -5024,6 +5271,8 @@ function New-RunMetaData
         対象を絞り込むための包含または除外条件を指定する。
     .PARAMETER EmitPlantUml
         EmitPlantUml の値を指定する。
+    .PARAMETER EmitCharts
+        EmitCharts の値を指定する。
     .PARAMETER NonInteractive
         NonInteractive の値を指定する。
     .PARAMETER TrustServerCert
@@ -5063,6 +5312,7 @@ function New-RunMetaData
         [string[]]$IncludeExtensions,
         [string[]]$ExcludeExtensions,
         [switch]$EmitPlantUml,
+        [switch]$EmitCharts,
         [switch]$NonInteractive,
         [switch]$TrustServerCert,
         [switch]$IgnoreSpaceChange,
@@ -5101,6 +5351,7 @@ function New-RunMetaData
             IncludeExtensions = $IncludeExtensions
             ExcludeExtensions = $ExcludeExtensions
             EmitPlantUml = [bool]$EmitPlantUml
+            EmitCharts = [bool]$EmitCharts
             NonInteractive = [bool]$NonInteractive
             TrustServerCert = [bool]$TrustServerCert
             IgnoreSpaceChange = [bool]$IgnoreSpaceChange
@@ -5134,6 +5385,14 @@ function New-RunMetaData
             CoChangePlantUml = if ($EmitPlantUml)
             {
                 'cochange_network.puml'
+            }
+            else
+            {
+                $null
+            }
+            FileBubbleSvg = if ($EmitCharts)
+            {
+                'file_bubble.svg'
             }
             else
             {
@@ -5298,15 +5557,19 @@ try
     Write-CsvFile -FilePath (Join-Path $OutDir 'files.csv') -Rows $fileRows -Headers $headers.File -EncodingName $Encoding
     Write-CsvFile -FilePath (Join-Path $OutDir 'commits.csv') -Rows $commitRows -Headers $headers.Commit -EncodingName $Encoding
     Write-CsvFile -FilePath (Join-Path $OutDir 'couplings.csv') -Rows $couplingRows -Headers $headers.Coupling -EncodingName $Encoding
-    # --- ステップ 7: PlantUML 出力（指定時のみ） ---
+    # --- ステップ 7: 可視化出力（指定時のみ） ---
     if ($EmitPlantUml)
     {
         Write-PlantUmlFile -OutDirectory $OutDir -Committers $committerRows -Files $fileRows -Couplings $couplingRows -TopNCount $TopN -EncodingName $Encoding
     }
+    if ($EmitCharts)
+    {
+        Write-FileBubbleChart -OutDirectory $OutDir -Files $fileRows -TopNCount $TopN -EncodingName $Encoding
+    }
 
     # --- ステップ 8: 実行メタデータとサマリーの書き出し ---
     $finishedAt = Get-Date
-    $meta = New-RunMetaData -StartTime $startedAt -EndTime $finishedAt -TargetUrl $targetUrl -FromRevision $FromRev -ToRevision $ToRev -AuthorFilter $Author -SvnVersion $svnVersion -NoBlame:$NoBlame -DeadDetailLevel $DeadDetailLevel -Parallel $Parallel -TopN $TopN -Encoding $Encoding -Commits $commits -FileRows $fileRows -OutDir $OutDir -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -EmitPlantUml:$EmitPlantUml -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -IgnoreSpaceChange:$IgnoreSpaceChange -IgnoreAllSpace:$IgnoreAllSpace -IgnoreEolStyle:$IgnoreEolStyle -IncludeProperties:$IncludeProperties -ForceBinary:$ForceBinary
+    $meta = New-RunMetaData -StartTime $startedAt -EndTime $finishedAt -TargetUrl $targetUrl -FromRevision $FromRev -ToRevision $ToRev -AuthorFilter $Author -SvnVersion $svnVersion -NoBlame:$NoBlame -DeadDetailLevel $DeadDetailLevel -Parallel $Parallel -TopN $TopN -Encoding $Encoding -Commits $commits -FileRows $fileRows -OutDir $OutDir -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -EmitPlantUml:$EmitPlantUml -EmitCharts:$EmitCharts -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -IgnoreSpaceChange:$IgnoreSpaceChange -IgnoreAllSpace:$IgnoreAllSpace -IgnoreEolStyle:$IgnoreEolStyle -IncludeProperties:$IncludeProperties -ForceBinary:$ForceBinary
     Write-JsonFile -Data $meta -FilePath (Join-Path $OutDir 'run_meta.json') -Depth 12 -EncodingName $Encoding
 
     Write-RunSummary -TargetUrl $targetUrl -FromRevision $FromRev -ToRevision $ToRev -Commits $commits -FileRows $fileRows -OutDir $OutDir
