@@ -3811,7 +3811,7 @@ function Write-FileHeatMap
     $gridRight = $leftMargin + $gridWidth
 
     $sb = New-Object System.Text.StringBuilder
-    [void]$sb.AppendLine('<?xml version="1.0" encoding="UTF-8"?>')
+    [void]$sb.AppendLine('<?xml version="1.0"?>')
     [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {0} {1}" width="{0}" height="{1}">' -f $totalWidth, $totalHeight))
     [void]$sb.AppendLine('  <defs>')
     [void]$sb.AppendLine('    <style><![CDATA[')
