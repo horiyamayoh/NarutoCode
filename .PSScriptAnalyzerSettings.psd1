@@ -29,7 +29,7 @@
     ExcludeRules = @(
         # Write-Host はユーザー向け出力に使用しているため許可
         'PSAvoidUsingWriteHost',
-        # UTF-8 without BOM を意図的に使用
+        # NarutoCode.ps1 では UTF-8 (BOM 無し) を意図的に使用するため除外
         'PSUseBOMForUnicodeEncodedFile'
     )
 
