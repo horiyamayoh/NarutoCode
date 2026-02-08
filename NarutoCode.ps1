@@ -1213,6 +1213,63 @@ function Invoke-SvnCommand
         }
     }
 }
+function Test-SvnMissingTargetError
+{
+    <#
+    .SYNOPSIS
+        SVN の対象不存在エラーかどうかを判定する。
+    #>
+    param([string]$Message)
+    if ([string]::IsNullOrWhiteSpace($Message))
+    {
+        return $false
+    }
+    if ($Message -match 'E200009')
+    {
+        return $true
+    }
+    if ($Message -match 'targets don''t exist')
+    {
+        return $true
+    }
+    return $false
+}
+function Invoke-SvnCommandAllowMissingTarget
+{
+    <#
+    .SYNOPSIS
+        対象不存在時に null を返す SVN コマンド実行。
+    #>
+    [CmdletBinding()]param([string[]]$Arguments, [string]$ErrorContext = 'SVN command')
+    try
+    {
+        return (Invoke-SvnCommand -Arguments $Arguments -ErrorContext $ErrorContext)
+    }
+    catch
+    {
+        if (Test-SvnMissingTargetError -Message $_.Exception.Message)
+        {
+            return $null
+        }
+        throw
+    }
+}
+function New-EmptyBlameResult
+{
+    <#
+    .SYNOPSIS
+        blame 取得失敗時に返す空の集計結果を生成する。
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param()
+    return [pscustomobject]@{
+        LineCountTotal = 0
+        LineCountByRevision = @{}
+        LineCountByAuthor = @{}
+        Lines = @()
+    }
+}
 function ConvertFrom-SvnXmlText
 {
     <#
@@ -1847,14 +1904,21 @@ function Get-SvnBlameSummary
     if ([string]::IsNullOrEmpty($text))
     {
         $script:StrictBlameCacheMisses++
-        $text = Invoke-SvnCommand -Arguments @('blame', '--xml', '-r', [string]$ToRevision, $url) -ErrorContext ("svn blame $FilePath")
-        Write-BlameCacheFile -CacheDir $CacheDir -Revision $ToRevision -FilePath $FilePath -Content $text
+        $text = Invoke-SvnCommandAllowMissingTarget -Arguments @('blame', '--xml', '-r', [string]$ToRevision, $url) -ErrorContext ("svn blame $FilePath")
+        if (-not [string]::IsNullOrEmpty($text))
+        {
+            Write-BlameCacheFile -CacheDir $CacheDir -Revision $ToRevision -FilePath $FilePath -Content $text
+        }
     }
     else
     {
         $script:StrictBlameCacheHits++
     }
-    ConvertFrom-SvnBlameXml -XmlText $text
+    if ([string]::IsNullOrEmpty($text))
+    {
+        return (New-EmptyBlameResult)
+    }
+    return (ConvertFrom-SvnBlameXml -XmlText $text)
 }
 function Get-SvnBlameLine
 {
@@ -1879,8 +1943,11 @@ function Get-SvnBlameLine
     if ([string]::IsNullOrEmpty($blameXml))
     {
         $script:StrictBlameCacheMisses++
-        $blameXml = Invoke-SvnCommand -Arguments @('blame', '--xml', '-r', [string]$Revision, $url) -ErrorContext ("svn blame $FilePath@$Revision")
-        Write-BlameCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath -Content $blameXml
+        $blameXml = Invoke-SvnCommandAllowMissingTarget -Arguments @('blame', '--xml', '-r', [string]$Revision, $url) -ErrorContext ("svn blame $FilePath@$Revision")
+        if (-not [string]::IsNullOrEmpty($blameXml))
+        {
+            Write-BlameCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath -Content $blameXml
+        }
     }
     else
     {
@@ -1890,8 +1957,15 @@ function Get-SvnBlameLine
     $catText = Read-CatCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
     if ($null -eq $catText)
     {
-        $catText = Invoke-SvnCommand -Arguments @('cat', '-r', [string]$Revision, $url) -ErrorContext ("svn cat $FilePath@$Revision")
-        Write-CatCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath -Content $catText
+        $catText = Invoke-SvnCommandAllowMissingTarget -Arguments @('cat', '-r', [string]$Revision, $url) -ErrorContext ("svn cat $FilePath@$Revision")
+        if ($null -ne $catText)
+        {
+            Write-CatCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath -Content $catText
+        }
+    }
+    if ([string]::IsNullOrEmpty($blameXml) -or $null -eq $catText)
+    {
+        return (New-EmptyBlameResult)
     }
     $contentLines = ConvertTo-TextLine -Text $catText
     return (ConvertFrom-SvnBlameXml -XmlText $blameXml -ContentLines $contentLines)
@@ -1931,8 +2005,11 @@ function Initialize-SvnBlameLineCache
     if ([string]::IsNullOrEmpty($blameXml))
     {
         $misses++
-        $blameXml = Invoke-SvnCommand -Arguments @('blame', '--xml', '-r', [string]$Revision, $url) -ErrorContext ("svn blame $FilePath@$Revision")
-        Write-BlameCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath -Content $blameXml
+        $blameXml = Invoke-SvnCommandAllowMissingTarget -Arguments @('blame', '--xml', '-r', [string]$Revision, $url) -ErrorContext ("svn blame $FilePath@$Revision")
+        if (-not [string]::IsNullOrEmpty($blameXml))
+        {
+            Write-BlameCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath -Content $blameXml
+        }
     }
     else
     {
@@ -1943,8 +2020,11 @@ function Initialize-SvnBlameLineCache
     if ($null -eq $catText)
     {
         $misses++
-        $catText = Invoke-SvnCommand -Arguments @('cat', '-r', [string]$Revision, $url) -ErrorContext ("svn cat $FilePath@$Revision")
-        Write-CatCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath -Content $catText
+        $catText = Invoke-SvnCommandAllowMissingTarget -Arguments @('cat', '-r', [string]$Revision, $url) -ErrorContext ("svn cat $FilePath@$Revision")
+        if ($null -ne $catText)
+        {
+            Write-CatCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath -Content $catText
+        }
     }
     else
     {
