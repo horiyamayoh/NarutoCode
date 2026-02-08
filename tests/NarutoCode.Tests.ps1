@@ -1203,6 +1203,7 @@ Describe 'Write-CommitterRadarChart' {
                 '追加行数' = 100
                 '削除行数' = 20
                 '生存行数' = 80
+                '変更エントロピー' = 2.5
                 '自己相殺行数' = 10
                 '被他者削除行数' = 5
                 '他者コード変更生存率' = 0.6
@@ -1217,6 +1218,7 @@ Describe 'Write-CommitterRadarChart' {
                 '追加行数' = 80
                 '削除行数' = 30
                 '生存行数' = 40
+                '変更エントロピー' = 1.8
                 '自己相殺行数' = 20
                 '被他者削除行数' = 10
                 '他者コード変更生存率' = 0
@@ -1231,6 +1233,7 @@ Describe 'Write-CommitterRadarChart' {
                 '追加行数' = 0
                 '削除行数' = 0
                 '生存行数' = 0
+                '変更エントロピー' = 0
                 '自己相殺行数' = 0
                 '被他者削除行数' = 0
                 '他者コード変更生存率' = 0
@@ -1256,6 +1259,7 @@ Describe 'Write-CommitterRadarChart' {
                 '追加行数' = 20
                 '削除行数' = 5
                 '生存行数' = 15
+                '変更エントロピー' = 1.2
                 '自己相殺行数' = 1
                 '被他者削除行数' = 2
                 '他者コード変更生存率' = 0.75
@@ -1279,10 +1283,10 @@ Describe 'Write-CommitterRadarChart' {
         $content | Should -Match '定着コミット量'
         $content | Should -Match 'トータルコミット量'
         $content | Should -Match '指標定義'
-        $content | Should -Match '式: 生存行数 / コミット数'
-        $content | Should -Match '式: 追加行数 \+ 削除行数'
-        $content | Should -Match '式: 被他者削除行数 / 追加行数'
-        $content | Should -Match '低いほど良い指標のため反転'
+        $content | Should -Match '生存行数 / コミット数'
+        $content | Should -Match '追加行数 \+ 削除行数'
+        $content | Should -Match '被他者削除行数 / 追加行数'
+        $content | Should -Match '低いほど良いため反転'
     }
 }
 
@@ -2215,5 +2219,58 @@ Describe 'Invoke-StrictBlameCachePrefetch parallel consistency' {
         $seqMisses | Should -Be $parMisses
         $parHits | Should -Be 2
         $parMisses | Should -Be 1
+    }
+}
+
+Describe 'Test-SvnMissingTargetError' {
+    It 'E200009 を含むメッセージで true を返す' {
+        Test-SvnMissingTargetError -Message 'svn: E200009: Could not get info' | Should -BeTrue
+    }
+    It "targets don't exist を含むメッセージで true を返す" {
+        Test-SvnMissingTargetError -Message "Some of the specified targets don't exist" | Should -BeTrue
+    }
+    It '通常のエラーメッセージで false を返す' {
+        Test-SvnMissingTargetError -Message 'svn: E170001: Authorization failed' | Should -BeFalse
+    }
+    It '空文字列で false を返す' {
+        Test-SvnMissingTargetError -Message '' | Should -BeFalse
+    }
+    It 'null で false を返す' {
+        Test-SvnMissingTargetError -Message $null | Should -BeFalse
+    }
+}
+
+Describe 'Invoke-SvnCommandAllowMissingTarget' {
+    It 'missing-target エラー時に null を返す' {
+        Mock Invoke-SvnCommand {
+            throw "svn: E200009: Some of the specified targets don't exist"
+        }
+        $result = Invoke-SvnCommandAllowMissingTarget -Arguments @('blame', 'dummy') -ErrorContext 'test'
+        $result | Should -BeNullOrEmpty
+    }
+    It 'その他のエラーは再スローする' {
+        Mock Invoke-SvnCommand {
+            throw 'svn: E170001: Authorization failed'
+        }
+        { Invoke-SvnCommandAllowMissingTarget -Arguments @('blame', 'dummy') -ErrorContext 'test' } | Should -Throw
+    }
+    It '正常時は結果をそのまま返す' {
+        Mock Invoke-SvnCommand {
+            return '<xml>ok</xml>'
+        }
+        $result = Invoke-SvnCommandAllowMissingTarget -Arguments @('blame', 'dummy') -ErrorContext 'test'
+        $result | Should -Be '<xml>ok</xml>'
+    }
+}
+
+Describe 'Get-EmptyBlameResult' {
+    It '正しいスキーマの空オブジェクトを返す' {
+        $result = Get-EmptyBlameResult
+        $result.LineCountTotal | Should -Be 0
+        $result.LineCountByRevision | Should -BeOfType [hashtable]
+        $result.LineCountByRevision.Keys.Count | Should -Be 0
+        $result.LineCountByAuthor | Should -BeOfType [hashtable]
+        $result.LineCountByAuthor.Keys.Count | Should -Be 0
+        @($result.Lines).Count | Should -Be 0
     }
 }
