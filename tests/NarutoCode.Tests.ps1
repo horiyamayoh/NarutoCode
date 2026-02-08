@@ -1048,7 +1048,6 @@ Describe 'Write-PlantUmlFile' {
     }
 }
 
-<<<<<<< HEAD
 Describe 'Write-FileBubbleChart' {
     BeforeEach {
         $script:svgDir = Join-Path $env:TEMP ('narutocode_svg_' + [guid]::NewGuid().ToString('N'))
@@ -1086,6 +1085,7 @@ Describe 'Write-FileBubbleChart' {
         $content | Should -Match '作者数'
     }
 }
+
 Describe 'Write-FileHeatMap' {
     BeforeEach {
         $script:heatMapDir = Join-Path $env:TEMP ('narutocode_heatmap_' + [guid]::NewGuid().ToString('N'))
@@ -1303,7 +1303,6 @@ Describe 'Write-FileTreeMap' {
         $content | Should -Match 'src/core'
         $content | Should -Match 'docs'
         $content | Should -Match 'A\.cs: 総チャーン='
->>>>>>> origin/main
     }
 }
 
