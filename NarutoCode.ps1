@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     SVN リポジトリの履歴を解析し、コミット品質・変更傾向のメトリクスを生成する。
 .DESCRIPTION
@@ -5376,6 +5376,8 @@ function New-RunMetaData
         対象を絞り込むための包含または除外条件を指定する。
     .PARAMETER EmitPlantUml
         EmitPlantUml の値を指定する。
+    .PARAMETER EmitCharts
+        EmitCharts の値を指定する。
     .PARAMETER NonInteractive
         NonInteractive の値を指定する。
     .PARAMETER TrustServerCert
@@ -5415,6 +5417,7 @@ function New-RunMetaData
         [string[]]$IncludeExtensions,
         [string[]]$ExcludeExtensions,
         [switch]$EmitPlantUml,
+        [switch]$EmitCharts,
         [switch]$NonInteractive,
         [switch]$TrustServerCert,
         [switch]$IgnoreSpaceChange,
@@ -5453,6 +5456,7 @@ function New-RunMetaData
             IncludeExtensions = $IncludeExtensions
             ExcludeExtensions = $ExcludeExtensions
             EmitPlantUml = [bool]$EmitPlantUml
+            EmitCharts = [bool]$EmitCharts
             NonInteractive = [bool]$NonInteractive
             TrustServerCert = [bool]$TrustServerCert
             IgnoreSpaceChange = [bool]$IgnoreSpaceChange
@@ -5486,6 +5490,14 @@ function New-RunMetaData
             CoChangePlantUml = if ($EmitPlantUml)
             {
                 'cochange_network.puml'
+            }
+            else
+            {
+                $null
+            }
+            CommitterRadarCharts = if ($EmitCharts)
+            {
+                'committer_radar_*.svg'
             }
             else
             {
@@ -5662,7 +5674,7 @@ try
 
     # --- ステップ 8: 実行メタデータとサマリーの書き出し ---
     $finishedAt = Get-Date
-    $meta = New-RunMetaData -StartTime $startedAt -EndTime $finishedAt -TargetUrl $targetUrl -FromRevision $FromRev -ToRevision $ToRev -AuthorFilter $Author -SvnVersion $svnVersion -NoBlame:$NoBlame -DeadDetailLevel $DeadDetailLevel -Parallel $Parallel -TopN $TopN -Encoding $Encoding -Commits $commits -FileRows $fileRows -OutDir $OutDir -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -EmitPlantUml:$EmitPlantUml -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -IgnoreSpaceChange:$IgnoreSpaceChange -IgnoreAllSpace:$IgnoreAllSpace -IgnoreEolStyle:$IgnoreEolStyle -IncludeProperties:$IncludeProperties -ForceBinary:$ForceBinary
+    $meta = New-RunMetaData -StartTime $startedAt -EndTime $finishedAt -TargetUrl $targetUrl -FromRevision $FromRev -ToRevision $ToRev -AuthorFilter $Author -SvnVersion $svnVersion -NoBlame:$NoBlame -DeadDetailLevel $DeadDetailLevel -Parallel $Parallel -TopN $TopN -Encoding $Encoding -Commits $commits -FileRows $fileRows -OutDir $OutDir -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -EmitPlantUml:$EmitPlantUml -EmitCharts:$EmitCharts -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -IgnoreSpaceChange:$IgnoreSpaceChange -IgnoreAllSpace:$IgnoreAllSpace -IgnoreEolStyle:$IgnoreEolStyle -IncludeProperties:$IncludeProperties -ForceBinary:$ForceBinary
     Write-JsonFile -Data $meta -FilePath (Join-Path $OutDir 'run_meta.json') -Depth 12 -EncodingName $Encoding
 
     Write-RunSummary -TargetUrl $targetUrl -FromRevision $FromRev -ToRevision $ToRev -Commits $commits -FileRows $fileRows -OutDir $OutDir
