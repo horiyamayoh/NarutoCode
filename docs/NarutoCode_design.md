@@ -37,27 +37,27 @@ SVN のリモートリポジトリに対し、指定したリビジョン範囲 
 
 ### 3.2 パラメータ設計
 
-> **パラメータ名統一方針（実装との整合）**
-> 現行実装では `-Path` / `-FromRevision` / `-ToRevision` を使用しているが、
-> 本設計書では意図が明確な `-RepoUrl` / `-FromRev` / `-ToRev` に統一する。
-> 実装側を設計書に合わせて改名する（Phase 1-1 で対応）。
-> 既存の短縮エイリアス（`-Pre`, `-Post`, `-Start`, `-End`, `-From`, `-To` 等）は後方互換のため残す。
+> **パラメータ名統一方針**
+> 旧名（`-Path` / `-FromRevision` / `-ToRevision`）はエイリアスとして後方互換を維持。
+> 短縮エイリアス（`-Pre`, `-Post`, `-Start`, `-End`, `-From`, `-To` 等）も引き続き使用可能。
 
 - 必須
-  - `-RepoUrl <string>`: SVN リモート URL（旧名: `-Path`）
-  - `-FromRev <int>`: 開始リビジョン（含む）（旧名: `-FromRevision`）
-  - `-ToRev <int>`: 終了リビジョン（含む）（旧名: `-ToRevision`）
+  - `-RepoUrl <string>`: SVN リモート URL（エイリアス: `-Path`）
+  - `-FromRev <int>`: 開始リビジョン（含む）
+  - `-ToRev <int>`: 終了リビジョン（含む）
 - 任意（運用で効く）
-  - `-OutDir <string>`: 出力先（既定: `./NarutoCode_out_yyyyMMdd_HHmmss`）
-  - `-Username <string>` / `-Password <securestring>`: 認証
+  - `-SvnExecutable <string>`: svn コマンドのパス（既定: `svn`）
+  - `-OutDir <string>`: 出力先（既定: `./NarutoCode_out`・固定名でキャッシュ再利用）
+  - `-Username <string>` / `-Password <securestring>`: SVN 認証情報
   - `-NonInteractive`: `--non-interactive` を強制（CI 想定）
-  - `-TrustServerCert`: `--trust-server-cert`（必要な場合）
-  - `-NoBlame`: blame（生存量解析）を無効化（超大規模向け）
-  - `-Parallel <int>`: 最大並列数（既定: CPU 論理数）
-  - `-IncludePaths <string[]>` / `-ExcludePaths <string[]>`: 解析対象パスの絞り込み（正規表現 or ワイルドカード）
-  - `-EmitPlantUml`: PlantUML も出力
-  - `-TopN <int>`: 可視化や coupling 表の出力上限（既定: 50）
-  - `-Encoding <string>`: 出力 CSV/PUML（既定: UTF-8）
+  - `-TrustServerCert`: `--trust-server-cert`（自己署名証明書対応）
+  - `-Parallel <int>`: 最大並列数（既定: CPU コア数）
+  - `-IncludePaths <string[]>` / `-ExcludePaths <string[]>`: 解析対象パスの絞り込み（ワイルドカード）
+  - `-IncludeExtensions <string[]>` / `-ExcludeExtensions <string[]>`: 拡張子フィルタ
+  - `-TopN <int>`: 可視化の出力上限（既定: 50・CSV は全件出力）
+  - `-Encoding <string>`: 出力エンコーディング（既定: UTF-8）
+  - `-IgnoreWhitespace`: diff 時に空白・改行コードの差異を無視
+  - `-NoProgress`: 進捗バー表示を抑止
 
 ---
 
@@ -152,16 +152,16 @@ PowerShell 内で扱う主要構造（擬似定義）。
    - co-change（ファイル同時変更）集計
 7. **CSV / PlantUML 出力**
    - `committers.csv` / `files.csv` / `commits.csv` / `couplings.csv` etc.
-   - 任意で `.puml`（グラフ・ネットワーク）
+   - `.puml` / `.svg`（グラフ・ネットワーク）を常時出力
 
 ### 6.2 パフォーマンス方針
 - `svn log` は 1 回で範囲全体を取得
 - `svn diff -c` は revision 数回だが、
-  - **並列**（RunspacePool）
+  - **並列**（RunspacePool、`-Parallel` で制御）
   - 取得結果を一時ファイルにキャッシュ（`$OutDir/cache/diff_r1234.txt`）
-  - 再実行時の再利用（`-UseCache` オプションも可）
+  - 同一 `-OutDir` での再実行時にキャッシュを自動再利用
 - `svn blame` は **変更されたファイル集合**に限定
-  - さらに `-NoBlame` で無効化可能
+  - per-revision blame のキャッシュも `$OutDir/cache/blame/` に保存
 
 ---
 

@@ -29,11 +29,16 @@ NarutoCode が出力する CSV / JSON / PlantUML の各指標について、
 ├── files.csv                  ← ファイルごとの集計
 ├── commits.csv                ← コミット単位の生ログ
 ├── couplings.csv              ← ファイル同時変更ペアの関連度
-├── contributors_summary.puml  ← （-EmitPlantUml 時）コミッター表
-├── hotspots.puml              ← （-EmitPlantUml 時）ホットスポット表
-├── cochange_network.puml      ← （-EmitPlantUml 時）共変更ネットワーク図
+├── contributors_summary.puml  ← コミッター表（PlantUML）
+├── hotspots.puml              ← ホットスポット表（PlantUML）
+├── cochange_network.puml      ← 共変更ネットワーク図（PlantUML）
+├── contributors_summary.svg   ← コミッター表（SVG）
+├── hotspots.svg               ← ホットスポット表（SVG）
+├── cochange_network.svg       ← 共変更ネットワーク図（SVG）
 └── cache/
-    └── diff_r{N}.txt          ← svn diff の生出力キャッシュ
+    ├── diff_r{N}.txt          ← svn diff の生出力キャッシュ
+    ├── blame/r{N}/            ← svn blame XML のキャッシュ
+    └── cat/r{N}/              ← svn cat テキストのキャッシュ
 ```
 
 ### 解析パイプラインと出力ファイルの関係
@@ -58,8 +63,8 @@ flowchart LR
         CSV3["📄 commits.csv\nコミットログ"]
         CSV4["📄 couplings.csv\n共変更ペア"]
         META["📋 run_meta.json"]
-        PUML["📊 *.puml\nPlantUML 図"]
-        CACHE["💾 cache/\ndiff キャッシュ"]
+        PUML["📊 *.puml / *.svg\nPlantUML 図 + SVG"]
+        CACHE["💾 cache/\ndiff / blame / cat キャッシュ"]
     end
 
     LOG --> COMMITS_DATA
@@ -237,8 +242,6 @@ flowchart LR
 | **バイナリ変更回数** | バイナリファイルの変更回数 | 画像・Excel 等の変更。行数には反映されない |
 
 ### 2.5 生存量・所有量（blame 系指標）
-
-> `-NoBlame` を指定した場合、これらの列は空（null）になります。
 
 | 列名 | 意味 | 読み方 |
 |---|---|---|
@@ -731,20 +734,18 @@ $$L(A, B) = \frac{P(A \cap B)}{P(A) \times P(B)}$$
 | `DurationSeconds` | 実行時間（秒） |
 | `RepoUrl` | 解析対象のリポジトリ URL |
 | `FromRev` / `ToRev` | リビジョン範囲 |
-| `AuthorFilter` | `-Author` で絞り込んだ場合の値 |
-| `NoBlame` | blame 解析を無効化したかどうか |
+| `StrictMode` | Strict モード（per-revision blame による厄密計算）の有無 |
 | `CommitCount` / `FileCount` | 検出されたコミット数・ファイル数 |
-| `Parameters` | 使用したフィルタ・オプション一覧 |
+| `Parameters` | 使用したフィルタ・オプション一覧（IgnoreWhitespace 等） |
 | `Outputs` | 出力されたファイル名の一覧 |
 
 > **同じ条件で再実行したい場合**、このファイルを見ればパラメータを復元できます。
 
 ---
 
-## 7. PlantUML ファイル
+## 7. PlantUML / SVG ファイル
 
-`-EmitPlantUml` スイッチを指定した場合にのみ出力されます。  
-ツール自体は `.puml` テキストを生成するだけで、描画には PlantUML レンダラ（`plantuml.jar` 等）が別途必要です。
+CSV の集計結果を元に、以下の PlantUML テキストと SVG 画像が自動生成されます。
 
 | ファイル | 内容 | 形式 |
 |---|---|---|
@@ -754,14 +755,17 @@ $$L(A, B) = \frac{P(A \cap B)}{P(A) \times P(B)}$$
 
 ---
 
-## 8. cache/ — diff キャッシュ
+## 8. cache/ — キャッシュディレクトリ
 
-`svn diff -c {rev}` の生出力がリビジョンごとに保存されます。
+SVN コマンドの取得結果がリビジョン・ファイルごとに保存されます。
 
-- **ファイル名規則：** `diff_r{リビジョン番号}.txt`
-- **目的：** 再実行時に同じ diff を SVN サーバーから再取得しない（高速化）
-- **中身：** Unified diff 形式のテキストそのもの
-- **注意：** フィルタ前の生データなので、`-IncludeExtensions` 等で絞っていても全ファイルの diff が含まれます
+- **`diff_r{N}.txt`**: `svn diff -c {rev}` の生出力（Unified diff テキスト）
+- **`blame/r{N}/{hash}.xml`**: `svn blame --xml` の XML 出力
+- **`cat/r{N}/{hash}.txt`**: `svn cat` のテキスト出力
+
+同一の `-OutDir` を指定して再実行すると、キャッシュが自動的に再利用され、SVN サーバーへのアクセスを省略できます。
+
+> **注意:** diff キャッシュはフィルタ前の生データなので、`-IncludeExtensions` 等で絞っていても全ファイルの diff が含まれます。
 
 ---
 
@@ -845,14 +849,9 @@ flowchart TD
 
 文脈を踏まえて人間が判断する材料を提供するのがこのツールの役割です。
 
-### Q. `-NoBlame` にすると何が失われますか？
+### Q. blame 解析には時間がかかりますか？
 
-以下の列が空（null）になります：
-
-- committers.csv: `生存行数`, `消滅追加行数 (概算)`, `所有行数`, `所有割合`
-- files.csv: `生存行数 (範囲指定)`, `消滅追加行数 (概算)`, `最多作者blame占有率`
-
-blame はファイル数分の SVN アクセスが発生するため、大規模リポジトリでは `-NoBlame` で高速化できます。
+blame はファイル数 × リビジョン数分の SVN アクセスが発生するため、大規模リポジトリでは時間がかかります。ただし `-Parallel` で並列化され、キャッシュ（`cache/blame/`）により再実行は高速化されます。
 
 ### Q. バイナリ変更回数 は何を反映していますか？
 
@@ -868,4 +867,4 @@ blame はファイル数分の SVN アクセスが発生するため、大規模
 
 ---
 
-*このドキュメントは NarutoCode Phase 1 の出力仕様に基づいています。*
+*このドキュメントは NarutoCode の現行実装に基づいています。*

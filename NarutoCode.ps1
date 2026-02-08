@@ -10,7 +10,66 @@
     - 共変更カップリング（Jaccard / Lift）
     - Strict 死亡帰属（リビジョン横断の行単位 birth/death 追跡）
 
-    出力は CSV レポートおよびオプションの PlantUML 可視化。
+    出力は CSV レポートおよび PlantUML / SVG 可視化。
+.PARAMETER RepoUrl
+    解析対象の SVN リポジトリ URL。trunk やブランチのパスまで含めて指定する。
+    例: https://svn.example.com/repos/myproject/trunk
+.PARAMETER FromRev
+    解析範囲の開始リビジョン番号。この番号のコミットから解析を開始する。
+.PARAMETER ToRev
+    解析範囲の終了リビジョン番号。この番号のコミットまでを解析対象とする。
+.PARAMETER SvnExecutable
+    使用する svn コマンドのパスまたは名前。デフォルトは 'svn'（PATH 上の svn を使用）。
+    別バージョンの svn を使いたい場合はフルパスを指定する。
+.PARAMETER OutDir
+    解析結果（CSV / PlantUML / SVG / キャッシュ）の出力先ディレクトリ。
+    未指定時はカレントディレクトリ直下に 'NarutoCode_out' を作成して使用する。
+    同じディレクトリを再利用するとキャッシュが効き、再実行が高速になる。
+.PARAMETER Username
+    SVN リポジトリへの認証に使用するユーザー名。
+    svn コマンドの --username オプションに渡される。
+    認証不要なリポジトリでは省略可。
+.PARAMETER Password
+    SVN リポジトリへの認証に使用するパスワード（SecureString 型）。
+    svn コマンドの --password オプションに渡される。
+    平文ではなく SecureString で受け取るため、スクリプト内でのみ復号される。
+.PARAMETER NonInteractive
+    svn コマンドに --non-interactive を付与し、対話的な認証プロンプトを抑止する。
+    CI/CD 環境など無人実行時に指定する。
+.PARAMETER TrustServerCert
+    svn コマンドに --trust-server-cert を付与し、SSL 証明書の検証をスキップする。
+    自己署名証明書の SVN サーバーに接続する場合に使用する。
+.PARAMETER Parallel
+    並列実行するワーカー数の上限。デフォルトは CPU コア数。
+    svn diff / blame の取得を並列化して高速化する。1 を指定すると逐次実行になる。
+.PARAMETER IncludePaths
+    解析対象に含めるパスパターンの配列（ワイルドカード対応）。
+    指定するとパターンに一致するファイルのみが解析対象になる。
+    例: @('src/*', 'lib/*')
+.PARAMETER ExcludePaths
+    解析対象から除外するパスパターンの配列（ワイルドカード対応）。
+    例: @('test/*', 'vendor/*')
+.PARAMETER IncludeExtensions
+    解析対象に含める拡張子の配列。先頭のドットは省略可。
+    指定するとこの拡張子のファイルのみが解析対象になる。
+    例: @('cs', 'java', '.xml')
+.PARAMETER ExcludeExtensions
+    解析対象から除外する拡張子の配列。先頭のドットは省略可。
+    例: @('dll', 'exe', 'png')
+.PARAMETER TopN
+    可視化（ホットスポット図・共変更ネットワーク等）に表示する上位件数。
+    デフォルトは 50。CSV レポートには全件出力されるため、このパラメータは
+    可視化の見やすさ制御のみに影響する。
+.PARAMETER Encoding
+    CSV や PlantUML など出力ファイルの文字エンコーディング。
+    UTF8（BOM なし）/ UTF8BOM / Unicode / ASCII から選択。デフォルトは UTF8。
+.PARAMETER IgnoreWhitespace
+    svn diff 実行時に空白・改行コードの差異を無視する。
+    指定すると --ignore-space-change および --ignore-eol-style が付与される。
+    インデント変更のみのコミットをチャーンから除外したい場合に有用。
+.PARAMETER NoProgress
+    進捗バー（Write-Progress）の出力を抑止する。
+    CI/CD のログやリダイレクト出力で余計な表示を避けたい場合に指定する。
 #>
 [CmdletBinding()]
 param(
