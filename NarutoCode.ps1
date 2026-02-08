@@ -49,6 +49,7 @@ if ($NoProgress)
     $ProgressPreference = 'SilentlyContinue'
 }
 
+# region Utility
 $script:StrictModeEnabled = $true
 $script:ColDeadAdded = '消滅追加行数'       # 追加されたが ToRev 時点で生存していない行数
 $script:ColSelfDead = '自己消滅行数'         # 追加した本人が後のコミットで削除した行数
@@ -4337,6 +4338,615 @@ function Write-CommitterRadarChart
     }
 }
 # endregion PlantUML 出力
+# region SVG 出力
+function ConvertTo-SvgNumberString
+{
+    <#
+    .SYNOPSIS
+        SVG 属性値向けに数値を InvariantCulture 文字列へ変換する。
+    #>
+    param([double]$Value)
+    return $Value.ToString('0.###', [System.Globalization.CultureInfo]::InvariantCulture)
+}
+function ConvertTo-SvgColor
+{
+    <#
+    .SYNOPSIS
+        スコアを赤→黄→緑のグラデーション色へ変換する。
+    .PARAMETER Score
+        正規化対象のスコア値を指定する。
+    .PARAMETER Min
+        スコア範囲の最小値を指定する。
+    .PARAMETER Max
+        スコア範囲の最大値を指定する。
+    #>
+    param([double]$Score, [double]$Min, [double]$Max)
+    $t = 0.0
+    if ($Max -gt $Min)
+    {
+        $t = ($Score - $Min) / ($Max - $Min)
+        if ($t -lt 0.0)
+        {
+            $t = 0.0
+        }
+        elseif ($t -gt 1.0)
+        {
+            $t = 1.0
+        }
+    }
+
+    $r = 0
+    $g = 0
+    $b = 0
+    if ($t -lt 0.5)
+    {
+        $local = $t / 0.5
+        $r = 231
+        $g = [int][Math]::Round(76 + ((255 - 76) * $local))
+        $b = [int][Math]::Round(60 + ((0 - 60) * $local))
+    }
+    else
+    {
+        $local = ($t - 0.5) / 0.5
+        $r = [int][Math]::Round(255 + ((46 - 255) * $local))
+        $g = [int][Math]::Round(255 + ((204 - 255) * $local))
+        $b = [int][Math]::Round(0 + ((113 - 0) * $local))
+    }
+
+    return ('#{0}{1}{2}' -f $r.ToString('X2'), $g.ToString('X2'), $b.ToString('X2')).ToLowerInvariant()
+}
+function ConvertTo-SvgEscapedText
+{
+    <#
+    .SYNOPSIS
+        SVG テキスト用に XML 特殊文字をエスケープする。
+    #>
+    param([string]$Text)
+    if ($null -eq $Text)
+    {
+        return ''
+    }
+    $escaped = [System.Security.SecurityElement]::Escape($Text)
+    if ($null -eq $escaped)
+    {
+        return ''
+    }
+    return $escaped
+}
+function Get-TreemapWorstAspectRatio
+{
+    <#
+    .SYNOPSIS
+        Squarified Treemap 行候補の worst aspect ratio を計算する。
+    #>
+    param([object[]]$RowItems, [double]$ShortSide)
+    $items = @($RowItems)
+    if ($items.Count -eq 0 -or $ShortSide -le 0)
+    {
+        return [double]::PositiveInfinity
+    }
+
+    $sumArea = 0.0
+    $maxArea = 0.0
+    $minArea = [double]::PositiveInfinity
+    foreach ($item in $items)
+    {
+        if ($null -eq $item)
+        {
+            continue
+        }
+        $area = [double]$item.Area
+        if ($area -le 0)
+        {
+            continue
+        }
+        $sumArea += $area
+        if ($area -gt $maxArea)
+        {
+            $maxArea = $area
+        }
+        if ($area -lt $minArea)
+        {
+            $minArea = $area
+        }
+    }
+
+    if ($sumArea -le 0 -or $maxArea -le 0 -or $minArea -le 0)
+    {
+        return [double]::PositiveInfinity
+    }
+
+    $shortSideSquare = $ShortSide * $ShortSide
+    $sumSquare = $sumArea * $sumArea
+    $ratioA = ($shortSideSquare * $maxArea) / $sumSquare
+    $ratioB = $sumSquare / ($shortSideSquare * $minArea)
+    if ($ratioA -gt $ratioB)
+    {
+        return $ratioA
+    }
+    return $ratioB
+}
+function Add-SquarifiedTreemapRow
+{
+    <#
+    .SYNOPSIS
+        Squarified Treemap の 1 行を現在矩形へ配置し、残り領域を返す。
+    #>
+    param([object[]]$RowItems, [double]$X, [double]$Y, [double]$Width, [double]$Height)
+    $items = @($RowItems)
+    $rectangles = New-Object 'System.Collections.Generic.List[object]'
+    if ($items.Count -eq 0)
+    {
+        return [pscustomobject]@{
+            Rectangles = @()
+            NextX = $X
+            NextY = $Y
+            NextWidth = $Width
+            NextHeight = $Height
+        }
+    }
+
+    $rowArea = 0.0
+    foreach ($item in $items)
+    {
+        $rowArea += [double]$item.Area
+    }
+
+    if ($Width -ge $Height)
+    {
+        $rowHeight = 0.0
+        if ($Width -gt 0)
+        {
+            $rowHeight = $rowArea / $Width
+        }
+        $rowHeight = [Math]::Max(0.0, [Math]::Min($rowHeight, $Height))
+        $currentX = $X
+        for ($index = 0
+            $index -lt $items.Count
+            $index++)
+        {
+            $item = $items[$index]
+            $cellWidth = 0.0
+            if ($rowHeight -gt 0)
+            {
+                $cellWidth = [double]$item.Area / $rowHeight
+            }
+            if ($index -eq ($items.Count - 1))
+            {
+                $cellWidth = ($X + $Width) - $currentX
+            }
+            $cellWidth = [Math]::Max(0.0, $cellWidth)
+            $rectangles.Add([pscustomobject]@{
+                    Item = $item.Item
+                    X = $currentX
+                    Y = $Y
+                    Width = $cellWidth
+                    Height = $rowHeight
+                }) | Out-Null
+            $currentX += $cellWidth
+        }
+        return [pscustomobject]@{
+            Rectangles = @($rectangles.ToArray())
+            NextX = $X
+            NextY = $Y + $rowHeight
+            NextWidth = $Width
+            NextHeight = [Math]::Max(0.0, $Height - $rowHeight)
+        }
+    }
+
+    $rowWidth = 0.0
+    if ($Height -gt 0)
+    {
+        $rowWidth = $rowArea / $Height
+    }
+    $rowWidth = [Math]::Max(0.0, [Math]::Min($rowWidth, $Width))
+    $currentY = $Y
+    for ($index = 0
+        $index -lt $items.Count
+        $index++)
+    {
+        $item = $items[$index]
+        $cellHeight = 0.0
+        if ($rowWidth -gt 0)
+        {
+            $cellHeight = [double]$item.Area / $rowWidth
+        }
+        if ($index -eq ($items.Count - 1))
+        {
+            $cellHeight = ($Y + $Height) - $currentY
+        }
+        $cellHeight = [Math]::Max(0.0, $cellHeight)
+        $rectangles.Add([pscustomobject]@{
+                Item = $item.Item
+                X = $X
+                Y = $currentY
+                Width = $rowWidth
+                Height = $cellHeight
+            }) | Out-Null
+        $currentY += $cellHeight
+    }
+    return [pscustomobject]@{
+        Rectangles = @($rectangles.ToArray())
+        NextX = $X + $rowWidth
+        NextY = $Y
+        NextWidth = [Math]::Max(0.0, $Width - $rowWidth)
+        NextHeight = $Height
+    }
+}
+function Get-SquarifiedTreemapLayout
+{
+    <#
+    .SYNOPSIS
+        Squarified Treemap アルゴリズムで重み付き項目の矩形配置を計算する。
+    #>
+    param([double]$X, [double]$Y, [double]$Width, [double]$Height, [object[]]$Items)
+    if ($Width -le 0 -or $Height -le 0)
+    {
+        return @()
+    }
+
+    $weighted = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($item in @($Items))
+    {
+        if ($null -eq $item)
+        {
+            continue
+        }
+        $weightValue = 0.0
+        try
+        {
+            $weightValue = [double]$item.Weight
+        }
+        catch
+        {
+            $weightValue = 0.0
+        }
+        $weightValue = [Math]::Max(1.0, $weightValue)
+        $weighted.Add([pscustomobject]@{
+                Item = $item
+                Weight = $weightValue
+            }) | Out-Null
+    }
+
+    if ($weighted.Count -eq 0)
+    {
+        return @()
+    }
+
+    $sortedItems = @($weighted.ToArray() | Sort-Object -Property @{Expression = 'Weight'
+            Descending = $true
+        })
+    $totalWeight = 0.0
+    foreach ($sortedItem in $sortedItems)
+    {
+        $totalWeight += [double]$sortedItem.Weight
+    }
+
+    $canvasArea = [Math]::Max(0.0, ($Width * $Height))
+    $scaledItems = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($sortedItem in $sortedItems)
+    {
+        $scaledArea = 0.0
+        if ($totalWeight -gt 0)
+        {
+            $scaledArea = ([double]$sortedItem.Weight / $totalWeight) * $canvasArea
+        }
+        elseif ($sortedItems.Count -gt 0)
+        {
+            $scaledArea = $canvasArea / [double]$sortedItems.Count
+        }
+        $scaledItems.Add([pscustomobject]@{
+                Item = $sortedItem.Item
+                Area = $scaledArea
+            }) | Out-Null
+    }
+
+    $result = New-Object 'System.Collections.Generic.List[object]'
+    $row = New-Object 'System.Collections.Generic.List[object]'
+    $remainingX = $X
+    $remainingY = $Y
+    $remainingWidth = $Width
+    $remainingHeight = $Height
+    $index = 0
+    while ($index -lt $scaledItems.Count)
+    {
+        if ($remainingWidth -le 0 -or $remainingHeight -le 0)
+        {
+            break
+        }
+
+        $candidate = $scaledItems[$index]
+        if ($row.Count -eq 0)
+        {
+            $row.Add($candidate) | Out-Null
+            $index++
+            continue
+        }
+
+        $shortSide = [Math]::Min($remainingWidth, $remainingHeight)
+        $currentWorst = Get-TreemapWorstAspectRatio -RowItems @($row.ToArray()) -ShortSide $shortSide
+        $trialRow = @($row.ToArray()) + $candidate
+        $trialWorst = Get-TreemapWorstAspectRatio -RowItems $trialRow -ShortSide $shortSide
+        if ($trialWorst -le $currentWorst)
+        {
+            $row.Add($candidate) | Out-Null
+            $index++
+            continue
+        }
+
+        $layout = Add-SquarifiedTreemapRow -RowItems @($row.ToArray()) -X $remainingX -Y $remainingY -Width $remainingWidth -Height $remainingHeight
+        foreach ($rect in @($layout.Rectangles))
+        {
+            $result.Add($rect) | Out-Null
+        }
+        $remainingX = [double]$layout.NextX
+        $remainingY = [double]$layout.NextY
+        $remainingWidth = [double]$layout.NextWidth
+        $remainingHeight = [double]$layout.NextHeight
+        $row.Clear()
+    }
+
+    if ($row.Count -gt 0 -and $remainingWidth -gt 0 -and $remainingHeight -gt 0)
+    {
+        $layout = Add-SquarifiedTreemapRow -RowItems @($row.ToArray()) -X $remainingX -Y $remainingY -Width $remainingWidth -Height $remainingHeight
+        foreach ($rect in @($layout.Rectangles))
+        {
+            $result.Add($rect) | Out-Null
+        }
+    }
+    return @($result.ToArray())
+}
+function Write-FileTreeMap
+{
+    <#
+    .SYNOPSIS
+        ファイル別メトリクスをディレクトリ単位の SVG ツリーマップとして出力する。
+    .PARAMETER OutDirectory
+        出力先ディレクトリを指定する。
+    .PARAMETER Files
+        Get-FileMetric の出力行を指定する。
+    .PARAMETER EncodingName
+        出力時に使用する文字エンコーディングを指定する。
+    #>
+    param([string]$OutDirectory, [object[]]$Files, [string]$EncodingName)
+    $svgWidth = 1200.0
+    $svgHeight = 800.0
+    $canvasMargin = 8.0
+    $rootX = $canvasMargin
+    $rootY = $canvasMargin
+    $rootWidth = $svgWidth - ($canvasMargin * 2.0)
+    $rootHeight = $svgHeight - ($canvasMargin * 2.0)
+    $directoryPadding = 4.0
+    $directoryHeaderHeight = 20.0
+    $minFileLabelWidth = 70.0
+    $minFileLabelHeight = 18.0
+
+    $directoryMap = @{}
+    $rankValues = New-Object 'System.Collections.Generic.List[double]'
+    foreach ($row in @($Files))
+    {
+        if ($null -eq $row)
+        {
+            continue
+        }
+
+        $filePath = ConvertTo-PathKey -Path ([string]$row.'ファイルパス')
+        if ([string]::IsNullOrWhiteSpace($filePath))
+        {
+            continue
+        }
+
+        $directoryPath = '(root)'
+        $fileName = $filePath
+        $lastSlash = $filePath.LastIndexOf('/')
+        if ($lastSlash -ge 0)
+        {
+            $directoryPath = $filePath.Substring(0, $lastSlash)
+            $fileName = $filePath.Substring($lastSlash + 1)
+        }
+        if ([string]::IsNullOrWhiteSpace($directoryPath))
+        {
+            $directoryPath = '(root)'
+        }
+        if ([string]::IsNullOrWhiteSpace($fileName))
+        {
+            $fileName = $filePath
+        }
+
+        $churnValue = 0.0
+        try
+        {
+            $churnValue = [double]$row.'総チャーン'
+        }
+        catch
+        {
+            $churnValue = 0.0
+        }
+        $weight = [Math]::Max(1.0, $churnValue)
+
+        $commitCount = 0
+        try
+        {
+            $commitCount = [int]$row.'コミット数'
+        }
+        catch
+        {
+            $commitCount = 0
+        }
+
+        $authorCount = 0
+        try
+        {
+            $authorCount = [int]$row.'作者数'
+        }
+        catch
+        {
+            $authorCount = 0
+        }
+
+        $rankValue = [double]($rankValues.Count + 1)
+        try
+        {
+            $rankValue = [double]$row.'ホットスポット順位'
+        }
+        catch
+        {
+            $rankValue = [double]($rankValues.Count + 1)
+        }
+        if ($rankValue -le 0)
+        {
+            $rankValue = [double]($rankValues.Count + 1)
+        }
+        $rankValues.Add($rankValue) | Out-Null
+
+        if (-not $directoryMap.ContainsKey($directoryPath))
+        {
+            $directoryMap[$directoryPath] = [pscustomobject]@{
+                DirectoryPath = $directoryPath
+                TotalWeight = 0.0
+                Files = New-Object 'System.Collections.Generic.List[object]'
+            }
+        }
+        $group = $directoryMap[$directoryPath]
+        $group.TotalWeight = [double]$group.TotalWeight + $weight
+        $group.Files.Add([pscustomobject]@{
+                DirectoryPath = $directoryPath
+                FilePath = $filePath
+                FileName = $fileName
+                Churn = $churnValue
+                Weight = $weight
+                CommitCount = $commitCount
+                AuthorCount = $authorCount
+                Rank = $rankValue
+            }) | Out-Null
+    }
+
+    $minRank = 1.0
+    $maxRank = 1.0
+    if ($rankValues.Count -gt 0)
+    {
+        $minRank = [double](($rankValues | Measure-Object -Minimum).Minimum)
+        $maxRank = [double](($rankValues | Measure-Object -Maximum).Maximum)
+    }
+
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 800">')
+    [void]$sb.AppendLine('  <style>')
+    [void]$sb.AppendLine('    .dir-frame { fill: none; stroke: #2c3e50; stroke-width: 2; }')
+    [void]$sb.AppendLine('    .dir-label { font-family: "Segoe UI", sans-serif; font-size: 13px; font-weight: 600; fill: #1f2d3d; }')
+    [void]$sb.AppendLine('    .file-label { font-family: "Segoe UI", sans-serif; font-size: 11px; fill: #17202a; pointer-events: none; }')
+    [void]$sb.AppendLine('  </style>')
+    [void]$sb.AppendLine('  <rect x="0" y="0" width="1200" height="800" fill="#f8f9fa" />')
+
+    if ($directoryMap.Count -eq 0)
+    {
+        [void]$sb.AppendLine('  <text class="dir-label" x="20" y="40">No file metrics available.</text>')
+        [void]$sb.AppendLine('</svg>')
+        Write-TextFile -FilePath (Join-Path $OutDirectory 'file_treemap.svg') -Content $sb.ToString() -EncodingName $EncodingName
+        return
+    }
+
+    $directoryItems = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($directoryPath in @($directoryMap.Keys))
+    {
+        $group = $directoryMap[$directoryPath]
+        $directoryItems.Add([pscustomobject]@{
+                Name = $directoryPath
+                Weight = [double]$group.TotalWeight
+                Group = $group
+            }) | Out-Null
+    }
+
+    $directoryRects = @(Get-SquarifiedTreemapLayout -X $rootX -Y $rootY -Width $rootWidth -Height $rootHeight -Items @($directoryItems.ToArray()))
+    foreach ($directoryRect in $directoryRects)
+    {
+        if ($null -eq $directoryRect -or $null -eq $directoryRect.Item -or $null -eq $directoryRect.Item.Group)
+        {
+            continue
+        }
+
+        $group = $directoryRect.Item.Group
+        $dirX = [double]$directoryRect.X
+        $dirY = [double]$directoryRect.Y
+        $dirWidth = [double]$directoryRect.Width
+        $dirHeight = [double]$directoryRect.Height
+        if ($dirWidth -le 0 -or $dirHeight -le 0)
+        {
+            continue
+        }
+
+        $dirXText = ConvertTo-SvgNumberString -Value $dirX
+        $dirYText = ConvertTo-SvgNumberString -Value $dirY
+        $dirWidthText = ConvertTo-SvgNumberString -Value $dirWidth
+        $dirHeightText = ConvertTo-SvgNumberString -Value $dirHeight
+        [void]$sb.AppendLine(("  <rect class=""dir-frame"" x=""{0}"" y=""{1}"" width=""{2}"" height=""{3}"" />" -f $dirXText, $dirYText, $dirWidthText, $dirHeightText))
+        if ($dirHeight -ge 18.0)
+        {
+            $headerXText = ConvertTo-SvgNumberString -Value ($dirX + 6.0)
+            $headerYText = ConvertTo-SvgNumberString -Value ($dirY + 15.0)
+            $headerText = ConvertTo-SvgEscapedText -Text ([string]$group.DirectoryPath)
+            [void]$sb.AppendLine(("  <text class=""dir-label"" x=""{0}"" y=""{1}"">{2}</text>" -f $headerXText, $headerYText, $headerText))
+        }
+
+        $innerX = $dirX + $directoryPadding
+        $innerY = $dirY + $directoryHeaderHeight + $directoryPadding
+        $innerWidth = $dirWidth - ($directoryPadding * 2.0)
+        $innerHeight = $dirHeight - $directoryHeaderHeight - ($directoryPadding * 2.0)
+        if ($innerWidth -le 0 -or $innerHeight -le 0)
+        {
+            continue
+        }
+
+        $fileItems = New-Object 'System.Collections.Generic.List[object]'
+        foreach ($fileData in @($group.Files.ToArray()))
+        {
+            $fileItems.Add([pscustomobject]@{
+                    Name = $fileData.FileName
+                    Weight = [double]$fileData.Weight
+                    Data = $fileData
+                }) | Out-Null
+        }
+        $fileRects = @(Get-SquarifiedTreemapLayout -X $innerX -Y $innerY -Width $innerWidth -Height $innerHeight -Items @($fileItems.ToArray()))
+        foreach ($fileRect in $fileRects)
+        {
+            if ($null -eq $fileRect -or $null -eq $fileRect.Item -or $null -eq $fileRect.Item.Data)
+            {
+                continue
+            }
+
+            $fileData = $fileRect.Item.Data
+            $fileX = [double]$fileRect.X
+            $fileY = [double]$fileRect.Y
+            $fileWidth = [double]$fileRect.Width
+            $fileHeight = [double]$fileRect.Height
+            if ($fileWidth -le 0 -or $fileHeight -le 0)
+            {
+                continue
+            }
+
+            $fillColor = ConvertTo-SvgColor -Score ([double]$fileData.Rank) -Min $minRank -Max $maxRank
+            $fileXText = ConvertTo-SvgNumberString -Value $fileX
+            $fileYText = ConvertTo-SvgNumberString -Value $fileY
+            $fileWidthText = ConvertTo-SvgNumberString -Value $fileWidth
+            $fileHeightText = ConvertTo-SvgNumberString -Value $fileHeight
+            $churnText = ConvertTo-SvgNumberString -Value ([double]$fileData.Churn)
+            $tooltip = '{0}: 総チャーン={1}, コミット数={2}, 作者数={3}' -f ([string]$fileData.FilePath), $churnText, ([int]$fileData.CommitCount), ([int]$fileData.AuthorCount)
+            $tooltipText = ConvertTo-SvgEscapedText -Text $tooltip
+            [void]$sb.AppendLine(("  <rect x=""{0}"" y=""{1}"" width=""{2}"" height=""{3}"" fill=""{4}"" stroke=""#ffffff"" stroke-width=""0.5""><title>{5}</title></rect>" -f $fileXText, $fileYText, $fileWidthText, $fileHeightText, $fillColor, $tooltipText))
+            if ($fileWidth -ge $minFileLabelWidth -and $fileHeight -ge $minFileLabelHeight)
+            {
+                $fileLabelX = ConvertTo-SvgNumberString -Value ($fileX + 3.0)
+                $fileLabelY = ConvertTo-SvgNumberString -Value ($fileY + 13.0)
+                $fileLabel = ConvertTo-SvgEscapedText -Text ([string]$fileData.FileName)
+                [void]$sb.AppendLine(("  <text class=""file-label"" x=""{0}"" y=""{1}"">{2}</text>" -f $fileLabelX, $fileLabelY, $fileLabel))
+            }
+        }
+    }
+
+    [void]$sb.AppendLine('</svg>')
+    Write-TextFile -FilePath (Join-Path $OutDirectory 'file_treemap.svg') -Content $sb.ToString() -EncodingName $EncodingName
+}
+# endregion SVG 出力
 # region 消滅行詳細
 function Get-DeadLineDetail
 {
@@ -5889,6 +6499,14 @@ function New-RunMetaData
             {
                 $null
             }
+            FileTreeMapSvg = if ($EmitCharts)
+            {
+                'file_treemap.svg'
+            }
+            else
+            {
+                $null
+            }
         }
     }
 }
@@ -6058,6 +6676,7 @@ try
     {
         Write-FileHeatMap -OutDirectory $OutDir -Files $fileRows -TopNCount $TopN -EncodingName $Encoding
         Write-CommitterRadarChart -OutDirectory $OutDir -Committers $committerRows -TopNCount $TopN -EncodingName $Encoding
+        Write-FileTreeMap -OutDirectory $OutDir -Files $fileRows -EncodingName $Encoding
     }
 
     # --- ステップ 8: 実行メタデータとサマリーの書き出し ---

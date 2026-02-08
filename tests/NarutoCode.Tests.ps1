@@ -1233,6 +1233,35 @@ Describe 'Write-CommitterRadarChart' {
     }
 }
 
+Describe 'Write-FileTreeMap' {
+    BeforeEach {
+        $script:treemapDir = Join-Path $env:TEMP ('narutocode_treemap_' + [guid]::NewGuid().ToString('N'))
+        New-Item -Path $script:treemapDir -ItemType Directory -Force | Out-Null
+    }
+    AfterEach {
+        Remove-Item -Path $script:treemapDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'creates SVG with rectangles and directory labels' {
+        $files = @(
+            [pscustomobject]@{ 'ファイルパス' = 'src/core/A.cs'; '総チャーン' = 12; 'コミット数' = 3; '作者数' = 2; 'ホットスポット順位' = 1 },
+            [pscustomobject]@{ 'ファイルパス' = 'src/core/B.cs'; '総チャーン' = 5; 'コミット数' = 2; '作者数' = 1; 'ホットスポット順位' = 2 },
+            [pscustomobject]@{ 'ファイルパス' = 'docs/readme.md'; '総チャーン' = 3; 'コミット数' = 1; '作者数' = 1; 'ホットスポット順位' = 3 }
+        )
+
+        Write-FileTreeMap -OutDirectory $script:treemapDir -Files $files -EncodingName 'UTF8'
+
+        $svgPath = Join-Path $script:treemapDir 'file_treemap.svg'
+        Test-Path $svgPath | Should -BeTrue
+        $content = Get-Content -Path $svgPath -Raw -Encoding UTF8
+        $content | Should -Match '<svg'
+        $content | Should -Match '<rect'
+        $content | Should -Match 'src/core'
+        $content | Should -Match 'docs'
+        $content | Should -Match 'A\.cs: 総チャーン='
+    }
+}
+
 Describe 'NarutoCode.ps1 execution' {
     It 'fails when svn executable does not exist' {
         $tempOut = Join-Path $env:TEMP ('narutocode_test_' + [guid]::NewGuid().ToString('N'))
