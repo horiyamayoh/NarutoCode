@@ -31,6 +31,7 @@ param(
     [string[]]$IncludeExtensions,
     [string[]]$ExcludeExtensions,
     [switch]$EmitPlantUml,
+    [switch]$EmitCharts,
     [ValidateRange(1, 5000)][int]$TopN = 50,
     [ValidateSet('UTF8', 'UTF8BOM', 'Unicode', 'ASCII')][string]$Encoding = 'UTF8',
     [switch]$IgnoreSpaceChange,
@@ -55,6 +56,7 @@ $script:ColOtherDead = '被他者消滅行数'      # 別の作者によって�
 $script:StrictBlameCacheHits = 0
 $script:StrictBlameCacheMisses = 0
 
+# region Utility
 # region 初期化
 function Initialize-StrictModeContext
 {
@@ -3606,6 +3608,286 @@ function Write-PlantUmlFile
     [void]$sb3.AppendLine('@enduml')
     Write-TextFile -FilePath (Join-Path $OutDirectory 'cochange_network.puml') -Content $sb3.ToString() -EncodingName $EncodingName
 }
+function Write-FileHeatMap
+{
+    <#
+    .SYNOPSIS
+        ファイル別メトリクスのヒートマップ SVG を出力する。
+    .DESCRIPTION
+        ホットスポット順位の上位ファイルを行、比較可能なメトリクスを列として
+        0-1 正規化したヒートマップを SVG で生成する。
+        Phase 2 の追加列が存在する場合は、同一ヒートマップへ列を拡張して描画する。
+    .PARAMETER OutDirectory
+        出力先ディレクトリを指定する。
+    .PARAMETER Files
+        Get-FileMetric が返すファイル別メトリクス行を指定する。
+    .PARAMETER TopNCount
+        ヒートマップ対象にする上位件数を指定する。
+    .PARAMETER EncodingName
+        出力時に使用する文字エンコーディングを指定する。
+    #>
+    [CmdletBinding()]
+    param([string]$OutDirectory, [object[]]$Files, [int]$TopNCount, [string]$EncodingName)
+    $metrics = @(
+        'コミット数',
+        '作者数',
+        '総チャーン',
+        '消滅追加行数',
+        '最多作者チャーン占有率',
+        '最多作者blame占有率',
+        '平均変更間隔日数',
+        'ホットスポットスコア'
+    )
+    if (@($Files).Count -gt 0 -and ($Files[0].PSObject.Properties.Name -contains '自己相殺行数 (合計)'))
+    {
+        $metrics += @(
+            '自己相殺行数 (合計)',
+            '他者差戻行数 (合計)',
+            '同一箇所反復編集数 (合計)',
+            'ピンポン回数 (合計)'
+        )
+    }
+    $targetFiles = @($Files | Sort-Object -Property 'ホットスポット順位')
+    if ($TopNCount -gt 0)
+    {
+        $targetFiles = @($targetFiles | Select-Object -First $TopNCount)
+    }
+
+    $toNumber = {
+        param([object]$Value)
+        if ($null -eq $Value)
+        {
+            return 0.0
+        }
+        if ($Value -is [byte] -or $Value -is [sbyte] -or $Value -is [int16] -or $Value -is [uint16] -or $Value -is [int32] -or $Value -is [uint32] -or $Value -is [int64] -or $Value -is [uint64] -or $Value -is [single] -or $Value -is [double] -or $Value -is [decimal])
+        {
+            return [double]$Value
+        }
+        $text = [string]$Value
+        if ([string]::IsNullOrWhiteSpace($text))
+        {
+            return 0.0
+        }
+        $numberStyles = [System.Globalization.NumberStyles]::Float -bor [System.Globalization.NumberStyles]::AllowThousands
+        $parsed = 0.0
+        if ([double]::TryParse($text, $numberStyles, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$parsed))
+        {
+            return $parsed
+        }
+        if ([double]::TryParse($text, $numberStyles, [System.Globalization.CultureInfo]::CurrentCulture, [ref]$parsed))
+        {
+            return $parsed
+        }
+        return 0.0
+    }
+
+    $toDisplayValue = {
+        param([object]$Value)
+        if ($null -eq $Value)
+        {
+            return '-'
+        }
+        if ($Value -is [double] -or $Value -is [single] -or $Value -is [decimal])
+        {
+            return ([double]$Value).ToString('0.####', [System.Globalization.CultureInfo]::InvariantCulture)
+        }
+        if ($Value -is [byte] -or $Value -is [sbyte] -or $Value -is [int16] -or $Value -is [uint16] -or $Value -is [int32] -or $Value -is [uint32] -or $Value -is [int64] -or $Value -is [uint64])
+        {
+            return [string]$Value
+        }
+        $text = [string]$Value
+        if ([string]::IsNullOrWhiteSpace($text))
+        {
+            return '-'
+        }
+        return $text
+    }
+
+    $escapeXml = {
+        param([string]$Text)
+        if ($null -eq $Text)
+        {
+            return ''
+        }
+        $escaped = [System.Security.SecurityElement]::Escape($Text)
+        if ($null -eq $escaped)
+        {
+            return ''
+        }
+        return $escaped
+    }
+
+    $toDisplayPath = {
+        param([string]$Path, [int]$MaxLength)
+        if ([string]::IsNullOrWhiteSpace($Path))
+        {
+            return ''
+        }
+        $normalizedPath = [string]$Path -replace '\\', '/'
+        if ($normalizedPath.Length -le $MaxLength)
+        {
+            return $normalizedPath
+        }
+        $fileName = Split-Path -Path $normalizedPath -Leaf
+        if ([string]::IsNullOrWhiteSpace($fileName))
+        {
+            $parts = @($normalizedPath -split '/')
+            if ($parts.Count -gt 0)
+            {
+                $fileName = [string]$parts[$parts.Count - 1]
+            }
+        }
+        if ([string]::IsNullOrWhiteSpace($fileName))
+        {
+            $fileName = $normalizedPath
+        }
+        $shortPath = '…/' + $fileName
+        if ($shortPath.Length -le $MaxLength)
+        {
+            return $shortPath
+        }
+        if ($MaxLength -le 1)
+        {
+            return '…'
+        }
+        $tailLength = $MaxLength - 1
+        if ($fileName.Length -le $tailLength)
+        {
+            return '…' + $fileName
+        }
+        return '…' + $fileName.Substring($fileName.Length - $tailLength)
+    }
+
+    $toCellColor = {
+        param([double]$NormalizedValue)
+        $v = [Math]::Max(0.0, [Math]::Min(1.0, [double]$NormalizedValue))
+        $r = [Math]::Round(255.0 + ((231.0 - 255.0) * $v))
+        $g = [Math]::Round(255.0 + ((76.0 - 255.0) * $v))
+        $b = [Math]::Round(255.0 + ((60.0 - 255.0) * $v))
+        return ('#{0}{1}{2}' -f ([int]$r).ToString('X2'), ([int]$g).ToString('X2'), ([int]$b).ToString('X2')).ToLowerInvariant()
+    }
+
+    $columnStats = @{}
+    foreach ($metric in $metrics)
+    {
+        $numbers = New-Object 'System.Collections.Generic.List[double]'
+        foreach ($row in $targetFiles)
+        {
+            $property = $row.PSObject.Properties[$metric]
+            $rawValue = $null
+            if ($null -ne $property)
+            {
+                $rawValue = $property.Value
+            }
+            $numbers.Add((& $toNumber $rawValue)) | Out-Null
+        }
+        $min = 0.0
+        $max = 0.0
+        if ($numbers.Count -gt 0)
+        {
+            $min = [double](($numbers | Measure-Object -Minimum).Minimum)
+            $max = [double](($numbers | Measure-Object -Maximum).Maximum)
+        }
+        $columnStats[$metric] = [pscustomobject]@{
+            Min = $min
+            Max = $max
+        }
+    }
+
+    $cellWidth = 120
+    $cellHeight = 30
+    $leftMargin = 250
+    $topMargin = 100
+    $rightMargin = 20
+    $bottomMargin = 20
+    $rowCount = @($targetFiles).Count
+    $columnCount = @($metrics).Count
+    $gridWidth = $columnCount * $cellWidth
+    $gridHeight = $rowCount * $cellHeight
+    $totalWidth = $leftMargin + $gridWidth + $rightMargin
+    $totalHeight = $topMargin + $gridHeight + $bottomMargin
+    $rowHeaderMaxLength = 34
+    $rowHeaderX = $leftMargin - 8
+    $gridRight = $leftMargin + $gridWidth
+
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine('<?xml version="1.0" encoding="UTF-8"?>')
+    [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {0} {1}" width="{0}" height="{1}">' -f $totalWidth, $totalHeight))
+    [void]$sb.AppendLine('  <defs>')
+    [void]$sb.AppendLine('    <style><![CDATA[')
+    [void]$sb.AppendLine('      text { font-family: "Segoe UI", "Meiryo", sans-serif; fill: #333333; }')
+    [void]$sb.AppendLine('      .row-header { font-size: 11px; text-anchor: end; dominant-baseline: middle; }')
+    [void]$sb.AppendLine('      .col-header { font-size: 11px; text-anchor: start; dominant-baseline: middle; }')
+    [void]$sb.AppendLine('      .cell-text { font-size: 10px; text-anchor: middle; dominant-baseline: middle; fill: #222222; }')
+    [void]$sb.AppendLine('    ]]></style>')
+    [void]$sb.AppendLine('  </defs>')
+    [void]$sb.AppendLine(('  <rect x="0" y="0" width="{0}" height="{1}" fill="#ffffff" />' -f $totalWidth, $totalHeight))
+
+    for ($columnIndex = 0
+        $columnIndex -lt $columnCount
+        $columnIndex++)
+    {
+        $metric = [string]$metrics[$columnIndex]
+        $headerX = $leftMargin + ($columnIndex * $cellWidth) + 10
+        $headerY = $topMargin - 12
+        [void]$sb.AppendLine(('  <text class="col-header" x="{0}" y="{1}" transform="rotate(-45 {0} {1})">{2}</text>' -f $headerX, $headerY, (& $escapeXml $metric)))
+    }
+
+    for ($rowIndex = 0
+        $rowIndex -le $rowCount
+        $rowIndex++)
+    {
+        $lineY = $topMargin + ($rowIndex * $cellHeight)
+        [void]$sb.AppendLine(('  <line x1="{0}" y1="{1}" x2="{2}" y2="{1}" stroke="#e6e6e6" stroke-width="1" />' -f $leftMargin, $lineY, $gridRight))
+    }
+
+    for ($rowIndex = 0
+        $rowIndex -lt $rowCount
+        $rowIndex++)
+    {
+        $row = $targetFiles[$rowIndex]
+        $filePath = [string]$row.'ファイルパス'
+        $displayPath = & $toDisplayPath $filePath $rowHeaderMaxLength
+        $rowY = $topMargin + ($rowIndex * $cellHeight)
+        $rowTextY = $rowY + [Math]::Round($cellHeight / 2.0)
+        [void]$sb.AppendLine(('  <text class="row-header" x="{0}" y="{1}">{2}</text>' -f $rowHeaderX, $rowTextY, (& $escapeXml $displayPath)))
+
+        for ($columnIndex = 0
+            $columnIndex -lt $columnCount
+            $columnIndex++)
+        {
+            $metric = [string]$metrics[$columnIndex]
+            $property = $row.PSObject.Properties[$metric]
+            $rawValue = $null
+            if ($null -ne $property)
+            {
+                $rawValue = $property.Value
+            }
+            $displayValue = & $toDisplayValue $rawValue
+            $numericValue = & $toNumber $rawValue
+            $stat = $columnStats[$metric]
+            $range = [double]$stat.Max - [double]$stat.Min
+            $normalizedValue = 0.0
+            if ($range -gt 0.0)
+            {
+                $normalizedValue = ($numericValue - [double]$stat.Min) / $range
+            }
+            $cellColor = & $toCellColor $normalizedValue
+            $cellX = $leftMargin + ($columnIndex * $cellWidth)
+            $cellTextX = $cellX + [Math]::Round($cellWidth / 2.0)
+            $cellTextY = $rowY + [Math]::Round($cellHeight / 2.0)
+            $title = '{0}: {1}={2}' -f $filePath, $metric, $displayValue
+            [void]$sb.AppendLine('  <g>')
+            [void]$sb.AppendLine(('    <title>{0}</title>' -f (& $escapeXml $title)))
+            [void]$sb.AppendLine(('    <rect x="{0}" y="{1}" width="{2}" height="{3}" fill="{4}" stroke="#d0d0d0" stroke-width="1" />' -f $cellX, $rowY, $cellWidth, $cellHeight, $cellColor))
+            [void]$sb.AppendLine(('    <text class="cell-text" x="{0}" y="{1}">{2}</text>' -f $cellTextX, $cellTextY, (& $escapeXml ([string]$displayValue))))
+            [void]$sb.AppendLine('  </g>')
+        }
+    }
+
+    [void]$sb.AppendLine('</svg>')
+    Write-TextFile -FilePath (Join-Path $OutDirectory 'file_heatmap.svg') -Content $sb.ToString() -EncodingName $EncodingName
+}
 # endregion PlantUML 出力
 # region 消滅行詳細
 function Get-DeadLineDetail
@@ -5024,6 +5306,8 @@ function New-RunMetaData
         対象を絞り込むための包含または除外条件を指定する。
     .PARAMETER EmitPlantUml
         EmitPlantUml の値を指定する。
+    .PARAMETER EmitCharts
+        EmitCharts の値を指定する。
     .PARAMETER NonInteractive
         NonInteractive の値を指定する。
     .PARAMETER TrustServerCert
@@ -5063,6 +5347,7 @@ function New-RunMetaData
         [string[]]$IncludeExtensions,
         [string[]]$ExcludeExtensions,
         [switch]$EmitPlantUml,
+        [switch]$EmitCharts,
         [switch]$NonInteractive,
         [switch]$TrustServerCert,
         [switch]$IgnoreSpaceChange,
@@ -5101,6 +5386,7 @@ function New-RunMetaData
             IncludeExtensions = $IncludeExtensions
             ExcludeExtensions = $ExcludeExtensions
             EmitPlantUml = [bool]$EmitPlantUml
+            EmitCharts = [bool]$EmitCharts
             NonInteractive = [bool]$NonInteractive
             TrustServerCert = [bool]$TrustServerCert
             IgnoreSpaceChange = [bool]$IgnoreSpaceChange
@@ -5134,6 +5420,14 @@ function New-RunMetaData
             CoChangePlantUml = if ($EmitPlantUml)
             {
                 'cochange_network.puml'
+            }
+            else
+            {
+                $null
+            }
+            FileHeatMapSvg = if ($EmitCharts)
+            {
+                'file_heatmap.svg'
             }
             else
             {
@@ -5214,6 +5508,7 @@ function Get-RenameMap
 }
 
 # endregion ヘッダーとメタデータ
+# endregion Utility
 try
 {
     # --- ステップ 1: パラメータの初期化と検証 ---
@@ -5298,15 +5593,19 @@ try
     Write-CsvFile -FilePath (Join-Path $OutDir 'files.csv') -Rows $fileRows -Headers $headers.File -EncodingName $Encoding
     Write-CsvFile -FilePath (Join-Path $OutDir 'commits.csv') -Rows $commitRows -Headers $headers.Commit -EncodingName $Encoding
     Write-CsvFile -FilePath (Join-Path $OutDir 'couplings.csv') -Rows $couplingRows -Headers $headers.Coupling -EncodingName $Encoding
-    # --- ステップ 7: PlantUML 出力（指定時のみ） ---
+    # --- ステップ 7: 可視化出力（指定時のみ） ---
     if ($EmitPlantUml)
     {
         Write-PlantUmlFile -OutDirectory $OutDir -Committers $committerRows -Files $fileRows -Couplings $couplingRows -TopNCount $TopN -EncodingName $Encoding
     }
+    if ($EmitCharts)
+    {
+        Write-FileHeatMap -OutDirectory $OutDir -Files $fileRows -TopNCount $TopN -EncodingName $Encoding
+    }
 
     # --- ステップ 8: 実行メタデータとサマリーの書き出し ---
     $finishedAt = Get-Date
-    $meta = New-RunMetaData -StartTime $startedAt -EndTime $finishedAt -TargetUrl $targetUrl -FromRevision $FromRev -ToRevision $ToRev -AuthorFilter $Author -SvnVersion $svnVersion -NoBlame:$NoBlame -DeadDetailLevel $DeadDetailLevel -Parallel $Parallel -TopN $TopN -Encoding $Encoding -Commits $commits -FileRows $fileRows -OutDir $OutDir -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -EmitPlantUml:$EmitPlantUml -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -IgnoreSpaceChange:$IgnoreSpaceChange -IgnoreAllSpace:$IgnoreAllSpace -IgnoreEolStyle:$IgnoreEolStyle -IncludeProperties:$IncludeProperties -ForceBinary:$ForceBinary
+    $meta = New-RunMetaData -StartTime $startedAt -EndTime $finishedAt -TargetUrl $targetUrl -FromRevision $FromRev -ToRevision $ToRev -AuthorFilter $Author -SvnVersion $svnVersion -NoBlame:$NoBlame -DeadDetailLevel $DeadDetailLevel -Parallel $Parallel -TopN $TopN -Encoding $Encoding -Commits $commits -FileRows $fileRows -OutDir $OutDir -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -EmitPlantUml:$EmitPlantUml -EmitCharts:$EmitCharts -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -IgnoreSpaceChange:$IgnoreSpaceChange -IgnoreAllSpace:$IgnoreAllSpace -IgnoreEolStyle:$IgnoreEolStyle -IncludeProperties:$IncludeProperties -ForceBinary:$ForceBinary
     Write-JsonFile -Data $meta -FilePath (Join-Path $OutDir 'run_meta.json') -Depth 12 -EncodingName $Encoding
 
     Write-RunSummary -TargetUrl $targetUrl -FromRevision $FromRev -ToRevision $ToRev -Commits $commits -FileRows $fileRows -OutDir $OutDir
