@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     SVN リポジトリの履歴を解析し、コミット品質・変更傾向のメトリクスを生成する。
 .DESCRIPTION
@@ -5290,7 +5290,7 @@ function New-RunMetaData
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
-    [OutputType([hashtable])]
+    [OutputType([System.Collections.Specialized.OrderedDictionary])]
     param(
         [datetime]$StartTime,
         [datetime]$EndTime,
