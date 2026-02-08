@@ -8,11 +8,13 @@ BeforeAll {
     $script:ScriptPath = Join-Path (Join-Path $here '..') 'NarutoCode.ps1'
 
     $scriptContent = Get-Content -Path $script:ScriptPath -Raw -Encoding UTF8
-    # Extract all region blocks (from first "# region" to last "# endregion") which contain all function definitions
-    $regionPattern = '(?s)(# region .+?# endregion [^\r\n]+)'
-    $allRegions = [regex]::Matches($scriptContent, $regionPattern)
-    if ($allRegions.Count -gt 0) {
-        $functionBlock = ($allRegions | ForEach-Object { $_.Value }) -join "`r`n"
+    # Extract the script-scope variables and all region blocks (functions) from
+    # NarutoCode.ps1, skipping the param() block at the top and the try/catch
+    # execution body at the bottom.
+    $regionPattern = '(?s)(\$script:StrictModeEnabled\b.*# endregion [^\r\n]+)'
+    if ($scriptContent -match $regionPattern)
+    {
+        $functionBlock = $Matches[1]
         $script:SvnExecutable = 'svn'
         $script:SvnGlobalArguments = @()
         $script:StrictModeEnabled = $true
@@ -25,9 +27,11 @@ BeforeAll {
         Set-Content -Path $tempFile -Value $functionBlock -Encoding UTF8
         . $tempFile
         Remove-Item $tempFile -ErrorAction SilentlyContinue
+        Initialize-StrictModeContext
     }
-    else {
-        throw 'Could not extract utility functions from NarutoCode.ps1.'
+    else
+    {
+        throw 'Could not extract function regions from NarutoCode.ps1.'
     }
 }
 
@@ -1044,6 +1048,7 @@ Describe 'Write-PlantUmlFile' {
     }
 }
 
+<<<<<<< HEAD
 Describe 'Write-FileBubbleChart' {
     BeforeEach {
         $script:svgDir = Join-Path $env:TEMP ('narutocode_svg_' + [guid]::NewGuid().ToString('N'))
@@ -1079,6 +1084,226 @@ Describe 'Write-FileBubbleChart' {
         $content | Should -Match '<circle'
         $content | Should -Match 'コミット数'
         $content | Should -Match '作者数'
+    }
+}
+Describe 'Write-FileHeatMap' {
+    BeforeEach {
+        $script:heatMapDir = Join-Path $env:TEMP ('narutocode_heatmap_' + [guid]::NewGuid().ToString('N'))
+        New-Item -Path $script:heatMapDir -ItemType Directory -Force | Out-Null
+    }
+
+    AfterEach {
+        Remove-Item -Path $script:heatMapDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'creates heatmap svg with base metric columns' {
+        $files = @(
+            [pscustomobject]@{
+                'ファイルパス' = 'src/very/long/path/to/module/FileA.cs'
+                'ホットスポット順位' = 2
+                'コミット数' = 10
+                '作者数' = 2
+                '総チャーン' = 120
+                '消滅追加行数' = 30
+                '最多作者チャーン占有率' = 0.75
+                '最多作者blame占有率' = 0.80
+                '平均変更間隔日数' = 3.5
+                'ホットスポットスコア' = 1200
+            },
+            [pscustomobject]@{
+                'ファイルパス' = 'src/FileB.cs'
+                'ホットスポット順位' = 1
+                'コミット数' = 5
+                '作者数' = 3
+                '総チャーン' = 60
+                '消滅追加行数' = 12
+                '最多作者チャーン占有率' = 0.55
+                '最多作者blame占有率' = 0.50
+                '平均変更間隔日数' = 8.0
+                'ホットスポットスコア' = 300
+            }
+        )
+
+        Write-FileHeatMap -OutDirectory $script:heatMapDir -Files $files -TopNCount 2 -EncodingName 'UTF8'
+
+        $svgPath = Join-Path $script:heatMapDir 'file_heatmap.svg'
+        Test-Path $svgPath | Should -BeTrue
+
+        $content = Get-Content -Path $svgPath -Raw -Encoding UTF8
+        $content | Should -Match '<rect'
+        $content | Should -Match 'コミット数'
+        $content | Should -Match 'ホットスポットスコア'
+        $content | Should -Match 'FileB\.cs'
+        $content | Should -Not -Match '自己相殺行数 \(合計\)'
+    }
+
+    It 'includes phase 2 metric columns when properties exist' {
+        $files = @(
+            [pscustomobject]@{
+                'ファイルパス' = 'src/FileC.cs'
+                'ホットスポット順位' = 1
+                'コミット数' = 9
+                '作者数' = 2
+                '総チャーン' = 90
+                '消滅追加行数' = 20
+                '最多作者チャーン占有率' = 0.60
+                '最多作者blame占有率' = 0.65
+                '平均変更間隔日数' = 2.0
+                'ホットスポットスコア' = 810
+                '自己相殺行数 (合計)' = 3
+                '他者差戻行数 (合計)' = 4
+                '同一箇所反復編集数 (合計)' = 5
+                'ピンポン回数 (合計)' = 6
+            },
+            [pscustomobject]@{
+                'ファイルパス' = 'src/FileD.cs'
+                'ホットスポット順位' = 2
+                'コミット数' = 3
+                '作者数' = 1
+                '総チャーン' = 25
+                '消滅追加行数' = 3
+                '最多作者チャーン占有率' = 0.50
+                '最多作者blame占有率' = 0.52
+                '平均変更間隔日数' = 10.0
+                'ホットスポットスコア' = 75
+                '自己相殺行数 (合計)' = 0
+                '他者差戻行数 (合計)' = 1
+                '同一箇所反復編集数 (合計)' = 0
+                'ピンポン回数 (合計)' = 2
+            }
+        )
+
+        Write-FileHeatMap -OutDirectory $script:heatMapDir -Files $files -TopNCount 2 -EncodingName 'UTF8'
+
+        $svgPath = Join-Path $script:heatMapDir 'file_heatmap.svg'
+        $content = Get-Content -Path $svgPath -Raw -Encoding UTF8
+
+        $content | Should -Match '自己相殺行数 \(合計\)'
+        $content | Should -Match '他者差戻行数 \(合計\)'
+        $content | Should -Match '同一箇所反復編集数 \(合計\)'
+        $content | Should -Match 'ピンポン回数 \(合計\)'
+        $content | Should -Match 'FileC\.cs'
+    }
+}
+
+Describe 'Write-CommitterRadarChart' {
+    BeforeEach {
+        $script:chartDir = Join-Path $env:TEMP ('narutocode_chart_' + [guid]::NewGuid().ToString('N'))
+        New-Item -Path $script:chartDir -ItemType Directory -Force | Out-Null
+    }
+    AfterEach {
+        Remove-Item -Path $script:chartDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'creates committer radar svg files for top committers' {
+        $committers = @(
+            [pscustomobject]@{
+                '作者' = 'alice'
+                '総チャーン' = 200
+                '追加行数' = 100
+                '生存行数' = 80
+                'チャーン対純増比' = 2.5
+                '自己相殺行数' = 10
+                '被他者削除行数' = 5
+                '他者コード変更行数' = 20
+                '他者コード変更生存行数' = 12
+                'ピンポン回数' = 2
+                'コミット数' = 10
+                '課題ID言及数' = 8
+            },
+            [pscustomobject]@{
+                '作者' = 'bob'
+                '総チャーン' = 150
+                '追加行数' = 80
+                '生存行数' = 40
+                'チャーン対純増比' = 4.0
+                '自己相殺行数' = 20
+                '被他者削除行数' = 10
+                '他者コード変更行数' = 0
+                '他者コード変更生存行数' = 0
+                'ピンポン回数' = 3
+                'コミット数' = 12
+                '課題ID言及数' = 6
+            },
+            [pscustomobject]@{
+                '作者' = 'binary-only'
+                '総チャーン' = 999
+                '追加行数' = 0
+                '生存行数' = 0
+                'チャーン対純増比' = 0
+                '自己相殺行数' = 0
+                '被他者削除行数' = 0
+                '他者コード変更行数' = 0
+                '他者コード変更生存行数' = 0
+                'ピンポン回数' = 0
+                'コミット数' = 1
+                '課題ID言及数' = 0
+            }
+        )
+
+        Write-CommitterRadarChart -OutDirectory $script:chartDir -Committers $committers -TopNCount 2 -EncodingName 'UTF8'
+
+        Test-Path (Join-Path $script:chartDir 'committer_radar_alice.svg') | Should -BeTrue
+        Test-Path (Join-Path $script:chartDir 'committer_radar_bob.svg') | Should -BeTrue
+        Test-Path (Join-Path $script:chartDir 'committer_radar_binary-only.svg') | Should -BeFalse
+    }
+
+    It 'svg contains expected tags, author, and axis labels' {
+        $committers = @(
+            [pscustomobject]@{
+                '作者' = 'charlie'
+                '総チャーン' = 10
+                '追加行数' = 20
+                '生存行数' = 15
+                'チャーン対純増比' = 1.5
+                '自己相殺行数' = 1
+                '被他者削除行数' = 2
+                '他者コード変更行数' = 4
+                '他者コード変更生存行数' = 3
+                'ピンポン回数' = 1
+                'コミット数' = 5
+                '課題ID言及数' = 3
+            }
+        )
+
+        Write-CommitterRadarChart -OutDirectory $script:chartDir -Committers $committers -TopNCount 1 -EncodingName 'UTF8'
+
+        $content = Get-Content -Path (Join-Path $script:chartDir 'committer_radar_charlie.svg') -Raw -Encoding UTF8
+        $content | Should -Match '<svg'
+        $content | Should -Match '</svg>'
+        $content | Should -Match 'charlie'
+        $content | Should -Match 'コード生存率'
+        $content | Should -Match 'プロセス遵守'
+    }
+}
+
+Describe 'Write-FileTreeMap' {
+    BeforeEach {
+        $script:treemapDir = Join-Path $env:TEMP ('narutocode_treemap_' + [guid]::NewGuid().ToString('N'))
+        New-Item -Path $script:treemapDir -ItemType Directory -Force | Out-Null
+    }
+    AfterEach {
+        Remove-Item -Path $script:treemapDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'creates SVG with rectangles and directory labels' {
+        $files = @(
+            [pscustomobject]@{ 'ファイルパス' = 'src/core/A.cs'; '総チャーン' = 12; 'コミット数' = 3; '作者数' = 2; 'ホットスポット順位' = 1 },
+            [pscustomobject]@{ 'ファイルパス' = 'src/core/B.cs'; '総チャーン' = 5; 'コミット数' = 2; '作者数' = 1; 'ホットスポット順位' = 2 },
+            [pscustomobject]@{ 'ファイルパス' = 'docs/readme.md'; '総チャーン' = 3; 'コミット数' = 1; '作者数' = 1; 'ホットスポット順位' = 3 }
+        )
+
+        Write-FileTreeMap -OutDirectory $script:treemapDir -Files $files -EncodingName 'UTF8'
+
+        $svgPath = Join-Path $script:treemapDir 'file_treemap.svg'
+        Test-Path $svgPath | Should -BeTrue
+        $content = Get-Content -Path $svgPath -Raw -Encoding UTF8
+        $content | Should -Match '<svg'
+        $content | Should -Match '<rect'
+        $content | Should -Match 'src/core'
+        $content | Should -Match 'docs'
+        $content | Should -Match 'A\.cs: 総チャーン='
+>>>>>>> origin/main
     }
 }
 
