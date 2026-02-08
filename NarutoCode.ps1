@@ -1254,7 +1254,7 @@ function Invoke-SvnCommandAllowMissingTarget
         throw
     }
 }
-function New-EmptyBlameResult
+function Get-EmptyBlameResult
 {
     <#
     .SYNOPSIS
@@ -1916,7 +1916,7 @@ function Get-SvnBlameSummary
     }
     if ([string]::IsNullOrEmpty($text))
     {
-        return (New-EmptyBlameResult)
+        return (Get-EmptyBlameResult)
     }
     return (ConvertFrom-SvnBlameXml -XmlText $text)
 }
@@ -1965,7 +1965,7 @@ function Get-SvnBlameLine
     }
     if ([string]::IsNullOrEmpty($blameXml) -or $null -eq $catText)
     {
-        return (New-EmptyBlameResult)
+        return (Get-EmptyBlameResult)
     }
     $contentLines = ConvertTo-TextLine -Text $catText
     return (ConvertFrom-SvnBlameXml -XmlText $blameXml -ContentLines $contentLines)
@@ -2895,6 +2895,9 @@ function Invoke-StrictBlameCachePrefetch
             'Write-CatCacheFile',
             'Join-CommandArgument',
             'Invoke-SvnCommand',
+            'Test-SvnMissingTargetError',
+            'Invoke-SvnCommandAllowMissingTarget',
+            'Get-EmptyBlameResult',
             'Initialize-SvnBlameLineCache'
         ) -SessionVariables @{
             SvnExecutable = $script:SvnExecutable
@@ -7740,6 +7743,9 @@ function Update-StrictAttributionMetric
                 'ConvertFrom-SvnBlameXml',
                 'Join-CommandArgument',
                 'Invoke-SvnCommand',
+                'Test-SvnMissingTargetError',
+                'Invoke-SvnCommandAllowMissingTarget',
+                'Get-EmptyBlameResult',
                 'Get-SvnBlameSummary'
             ) -SessionVariables @{
                 SvnExecutable = $script:SvnExecutable
