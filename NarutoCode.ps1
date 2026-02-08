@@ -3731,6 +3731,7 @@ function Get-SafeFileName
     if ($safe.Length -gt $maxBaseLen)
     {
         # 長すぎる場合は切り詰めてハッシュを付与
+        # NOTE: MD5 はセキュリティ目的ではなく、ファイル名の一意性確保のみに使用
         $hash = [BitConverter]::ToString([System.Security.Cryptography.MD5]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($safe))).Replace('-', '').Substring(0, 8).ToLowerInvariant()
         $truncLen = $maxBaseLen - 9
         if ($truncLen -lt 1)
@@ -3983,8 +3984,9 @@ function Write-CommitterRadarChart
         }
 
         # 安全なファイル名を生成（予約名・長さ制限対応）
-        # まず著者名を安全化してから、プレフィックスを付与する
-        $safeAuthor = Get-SafeFileName -BaseName $authorName -Extension '' -MaxLength 50
+        # 著者名のみを先にサニタイズ（予約名処理のため、長さ制限なし）
+        $safeAuthor = Get-SafeFileName -BaseName $authorName -Extension '' -MaxLength 999
+        # フルファイル名を生成し、長さ制限を適用
         $fileName = Get-SafeFileName -BaseName "committer_radar_$safeAuthor" -Extension '.svg' -MaxLength 100
         if (-not $usedNames.Add($fileName))
         {
