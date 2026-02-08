@@ -3772,8 +3772,18 @@ function Write-FileBubbleChart
     $rankStartColor = ConvertTo-SvgColor -Rank 1 -MaxRank $maxRank
     $rankEndColor = ConvertTo-SvgColor -Rank $maxRank -MaxRank $maxRank
 
+    # XML 宣言の encoding を、実際の書き込みエンコーディングと一致させる
+    $xmlEncoding = if ($null -ne $EncodingName -and $EncodingName -ne '')
+    {
+        $EncodingName
+    }
+    else
+    {
+        'UTF-8'
+    }
+
     $sb = New-Object System.Text.StringBuilder
-    [void]$sb.AppendLine('<?xml version="1.0" encoding="UTF-8"?>')
+    [void]$sb.AppendLine(('<?xml version="1.0" encoding="{0}"?>' -f $xmlEncoding))
     [void]$sb.AppendLine('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 700">')
     [void]$sb.AppendLine('  <defs>')
     [void]$sb.AppendLine('    <linearGradient id="rankGradient" x1="0%" y1="0%" x2="100%" y2="0%">')
