@@ -21,6 +21,7 @@ BeforeAll {
         Set-Content -Path $tempFile -Value $functionBlock -Encoding UTF8
         . $tempFile
         Remove-Item $tempFile -ErrorAction SilentlyContinue
+        Initialize-StrictModeContext
     }
     else
     {
@@ -1038,6 +1039,106 @@ Describe 'Write-PlantUmlFile' {
         $content | Should -Match 'X\.cs'
         $content | Should -Match 'Y\.cs'
         $content | Should -Match 'co=2'
+    }
+}
+
+Describe 'Write-FileHeatMap' {
+    BeforeEach {
+        $script:heatMapDir = Join-Path $env:TEMP ('narutocode_heatmap_' + [guid]::NewGuid().ToString('N'))
+        New-Item -Path $script:heatMapDir -ItemType Directory -Force | Out-Null
+    }
+
+    AfterEach {
+        Remove-Item -Path $script:heatMapDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'creates heatmap svg with base metric columns' {
+        $files = @(
+            [pscustomobject]@{
+                'ファイルパス' = 'src/very/long/path/to/module/FileA.cs'
+                'ホットスポット順位' = 2
+                'コミット数' = 10
+                '作者数' = 2
+                '総チャーン' = 120
+                '消滅追加行数' = 30
+                '最多作者チャーン占有率' = 0.75
+                '最多作者blame占有率' = 0.80
+                '平均変更間隔日数' = 3.5
+                'ホットスポットスコア' = 1200
+            },
+            [pscustomobject]@{
+                'ファイルパス' = 'src/FileB.cs'
+                'ホットスポット順位' = 1
+                'コミット数' = 5
+                '作者数' = 3
+                '総チャーン' = 60
+                '消滅追加行数' = 12
+                '最多作者チャーン占有率' = 0.55
+                '最多作者blame占有率' = 0.50
+                '平均変更間隔日数' = 8.0
+                'ホットスポットスコア' = 300
+            }
+        )
+
+        Write-FileHeatMap -OutDirectory $script:heatMapDir -Files $files -TopNCount 2 -EncodingName 'UTF8'
+
+        $svgPath = Join-Path $script:heatMapDir 'file_heatmap.svg'
+        Test-Path $svgPath | Should -BeTrue
+
+        $content = Get-Content -Path $svgPath -Raw -Encoding UTF8
+        $content | Should -Match '<rect'
+        $content | Should -Match 'コミット数'
+        $content | Should -Match 'ホットスポットスコア'
+        $content | Should -Match 'FileB\.cs'
+        $content | Should -Not -Match '自己相殺行数 \(合計\)'
+    }
+
+    It 'includes phase 2 metric columns when properties exist' {
+        $files = @(
+            [pscustomobject]@{
+                'ファイルパス' = 'src/FileC.cs'
+                'ホットスポット順位' = 1
+                'コミット数' = 9
+                '作者数' = 2
+                '総チャーン' = 90
+                '消滅追加行数' = 20
+                '最多作者チャーン占有率' = 0.60
+                '最多作者blame占有率' = 0.65
+                '平均変更間隔日数' = 2.0
+                'ホットスポットスコア' = 810
+                '自己相殺行数 (合計)' = 3
+                '他者差戻行数 (合計)' = 4
+                '同一箇所反復編集数 (合計)' = 5
+                'ピンポン回数 (合計)' = 6
+            },
+            [pscustomobject]@{
+                'ファイルパス' = 'src/FileD.cs'
+                'ホットスポット順位' = 2
+                'コミット数' = 3
+                '作者数' = 1
+                '総チャーン' = 25
+                '消滅追加行数' = 3
+                '最多作者チャーン占有率' = 0.50
+                '最多作者blame占有率' = 0.52
+                '平均変更間隔日数' = 10.0
+                'ホットスポットスコア' = 75
+                '自己相殺行数 (合計)' = 0
+                '他者差戻行数 (合計)' = 1
+                '同一箇所反復編集数 (合計)' = 0
+                'ピンポン回数 (合計)' = 2
+            }
+        )
+
+        Write-FileHeatMap -OutDirectory $script:heatMapDir -Files $files -TopNCount 2 -EncodingName 'UTF8'
+
+        $svgPath = Join-Path $script:heatMapDir 'file_heatmap.svg'
+        $content = Get-Content -Path $svgPath -Raw -Encoding UTF8
+
+        $content | Should -Match '自己相殺行数 \(合計\)'
+        $content | Should -Match '他者差戻行数 \(合計\)'
+        $content | Should -Match '同一箇所反復編集数 \(合計\)'
+        $content | Should -Match 'ピンポン回数 \(合計\)'
+        $content | Should -Match 'FileC\.cs'
     }
 }
 
