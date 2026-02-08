@@ -3284,6 +3284,8 @@ function Get-CommitterMetric
                 $script:ColOtherDead = $null
                 '他者コード変更行数' = $null
                 '他者コード変更生存行数' = $null
+                '他者コード変更生存率' = $null
+                'コミットあたりピンポン' = $null
                 '変更エントロピー' = Format-MetricValue -Value $entropy
                 '平均共同作者数' = Format-MetricValue -Value $coAvg
                 '最大共同作者数' = [int]$coMax
@@ -4324,7 +4326,7 @@ function Write-CommitterRadarChart
             Invert = $false
         },
         [pscustomobject][ordered]@{
-            Label = '手戻り効率'
+            Label = '削除対追加比'
             Invert = $true
         },
         [pscustomobject][ordered]@{
@@ -4336,15 +4338,15 @@ function Write-CommitterRadarChart
             Invert = $true
         },
         [pscustomobject][ordered]@{
-            Label = '他者改善力'
+            Label = '他者コード変更生存率'
             Invert = $false
         },
         [pscustomobject][ordered]@{
-            Label = '反復回避'
+            Label = 'コミットあたりピンポン'
             Invert = $true
         },
         [pscustomobject][ordered]@{
-            Label = 'プロセス遵守'
+            Label = '所有集中度'
             Invert = $false
         }
     )
@@ -4372,10 +4374,10 @@ function Write-CommitterRadarChart
         {
             $survivedLines = [double]$committer.'生存行数'
         }
-        $churnToNetRatio = 0.0
-        if ($null -ne $committer.'チャーン対純増比')
+        $deletedLines = 0.0
+        if ($null -ne $committer.'削除行数')
         {
-            $churnToNetRatio = [double]$committer.'チャーン対純増比'
+            $deletedLines = [double]$committer.'削除行数'
         }
         $selfCancelLines = 0.0
         if ($null -ne $committer.'自己相殺行数')
@@ -4387,30 +4389,20 @@ function Write-CommitterRadarChart
         {
             $removedByOthers = [double]$committer.'被他者削除行数'
         }
-        $changedOthersLines = 0.0
-        if ($null -ne $committer.'他者コード変更行数')
+        $otherChangeRate = 0.0
+        if ($null -ne $committer.'他者コード変更生存率')
         {
-            $changedOthersLines = [double]$committer.'他者コード変更行数'
+            $otherChangeRate = [double]$committer.'他者コード変更生存率'
         }
-        $changedOthersSurvived = 0.0
-        if ($null -ne $committer.'他者コード変更生存行数')
+        $pingPongPerCommit = 0.0
+        if ($null -ne $committer.'コミットあたりピンポン')
         {
-            $changedOthersSurvived = [double]$committer.'他者コード変更生存行数'
+            $pingPongPerCommit = [double]$committer.'コミットあたりピンポン'
         }
-        $commitCount = 0.0
-        if ($null -ne $committer.'コミット数')
+        $ownershipShare = 0.0
+        if ($null -ne $committer.'所有割合')
         {
-            $commitCount = [double]$committer.'コミット数'
-        }
-        $pingPongCount = 0.0
-        if ($null -ne $committer.'ピンポン回数')
-        {
-            $pingPongCount = [double]$committer.'ピンポン回数'
-        }
-        $issueMentionCount = 0.0
-        if ($null -ne $committer.'課題ID言及数')
-        {
-            $issueMentionCount = [double]$committer.'課題ID言及数'
+            $ownershipShare = [double]$committer.'所有割合'
         }
         $totalChurn = 0.0
         if ($null -ne $committer.'総チャーン')
@@ -4418,28 +4410,14 @@ function Write-CommitterRadarChart
             $totalChurn = [double]$committer.'総チャーン'
         }
 
-        $processCompliance = 0.0
-        $repeatAvoidance = 0.0
-        if ($commitCount -gt 0)
-        {
-            $processCompliance = $issueMentionCount / $commitCount
-            $repeatAvoidance = $pingPongCount / $commitCount
-        }
-
-        $otherImprovement = 0.0
-        if ($changedOthersLines -gt 0)
-        {
-            $otherImprovement = $changedOthersSurvived / $changedOthersLines
-        }
-
         $rawScores = [ordered]@{
             'コード生存率' = $survivedLines / $addedLines
-            '手戻り効率' = $churnToNetRatio
+            '削除対追加比' = $deletedLines / $addedLines
             '自己相殺率' = $selfCancelLines / $addedLines
             '被削除率' = $removedByOthers / $addedLines
-            '他者改善力' = $otherImprovement
-            '反復回避' = $repeatAvoidance
-            'プロセス遵守' = $processCompliance
+            '他者コード変更生存率' = $otherChangeRate
+            'コミットあたりピンポン' = $pingPongPerCommit
+            '所有集中度' = $ownershipShare
         }
         $chartRows.Add([pscustomobject][ordered]@{
                 Author = (Get-NormalizedAuthorName -Author ([string]$committer.'作者'))
@@ -6394,6 +6372,27 @@ function Update-CommitterRowWithStrictMetric
         $row.($script:ColOtherDead) = $otherDead
         $row.'他者コード変更行数' = $modifiedOthersCode
         $row.'他者コード変更生存行数' = $modifiedOthersSurvived
+
+        $otherChangeRate = if ($modifiedOthersCode -gt 0)
+        {
+            $modifiedOthersSurvived / [double]$modifiedOthersCode
+        }
+        else
+        {
+            0
+        }
+        $row.'他者コード変更生存率' = Format-MetricValue -Value $otherChangeRate
+
+        $commitCount = [int]$row.'コミット数'
+        $pingPongPerCommit = if ($commitCount -gt 0)
+        {
+            $pingPong / [double]$commitCount
+        }
+        else
+        {
+            0
+        }
+        $row.'コミットあたりピンポン' = Format-MetricValue -Value $pingPongPerCommit
     }
 }
 function Update-StrictAttributionMetric
@@ -6566,7 +6565,7 @@ function Get-MetricHeader
     [OutputType([object])]
     param()
     return [pscustomobject]@{
-        Committer = @('作者', 'コミット数', '活動日数', '変更ファイル数', '変更ディレクトリ数', '追加行数', '削除行数', '純増行数', '総チャーン', 'コミットあたりチャーン', '削除対追加比', 'チャーン対純増比', 'バイナリ変更回数', '追加アクション数', '変更アクション数', '削除アクション数', '置換アクション数', '生存行数', $script:ColDeadAdded, '所有行数', '所有割合', '自己相殺行数', '自己差戻行数', '他者差戻行数', '被他者削除行数', '同一箇所反復編集数', 'ピンポン回数', '内部移動行数', $script:ColSelfDead, $script:ColOtherDead, '他者コード変更行数', '他者コード変更生存行数', '変更エントロピー', '平均共同作者数', '最大共同作者数', 'メッセージ総文字数', 'メッセージ平均文字数', '課題ID言及数', '修正キーワード数', '差戻キーワード数', 'マージキーワード数')
+        Committer = @('作者', 'コミット数', '活動日数', '変更ファイル数', '変更ディレクトリ数', '追加行数', '削除行数', '純増行数', '総チャーン', 'コミットあたりチャーン', '削除対追加比', 'チャーン対純増比', 'バイナリ変更回数', '追加アクション数', '変更アクション数', '削除アクション数', '置換アクション数', '生存行数', $script:ColDeadAdded, '所有行数', '所有割合', '自己相殺行数', '自己差戻行数', '他者差戻行数', '被他者削除行数', '同一箇所反復編集数', 'ピンポン回数', '内部移動行数', $script:ColSelfDead, $script:ColOtherDead, '他者コード変更行数', '他者コード変更生存行数', '他者コード変更生存率', 'コミットあたりピンポン', '変更エントロピー', '平均共同作者数', '最大共同作者数', 'メッセージ総文字数', 'メッセージ平均文字数', '課題ID言及数', '修正キーワード数', '差戻キーワード数', 'マージキーワード数')
         File = @('ファイルパス', 'コミット数', '作者数', '追加行数', '削除行数', '純増行数', '総チャーン', 'バイナリ変更回数', '作成回数', '削除回数', '置換回数', '初回変更リビジョン', '最終変更リビジョン', '平均変更間隔日数', '生存行数 (範囲指定)', $script:ColDeadAdded, '最多作者チャーン占有率', '最多作者blame占有率', '自己相殺行数 (合計)', '他者差戻行数 (合計)', '同一箇所反復編集数 (合計)', 'ピンポン回数 (合計)', '内部移動行数 (合計)', 'ホットスポットスコア', 'ホットスポット順位')
         Commit = @('リビジョン', '日時', '作者', 'メッセージ文字数', 'メッセージ', '変更ファイル数', '追加行数', '削除行数', 'チャーン', 'エントロピー')
         Coupling = @('ファイルA', 'ファイルB', '共変更回数', 'Jaccard', 'リフト値')

@@ -25,7 +25,7 @@ CSV / PlantUML の見出しを日本語化した際の対訳一覧です。
 | Churn | チャーン | |
 | Entropy | エントロピー | |
 
-## committers.csv（41 列）
+## committers.csv（43 列）
 
 ### Phase 1（基本指標 — 30 列）
 
@@ -77,6 +77,13 @@ CSV / PlantUML の見出しを日本語化した際の対訳一覧です。
 | DeadByOthersApprox | 被他者消滅行数 (概算) | 残差。「被」＝受身 |
 | ModifiedOthersCodeLines | 他者コード変更行数 | 他者が書いた行を自分が削除した行数。blame 由来 |
 | ModifiedOthersCodeSurvivedLines | 他者コード変更生存行数 | 他者コード変更コミットで追加した行のうち ToRev 時点で生存している行数。blame 由来 |
+
+### Phase 3（派生指標 — 2 列）
+
+| 英語（旧） | 日本語（新） | 備考 |
+|---|---|---|
+| OtherCodeChangeSurvivalRate | 他者コード変更生存率 | 他者コード変更生存行数 ÷ 他者コード変更行数 |
+| PingPongPerCommit | コミットあたりピンポン | ピンポン回数 ÷ コミット数 |
 
 ## files.csv（25 列）
 
