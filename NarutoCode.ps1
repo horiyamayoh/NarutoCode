@@ -755,8 +755,19 @@ function Get-Sha1Hex
     {
         New-Object System.Security.Cryptography.SHA1CryptoServiceProvider
     }
-    $hash = $sha.ComputeHash($bytes)
-    return [BitConverter]::ToString($hash).Replace('-', '').ToLowerInvariant()
+    try
+    {
+        $hash = $sha.ComputeHash($bytes)
+        return [BitConverter]::ToString($hash).Replace('-', '').ToLowerInvariant()
+    }
+    finally
+    {
+        # 共有インスタンスは破棄せず、フォールバック生成分のみ Dispose する
+        if ($sha -ne $script:SharedSha1)
+        {
+            $sha.Dispose()
+        }
+    }
 }
 function Get-PathCacheHash
 {
@@ -1554,25 +1565,13 @@ function ConvertTo-LineHash
     .SYNOPSIS
         行内容をファイル文脈付きの比較用ハッシュに変換する。
     .DESCRIPTION
-        メインスレッドでは SharedSha1 を再利用する。並列 runspace 内では
-        SharedSha1 が注入されないため都度生成にフォールバックする。
+        空白を正規化したうえでファイルパスと結合し、Get-Sha1Hex でハッシュ化する。
     #>
     param([string]$FilePath, [string]$Content)
     $norm = $Content -replace '\s+', ' '
     $norm = $norm.Trim()
     $raw = $FilePath + [char]0 + $norm
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($raw)
-    # 並列 runspace では SharedSha1 が存在しないため都度生成する
-    $sha = if ($script:SharedSha1)
-    {
-        $script:SharedSha1
-    }
-    else
-    {
-        New-Object System.Security.Cryptography.SHA1CryptoServiceProvider
-    }
-    $hash = $sha.ComputeHash($bytes)
-    return [BitConverter]::ToString($hash).Replace('-', '').ToLowerInvariant()
+    return Get-Sha1Hex -Text $raw
 }
 function Test-IsTrivialLine
 {
@@ -1599,8 +1598,7 @@ function ConvertTo-ContextHash
     .SYNOPSIS
         hunk 周辺文脈から位置識別用のコンテキストハッシュを作成する。
     .DESCRIPTION
-        メインスレッドでは SharedSha1 を再利用する。並列 runspace 内では
-        SharedSha1 が注入されないため都度生成にフォールバックする。
+        先頭 K 行と末尾 K 行を結合して Get-Sha1Hex でハッシュ化する。
     .PARAMETER FilePath
         処理対象のファイルパスを指定する。
     .PARAMETER ContextLines
@@ -1627,18 +1625,7 @@ function ConvertTo-ContextHash
         }
     }
     $raw = $FilePath + '|' + ($first -join '|') + '|' + ($last -join '|')
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($raw)
-    # 並列 runspace では SharedSha1 が存在しないため都度生成する
-    $sha = if ($script:SharedSha1)
-    {
-        $script:SharedSha1
-    }
-    else
-    {
-        New-Object System.Security.Cryptography.SHA1CryptoServiceProvider
-    }
-    $hash = $sha.ComputeHash($bytes)
-    return [BitConverter]::ToString($hash).Replace('-', '').ToLowerInvariant()
+    return Get-Sha1Hex -Text $raw
 }
 function ConvertFrom-SvnUnifiedDiff
 {
@@ -2234,10 +2221,11 @@ function Get-LcsMatchedPair
     $currIdxArr = $currIdx.ToArray()
 
     # 未一致区間のみでDPを組み、既知一致を再計算しないため。
-    # Hirschberg 風に空間を O(n) へ削減し、DP 行を2行ローリングする。
+    # DP 値は2行ローリングで保持し、復元用に byte 型 direction テーブルを使う。
+    # 空間計算量は direction テーブルにより O(mn) だが、int[,] → byte[,] で
+    # メモリ使用量を約 1/4 に削減し、Sort-Object による復元も不要にしている。
     $dpPrev = New-Object 'int[]' ($n + 1)
     $dpCurr = New-Object 'int[]' ($n + 1)
-    # 逆方向に走査して復元するため direction テーブルを保持する。
     $dir = New-Object 'byte[,]' ($m + 1), ($n + 1)
     for ($i = 1
         $i -le $m
@@ -2795,6 +2783,7 @@ function Get-StrictHunkDetail
                 {
                     continue
                 }
+                # 範囲重複判定: [s1,e1] ∩ [sj,ej] ≠ ∅ ⇔ s1≤ej ∧ sj≤e1
                 if ($s1 -le $evtEnd[$j] -and $evtStart[$j] -le $e1)
                 {
                     Add-Count -Table $authorRepeated -Key $a1
@@ -2820,11 +2809,12 @@ function Get-StrictHunkDetail
                 }
                 $sj = $evtStart[$j]
                 $ej = $evtEnd[$j]
+                # 2者重複判定: [s1,e1] ∩ [sj,ej] = ∅ ⇔ s1>ej ∨ sj>e1
                 if ($s1 -gt $ej -or $sj -gt $e1)
                 {
                     continue
                 }
-                # i-j overlap confirmed; compute intersection for triple check
+                # i-j の重複区間 [abMax, abMin] を求め、k との3者重複を判定する
                 $abMax = if ($s1 -gt $sj)
                 {
                     $s1
@@ -2849,6 +2839,7 @@ function Get-StrictHunkDetail
                     {
                         continue
                     }
+                    # 3者重複判定: [abMax,abMin] ∩ [sk,ek] ≠ ∅
                     if ($abMax -le $evtEnd[$k] -and $evtStart[$k] -le $abMin)
                     {
                         Add-Count -Table $authorPingPong -Key $a1
@@ -7362,6 +7353,7 @@ function Initialize-CommitDiffData
         }
         $phaseAResults = @(Invoke-ParallelWork -InputItems $phaseAItems.ToArray() -WorkerScript $phaseAWorker -MaxParallel $Parallel -RequiredFunctions @(
                 'ConvertTo-PathKey',
+                'Get-Sha1Hex',
                 'ConvertTo-LineHash',
                 'ConvertTo-ContextHash',
                 'ConvertFrom-SvnUnifiedDiff',
