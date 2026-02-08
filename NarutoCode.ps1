@@ -106,6 +106,7 @@ $script:ColSelfDead = '自己消滅行数'         # 追加した本人が後の
 $script:ColOtherDead = '被他者消滅行数'      # 別の作者によって削除された行数
 $script:StrictBlameCacheHits = 0
 $script:StrictBlameCacheMisses = 0
+$script:SharedSha1 = New-Object System.Security.Cryptography.SHA1CryptoServiceProvider
 
 # region Utility
 # region 初期化
@@ -121,6 +122,10 @@ function Initialize-StrictModeContext
     $script:ColDeadAdded = '消滅追加行数'       # 追加されたが ToRev 時点で生存していない行数
     $script:ColSelfDead = '自己消滅行数'         # 追加した本人が後のコミットで削除した行数
     $script:ColOtherDead = '被他者消滅行数'      # 別の作者によって削除された行数
+    if ($null -eq $script:SharedSha1)
+    {
+        $script:SharedSha1 = New-Object System.Security.Cryptography.SHA1CryptoServiceProvider
+    }
 }
 function ConvertTo-NormalizedExtension
 {
@@ -729,6 +734,11 @@ function Get-Sha1Hex
     <#
     .SYNOPSIS
         文字列の SHA1 ハッシュを16進小文字で取得する。
+    .DESCRIPTION
+        メインスレッドでは SharedSha1 を再利用し、並列 runspace 内では
+        SharedSha1 が注入されないため都度生成にフォールバックする。
+        SHA1CryptoServiceProvider.ComputeHash はスレッドセーフでないため
+        インスタンス共有は単一スレッド内に限定する。
     #>
     param([string]$Text)
     if ($null -eq $Text)
@@ -736,16 +746,17 @@ function Get-Sha1Hex
         $Text = ''
     }
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
-    $sha = New-Object System.Security.Cryptography.SHA1CryptoServiceProvider
-    try
+    # 並列 runspace では SharedSha1 が存在しないため都度生成する
+    $sha = if ($script:SharedSha1)
     {
-        $hash = $sha.ComputeHash($bytes)
-        return [BitConverter]::ToString($hash).Replace('-', '').ToLowerInvariant()
+        $script:SharedSha1
     }
-    finally
+    else
     {
-        $sha.Dispose()
+        New-Object System.Security.Cryptography.SHA1CryptoServiceProvider
     }
+    $hash = $sha.ComputeHash($bytes)
+    return [BitConverter]::ToString($hash).Replace('-', '').ToLowerInvariant()
 }
 function Get-PathCacheHash
 {
@@ -806,11 +817,11 @@ function Read-BlameCacheFile
         return $null
     }
     $path = Get-BlameCachePath -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
-    if (-not (Test-Path $path))
+    if (-not [System.IO.File]::Exists($path))
     {
         return $null
     }
-    return (Get-Content -Path $path -Raw -Encoding UTF8)
+    return [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
 }
 function Write-BlameCacheFile
 {
@@ -832,12 +843,12 @@ function Write-BlameCacheFile
         return
     }
     $path = Get-BlameCachePath -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
-    $dir = Split-Path -Parent $path
-    if (-not (Test-Path $dir))
+    $dir = [System.IO.Path]::GetDirectoryName($path)
+    if (-not [System.IO.Directory]::Exists($dir))
     {
-        New-Item -Path $dir -ItemType Directory -Force | Out-Null
+        [void][System.IO.Directory]::CreateDirectory($dir)
     }
-    Set-Content -Path $path -Value $Content -Encoding UTF8
+    [System.IO.File]::WriteAllText($path, $Content, [System.Text.Encoding]::UTF8)
 }
 function Read-CatCacheFile
 {
@@ -857,11 +868,11 @@ function Read-CatCacheFile
         return $null
     }
     $path = Get-CatCachePath -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
-    if (-not (Test-Path $path))
+    if (-not [System.IO.File]::Exists($path))
     {
         return $null
     }
-    return (Get-Content -Path $path -Raw -Encoding UTF8)
+    return [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
 }
 function Write-CatCacheFile
 {
@@ -883,12 +894,12 @@ function Write-CatCacheFile
         return
     }
     $path = Get-CatCachePath -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
-    $dir = Split-Path -Parent $path
-    if (-not (Test-Path $dir))
+    $dir = [System.IO.Path]::GetDirectoryName($path)
+    if (-not [System.IO.Directory]::Exists($dir))
     {
-        New-Item -Path $dir -ItemType Directory -Force | Out-Null
+        [void][System.IO.Directory]::CreateDirectory($dir)
     }
-    Set-Content -Path $path -Value $Content -Encoding UTF8
+    [System.IO.File]::WriteAllText($path, $Content, [System.Text.Encoding]::UTF8)
 }
 function ConvertTo-TextLine
 {
@@ -1025,7 +1036,7 @@ function Get-AllRepositoryFile
         }
         if (Test-ShouldCountFile -FilePath $path -IncludeExt $IncludeExt -ExcludeExt $ExcludeExt -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns)
         {
-            $files.Add($path) | Out-Null
+            [void]$files.Add($path)
         }
     }
     return @($files.ToArray() | Sort-Object -Unique)
@@ -1076,7 +1087,7 @@ function Add-CanonicalOffsetEvent
     {
         return
     }
-    $OffsetEvents.Add([pscustomobject]@{ Threshold = $ThresholdLine; Delta = $ShiftDelta }) | Out-Null
+    [void]$OffsetEvents.Add([pscustomobject]@{ Threshold = $ThresholdLine; Delta = $ShiftDelta })
 }
 function Test-RangeOverlap
 {
@@ -1256,8 +1267,10 @@ function Invoke-SvnCommand
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo = $psi
         $null = $process.Start()
+        $errTask = $process.StandardError.ReadToEndAsync()
         $out = $process.StandardOutput.ReadToEnd()
-        $err = $process.StandardError.ReadToEnd()
+        $errTask.Wait()
+        $err = $errTask.Result
         $process.WaitForExit()
         if ($process.ExitCode -ne 0)
         {
@@ -1509,14 +1522,14 @@ function ConvertFrom-SvnLogXml
             {
                 $isDirectory = $true
             }
-            $paths.Add([pscustomobject]@{ Path = $path
+            [void]$paths.Add([pscustomobject]@{ Path = $path
                     Action = [string]$p.action
                     CopyFromPath = $copyPath
                     CopyFromRev = $copyRev
                     IsDirectory = $isDirectory
-                }) | Out-Null
+                })
         }
-        $list.Add([pscustomobject]@{
+        [void]$list.Add([pscustomobject]@{
                 Revision = $rev
                 Author = $author
                 Date = $date
@@ -1531,7 +1544,7 @@ function ConvertFrom-SvnLogXml
                 Entropy = 0.0
                 MsgLen = 0
                 MessageShort = ''
-            }) | Out-Null
+            })
     }
     return $list.ToArray() | Sort-Object Revision
 }
@@ -1540,22 +1553,26 @@ function ConvertTo-LineHash
     <#
     .SYNOPSIS
         行内容をファイル文脈付きの比較用ハッシュに変換する。
+    .DESCRIPTION
+        メインスレッドでは SharedSha1 を再利用する。並列 runspace 内では
+        SharedSha1 が注入されないため都度生成にフォールバックする。
     #>
     param([string]$FilePath, [string]$Content)
     $norm = $Content -replace '\s+', ' '
     $norm = $norm.Trim()
     $raw = $FilePath + [char]0 + $norm
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($raw)
-    $sha = New-Object System.Security.Cryptography.SHA1CryptoServiceProvider
-    try
+    # 並列 runspace では SharedSha1 が存在しないため都度生成する
+    $sha = if ($script:SharedSha1)
     {
-        $hash = $sha.ComputeHash($bytes)
-        return [BitConverter]::ToString($hash).Replace('-', '').ToLowerInvariant()
+        $script:SharedSha1
     }
-    finally
+    else
     {
-        $sha.Dispose()
+        New-Object System.Security.Cryptography.SHA1CryptoServiceProvider
     }
+    $hash = $sha.ComputeHash($bytes)
+    return [BitConverter]::ToString($hash).Replace('-', '').ToLowerInvariant()
 }
 function Test-IsTrivialLine
 {
@@ -1581,6 +1598,9 @@ function ConvertTo-ContextHash
     <#
     .SYNOPSIS
         hunk 周辺文脈から位置識別用のコンテキストハッシュを作成する。
+    .DESCRIPTION
+        メインスレッドでは SharedSha1 を再利用する。並列 runspace 内では
+        SharedSha1 が注入されないため都度生成にフォールバックする。
     .PARAMETER FilePath
         処理対象のファイルパスを指定する。
     .PARAMETER ContextLines
@@ -1608,16 +1628,17 @@ function ConvertTo-ContextHash
     }
     $raw = $FilePath + '|' + ($first -join '|') + '|' + ($last -join '|')
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($raw)
-    $sha = New-Object System.Security.Cryptography.SHA1CryptoServiceProvider
-    try
+    # 並列 runspace では SharedSha1 が存在しないため都度生成する
+    $sha = if ($script:SharedSha1)
     {
-        $hash = $sha.ComputeHash($bytes)
-        return [BitConverter]::ToString($hash).Replace('-', '').ToLowerInvariant()
+        $script:SharedSha1
     }
-    finally
+    else
     {
-        $sha.Dispose()
+        New-Object System.Security.Cryptography.SHA1CryptoServiceProvider
     }
+    $hash = $sha.ComputeHash($bytes)
+    return [BitConverter]::ToString($hash).Replace('-', '').ToLowerInvariant()
 }
 function ConvertFrom-SvnUnifiedDiff
 {
@@ -1712,7 +1733,7 @@ function ConvertFrom-SvnUnifiedDiff
                 AddedLineHashes = @()
                 DeletedLineHashes = @()
             }
-            $current.Hunks.Add($hunkObj) | Out-Null
+            [void]$current.Hunks.Add($hunkObj)
             $currentHunk = $hunkObj
             if ($DetailLevel -ge 1)
             {
@@ -1732,12 +1753,14 @@ function ConvertFrom-SvnUnifiedDiff
         {
             continue
         }
-        if ($line.StartsWith('+++') -or $line.StartsWith('---') -or $line -eq '\ No newline at end of file')
+        # 最頻出文字を先にチェックして分岐を減らす。
+        $ch = $line[0]
+        if ($ch -eq '+')
         {
-            continue
-        }
-        if ($line[0] -eq '+')
-        {
+            if ($line.Length -ge 3 -and $line[1] -eq '+' -and $line[2] -eq '+')
+            {
+                continue
+            }
             $current.AddedLines++
             if ($DetailLevel -ge 1 -and $null -ne $currentFile)
             {
@@ -1751,8 +1774,12 @@ function ConvertFrom-SvnUnifiedDiff
             }
             continue
         }
-        if ($line[0] -eq '-')
+        if ($ch -eq '-')
         {
+            if ($line.Length -ge 3 -and $line[1] -eq '-' -and $line[2] -eq '-')
+            {
+                continue
+            }
             $current.DeletedLines++
             if ($DetailLevel -ge 1 -and $null -ne $currentFile)
             {
@@ -1766,9 +1793,14 @@ function ConvertFrom-SvnUnifiedDiff
             }
             continue
         }
-        if ($DetailLevel -ge 1 -and $line.Length -gt 0 -and $line[0] -eq ' ' -and $null -ne $hunkContextLines)
+        if ($ch -eq ' ' -and $DetailLevel -ge 1 -and $null -ne $hunkContextLines)
         {
             $hunkContextLines.Add($line.Substring(1))
+            continue
+        }
+        if ($ch -eq '\' -and $line -eq '\ No newline at end of file')
+        {
+            continue
         }
     }
     if ($DetailLevel -ge 1 -and $null -ne $currentHunk -and $null -ne $currentFile)
@@ -1832,12 +1864,12 @@ function ConvertFrom-SvnBlameXml
             {
                 $content = [string]$ContentLines[$lineNumber - 1]
             }
-            $lineRows.Add([pscustomobject]@{
+            [void]$lineRows.Add([pscustomobject]@{
                     LineNumber = $lineNumber
                     Content = $content
                     Revision = $null
                     Author = '(unknown)'
-                }) | Out-Null
+                })
             continue
         }
         try
@@ -1880,17 +1912,19 @@ function ConvertFrom-SvnBlameXml
         {
             $content = [string]$ContentLines[$lineNumber - 1]
         }
-        $lineRows.Add([pscustomobject]@{
+        [void]$lineRows.Add([pscustomobject]@{
                 LineNumber = $lineNumber
                 Content = $content
                 Revision = $rev
                 Author = $author
-            }) | Out-Null
+            })
     }
-    return [pscustomobject]@{ LineCountTotal = $total
+    # blame XML の entry は line-number 昇順で出力されるため再ソート不要
+    return [pscustomobject]@{
+        LineCountTotal = $total
         LineCountByRevision = $byRev
         LineCountByAuthor = $byAuthor
-        Lines = @($lineRows.ToArray() | Sort-Object LineNumber)
+        Lines = $lineRows.ToArray()
     }
 }
 function Get-Entropy
@@ -2169,7 +2203,7 @@ function Get-LcsMatchedPair
         }
         if (-not $isLocked)
         {
-            $prevIdx.Add($i) | Out-Null
+            [void]$prevIdx.Add($i)
         }
     }
     $currIdx = New-Object 'System.Collections.Generic.List[int]'
@@ -2184,7 +2218,7 @@ function Get-LcsMatchedPair
         }
         if (-not $isLocked)
         {
-            $currIdx.Add($j) | Out-Null
+            [void]$currIdx.Add($j)
         }
     }
 
@@ -2195,67 +2229,93 @@ function Get-LcsMatchedPair
         return @()
     }
 
+    # インデックスリストを配列化してインデクサアクセスを高速化する。
+    $prevIdxArr = $prevIdx.ToArray()
+    $currIdxArr = $currIdx.ToArray()
+
     # 未一致区間のみでDPを組み、既知一致を再計算しないため。
-    $dp = New-Object 'int[,]' ($m + 1), ($n + 1)
+    # Hirschberg 風に空間を O(n) へ削減し、DP 行を2行ローリングする。
+    $dpPrev = New-Object 'int[]' ($n + 1)
+    $dpCurr = New-Object 'int[]' ($n + 1)
+    # 逆方向に走査して復元するため direction テーブルを保持する。
+    $dir = New-Object 'byte[,]' ($m + 1), ($n + 1)
     for ($i = 1
         $i -le $m
         $i++)
     {
+        $leftPrev = $prevIdxArr[$i - 1]
+        $prevKey = $prev[$leftPrev]
         for ($j = 1
             $j -le $n
             $j++)
         {
-            $iPrev = $i - 1
-            $jPrev = $j - 1
-            $leftPrev = [int]$prevIdx[$iPrev]
-            $leftCurr = [int]$currIdx[$jPrev]
-            if ($prev[$leftPrev] -ceq $curr[$leftCurr])
+            $leftCurr = $currIdxArr[$j - 1]
+            if ($prevKey -ceq $curr[$leftCurr])
             {
-                $dp[$i, $j] = $dp[$iPrev, $jPrev] + 1
+                $dpCurr[$j] = $dpPrev[$j - 1] + 1
+                $dir[$i, $j] = 1 # diagonal match
             }
             else
             {
-                $left = $dp[$iPrev, $j]
-                $up = $dp[$i, $jPrev]
-                $dp[$i, $j] = [Math]::Max($left, $up)
+                $left = $dpCurr[$j - 1]
+                $up = $dpPrev[$j]
+                if ($up -ge $left)
+                {
+                    $dpCurr[$j] = $up
+                    $dir[$i, $j] = 2 # up
+                }
+                else
+                {
+                    $dpCurr[$j] = $left
+                    $dir[$i, $j] = 3 # left
+                }
             }
+        }
+        # swap rows
+        $tmp = $dpPrev
+        $dpPrev = $dpCurr
+        $dpCurr = $tmp
+        for ($x = 0
+            $x -le $n
+            $x++)
+        {
+            $dpCurr[$x] = 0
         }
     }
 
-    $pairs = New-Object 'System.Collections.Generic.List[object]'
+    $lcsLen = $dpPrev[$n]
+    if ($lcsLen -eq 0)
+    {
+        return @()
+    }
+    $pairs = New-Object 'object[]' $lcsLen
+    $writePos = $lcsLen - 1
     $i = $m
     $j = $n
-    # 後ろから復元して順序を保った一致ペアだけを採用するため。
+    # direction テーブルで逆順復元し Sort-Object を不要にする。
     while ($i -gt 0 -and $j -gt 0)
     {
-        $iPrev = $i - 1
-        $jPrev = $j - 1
-        $prevPos = [int]$prevIdx[$iPrev]
-        $currPos = [int]$currIdx[$jPrev]
-        if ($prev[$prevPos] -ceq $curr[$currPos])
+        $d = $dir[$i, $j]
+        if ($d -eq 1)
         {
-            $pairs.Add([pscustomobject]@{
-                    PrevIndex = $prevPos
-                    CurrIndex = $currPos
-                }) | Out-Null
+            $pairs[$writePos] = [pscustomobject]@{
+                PrevIndex = [int]$prevIdxArr[$i - 1]
+                CurrIndex = [int]$currIdxArr[$j - 1]
+            }
+            $writePos--
             $i--
             $j--
         }
+        elseif ($d -eq 2)
+        {
+            $i--
+        }
         else
         {
-            $iPrev = $i - 1
-            $jPrev = $j - 1
-            if ($dp[$iPrev, $j] -ge $dp[$i, $jPrev])
-            {
-                $i--
-            }
-            else
-            {
-                $j--
-            }
+            $j--
         }
     }
-    return @($pairs.ToArray() | Sort-Object PrevIndex, CurrIndex)
+    return $pairs
 }
 function Compare-BlameOutput
 {
@@ -2305,13 +2365,13 @@ function Compare-BlameOutput
         $currIdx = [int]$pair.CurrIndex
         $prevMatched[$prevIdx] = $true
         $currMatched[$currIdx] = $true
-        $matchedPairs.Add([pscustomobject]@{
+        [void]$matchedPairs.Add([pscustomobject]@{
                 PrevIndex = $prevIdx
                 CurrIndex = $currIdx
                 PrevLine = $prev[$prevIdx]
                 CurrLine = $curr[$currIdx]
                 MatchType = 'LcsIdentity'
-            }) | Out-Null
+            })
     }
 
     $unmatchedPrevByKey = @{}
@@ -2323,12 +2383,12 @@ function Compare-BlameOutput
         {
             continue
         }
-        $key = Get-LineIdentityKey -Line $prev[$pi]
+        $key = $prevIdentity[$pi]
         if (-not $unmatchedPrevByKey.ContainsKey($key))
         {
             $unmatchedPrevByKey[$key] = New-Object 'System.Collections.Generic.List[int]'
         }
-        $unmatchedPrevByKey[$key].Add($pi) | Out-Null
+        [void]$unmatchedPrevByKey[$key].Add($pi)
     }
 
     $movedPairs = New-Object 'System.Collections.Generic.List[object]'
@@ -2340,7 +2400,7 @@ function Compare-BlameOutput
         {
             continue
         }
-        $key = Get-LineIdentityKey -Line $curr[$ci]
+        $key = $currIdentity[$ci]
         if (-not $unmatchedPrevByKey.ContainsKey($key))
         {
             continue
@@ -2361,8 +2421,8 @@ function Compare-BlameOutput
             CurrLine = $curr[$ci]
             MatchType = 'Move'
         }
-        $matchedPairs.Add($pair) | Out-Null
-        $movedPairs.Add($pair) | Out-Null
+        [void]$matchedPairs.Add($pair)
+        [void]$movedPairs.Add($pair)
     }
 
     # 次に content LCS で帰属変更行を救済し誤検出を減らす。
@@ -2376,13 +2436,13 @@ function Compare-BlameOutput
         }
         $prevMatched[$prevIdx] = $true
         $currMatched[$currIdx] = $true
-        $matchedPairs.Add([pscustomobject]@{
+        [void]$matchedPairs.Add([pscustomobject]@{
                 PrevIndex = $prevIdx
                 CurrIndex = $currIdx
                 PrevLine = $prev[$prevIdx]
                 CurrLine = $curr[$currIdx]
                 MatchType = 'LcsContent'
-            }) | Out-Null
+            })
     }
 
     # 最後に未一致残余を born/dead として確定する。
@@ -2393,10 +2453,10 @@ function Compare-BlameOutput
     {
         if (-not $prevMatched[$pi])
         {
-            $killed.Add([pscustomobject]@{
+            [void]$killed.Add([pscustomobject]@{
                     Index = $pi
                     Line = $prev[$pi]
-                }) | Out-Null
+                })
         }
     }
     $born = New-Object 'System.Collections.Generic.List[object]'
@@ -2406,10 +2466,10 @@ function Compare-BlameOutput
     {
         if (-not $currMatched[$ci])
         {
-            $born.Add([pscustomobject]@{
+            [void]$born.Add([pscustomobject]@{
                     Index = $ci
                     Line = $curr[$ci]
-                }) | Out-Null
+                })
         }
     }
 
@@ -2420,7 +2480,7 @@ function Compare-BlameOutput
         $currLine = $pair.CurrLine
         if ([string]$prevLine.Content -ceq [string]$currLine.Content -and (([string]$prevLine.Revision -ne [string]$currLine.Revision) -or ((Get-NormalizedAuthorName -Author ([string]$prevLine.Author)) -ne (Get-NormalizedAuthorName -Author ([string]$currLine.Author)))))
         {
-            $reattributed.Add($pair) | Out-Null
+            [void]$reattributed.Add($pair)
         }
     }
 
@@ -2462,7 +2522,7 @@ function Get-CommitFileTransition
         {
             $pathMap[$path] = New-Object 'System.Collections.Generic.List[object]'
         }
-        $pathMap[$path].Add($p) | Out-Null
+        [void]$pathMap[$path].Add($p)
         if (([string]$p.Action).ToUpperInvariant() -eq 'D')
         {
             $null = $deleted.Add($path)
@@ -2499,10 +2559,10 @@ function Get-CommitFileTransition
         $key = $oldPath + [char]31 + $newPath
         if ($dedup.Add($key))
         {
-            $result.Add([pscustomobject]@{
+            [void]$result.Add([pscustomobject]@{
                     BeforePath = $oldPath
                     AfterPath = $newPath
-                }) | Out-Null
+                })
         }
     }
 
@@ -2515,10 +2575,10 @@ function Get-CommitFileTransition
         $key = $oldPath + [char]31
         if ($dedup.Add($key))
         {
-            $result.Add([pscustomobject]@{
+            [void]$result.Add([pscustomobject]@{
                     BeforePath = $oldPath
                     AfterPath = $null
-                }) | Out-Null
+                })
         }
     }
 
@@ -2560,10 +2620,10 @@ function Get-CommitFileTransition
         $key = ([string]$beforePath) + [char]31 + ([string]$afterPath)
         if ($dedup.Add($key))
         {
-            $result.Add([pscustomobject]@{
+            [void]$result.Add([pscustomobject]@{
                     BeforePath = $beforePath
                     AfterPath = $afterPath
-                }) | Out-Null
+                })
         }
     }
 
@@ -2622,12 +2682,12 @@ function Get-StrictHunkDetail
             {
                 foreach ($hx in $hunksRaw)
                 {
-                    $hunks.Add($hx) | Out-Null
+                    [void]$hunks.Add($hx)
                 }
             }
             else
             {
-                $hunks.Add($hunksRaw) | Out-Null
+                [void]$hunks.Add($hunksRaw)
             }
             if ($hunks.Count -eq 0)
             {
@@ -2671,12 +2731,12 @@ function Get-StrictHunkDetail
                     $start = $end
                     $end = $tmp
                 }
-                $eventsByFile[$resolved].Add([pscustomobject]@{
+                [void]$eventsByFile[$resolved].Add([pscustomobject]@{
                         Revision = $rev
                         Author = $author
                         Start = $start
                         End = $end
-                    }) | Out-Null
+                    })
 
                 $shift = $newCount - $oldCount
                 if ($shift -ne 0)
@@ -2686,10 +2746,10 @@ function Get-StrictHunkDetail
                     {
                         $threshold = $oldStart
                     }
-                    $pending.Add([pscustomobject]@{
+                    [void]$pending.Add([pscustomobject]@{
                             Threshold = $threshold
                             Delta = $shift
-                        }) | Out-Null
+                        })
                 }
             }
             foreach ($p in @($pending.ToArray() | Sort-Object Threshold))
@@ -2706,22 +2766,36 @@ function Get-StrictHunkDetail
     foreach ($file in $eventsByFile.Keys)
     {
         $events = @($eventsByFile[$file].ToArray() | Sort-Object Revision)
+        $evtCount = $events.Count
+        # 属性を配列にバラしてプロパティアクセスを減らす。
+        $evtAuthor = New-Object 'string[]' $evtCount
+        $evtStart = New-Object 'int[]' $evtCount
+        $evtEnd = New-Object 'int[]' $evtCount
+        for ($x = 0
+            $x -lt $evtCount
+            $x++)
+        {
+            $evtAuthor[$x] = [string]$events[$x].Author
+            $evtStart[$x] = [int]$events[$x].Start
+            $evtEnd[$x] = [int]$events[$x].End
+        }
         # 同一作者の重なりを数え、反復編集の密度を可視化するため。
         for ($i = 0
-            $i -lt $events.Count
+            $i -lt $evtCount
             $i++)
         {
+            $a1 = $evtAuthor[$i]
+            $s1 = $evtStart[$i]
+            $e1 = $evtEnd[$i]
             for ($j = $i + 1
-                $j -lt $events.Count
+                $j -lt $evtCount
                 $j++)
             {
-                $a1 = [string]$events[$i].Author
-                $a2 = [string]$events[$j].Author
-                if ($a1 -ne $a2)
+                if ($a1 -ne $evtAuthor[$j])
                 {
                     continue
                 }
-                if (Test-RangeOverlap -StartA ([int]$events[$i].Start) -EndA ([int]$events[$i].End) -StartB ([int]$events[$j].Start) -EndB ([int]$events[$j].End))
+                if ($s1 -le $evtEnd[$j] -and $evtStart[$j] -le $e1)
                 {
                     Add-Count -Table $authorRepeated -Key $a1
                     Add-Count -Table $fileRepeated -Key $file
@@ -2730,33 +2804,52 @@ function Get-StrictHunkDetail
         }
         # A→B→A の往復を重なり範囲で絞り、偶然一致を減らすため。
         for ($i = 0
-            $i -lt ($events.Count - 2)
+            $i -lt ($evtCount - 2)
             $i++)
         {
+            $a1 = $evtAuthor[$i]
+            $s1 = $evtStart[$i]
+            $e1 = $evtEnd[$i]
             for ($j = $i + 1
-                $j -lt ($events.Count - 1)
+                $j -lt ($evtCount - 1)
                 $j++)
             {
-                $a1 = [string]$events[$i].Author
-                $a2 = [string]$events[$j].Author
-                if ($a1 -eq $a2)
+                if ($a1 -eq $evtAuthor[$j])
                 {
                     continue
                 }
-                if (-not (Test-RangeOverlap -StartA ([int]$events[$i].Start) -EndA ([int]$events[$i].End) -StartB ([int]$events[$j].Start) -EndB ([int]$events[$j].End)))
+                $sj = $evtStart[$j]
+                $ej = $evtEnd[$j]
+                if ($s1 -gt $ej -or $sj -gt $e1)
                 {
                     continue
+                }
+                # i-j overlap confirmed; compute intersection for triple check
+                $abMax = if ($s1 -gt $sj)
+                {
+                    $s1
+                }
+                else
+                {
+                    $sj
+                }
+                $abMin = if ($e1 -lt $ej)
+                {
+                    $e1
+                }
+                else
+                {
+                    $ej
                 }
                 for ($k = $j + 1
-                    $k -lt $events.Count
+                    $k -lt $evtCount
                     $k++)
                 {
-                    $a3 = [string]$events[$k].Author
-                    if ($a3 -ne $a1)
+                    if ($evtAuthor[$k] -ne $a1)
                     {
                         continue
                     }
-                    if (Test-RangeTripleOverlap -StartA ([int]$events[$i].Start) -EndA ([int]$events[$i].End) -StartB ([int]$events[$j].Start) -EndB ([int]$events[$j].End) -StartC ([int]$events[$k].Start) -EndC ([int]$events[$k].End))
+                    if ($abMax -le $evtEnd[$k] -and $evtStart[$k] -le $abMin)
                     {
                         Add-Count -Table $authorPingPong -Key $a1
                         Add-Count -Table $filePingPong -Key $file
@@ -3405,7 +3498,7 @@ function Get-CommitterMetric
         {
             0
         }
-        $rows.Add([pscustomobject][ordered]@{
+        [void]$rows.Add([pscustomobject][ordered]@{
                 '作者' = [string]$s.Author
                 'コミット数' = [int]$s.CommitCount
                 '活動日数' = [int]$s.ActiveDays.Count
@@ -3463,7 +3556,7 @@ function Get-CommitterMetric
                 '修正キーワード数' = [int]$s.Fix
                 '差戻キーワード数' = [int]$s.Revert
                 'マージキーワード数' = [int]$s.Merge
-            }) | Out-Null
+            })
     }
     return @($rows.ToArray() | Sort-Object -Property @{Expression = '総チャーン'
             Descending = $true
@@ -3592,7 +3685,7 @@ function Get-FileMetric
             $mx = ($s.AuthorChurn.Values | Measure-Object -Maximum).Maximum
             $topShare = $mx / [double]$ch
         }
-        $rows.Add([pscustomobject][ordered]@{
+        [void]$rows.Add([pscustomobject][ordered]@{
                 'ファイルパス' = [string]$s.FilePath
                 'コミット数' = $cc
                 '作者数' = [int]$s.Authors.Count
@@ -3618,7 +3711,7 @@ function Get-FileMetric
                 '内部移動行数 (合計)' = $null
                 'ホットスポットスコア' = ($cc * $ch)
                 'ホットスポット順位' = 0
-            }) | Out-Null
+            })
     }
     $sorted = @($rows.ToArray() | Sort-Object -Property @{Expression = 'ホットスポットスコア'
             Descending = $true
@@ -3712,12 +3805,12 @@ function Get-CoChangeMetric
                 $lift = $pab / ($pa * $pb)
             }
         }
-        $rows.Add([pscustomobject][ordered]@{ 'ファイルA' = $a
+        [void]$rows.Add([pscustomobject][ordered]@{ 'ファイルA' = $a
                 'ファイルB' = $b
                 '共変更回数' = $co
                 'Jaccard' = Format-MetricValue -Value $j
                 'リフト値' = Format-MetricValue -Value $lift
-            }) | Out-Null
+            })
     }
     $sorted = @($rows.ToArray() | Sort-Object -Property @{Expression = '共変更回数'
             Descending = $true
@@ -4353,7 +4446,7 @@ function Write-FileHeatMap
             {
                 $rawValue = $property.Value
             }
-            $numbers.Add((& $toNumber $rawValue)) | Out-Null
+            [void]$numbers.Add((& $toNumber $rawValue))
         }
         $min = 0.0
         $max = 0.0
@@ -4854,11 +4947,11 @@ function Write-CommitterRadarChart
             '定着コミット量' = $retainedVolumePerCommit
             'トータルコミット量' = $totalCommitVolume
         }
-        $chartRows.Add([pscustomobject][ordered]@{
+        [void]$chartRows.Add([pscustomobject][ordered]@{
                 Author = (Get-NormalizedAuthorName -Author ([string]$committer.'作者'))
                 TotalChurn = $totalChurn
                 RawScores = $rawScores
-            }) | Out-Null
+            })
     }
 
     if ($chartRows.Count -eq 0)
@@ -4935,22 +5028,22 @@ function Write-CommitterRadarChart
             {
                 '{0:P1}' -f $rawValue
             }
-            $outerPoints.Add([pscustomobject][ordered]@{
+            [void]$outerPoints.Add([pscustomobject][ordered]@{
                     X = $xOuter
                     Y = $yOuter
                     Angle = $angle
                     Label = $axisLabel
                     Invert = [bool]$axisDefinitions[$i].Invert
                     RawDisplay = $rawDisplayOuter
-                }) | Out-Null
+                })
             $normalized = ConvertTo-NormalizedScore -Value $rawValue -Min ([double]$axisMinMax[$axisLabel].Min) -Max ([double]$axisMinMax[$axisLabel].Max) -Invert:$axisDefinitions[$i].Invert
             $xData = $centerX + (($radius * $normalized) * [Math]::Cos($angle))
             $yData = $centerY + (($radius * $normalized) * [Math]::Sin($angle))
-            $dataPoints.Add([pscustomobject][ordered]@{
+            [void]$dataPoints.Add([pscustomobject][ordered]@{
                     X = $xData
                     Y = $yData
                     Value = $normalized
-                }) | Out-Null
+                })
         }
 
         $dataPolygonPoints = @($dataPoints.ToArray() | ForEach-Object { '{0:F2},{1:F2}' -f $_.X, $_.Y }) -join ' '
@@ -5051,7 +5144,7 @@ function Write-CommitterRadarChart
             {
                 $anchor = 'end'
             }
-            $labelItems.Add([pscustomobject][ordered]@{
+            [void]$labelItems.Add([pscustomobject][ordered]@{
                     X = $labelX
                     Y = $labelY
                     Anchor = $anchor
@@ -5059,7 +5152,7 @@ function Write-CommitterRadarChart
                     Angle = $point.Angle
                     Invert = [bool]$point.Invert
                     RawDisplay = [string]$point.RawDisplay
-                }) | Out-Null
+                })
         }
 
         # Y が下半分 (center より下) のラベルを Y 昇順に並べ、近すぎるペアを離す
@@ -5321,11 +5414,11 @@ function Write-CommitterRadarChartCombined
             '定着コミット量' = $retainedVolumePerCommit
             'トータルコミット量' = $totalCommitVolume
         }
-        $chartRows.Add([pscustomobject][ordered]@{
+        [void]$chartRows.Add([pscustomobject][ordered]@{
                 Author = (Get-NormalizedAuthorName -Author ([string]$committer.'作者'))
                 TotalChurn = $totalChurn
                 RawScores = $rawScores
-            }) | Out-Null
+            })
     }
 
     if ($chartRows.Count -eq 0)
@@ -5380,7 +5473,7 @@ function Write-CommitterRadarChartCombined
             $axisLabel = [string]$axisDefinitions[$i].Label
             $rawValue = [double]$row.RawScores[$axisLabel]
             $normalized = ConvertTo-NormalizedScore -Value $rawValue -Min ([double]$axisMinMax[$axisLabel].Min) -Max ([double]$axisMinMax[$axisLabel].Max) -Invert:$axisDefinitions[$i].Invert
-            $normalizedValues.Add($normalized) | Out-Null
+            [void]$normalizedValues.Add($normalized)
         }
         # レーダー面積スコア: Shoelace 公式による多角形面積 / 最大面積 * 100
         $radarArea = 0.0
@@ -5398,11 +5491,11 @@ function Write-CommitterRadarChartCombined
         {
             $areaScore = ($radarArea / $maxArea) * 100.0
         }
-        $rowDataList.Add([pscustomobject][ordered]@{
+        [void]$rowDataList.Add([pscustomobject][ordered]@{
                 Row = $row
                 NormalizedValues = $normalizedValues.ToArray()
                 AreaScore = $areaScore
-            }) | Out-Null
+            })
     }
 
     $sb = New-Object System.Text.StringBuilder
@@ -5488,14 +5581,14 @@ function Write-CommitterRadarChartCombined
             {
                 '{0:P1}' -f $rawValue
             }
-            $outerPoints.Add([pscustomobject][ordered]@{
+            [void]$outerPoints.Add([pscustomobject][ordered]@{
                     X = $xOuter
                     Y = $yOuter
                     Angle = $angle
                     Label = $axisLabel
                     Invert = [bool]$axisDefinitions[$i].Invert
                     RawDisplay = $rawDisplayCombined
-                }) | Out-Null
+                })
         }
 
         # ガイドライン（同心多角形）
@@ -5525,10 +5618,10 @@ function Write-CommitterRadarChartCombined
             $nv = $normalizedValues[$i]
             $xData = $cellCenterX + (($radius * $nv) * [Math]::Cos($angle))
             $yData = $cellCenterY + (($radius * $nv) * [Math]::Sin($angle))
-            $dataPoints.Add([pscustomobject][ordered]@{
+            [void]$dataPoints.Add([pscustomobject][ordered]@{
                     X = $xData
                     Y = $yData
-                }) | Out-Null
+                })
         }
         $polygonPoints = @($dataPoints.ToArray() | ForEach-Object { '{0:F2},{1:F2}' -f $_.X, $_.Y }) -join ' '
         [void]$sb.AppendLine(("  <polygon class=""radar-area"" points=""{0}"" />" -f $polygonPoints))
@@ -5553,14 +5646,14 @@ function Write-CommitterRadarChartCombined
             {
                 $anchor = 'end'
             }
-            $labelItems2.Add([pscustomobject][ordered]@{
+            [void]$labelItems2.Add([pscustomobject][ordered]@{
                     X = $labelX
                     Y = $labelY
                     Anchor = $anchor
                     Label = [string]$point.Label
                     Invert = [bool]$point.Invert
                     RawDisplay = [string]$point.RawDisplay
-                }) | Out-Null
+                })
         }
 
         $minGap2 = 14.0
@@ -5852,7 +5945,7 @@ function Get-SvgFittedText
         {
             break
         }
-        $buffer.Add($character) | Out-Null
+        [void]$buffer.Add($character)
         $currentWidth += $charWidth
     }
 
@@ -6028,13 +6121,13 @@ function Add-SquarifiedTreemapRow
                 $cellWidth = ($X + $Width) - $currentX
             }
             $cellWidth = [Math]::Max(0.0, $cellWidth)
-            $rectangles.Add([pscustomobject]@{
+            [void]$rectangles.Add([pscustomobject]@{
                     Item = $item.Item
                     X = $currentX
                     Y = $Y
                     Width = $cellWidth
                     Height = $rowHeight
-                }) | Out-Null
+                })
             $currentX += $cellWidth
         }
         return [pscustomobject]@{
@@ -6068,13 +6161,13 @@ function Add-SquarifiedTreemapRow
             $cellHeight = ($Y + $Height) - $currentY
         }
         $cellHeight = [Math]::Max(0.0, $cellHeight)
-        $rectangles.Add([pscustomobject]@{
+        [void]$rectangles.Add([pscustomobject]@{
                 Item = $item.Item
                 X = $X
                 Y = $currentY
                 Width = $rowWidth
                 Height = $cellHeight
-            }) | Out-Null
+            })
         $currentY += $cellHeight
     }
     return [pscustomobject]@{
@@ -6114,10 +6207,10 @@ function Get-SquarifiedTreemapLayout
             $weightValue = 0.0
         }
         $weightValue = [Math]::Max(1.0, $weightValue)
-        $weighted.Add([pscustomobject]@{
+        [void]$weighted.Add([pscustomobject]@{
                 Item = $item
                 Weight = $weightValue
-            }) | Out-Null
+            })
     }
 
     if ($weighted.Count -eq 0)
@@ -6147,10 +6240,10 @@ function Get-SquarifiedTreemapLayout
         {
             $scaledArea = $canvasArea / [double]$sortedItems.Count
         }
-        $scaledItems.Add([pscustomobject]@{
+        [void]$scaledItems.Add([pscustomobject]@{
                 Item = $sortedItem.Item
                 Area = $scaledArea
-            }) | Out-Null
+            })
     }
 
     $result = New-Object 'System.Collections.Generic.List[object]'
@@ -6170,7 +6263,7 @@ function Get-SquarifiedTreemapLayout
         $candidate = $scaledItems[$index]
         if ($row.Count -eq 0)
         {
-            $row.Add($candidate) | Out-Null
+            [void]$row.Add($candidate)
             $index++
             continue
         }
@@ -6181,7 +6274,7 @@ function Get-SquarifiedTreemapLayout
         $trialWorst = Get-TreemapWorstAspectRatio -RowItems $trialRow -ShortSide $shortSide
         if ($trialWorst -le $currentWorst)
         {
-            $row.Add($candidate) | Out-Null
+            [void]$row.Add($candidate)
             $index++
             continue
         }
@@ -6189,7 +6282,7 @@ function Get-SquarifiedTreemapLayout
         $layout = Add-SquarifiedTreemapRow -RowItems @($row.ToArray()) -X $remainingX -Y $remainingY -Width $remainingWidth -Height $remainingHeight
         foreach ($rect in @($layout.Rectangles))
         {
-            $result.Add($rect) | Out-Null
+            [void]$result.Add($rect)
         }
         $remainingX = [double]$layout.NextX
         $remainingY = [double]$layout.NextY
@@ -6203,7 +6296,7 @@ function Get-SquarifiedTreemapLayout
         $layout = Add-SquarifiedTreemapRow -RowItems @($row.ToArray()) -X $remainingX -Y $remainingY -Width $remainingWidth -Height $remainingHeight
         foreach ($rect in @($layout.Rectangles))
         {
-            $result.Add($rect) | Out-Null
+            [void]$result.Add($rect)
         }
     }
     return @($result.ToArray())
@@ -6309,7 +6402,7 @@ function Write-FileTreeMap
         {
             $rankValue = [double]($rankValues.Count + 1)
         }
-        $rankValues.Add($rankValue) | Out-Null
+        [void]$rankValues.Add($rankValue)
 
         if (-not $directoryMap.ContainsKey($directoryPath))
         {
@@ -6321,7 +6414,7 @@ function Write-FileTreeMap
         }
         $group = $directoryMap[$directoryPath]
         $group.TotalWeight = [double]$group.TotalWeight + $weight
-        $group.Files.Add([pscustomobject]@{
+        [void]$group.Files.Add([pscustomobject]@{
                 DirectoryPath = $directoryPath
                 FilePath = $filePath
                 FileName = $fileName
@@ -6330,7 +6423,7 @@ function Write-FileTreeMap
                 CommitCount = $commitCount
                 AuthorCount = $authorCount
                 Rank = $rankValue
-            }) | Out-Null
+            })
     }
 
     $minRank = 1.0
@@ -6362,11 +6455,11 @@ function Write-FileTreeMap
     foreach ($directoryPath in @($directoryMap.Keys))
     {
         $group = $directoryMap[$directoryPath]
-        $directoryItems.Add([pscustomobject]@{
+        [void]$directoryItems.Add([pscustomobject]@{
                 Name = $directoryPath
                 Weight = [double]$group.TotalWeight
                 Group = $group
-            }) | Out-Null
+            })
     }
 
     $directoryRects = @(Get-SquarifiedTreemapLayout -X $rootX -Y $rootY -Width $rootWidth -Height $rootHeight -Items @($directoryItems.ToArray()))
@@ -6417,11 +6510,11 @@ function Write-FileTreeMap
         $fileItems = New-Object 'System.Collections.Generic.List[object]'
         foreach ($fileData in @($group.Files.ToArray()))
         {
-            $fileItems.Add([pscustomobject]@{
+            [void]$fileItems.Add([pscustomobject]@{
                     Name = $fileData.FileName
                     Weight = [double]$fileData.Weight
                     Data = $fileData
-                }) | Out-Null
+                })
         }
         $fileRects = @(Get-SquarifiedTreemapLayout -X $innerX -Y $innerY -Width $innerWidth -Height $innerHeight -Items @($fileItems.ToArray()))
         foreach ($fileRect in $fileRects)
@@ -6862,9 +6955,9 @@ function Get-CachedOrFetchDiffText
     [OutputType([string])]
     param([string]$CacheDir, [int]$Revision, [string]$TargetUrl, [string[]]$DiffArguments)
     $cacheFile = Join-Path $CacheDir ("diff_r{0}.txt" -f $Revision)
-    if (Test-Path $cacheFile)
+    if ([System.IO.File]::Exists($cacheFile))
     {
-        return (Get-Content -Path $cacheFile -Raw -Encoding UTF8)
+        return [System.IO.File]::ReadAllText($cacheFile, [System.Text.Encoding]::UTF8)
     }
 
     $fetchArgs = New-Object 'System.Collections.Generic.List[string]'
@@ -6876,7 +6969,7 @@ function Get-CachedOrFetchDiffText
     $null = $fetchArgs.Add([string]$Revision)
     $null = $fetchArgs.Add($TargetUrl)
     $diffText = Invoke-SvnCommand -Arguments $fetchArgs.ToArray() -ErrorContext ("svn diff -c {0}" -f $Revision)
-    Set-Content -Path $cacheFile -Value $diffText -Encoding UTF8
+    [System.IO.File]::WriteAllText($cacheFile, $diffText, [System.Text.Encoding]::UTF8)
     return $diffText
 }
 # endregion SVN 引数ヘルパー
@@ -6918,13 +7011,13 @@ function Get-FilteredChangedPathEntry
         }
         if (Test-ShouldCountFile -FilePath $path -IncludeExt $IncludeExtensions -ExcludeExt $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns)
         {
-            $filtered.Add([pscustomobject]@{
+            [void]$filtered.Add([pscustomobject]@{
                     Path = $path
                     Action = [string]$pathEntry.Action
                     CopyFromPath = [string]$pathEntry.CopyFromPath
                     CopyFromRev = $pathEntry.CopyFromRev
                     IsDirectory = $false
-                }) | Out-Null
+                })
         }
     }
     return $filtered.ToArray()
@@ -6964,11 +7057,11 @@ function Set-DiffStatCollectionProperty
             {
                 if ($AsString)
                 {
-                    $sourceItems.Add([string]$item) | Out-Null
+                    [void]$sourceItems.Add([string]$item)
                 }
                 else
                 {
-                    $sourceItems.Add($item) | Out-Null
+                    [void]$sourceItems.Add($item)
                 }
             }
         }
@@ -6976,11 +7069,11 @@ function Set-DiffStatCollectionProperty
         {
             if ($AsString)
             {
-                $sourceItems.Add([string]$sourceValue) | Out-Null
+                [void]$sourceItems.Add([string]$sourceValue)
             }
             else
             {
-                $sourceItems.Add($sourceValue) | Out-Null
+                [void]$sourceItems.Add($sourceValue)
             }
         }
     }
@@ -6991,7 +7084,7 @@ function Set-DiffStatCollectionProperty
         $targetValue.Clear()
         foreach ($item in $sourceItems.ToArray())
         {
-            $targetValue.Add($item) | Out-Null
+            [void]$targetValue.Add($item)
         }
     }
     else
@@ -7121,10 +7214,10 @@ function Update-RenamePairDiffStat
         $compareArguments = New-Object 'System.Collections.Generic.List[string]'
         foreach ($item in $DiffArguments)
         {
-            $compareArguments.Add([string]$item) | Out-Null
+            [void]$compareArguments.Add([string]$item)
         }
-        $compareArguments.Add(($TargetUrl.TrimEnd('/') + '/' + $oldPath + '@' + [string]$copyRev)) | Out-Null
-        $compareArguments.Add(($TargetUrl.TrimEnd('/') + '/' + $newPath + '@' + [string]$Revision)) | Out-Null
+        [void]$compareArguments.Add(($TargetUrl.TrimEnd('/') + '/' + $oldPath + '@' + [string]$copyRev))
+        [void]$compareArguments.Add(($TargetUrl.TrimEnd('/') + '/' + $newPath + '@' + [string]$Revision))
 
         $realDiff = Invoke-SvnCommand -Arguments $compareArguments.ToArray() -ErrorContext ("svn diff rename pair r{0} {1}->{2}" -f $Revision, $oldPath, $newPath)
         $realParsed = ConvertFrom-SvnUnifiedDiff -DiffText $realDiff -DetailLevel 2
@@ -7512,7 +7605,7 @@ function Update-FileRowWithStrictMetric
             }
             catch
             {
-                $lookupErrors.Add(([string]$lookup + ': ' + $_.Exception.Message)) | Out-Null
+                [void]$lookupErrors.Add(([string]$lookup + ': ' + $_.Exception.Message))
             }
         }
         if ($null -eq $blame -and $existsAtToRevision)
