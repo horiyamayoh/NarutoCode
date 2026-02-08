@@ -21,9 +21,11 @@ if (-not (Test-Path $settingsPath))
 
 Write-Host 'フォーマット適用中...' -ForegroundColor Cyan
 
-$code = Get-Content -Path $scriptPath -Raw
+$code = Get-Content -Path $scriptPath -Raw -Encoding UTF8
 $formatted = Invoke-Formatter -ScriptDefinition $code -Settings $settingsPath
-Set-Content -Path $scriptPath -Value $formatted -NoNewline -Encoding UTF8
+
+# BOM 付き UTF-8 で保存
+[System.IO.File]::WriteAllText($scriptPath, $formatted, [System.Text.UTF8Encoding]::new($true))
 
 Write-Host 'フォーマット完了。静的解析を実行します...' -ForegroundColor Cyan
 
