@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     SVN リポジトリの履歴を解析し、コミット品質・変更傾向のメトリクスを生成する。
 .DESCRIPTION
@@ -31,6 +31,7 @@ param(
     [string[]]$IncludeExtensions,
     [string[]]$ExcludeExtensions,
     [switch]$EmitPlantUml,
+    [switch]$EmitCharts,
     [ValidateRange(1, 5000)][int]$TopN = 50,
     [ValidateSet('UTF8', 'UTF8BOM', 'Unicode', 'ASCII')][string]$Encoding = 'UTF8',
     [switch]$IgnoreSpaceChange,
@@ -283,6 +284,40 @@ function Format-MetricValue
     #>
     param([double]$Value)
     return $Value
+}
+function ConvertTo-NormalizedScore
+{
+    <#
+    .SYNOPSIS
+        min-max 正規化により 0 から 1 のスコアへ変換する。
+    .PARAMETER Value
+        正規化対象の実測値を指定する。
+    .PARAMETER Min
+        正規化に使用する最小値を指定する。
+    .PARAMETER Max
+        正規化に使用する最大値を指定する。
+    .PARAMETER Invert
+        指定時は正規化結果を反転し、低い値を高スコアとして扱う。
+    #>
+    param([double]$Value, [double]$Min, [double]$Max, [switch]$Invert)
+    if ($Max -eq $Min)
+    {
+        return 0.0
+    }
+    $normalized = ($Value - $Min) / ($Max - $Min)
+    if ($normalized -lt 0)
+    {
+        $normalized = 0.0
+    }
+    if ($normalized -gt 1)
+    {
+        $normalized = 1.0
+    }
+    if ($Invert)
+    {
+        return 1.0 - $normalized
+    }
+    return $normalized
 }
 function Add-Count
 {
@@ -3606,6 +3641,420 @@ function Write-PlantUmlFile
     [void]$sb3.AppendLine('@enduml')
     Write-TextFile -FilePath (Join-Path $OutDirectory 'cochange_network.puml') -Content $sb3.ToString() -EncodingName $EncodingName
 }
+function Get-SafeFileName
+{
+    <#
+    .SYNOPSIS
+        Windows 互換の安全なファイル名を生成する。
+    .DESCRIPTION
+        無効文字の除去、予約デバイス名の正規化、長さ制限を適用し、
+        Windows 環境で確実に使用可能なファイル名を返す。
+    .PARAMETER BaseName
+        サニタイズ対象の基本名を指定する。
+    .PARAMETER Extension
+        ファイル拡張子を指定する（ドットを含む、例: ".svg"）。
+    .PARAMETER MaxLength
+        ファイル名の最大長を指定する（拡張子を含む）。デフォルトは 100 文字。
+    .OUTPUTS
+        System.String
+        サニタイズされた安全なファイル名を返す。
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$BaseName,
+        [Parameter(Mandatory = $false)]
+        [string]$Extension = '',
+        [Parameter(Mandatory = $false)]
+        [int]$MaxLength = 100
+    )
+
+    $safe = [string]$BaseName
+    if ([string]::IsNullOrWhiteSpace($safe))
+    {
+        $safe = '(unknown)'
+    }
+    $safe = $safe.Trim()
+
+    # 無効な文字を置換
+    # GetInvalidFileNameChars() はプラットフォーム依存のため、Windows 固有の無効文字を明示的に処理
+    $windowsInvalidChars = [char[]]@('<', '>', ':', '"', '/', '\', '|', '?', '*')
+    foreach ($invalidChar in $windowsInvalidChars)
+    {
+        $safe = $safe.Replace([string]$invalidChar, '_')
+    }
+    # プラットフォームの無効文字も処理（制御文字など）
+    foreach ($invalidChar in [System.IO.Path]::GetInvalidFileNameChars())
+    {
+        $safe = $safe.Replace([string]$invalidChar, '_')
+    }
+
+    # 末尾のドットとスペースを除去（Windows では問題となる）
+    $safe = $safe.TrimEnd('. ')
+
+    # Windows 予約デバイス名のチェックと正規化
+    # 予約名: CON, PRN, AUX, NUL, COM1-9, LPT1-9
+    $reservedNames = @(
+        'CON', 'PRN', 'AUX', 'NUL',
+        'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9',
+        'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9'
+    )
+
+    # 予約名は大文字小文字を区別しない
+    $upperSafe = $safe.ToUpperInvariant()
+    foreach ($reserved in $reservedNames)
+    {
+        if ($upperSafe -eq $reserved)
+        {
+            # 予約名の場合はアンダースコアを接頭辞として付与
+            $safe = "_$safe"
+            break
+        }
+    }
+
+    # 空になった場合のフォールバック
+    if ([string]::IsNullOrWhiteSpace($safe))
+    {
+        $safe = '(unknown)'
+    }
+
+    # 最大長の制限（拡張子を含む）
+    $extLen = $Extension.Length
+    $maxBaseLen = $MaxLength - $extLen
+    if ($maxBaseLen -lt 1)
+    {
+        $maxBaseLen = 1
+    }
+
+    if ($safe.Length -gt $maxBaseLen)
+    {
+        # 長すぎる場合は切り詰めてハッシュを付与
+        # NOTE: MD5 はセキュリティ目的ではなく、ファイル名の一意性確保のみに使用
+        $hash = [BitConverter]::ToString([System.Security.Cryptography.MD5]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($safe))).Replace('-', '').Substring(0, 8).ToLowerInvariant()
+        $truncLen = $maxBaseLen - 9
+        if ($truncLen -lt 1)
+        {
+            $truncLen = 1
+        }
+        $safe = $safe.Substring(0, $truncLen) + '_' + $hash
+    }
+
+    return $safe + $Extension
+}
+function Write-CommitterRadarChart
+{
+    <#
+    .SYNOPSIS
+        コミッター品質を 7 軸レーダーチャート SVG として出力する。
+    .DESCRIPTION
+        追加行数が 0 を超えるコミッターを対象に品質指標を算出し、
+        全コミッター間で min-max 正規化した値を作者別 SVG として保存する。
+    .PARAMETER OutDirectory
+        SVG ファイルを保存する出力先ディレクトリを指定する。
+    .PARAMETER Committers
+        Get-CommitterMetric が返すコミッター行配列を指定する。
+    .PARAMETER TopNCount
+        総チャーン上位として SVG を生成する件数を指定する。
+    .PARAMETER EncodingName
+        出力時に使用する文字エンコーディング名を指定する。
+    #>
+    [CmdletBinding()]
+    param([string]$OutDirectory, [object[]]$Committers, [int]$TopNCount, [string]$EncodingName)
+    if ([string]::IsNullOrWhiteSpace($OutDirectory))
+    {
+        return
+    }
+    if ($TopNCount -le 0)
+    {
+        return
+    }
+    if (-not $Committers -or @($Committers).Count -eq 0)
+    {
+        return
+    }
+    if (-not (Test-Path -LiteralPath $OutDirectory))
+    {
+        $null = New-Item -LiteralPath $OutDirectory -ItemType Directory -Force
+    }
+
+    $axisDefinitions = @(
+        [pscustomobject][ordered]@{
+            Label = 'コード生存率'
+            Invert = $false
+        },
+        [pscustomobject][ordered]@{
+            Label = '手戻り効率'
+            Invert = $true
+        },
+        [pscustomobject][ordered]@{
+            Label = '自己相殺率'
+            Invert = $true
+        },
+        [pscustomobject][ordered]@{
+            Label = '被削除率'
+            Invert = $true
+        },
+        [pscustomobject][ordered]@{
+            Label = '他者改善力'
+            Invert = $false
+        },
+        [pscustomobject][ordered]@{
+            Label = '反復回避'
+            Invert = $true
+        },
+        [pscustomobject][ordered]@{
+            Label = 'プロセス遵守'
+            Invert = $false
+        }
+    )
+
+    $chartRows = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($committer in @($Committers))
+    {
+        if ($null -eq $committer)
+        {
+            continue
+        }
+
+        $addedLines = 0.0
+        if ($null -ne $committer.'追加行数')
+        {
+            $addedLines = [double]$committer.'追加行数'
+        }
+        if ($addedLines -le 0)
+        {
+            continue
+        }
+
+        $survivedLines = 0.0
+        if ($null -ne $committer.'生存行数')
+        {
+            $survivedLines = [double]$committer.'生存行数'
+        }
+        $churnToNetRatio = 0.0
+        if ($null -ne $committer.'チャーン対純増比')
+        {
+            $churnToNetRatio = [double]$committer.'チャーン対純増比'
+        }
+        $selfCancelLines = 0.0
+        if ($null -ne $committer.'自己相殺行数')
+        {
+            $selfCancelLines = [double]$committer.'自己相殺行数'
+        }
+        $removedByOthers = 0.0
+        if ($null -ne $committer.'被他者削除行数')
+        {
+            $removedByOthers = [double]$committer.'被他者削除行数'
+        }
+        $changedOthersLines = 0.0
+        if ($null -ne $committer.'他者コード変更行数')
+        {
+            $changedOthersLines = [double]$committer.'他者コード変更行数'
+        }
+        $changedOthersSurvived = 0.0
+        if ($null -ne $committer.'他者コード変更生存行数')
+        {
+            $changedOthersSurvived = [double]$committer.'他者コード変更生存行数'
+        }
+        $commitCount = 0.0
+        if ($null -ne $committer.'コミット数')
+        {
+            $commitCount = [double]$committer.'コミット数'
+        }
+        $pingPongCount = 0.0
+        if ($null -ne $committer.'ピンポン回数')
+        {
+            $pingPongCount = [double]$committer.'ピンポン回数'
+        }
+        $issueMentionCount = 0.0
+        if ($null -ne $committer.'課題ID言及数')
+        {
+            $issueMentionCount = [double]$committer.'課題ID言及数'
+        }
+        $totalChurn = 0.0
+        if ($null -ne $committer.'総チャーン')
+        {
+            $totalChurn = [double]$committer.'総チャーン'
+        }
+
+        $processCompliance = 0.0
+        $repeatAvoidance = 0.0
+        if ($commitCount -gt 0)
+        {
+            $processCompliance = $issueMentionCount / $commitCount
+            $repeatAvoidance = $pingPongCount / $commitCount
+        }
+
+        $otherImprovement = 0.0
+        if ($changedOthersLines -gt 0)
+        {
+            $otherImprovement = $changedOthersSurvived / $changedOthersLines
+        }
+
+        $rawScores = [ordered]@{
+            'コード生存率' = $survivedLines / $addedLines
+            '手戻り効率' = $churnToNetRatio
+            '自己相殺率' = $selfCancelLines / $addedLines
+            '被削除率' = $removedByOthers / $addedLines
+            '他者改善力' = $otherImprovement
+            '反復回避' = $repeatAvoidance
+            'プロセス遵守' = $processCompliance
+        }
+        $chartRows.Add([pscustomobject][ordered]@{
+                Author = (Get-NormalizedAuthorName -Author ([string]$committer.'作者'))
+                TotalChurn = $totalChurn
+                RawScores = $rawScores
+            }) | Out-Null
+    }
+
+    if ($chartRows.Count -eq 0)
+    {
+        return
+    }
+
+    $axisMinMax = @{}
+    foreach ($axis in $axisDefinitions)
+    {
+        $axisLabel = [string]$axis.Label
+        $axisValues = @($chartRows.ToArray() | ForEach-Object { [double]$_.RawScores[$axisLabel] })
+        $stats = $axisValues | Measure-Object -Minimum -Maximum
+        $axisMinMax[$axisLabel] = [pscustomobject][ordered]@{
+            Min = [double]$stats.Minimum
+            Max = [double]$stats.Maximum
+        }
+    }
+
+    $topChartRows = @($chartRows.ToArray() | Sort-Object -Property @{Expression = 'TotalChurn'
+            Descending = $true
+        }, 'Author' | Select-Object -First $TopNCount)
+    if ($topChartRows.Count -eq 0)
+    {
+        return
+    }
+
+    $centerX = 250.0
+    $centerY = 250.0
+    $radius = 200.0
+    $axisCount = $axisDefinitions.Count
+    $guideLevels = @(0.25, 0.5, 0.75, 1.0)
+    $labelRadius = 228.0
+    $usedNames = New-Object 'System.Collections.Generic.HashSet[string]'
+
+    foreach ($row in $topChartRows)
+    {
+        $outerPoints = New-Object 'System.Collections.Generic.List[object]'
+        $dataPoints = New-Object 'System.Collections.Generic.List[object]'
+        for ($i = 0; $i -lt $axisCount; $i++)
+        {
+            $angle = (((2.0 * [Math]::PI) * $i) / [double]$axisCount) - ([Math]::PI / 2.0)
+            $xOuter = $centerX + ($radius * [Math]::Cos($angle))
+            $yOuter = $centerY + ($radius * [Math]::Sin($angle))
+            $outerPoints.Add([pscustomobject][ordered]@{
+                    X = $xOuter
+                    Y = $yOuter
+                    Angle = $angle
+                    Label = [string]$axisDefinitions[$i].Label
+                }) | Out-Null
+
+            $axisLabel = [string]$axisDefinitions[$i].Label
+            $rawValue = [double]$row.RawScores[$axisLabel]
+            $normalized = ConvertTo-NormalizedScore -Value $rawValue -Min ([double]$axisMinMax[$axisLabel].Min) -Max ([double]$axisMinMax[$axisLabel].Max) -Invert:$axisDefinitions[$i].Invert
+            $xData = $centerX + (($radius * $normalized) * [Math]::Cos($angle))
+            $yData = $centerY + (($radius * $normalized) * [Math]::Sin($angle))
+            $dataPoints.Add([pscustomobject][ordered]@{
+                    X = $xData
+                    Y = $yData
+                    Value = $normalized
+                }) | Out-Null
+        }
+
+        $dataPolygonPoints = @($dataPoints.ToArray() | ForEach-Object { '{0:F2},{1:F2}' -f $_.X, $_.Y }) -join ' '
+        $authorTitle = [System.Security.SecurityElement]::Escape([string]$row.Author)
+        if ([string]::IsNullOrEmpty($authorTitle))
+        {
+            $authorTitle = '(unknown)'
+        }
+
+        $authorName = [string]$row.Author
+        if ([string]::IsNullOrWhiteSpace($authorName))
+        {
+            $authorName = '(unknown)'
+        }
+
+        # 安全なファイル名を生成（予約名・長さ制限対応）
+        # 著者名のみを先にサニタイズ（予約名処理のため、長さ制限なし）
+        $safeAuthor = Get-SafeFileName -BaseName $authorName -Extension '' -MaxLength 999
+        # フルファイル名を生成し、長さ制限を適用
+        $fileName = Get-SafeFileName -BaseName "committer_radar_$safeAuthor" -Extension '.svg' -MaxLength 100
+        if (-not $usedNames.Add($fileName))
+        {
+            $index = 2
+            while ($true)
+            {
+                $candidateBase = "committer_radar_{0}_{1}" -f $safeAuthor, $index
+                $candidate = Get-SafeFileName -BaseName $candidateBase -Extension '.svg' -MaxLength 100
+                if ($usedNames.Add($candidate))
+                {
+                    $fileName = $candidate
+                    break
+                }
+                $index++
+            }
+        }
+
+        $sb = New-Object System.Text.StringBuilder
+        [void]$sb.AppendLine('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 500 500">')
+        [void]$sb.AppendLine('  <rect x="0" y="0" width="500" height="500" fill="white" />')
+        [void]$sb.AppendLine(("  <text x=""250"" y=""30"" text-anchor=""middle"" font-size=""24"" font-weight=""bold"" fill=""#1f2937"" font-family=""'Meiryo', 'Yu Gothic', sans-serif"">{0}</text>" -f $authorTitle))
+
+        foreach ($level in $guideLevels)
+        {
+            $guidePoints = @()
+            foreach ($point in @($outerPoints.ToArray()))
+            {
+                $gx = $centerX + (($point.X - $centerX) * $level)
+                $gy = $centerY + (($point.Y - $centerY) * $level)
+                $guidePoints += ('{0:F2},{1:F2}' -f $gx, $gy)
+            }
+            [void]$sb.AppendLine(("  <polygon points=""{0}"" fill=""none"" stroke=""#d9d9d9"" stroke-width=""1"" />" -f ($guidePoints -join ' ')))
+        }
+
+        foreach ($point in @($outerPoints.ToArray()))
+        {
+            [void]$sb.AppendLine(("  <line x1=""{0:F2}"" y1=""{1:F2}"" x2=""{2:F2}"" y2=""{3:F2}"" stroke=""#e5e7eb"" stroke-width=""1"" />" -f $centerX, $centerY, $point.X, $point.Y))
+        }
+
+        [void]$sb.AppendLine(("  <polygon points=""{0}"" fill=""rgba(54,162,235,0.3)"" stroke=""rgb(54,162,235)"" stroke-width=""2"" />" -f $dataPolygonPoints))
+
+        foreach ($point in @($dataPoints.ToArray()))
+        {
+            [void]$sb.AppendLine(("  <circle cx=""{0:F2}"" cy=""{1:F2}"" r=""4"" fill=""rgb(54,162,235)"" />" -f $point.X, $point.Y))
+        }
+
+        foreach ($point in @($outerPoints.ToArray()))
+        {
+            $labelX = $centerX + ($labelRadius * [Math]::Cos($point.Angle))
+            $labelY = $centerY + ($labelRadius * [Math]::Sin($point.Angle))
+            $anchor = 'middle'
+            $axisCos = [Math]::Cos($point.Angle)
+            if ($axisCos -gt 0.2)
+            {
+                $anchor = 'start'
+            }
+            elseif ($axisCos -lt -0.2)
+            {
+                $anchor = 'end'
+            }
+            $escapedLabel = [System.Security.SecurityElement]::Escape([string]$point.Label)
+            [void]$sb.AppendLine(("  <text x=""{0:F2}"" y=""{1:F2}"" text-anchor=""{2}"" dominant-baseline=""middle"" font-size=""14"" fill=""#374151"" font-family=""'Meiryo', 'Yu Gothic', sans-serif"">{3}</text>" -f $labelX, $labelY, $anchor, $escapedLabel))
+        }
+
+        [void]$sb.AppendLine('</svg>')
+        Write-TextFile -FilePath (Join-Path $OutDirectory $fileName) -Content $sb.ToString() -EncodingName $EncodingName
+    }
+}
 # endregion PlantUML 出力
 # region 消滅行詳細
 function Get-DeadLineDetail
@@ -5024,6 +5473,8 @@ function New-RunMetaData
         対象を絞り込むための包含または除外条件を指定する。
     .PARAMETER EmitPlantUml
         EmitPlantUml の値を指定する。
+    .PARAMETER EmitCharts
+        EmitCharts の値を指定する。
     .PARAMETER NonInteractive
         NonInteractive の値を指定する。
     .PARAMETER TrustServerCert
@@ -5063,6 +5514,7 @@ function New-RunMetaData
         [string[]]$IncludeExtensions,
         [string[]]$ExcludeExtensions,
         [switch]$EmitPlantUml,
+        [switch]$EmitCharts,
         [switch]$NonInteractive,
         [switch]$TrustServerCert,
         [switch]$IgnoreSpaceChange,
@@ -5101,6 +5553,7 @@ function New-RunMetaData
             IncludeExtensions = $IncludeExtensions
             ExcludeExtensions = $ExcludeExtensions
             EmitPlantUml = [bool]$EmitPlantUml
+            EmitCharts = [bool]$EmitCharts
             NonInteractive = [bool]$NonInteractive
             TrustServerCert = [bool]$TrustServerCert
             IgnoreSpaceChange = [bool]$IgnoreSpaceChange
@@ -5134,6 +5587,14 @@ function New-RunMetaData
             CoChangePlantUml = if ($EmitPlantUml)
             {
                 'cochange_network.puml'
+            }
+            else
+            {
+                $null
+            }
+            CommitterRadarCharts = if ($EmitCharts)
+            {
+                'committer_radar_*.svg'
             }
             else
             {
@@ -5303,10 +5764,14 @@ try
     {
         Write-PlantUmlFile -OutDirectory $OutDir -Committers $committerRows -Files $fileRows -Couplings $couplingRows -TopNCount $TopN -EncodingName $Encoding
     }
+    if ($EmitCharts)
+    {
+        Write-CommitterRadarChart -OutDirectory $OutDir -Committers $committerRows -TopNCount $TopN -EncodingName $Encoding
+    }
 
     # --- ステップ 8: 実行メタデータとサマリーの書き出し ---
     $finishedAt = Get-Date
-    $meta = New-RunMetaData -StartTime $startedAt -EndTime $finishedAt -TargetUrl $targetUrl -FromRevision $FromRev -ToRevision $ToRev -AuthorFilter $Author -SvnVersion $svnVersion -NoBlame:$NoBlame -DeadDetailLevel $DeadDetailLevel -Parallel $Parallel -TopN $TopN -Encoding $Encoding -Commits $commits -FileRows $fileRows -OutDir $OutDir -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -EmitPlantUml:$EmitPlantUml -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -IgnoreSpaceChange:$IgnoreSpaceChange -IgnoreAllSpace:$IgnoreAllSpace -IgnoreEolStyle:$IgnoreEolStyle -IncludeProperties:$IncludeProperties -ForceBinary:$ForceBinary
+    $meta = New-RunMetaData -StartTime $startedAt -EndTime $finishedAt -TargetUrl $targetUrl -FromRevision $FromRev -ToRevision $ToRev -AuthorFilter $Author -SvnVersion $svnVersion -NoBlame:$NoBlame -DeadDetailLevel $DeadDetailLevel -Parallel $Parallel -TopN $TopN -Encoding $Encoding -Commits $commits -FileRows $fileRows -OutDir $OutDir -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -EmitPlantUml:$EmitPlantUml -EmitCharts:$EmitCharts -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -IgnoreSpaceChange:$IgnoreSpaceChange -IgnoreAllSpace:$IgnoreAllSpace -IgnoreEolStyle:$IgnoreEolStyle -IncludeProperties:$IncludeProperties -ForceBinary:$ForceBinary
     Write-JsonFile -Data $meta -FilePath (Join-Path $OutDir 'run_meta.json') -Depth 12 -EncodingName $Encoding
 
     Write-RunSummary -TargetUrl $targetUrl -FromRevision $FromRev -ToRevision $ToRev -Commits $commits -FileRows $fileRows -OutDir $OutDir
