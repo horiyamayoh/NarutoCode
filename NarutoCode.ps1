@@ -3679,6 +3679,13 @@ function Get-SafeFileName
     $safe = $safe.Trim()
 
     # 無効な文字を置換
+    # GetInvalidFileNameChars() はプラットフォーム依存のため、Windows 固有の無効文字を明示的に処理
+    $windowsInvalidChars = [char[]]@('<', '>', ':', '"', '/', '\', '|', '?', '*')
+    foreach ($invalidChar in $windowsInvalidChars)
+    {
+        $safe = $safe.Replace([string]$invalidChar, '_')
+    }
+    # プラットフォームの無効文字も処理（制御文字など）
     foreach ($invalidChar in [System.IO.Path]::GetInvalidFileNameChars())
     {
         $safe = $safe.Replace([string]$invalidChar, '_')
@@ -3976,14 +3983,15 @@ function Write-CommitterRadarChart
         }
 
         # 安全なファイル名を生成（予約名・長さ制限対応）
-        $baseName = "committer_radar_$authorName"
-        $fileName = Get-SafeFileName -BaseName $baseName -Extension '.svg' -MaxLength 100
+        # まず著者名を安全化してから、プレフィックスを付与する
+        $safeAuthor = Get-SafeFileName -BaseName $authorName -Extension '' -MaxLength 50
+        $fileName = Get-SafeFileName -BaseName "committer_radar_$safeAuthor" -Extension '.svg' -MaxLength 100
         if (-not $usedNames.Add($fileName))
         {
             $index = 2
             while ($true)
             {
-                $candidateBase = "committer_radar_{0}_{1}" -f $authorName, $index
+                $candidateBase = "committer_radar_{0}_{1}" -f $safeAuthor, $index
                 $candidate = Get-SafeFileName -BaseName $candidateBase -Extension '.svg' -MaxLength 100
                 if ($usedNames.Add($candidate))
                 {
