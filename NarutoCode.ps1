@@ -3784,15 +3784,16 @@ function Write-FileBubbleChart
 
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine(('<?xml version="1.0" encoding="{0}"?>' -f $xmlEncoding))
-    [void]$sb.AppendLine('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 700">')
+    $titleX = $svgWidth / 2.0
+    [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {0} {1}">' -f $svgWidth, $svgHeight))
     [void]$sb.AppendLine('  <defs>')
     [void]$sb.AppendLine('    <linearGradient id="rankGradient" x1="0%" y1="0%" x2="100%" y2="0%">')
     [void]$sb.AppendLine(('      <stop offset="0%" stop-color="{0}" />' -f $rankStartColor))
     [void]$sb.AppendLine(('      <stop offset="100%" stop-color="{0}" />' -f $rankEndColor))
     [void]$sb.AppendLine('    </linearGradient>')
     [void]$sb.AppendLine('  </defs>')
-    [void]$sb.AppendLine('  <rect x="0" y="0" width="1000" height="700" fill="#FFFFFF" />')
-    [void]$sb.AppendLine('  <text x="500" y="28" font-size="20" font-weight="bold" text-anchor="middle" fill="#222222">ファイル別ホットスポット バブルチャート</text>')
+    [void]$sb.AppendLine(('  <rect x="0" y="0" width="{0}" height="{1}" fill="#FFFFFF" />' -f $svgWidth, $svgHeight))
+    [void]$sb.AppendLine(('  <text x="{0}" y="28" font-size="20" font-weight="bold" text-anchor="middle" fill="#222222">ファイル別ホットスポット バブルチャート</text>' -f $titleX))
 
     for ($i = 0
         $i -le $tickCount
