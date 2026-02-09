@@ -3001,6 +3001,296 @@ Describe 'Write-CommitScatterChart' {
     }
 }
 
+Describe 'Write-ProjectCodeFateChart' {
+    BeforeEach {
+        $script:fateDir = Join-Path $env:TEMP ('narutocode_fate_' + [guid]::NewGuid().ToString('N'))
+        New-Item -Path $script:fateDir -ItemType Directory -Force | Out-Null
+    }
+    AfterEach {
+        Remove-Item -Path $script:fateDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'creates donut SVG with fate segments and survival rate' {
+        $committers = @(
+            [pscustomobject]@{ '作者' = 'alice'; '追加行数' = 400; '生存行数' = 300; '自己相殺行数' = 30; '被他者削除行数' = 20 }
+            [pscustomobject]@{ '作者' = 'bob'; '追加行数' = 100; '生存行数' = 50; '自己相殺行数' = 10; '被他者削除行数' = 5 }
+        )
+
+        Write-ProjectCodeFateChart -OutDirectory $script:fateDir -Committers $committers -EncodingName 'UTF8'
+
+        $svgPath = Join-Path $script:fateDir 'project_code_fate.svg'
+        Test-Path $svgPath | Should -BeTrue
+
+        $content = Get-Content -Path $svgPath -Raw -Encoding UTF8
+        $content | Should -Match '<svg'
+        $content | Should -Match '</svg>'
+        $content | Should -Match '<path'
+        $content | Should -Match '生存'
+        $content | Should -Match '自己相殺'
+        $content | Should -Match '被他者削除'
+        $content | Should -Match 'コード生存率'
+        $content | Should -Match '70\.0%'
+    }
+
+    It 'does not create SVG when Committers is empty' {
+        Write-ProjectCodeFateChart -OutDirectory $script:fateDir -Committers @() -EncodingName 'UTF8'
+        Test-Path (Join-Path $script:fateDir 'project_code_fate.svg') | Should -BeFalse
+    }
+
+    It 'does not create SVG when total added is zero' {
+        $committers = @(
+            [pscustomobject]@{ '作者' = 'x'; '追加行数' = 0; '生存行数' = 0; '自己相殺行数' = 0; '被他者削除行数' = 0 }
+        )
+        Write-ProjectCodeFateChart -OutDirectory $script:fateDir -Committers $committers -EncodingName 'UTF8'
+        Test-Path (Join-Path $script:fateDir 'project_code_fate.svg') | Should -BeFalse
+    }
+
+    It 'clamps other to zero when breakdown exceeds total added' {
+        $committers = @(
+            [pscustomobject]@{ '作者' = 'alice'; '追加行数' = 100; '生存行数' = 80; '自己相殺行数' = 15; '被他者削除行数' = 10 }
+        )
+
+        Write-ProjectCodeFateChart -OutDirectory $script:fateDir -Committers $committers -EncodingName 'UTF8'
+
+        $content = Get-Content -Path (Join-Path $script:fateDir 'project_code_fate.svg') -Raw -Encoding UTF8
+        $content | Should -Match '生存'
+        # その他消滅は 0 になるのでセグメントが出ないはず
+        $content | Should -Not -Match 'その他消滅'
+    }
+}
+
+Describe 'Get-ProjectEfficiencyData' {
+    It 'calculates survival rate and churn efficiency per file' {
+        $files = @(
+            [pscustomobject]@{
+                'ファイルパス' = 'src/A.cs'
+                '追加行数' = 100
+                '生存行数 (範囲指定)' = 80
+                '純増行数' = 60
+                '総チャーン' = 200
+            }
+            [pscustomobject]@{
+                'ファイルパス' = 'src/B.cs'
+                '追加行数' = 50
+                '生存行数 (範囲指定)' = 10
+                '純増行数' = -20
+                '総チャーン' = 80
+            }
+        )
+
+        $data = @(Get-ProjectEfficiencyData -Files $files)
+        $data.Count | Should -Be 2
+
+        $a = $data | Where-Object { $_.FilePath -eq 'src/A.cs' }
+        $a.SurvivalRate | Should -BeGreaterThan 0.79
+        $a.SurvivalRate | Should -BeLessThan 0.81
+        $a.ChurnEfficiency | Should -BeGreaterThan 0.29
+        $a.ChurnEfficiency | Should -BeLessThan 0.31
+
+        $b = $data | Where-Object { $_.FilePath -eq 'src/B.cs' }
+        $b.SurvivalRate | Should -BeGreaterThan 0.19
+        $b.SurvivalRate | Should -BeLessThan 0.21
+        $b.ChurnEfficiency | Should -BeGreaterThan 0.24
+        $b.ChurnEfficiency | Should -BeLessThan 0.26
+    }
+
+    It 'excludes files with zero added lines' {
+        $files = @(
+            [pscustomobject]@{
+                'ファイルパス' = 'src/empty.cs'
+                '追加行数' = 0
+                '生存行数 (範囲指定)' = 0
+                '純増行数' = 0
+                '総チャーン' = 0
+            }
+        )
+        $data = @(Get-ProjectEfficiencyData -Files $files)
+        $data.Count | Should -Be 0
+    }
+
+    It 'respects TopNCount parameter' {
+        $files = @(
+            [pscustomobject]@{ 'ファイルパス' = 'a.cs'; '追加行数' = 100; '生存行数 (範囲指定)' = 50; '純増行数' = 50; '総チャーン' = 200 }
+            [pscustomobject]@{ 'ファイルパス' = 'b.cs'; '追加行数' = 80; '生存行数 (範囲指定)' = 40; '純増行数' = 40; '総チャーン' = 160 }
+            [pscustomobject]@{ 'ファイルパス' = 'c.cs'; '追加行数' = 50; '生存行数 (範囲指定)' = 20; '純増行数' = 20; '総チャーン' = 100 }
+        )
+        $data = @(Get-ProjectEfficiencyData -Files $files -TopNCount 2)
+        $data.Count | Should -Be 2
+    }
+}
+
+Describe 'Write-ProjectEfficiencyQuadrantChart' {
+    BeforeEach {
+        $script:effDir = Join-Path $env:TEMP ('narutocode_eff_' + [guid]::NewGuid().ToString('N'))
+        New-Item -Path $script:effDir -ItemType Directory -Force | Out-Null
+    }
+    AfterEach {
+        Remove-Item -Path $script:effDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'creates quadrant SVG with axis labels and quadrant labels' {
+        $files = @(
+            [pscustomobject]@{
+                'ファイルパス' = 'src/A.cs'
+                '追加行数' = 100
+                '生存行数 (範囲指定)' = 80
+                '純増行数' = 60
+                '総チャーン' = 200
+            }
+            [pscustomobject]@{
+                'ファイルパス' = 'src/B.cs'
+                '追加行数' = 50
+                '生存行数 (範囲指定)' = 10
+                '純増行数' = -20
+                '総チャーン' = 80
+            }
+        )
+
+        Write-ProjectEfficiencyQuadrantChart -OutDirectory $script:effDir -Files $files -EncodingName 'UTF8'
+
+        $svgPath = Join-Path $script:effDir 'project_efficiency_quadrant.svg'
+        Test-Path $svgPath | Should -BeTrue
+
+        $content = Get-Content -Path $svgPath -Raw -Encoding UTF8
+        $content | Should -Match '<svg'
+        $content | Should -Match '<circle'
+        $content | Should -Match 'コード生存率'
+        $content | Should -Match 'チャーン効率'
+        $content | Should -Match '高効率安定'
+        $content | Should -Match '高リスク不安定'
+        $content | Should -Match '過修正安定'
+        $content | Should -Match '無駄な変動'
+    }
+
+    It 'does not create SVG when Files is empty' {
+        Write-ProjectEfficiencyQuadrantChart -OutDirectory $script:effDir -Files @() -EncodingName 'UTF8'
+        Test-Path (Join-Path $script:effDir 'project_efficiency_quadrant.svg') | Should -BeFalse
+    }
+}
+
+Describe 'Write-ProjectSummaryDashboard' {
+    BeforeEach {
+        $script:dashDir = Join-Path $env:TEMP ('narutocode_dash_' + [guid]::NewGuid().ToString('N'))
+        New-Item -Path $script:dashDir -ItemType Directory -Force | Out-Null
+    }
+    AfterEach {
+        Remove-Item -Path $script:dashDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'creates dashboard SVG with all KPI cards' {
+        $committers = @(
+            [pscustomobject]@{ '作者' = 'alice'; '追加行数' = 400; '削除行数' = 50; '生存行数' = 300; '所有割合' = 0.7 }
+            [pscustomobject]@{ '作者' = 'bob'; '追加行数' = 100; '削除行数' = 30; '生存行数' = 50; '所有割合' = 0.3 }
+        )
+        $fileRows = @(
+            [pscustomobject]@{ 'ファイルパス' = 'a.cs' }
+            [pscustomobject]@{ 'ファイルパス' = 'b.cs' }
+        )
+        $commitRows = @(
+            [pscustomobject]@{ '変更ファイル数' = 3; 'エントロピー' = 1.2 }
+            [pscustomobject]@{ '変更ファイル数' = 1; 'エントロピー' = 0.0 }
+        )
+
+        Write-ProjectSummaryDashboard -OutDirectory $script:dashDir -Committers $committers -FileRows $fileRows -CommitRows $commitRows -EncodingName 'UTF8'
+
+        $svgPath = Join-Path $script:dashDir 'project_summary_dashboard.svg'
+        Test-Path $svgPath | Should -BeTrue
+
+        $content = Get-Content -Path $svgPath -Raw -Encoding UTF8
+        $content | Should -Match '<svg'
+        $content | Should -Match 'プロジェクトサマリーダッシュボード'
+        $content | Should -Match 'コミット数'
+        $content | Should -Match '作者数'
+        $content | Should -Match 'ファイル数'
+        $content | Should -Match '追加行数'
+        $content | Should -Match '削除行数'
+        $content | Should -Match '純増行数'
+        $content | Should -Match 'コード生存率'
+        $content | Should -Match 'リワーク率'
+        $content | Should -Match 'HHI'
+    }
+
+    It 'calculates HHI as 1.0 when single author' {
+        $committers = @(
+            [pscustomobject]@{ '作者' = 'solo'; '追加行数' = 100; '削除行数' = 10; '生存行数' = 80; '所有割合' = 1.0 }
+        )
+        $commitRows = @(
+            [pscustomobject]@{ '変更ファイル数' = 1; 'エントロピー' = 0.0 }
+        )
+
+        Write-ProjectSummaryDashboard -OutDirectory $script:dashDir -Committers $committers -FileRows @() -CommitRows $commitRows -EncodingName 'UTF8'
+
+        $content = Get-Content -Path (Join-Path $script:dashDir 'project_summary_dashboard.svg') -Raw -Encoding UTF8
+        $content | Should -Match '1\.000'
+    }
+
+    It 'does not create SVG when all inputs are empty' {
+        Write-ProjectSummaryDashboard -OutDirectory $script:dashDir -Committers @() -FileRows @() -CommitRows @() -EncodingName 'UTF8'
+        Test-Path (Join-Path $script:dashDir 'project_summary_dashboard.svg') | Should -BeFalse
+    }
+}
+
+Describe 'Write-ContributorBalanceChart' {
+    BeforeEach {
+        $script:balDir = Join-Path $env:TEMP ('narutocode_bal_' + [guid]::NewGuid().ToString('N'))
+        New-Item -Path $script:balDir -ItemType Directory -Force | Out-Null
+    }
+    AfterEach {
+        Remove-Item -Path $script:balDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'creates butterfly SVG with bars for each committer' {
+        $committers = @(
+            [pscustomobject]@{ '作者' = 'alice'; '総チャーン' = 400; '生存行数' = 300 }
+            [pscustomobject]@{ '作者' = 'bob'; '総チャーン' = 100; '生存行数' = 20 }
+        )
+
+        Write-ContributorBalanceChart -OutDirectory $script:balDir -Committers $committers -EncodingName 'UTF8'
+
+        $svgPath = Join-Path $script:balDir 'contributor_balance.svg'
+        Test-Path $svgPath | Should -BeTrue
+
+        $content = Get-Content -Path $svgPath -Raw -Encoding UTF8
+        $content | Should -Match '<svg'
+        $content | Should -Match '</svg>'
+        $content | Should -Match '<rect'
+        $content | Should -Match 'alice'
+        $content | Should -Match 'bob'
+        $content | Should -Match '総チャーン'
+        $content | Should -Match '生存行数'
+        $content | Should -Match '投入量'
+        $content | Should -Match '最終成果'
+    }
+
+    It 'respects TopNCount parameter' {
+        $committers = @(
+            [pscustomobject]@{ '作者' = 'alice'; '総チャーン' = 400; '生存行数' = 300 }
+            [pscustomobject]@{ '作者' = 'bob'; '総チャーン' = 100; '生存行数' = 20 }
+            [pscustomobject]@{ '作者' = 'charlie'; '総チャーン' = 50; '生存行数' = 10 }
+        )
+
+        Write-ContributorBalanceChart -OutDirectory $script:balDir -Committers $committers -TopNCount 2 -EncodingName 'UTF8'
+
+        $content = Get-Content -Path (Join-Path $script:balDir 'contributor_balance.svg') -Raw -Encoding UTF8
+        $content | Should -Match 'alice'
+        $content | Should -Match 'bob'
+        $content | Should -Not -Match 'charlie'
+    }
+
+    It 'does not create SVG when Committers is empty' {
+        Write-ContributorBalanceChart -OutDirectory $script:balDir -Committers @() -EncodingName 'UTF8'
+        Test-Path (Join-Path $script:balDir 'contributor_balance.svg') | Should -BeFalse
+    }
+
+    It 'skips committers with zero churn and zero survived' {
+        $committers = @(
+            [pscustomobject]@{ '作者' = 'ghost'; '総チャーン' = 0; '生存行数' = 0 }
+        )
+        Write-ContributorBalanceChart -OutDirectory $script:balDir -Committers $committers -EncodingName 'UTF8'
+        Test-Path (Join-Path $script:balDir 'contributor_balance.svg') | Should -BeFalse
+    }
+}
+
 Describe 'SvnBlameLineMemoryCache eviction at commit boundary' {
     BeforeAll {
         $script:origGetStrictBlamePrefetchTargetEvict = (Get-Item function:Get-StrictBlamePrefetchTarget).ScriptBlock.ToString()

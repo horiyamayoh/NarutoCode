@@ -6731,6 +6731,858 @@ function Write-TeamActivityProfileChart
     Write-TextFile -FilePath (Join-Path $OutDirectory 'team_activity_profile.svg') -Content $sb.ToString() -EncodingName $EncodingName
 }
 
+function Write-ProjectCodeFateChart
+{
+    <#
+    .SYNOPSIS
+        プロジェクト全体の追加行数の帰結をドーナッツチャートで可視化する。
+    .DESCRIPTION
+        全コミッターの追加行数を合算し、その帰結（生存・自己相殺・被他者削除・
+        その他消滅）をドーナッツチャートとして描画する。
+        既存の team_survived_share.svg が「誰のコードが残ったか」を示すのに対し、
+        本チャートは「追加されたコード全体がどこへ行ったか」を示す対のチャート。
+        開発完了後の成果物評価として、コードの歩留まりを一目で把握できる。
+    .PARAMETER OutDirectory
+        出力先ディレクトリを指定する。
+    .PARAMETER Committers
+        Get-CommitterMetric が返すコミッター行配列を指定する。
+    .PARAMETER EncodingName
+        出力時に使用する文字エンコーディングを指定する。
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$OutDirectory,
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [object[]]$Committers,
+        [Parameter(Mandatory = $false)]
+        [string]$EncodingName = 'UTF-8'
+    )
+    if ([string]::IsNullOrWhiteSpace($OutDirectory))
+    {
+        return
+    }
+    if (-not $Committers -or @($Committers).Count -eq 0)
+    {
+        return
+    }
+
+    # 全作者合計を集計
+    $totalAdded = 0.0
+    $totalSurvived = 0.0
+    $totalSelfCancel = 0.0
+    $totalRemovedByOthers = 0.0
+    foreach ($c in @($Committers))
+    {
+        if ($null -eq $c)
+        {
+            continue
+        }
+        if ($null -ne $c.'追加行数')
+        {
+            $totalAdded += [double]$c.'追加行数'
+        }
+        if ($null -ne $c.'生存行数')
+        {
+            $totalSurvived += [double]$c.'生存行数'
+        }
+        if ($null -ne $c.'自己相殺行数')
+        {
+            $totalSelfCancel += [double]$c.'自己相殺行数'
+        }
+        if ($null -ne $c.'被他者削除行数')
+        {
+            $totalRemovedByOthers += [double]$c.'被他者削除行数'
+        }
+    }
+    if ($totalAdded -le 0)
+    {
+        return
+    }
+    $totalOther = $totalAdded - ($totalSurvived + $totalSelfCancel + $totalRemovedByOthers)
+    if ($totalOther -lt 0)
+    {
+        $totalOther = 0.0
+    }
+    if (-not (Test-Path -LiteralPath $OutDirectory))
+    {
+        New-Item -Path $OutDirectory -ItemType Directory -Force | Out-Null
+    }
+
+    $segments = @(
+        [pscustomobject]@{ Label = '生存'; Value = $totalSurvived; Color = '#4caf50' }
+        [pscustomobject]@{ Label = '自己相殺'; Value = $totalSelfCancel; Color = '#ffc107' }
+        [pscustomobject]@{ Label = '被他者削除'; Value = $totalRemovedByOthers; Color = '#f44336' }
+        [pscustomobject]@{ Label = 'その他消滅'; Value = $totalOther; Color = '#bdbdbd' }
+    )
+    # 値が 0 のセグメントを除外
+    $segments = @($segments | Where-Object { $_.Value -gt 0 })
+    if ($segments.Count -eq 0)
+    {
+        return
+    }
+
+    $svgW = 640
+    $svgH = 460
+    $cx = 240.0
+    $cy = 240.0
+    $outerR = 150.0
+    $innerR = 90.0
+    $legendX = 430.0
+    $legendY = 140.0
+
+    $survivalRate = $totalSurvived / $totalAdded
+
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine('<?xml version="1.0" encoding="UTF-8"?>')
+    [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" width="{0}" height="{1}" viewBox="0 0 {0} {1}">' -f $svgW, $svgH))
+    [void]$sb.AppendLine(@'
+<defs><style>
+  text { font-family: "Segoe UI", "Meiryo UI", sans-serif; }
+  .title { font-size: 16px; font-weight: bold; fill: #333; }
+  .subtitle { font-size: 11px; fill: #888; }
+  .legend-text { font-size: 12px; fill: #333; }
+  .center-label { font-size: 13px; fill: #555; text-anchor: middle; }
+  .center-value { font-size: 26px; font-weight: bold; fill: #333; text-anchor: middle; }
+  .center-sub { font-size: 11px; fill: #888; text-anchor: middle; }
+</style></defs>
+'@)
+    [void]$sb.AppendLine('<rect width="100%" height="100%" fill="#fafafa"/>')
+    [void]$sb.AppendLine('<text class="title" x="20" y="28">コード帰結サマリー（プロジェクト全体）</text>')
+    [void]$sb.AppendLine(('<text class="subtitle" x="20" y="46">追加された {0} 行のうち、最終的にどこへ行ったか</text>' -f [int]$totalAdded))
+
+    # ドーナッツ描画
+    $startAngle = -90.0
+    for ($i = 0; $i -lt $segments.Count; $i++)
+    {
+        $seg = $segments[$i]
+        $share = $seg.Value / $totalAdded
+        $sweepAngle = $share * 360.0
+        if ($sweepAngle -lt 0.1)
+        {
+            continue
+        }
+        $color = $seg.Color
+
+        $startRad = $startAngle * [Math]::PI / 180.0
+        $endRad = ($startAngle + $sweepAngle) * [Math]::PI / 180.0
+        $largeArc = if ($sweepAngle -gt 180.0)
+        {
+            1
+        }
+        else
+        {
+            0
+        }
+
+        $ox1 = $cx + $outerR * [Math]::Cos($startRad)
+        $oy1 = $cy + $outerR * [Math]::Sin($startRad)
+        $ox2 = $cx + $outerR * [Math]::Cos($endRad)
+        $oy2 = $cy + $outerR * [Math]::Sin($endRad)
+        $ix1 = $cx + $innerR * [Math]::Cos($endRad)
+        $iy1 = $cy + $innerR * [Math]::Sin($endRad)
+        $ix2 = $cx + $innerR * [Math]::Cos($startRad)
+        $iy2 = $cy + $innerR * [Math]::Sin($startRad)
+
+        $pathD = ('M {0:F1} {1:F1} A {2:F1} {2:F1} 0 {3} 1 {4:F1} {5:F1} L {6:F1} {7:F1} A {8:F1} {8:F1} 0 {3} 0 {9:F1} {10:F1} Z' -f $ox1, $oy1, $outerR, $largeArc, $ox2, $oy2, $ix1, $iy1, $innerR, $ix2, $iy2)
+        $tooltipText = ('{0}: {1} 行 ({2:F1}%)' -f (ConvertTo-SvgEscapedText -Text $seg.Label), [int]$seg.Value, ($share * 100))
+        [void]$sb.AppendLine(('<path d="{0}" fill="{1}" stroke="#fff" stroke-width="2"><title>{2}</title></path>' -f $pathD, $color, $tooltipText))
+
+        $startAngle += $sweepAngle
+    }
+
+    # 中央テキスト: 生存率
+    [void]$sb.AppendLine(('<text class="center-value" x="{0}" y="{1}">{2:F1}%</text>' -f [int]$cx, [int]($cy - 2), ($survivalRate * 100)))
+    [void]$sb.AppendLine(('<text class="center-label" x="{0}" y="{1}">コード生存率</text>' -f [int]$cx, [int]($cy + 18)))
+    [void]$sb.AppendLine(('<text class="center-sub" x="{0}" y="{1}">{2} / {3} 行</text>' -f [int]$cx, [int]($cy + 34), [int]$totalSurvived, [int]$totalAdded))
+
+    # 凡例
+    for ($i = 0; $i -lt $segments.Count; $i++)
+    {
+        $seg = $segments[$i]
+        $ly = $legendY + $i * 40
+        $share = $seg.Value / $totalAdded
+        [void]$sb.AppendLine(('<rect x="{0}" y="{1}" width="16" height="16" rx="3" fill="{2}"/>' -f [int]$legendX, [int]$ly, $seg.Color))
+        $legendLabel = ('{0}: {1} 行 ({2:F1}%)' -f (ConvertTo-SvgEscapedText -Text $seg.Label), [int]$seg.Value, ($share * 100))
+        [void]$sb.AppendLine(('<text class="legend-text" x="{0}" y="{1}">{2}</text>' -f [int]($legendX + 22), [int]($ly + 13), $legendLabel))
+    }
+
+    [void]$sb.AppendLine('</svg>')
+    Write-TextFile -FilePath (Join-Path $OutDirectory 'project_code_fate.svg') -Content $sb.ToString() -EncodingName $EncodingName
+}
+
+function Get-ProjectEfficiencyData
+{
+    <#
+    .SYNOPSIS
+        ファイル単位のコード効率データを4象限散布図用に抽出する。
+    .DESCRIPTION
+        X 軸: コード生存率（生存行数 ÷ 追加行数）
+        Y 軸: チャーン効率（|純増行数| ÷ 総チャーン）
+        バブルサイズ: 総チャーン
+        追加行数が 0 または総チャーンが 0 のファイルは除外する。
+    .PARAMETER Files
+        Get-FileMetric が返すファイル行配列を指定する。
+    .PARAMETER TopNCount
+        総チャーン上位として抽出する件数を指定する。0 で全件。
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [object[]]$Files,
+        [int]$TopNCount = 0
+    )
+    $rows = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($f in @($Files))
+    {
+        if ($null -eq $f)
+        {
+            continue
+        }
+        $added = 0.0
+        if ($null -ne $f.'追加行数')
+        {
+            $added = [double]$f.'追加行数'
+        }
+        if ($added -le 0)
+        {
+            continue
+        }
+        $churn = 0.0
+        if ($null -ne $f.'総チャーン')
+        {
+            $churn = [double]$f.'総チャーン'
+        }
+        if ($churn -le 0)
+        {
+            continue
+        }
+        $survived = 0.0
+        if ($null -ne $f.'生存行数 (範囲指定)')
+        {
+            $survived = [double]$f.'生存行数 (範囲指定)'
+        }
+        $net = 0.0
+        if ($null -ne $f.'純増行数')
+        {
+            $net = [double]$f.'純増行数'
+        }
+        $survivalRate = $survived / $added
+        if ($survivalRate -gt 1.0)
+        {
+            $survivalRate = 1.0
+        }
+        $churnEfficiency = [Math]::Abs($net) / $churn
+        if ($churnEfficiency -gt 1.0)
+        {
+            $churnEfficiency = 1.0
+        }
+        [void]$rows.Add([pscustomobject][ordered]@{
+                FilePath = [string]$f.'ファイルパス'
+                SurvivalRate = $survivalRate
+                ChurnEfficiency = $churnEfficiency
+                TotalChurn = $churn
+            })
+    }
+    if ($rows.Count -eq 0)
+    {
+        return @()
+    }
+    $sorted = @($rows.ToArray() | Sort-Object -Property @{Expression = 'TotalChurn'
+            Descending = $true
+        }, 'FilePath')
+    if ($TopNCount -gt 0 -and $sorted.Count -gt $TopNCount)
+    {
+        return @($sorted | Select-Object -First $TopNCount)
+    }
+    return $sorted
+}
+
+function Write-ProjectEfficiencyQuadrantChart
+{
+    <#
+    .SYNOPSIS
+        ファイル別のコード効率を4象限散布図 SVG として出力する。
+    .DESCRIPTION
+        X 軸にコード生存率（生存行数÷追加行数）、Y 軸にチャーン効率
+        （|純増行数|÷総チャーン）を取り、バブルサイズに総チャーンを反映した
+        散布図を生成する。
+        右上 = 高効率安定（生存率もチャーン効率も高い理想的なファイル）
+        左上 = 無駄な変動（効率は高いが最終的にコードが残らない）
+        右下 = 過修正安定（コードは残るが手戻りが多い）
+        左下 = 高リスク不安定（生存率もチャーン効率も低い問題ファイル）
+    .PARAMETER OutDirectory
+        SVG ファイルを保存する出力先ディレクトリを指定する。
+    .PARAMETER Files
+        Get-FileMetric が返すファイル行配列を指定する。
+    .PARAMETER TopNCount
+        表示するファイル数の上限を指定する。0 で全件。
+    .PARAMETER EncodingName
+        出力時に使用する文字エンコーディング名を指定する。
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$OutDirectory,
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [object[]]$Files,
+        [Parameter(Mandatory = $false)]
+        [int]$TopNCount = 0,
+        [Parameter(Mandatory = $false)]
+        [string]$EncodingName = 'UTF-8'
+    )
+    if ([string]::IsNullOrWhiteSpace($OutDirectory))
+    {
+        Write-Warning 'Write-ProjectEfficiencyQuadrantChart: OutDirectory が空です。'
+        return
+    }
+    $data = @(Get-ProjectEfficiencyData -Files $Files -TopNCount $TopNCount)
+    if ($data.Count -eq 0)
+    {
+        Write-Verbose 'Write-ProjectEfficiencyQuadrantChart: 有効なファイルデータがありません。'
+        return
+    }
+    if (-not (Test-Path -LiteralPath $OutDirectory))
+    {
+        try
+        {
+            New-Item -Path $OutDirectory -ItemType Directory -Force -ErrorAction Stop | Out-Null
+        }
+        catch
+        {
+            Write-Warning "Write-ProjectEfficiencyQuadrantChart: ディレクトリ作成失敗: $_"
+            return
+        }
+    }
+
+    $plotLeft = 80.0
+    $plotTop = 72.0
+    $plotWidth = 400.0
+    $plotHeight = 400.0
+    $plotRight = $plotLeft + $plotWidth
+    $plotBottom = $plotTop + $plotHeight
+    $svgW = 600
+    $svgH = 560
+
+    $maxChurn = ($data | Measure-Object -Property TotalChurn -Maximum).Maximum
+    if ($maxChurn -le 0)
+    {
+        $maxChurn = 1.0
+    }
+    $minBubble = 8.0
+    $maxBubble = 36.0
+
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine('<?xml version="1.0" encoding="UTF-8"?>')
+    [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" width="{0}" height="{1}" viewBox="0 0 {0} {1}">' -f $svgW, $svgH))
+    [void]$sb.AppendLine(@'
+<defs><style>
+  text { font-family: "Segoe UI", "Meiryo UI", sans-serif; }
+  .title { font-size: 16px; font-weight: bold; fill: #333; }
+  .subtitle { font-size: 11px; fill: #888; }
+  .axis-label { font-size: 12px; fill: #555; }
+  .tick-label { font-size: 10px; fill: #888; }
+  .quadrant-label { font-size: 13px; fill: #aaa; text-anchor: middle; }
+  .file-label { font-size: 9px; fill: #333; text-anchor: middle; }
+  .mid-line { stroke: #bdbdbd; stroke-width: 1; stroke-dasharray: 6,4; }
+  .axis-line { stroke: #999; stroke-width: 1.2; }
+</style></defs>
+'@)
+    [void]$sb.AppendLine('<rect width="100%" height="100%" fill="#fafafa"/>')
+    [void]$sb.AppendLine('<text class="title" x="20" y="28">ファイル効率マップ（成果 × 生産性）</text>')
+    [void]$sb.AppendLine(('<text class="subtitle" x="20" y="46">X: コード生存率 / Y: チャーン効率（|純増|÷チャーン） / バブル: 総チャーン / 上位{0}件</text>' -f $data.Count))
+
+    # プロットエリア
+    [void]$sb.AppendLine(('<rect x="{0}" y="{1}" width="{2}" height="{3}" fill="#fff" stroke="#ddd"/>' -f [int]$plotLeft, [int]$plotTop, [int]$plotWidth, [int]$plotHeight))
+
+    # 中央線（50%）
+    $midX = $plotLeft + $plotWidth * 0.5
+    $midY = $plotTop + $plotHeight * 0.5
+    [void]$sb.AppendLine(('<line class="mid-line" x1="{0}" y1="{1}" x2="{0}" y2="{2}"/>' -f [int]$midX, [int]$plotTop, [int]$plotBottom))
+    [void]$sb.AppendLine(('<line class="mid-line" x1="{0}" y1="{1}" x2="{2}" y2="{1}"/>' -f [int]$plotLeft, [int]$midY, [int]$plotRight))
+    # 目盛りラベル
+    for ($tick = 0.0; $tick -le 1.01; $tick += 0.25)
+    {
+        $tx = $plotLeft + $tick * $plotWidth
+        $ty = $plotBottom - $tick * $plotHeight
+        [void]$sb.AppendLine(('<text class="tick-label" x="{0:F0}" y="{1}" text-anchor="middle">{2:F0}%</text>' -f $tx, [int]($plotBottom + 16), ($tick * 100)))
+        [void]$sb.AppendLine(('<text class="tick-label" x="{0}" y="{1:F0}" text-anchor="end">{2:F0}%</text>' -f [int]($plotLeft - 6), ($ty + 4), ($tick * 100)))
+    }
+
+    # 軸線
+    [void]$sb.AppendLine(('<line class="axis-line" x1="{0}" y1="{1}" x2="{2}" y2="{1}"/>' -f [int]$plotLeft, [int]$plotBottom, [int]$plotRight))
+    [void]$sb.AppendLine(('<line class="axis-line" x1="{0}" y1="{1}" x2="{0}" y2="{2}"/>' -f [int]$plotLeft, [int]$plotTop, [int]$plotBottom))
+
+    # 軸ラベル
+    [void]$sb.AppendLine(('<text class="axis-label" x="{0}" y="{1}" text-anchor="middle">コード生存率</text>' -f [int]($plotLeft + $plotWidth / 2.0), [int]($plotBottom + 40)))
+    [void]$sb.AppendLine(('<text class="axis-label" x="16" y="{0}" text-anchor="middle" transform="rotate(-90,16,{0})">チャーン効率</text>' -f [int]($plotTop + $plotHeight / 2.0)))
+
+    # 4象限ラベル
+    $quadrants = @(
+        @{ X = $plotLeft + $plotWidth * 0.25; Y = $plotTop + $plotHeight * 0.15; Text = '🔥 無駄な変動' }
+        @{ X = $plotLeft + $plotWidth * 0.75; Y = $plotTop + $plotHeight * 0.15; Text = '✅ 高効率安定' }
+        @{ X = $plotLeft + $plotWidth * 0.25; Y = $plotTop + $plotHeight * 0.85; Text = '💀 高リスク不安定' }
+        @{ X = $plotLeft + $plotWidth * 0.75; Y = $plotTop + $plotHeight * 0.85; Text = '⚠️ 過修正安定' }
+    )
+    foreach ($q in $quadrants)
+    {
+        [void]$sb.AppendLine(('<text class="quadrant-label" x="{0:F0}" y="{1:F0}">{2}</text>' -f $q.X, $q.Y, (ConvertTo-SvgEscapedText -Text $q.Text)))
+    }
+
+    # バブル描画
+    foreach ($d in $data)
+    {
+        $bx = $plotLeft + $d.SurvivalRate * $plotWidth
+        $by = $plotBottom - $d.ChurnEfficiency * $plotHeight
+        $r = $minBubble + ($maxBubble - $minBubble) * [Math]::Sqrt($d.TotalChurn / $maxChurn)
+        $color = ConvertTo-SvgColor -Rank ([Math]::Max(1, [int]($data.Count * (1.0 - $d.SurvivalRate)))) -MaxRank ([Math]::Max(1, $data.Count))
+
+        $shortName = $d.FilePath
+        $slashIdx = $shortName.LastIndexOf('/')
+        if ($slashIdx -ge 0)
+        {
+            $shortName = $shortName.Substring($slashIdx + 1)
+        }
+        $tooltipText = ('{0} 生存率:{1:F0}% 効率:{2:F0}% チャーン:{3}' -f (ConvertTo-SvgEscapedText -Text $d.FilePath), ($d.SurvivalRate * 100), ($d.ChurnEfficiency * 100), [int]$d.TotalChurn)
+        [void]$sb.AppendLine(('<circle cx="{0:F1}" cy="{1:F1}" r="{2:F1}" fill="{3}" fill-opacity="0.6" stroke="{3}" stroke-width="1"><title>{4}</title></circle>' -f $bx, $by, $r, $color, $tooltipText))
+        $labelText = Get-SvgFittedText -Text $shortName -MaxWidth ($r * 3.0) -FontSize 9.0
+        if ($labelText)
+        {
+            [void]$sb.AppendLine(('<text class="file-label" x="{0:F1}" y="{1:F1}"><title>{2}</title>{3}</text>' -f $bx, ($by + $r + 12.0), $tooltipText, (ConvertTo-SvgEscapedText -Text $labelText)))
+        }
+    }
+
+    [void]$sb.AppendLine('</svg>')
+    Write-TextFile -FilePath (Join-Path $OutDirectory 'project_efficiency_quadrant.svg') -Content $sb.ToString() -EncodingName $EncodingName
+}
+
+function Write-ProjectSummaryDashboard
+{
+    <#
+    .SYNOPSIS
+        プロジェクト全体の KPI をダッシュボード SVG として描画する。
+    .DESCRIPTION
+        コミッター・ファイル・コミットの全データを集約し、プロジェクトの全体像を
+        カード型レイアウトで1枚の SVG にまとめる。開発完了後の成果報告やレビューで
+        「この開発はこうでした」と説明するための一覧ダッシュボード。
+        表示項目:
+        - 基本数値（コミット数、作者数、ファイル数）
+        - 量の概要（追加・削除・純増・総チャーン）
+        - コード生存率（ゲージ表示）
+        - リワーク率（プロジェクト全体の手戻り度）
+        - 所有権集中度（HHI）
+        - 平均変更ファイル数/コミット、平均エントロピー
+    .PARAMETER OutDirectory
+        出力先ディレクトリを指定する。
+    .PARAMETER Committers
+        Get-CommitterMetric が返すコミッター行配列を指定する。
+    .PARAMETER FileRows
+        Get-FileMetric が返すファイル行配列を指定する。
+    .PARAMETER CommitRows
+        New-CommitRowFromCommit が返すコミット行配列を指定する。
+    .PARAMETER AuthorBorn
+        blame ベースの作者別 Born 行数ハッシュテーブルを指定する。
+    .PARAMETER EncodingName
+        出力時に使用する文字エンコーディングを指定する。
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$OutDirectory,
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [object[]]$Committers,
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [object[]]$FileRows,
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [object[]]$CommitRows,
+        [Parameter(Mandatory = $false)]
+        [hashtable]$AuthorBorn,
+        [Parameter(Mandatory = $false)]
+        [string]$EncodingName = 'UTF-8'
+    )
+    if ([string]::IsNullOrWhiteSpace($OutDirectory))
+    {
+        return
+    }
+    if ((-not $Committers -or @($Committers).Count -eq 0) -and (-not $CommitRows -or @($CommitRows).Count -eq 0))
+    {
+        return
+    }
+    if (-not (Test-Path -LiteralPath $OutDirectory))
+    {
+        New-Item -Path $OutDirectory -ItemType Directory -Force | Out-Null
+    }
+
+    # 集計
+    $commitCount = @($CommitRows).Count
+    $authorCount = @($Committers).Count
+    $fileCount = @($FileRows).Count
+
+    $totalAdded = 0.0
+    $totalDeleted = 0.0
+    $totalSurvived = 0.0
+    foreach ($c in @($Committers))
+    {
+        if ($null -eq $c)
+        {
+            continue
+        }
+        if ($null -ne $c.'追加行数')
+        {
+            $totalAdded += [double]$c.'追加行数'
+        }
+        if ($null -ne $c.'削除行数')
+        {
+            $totalDeleted += [double]$c.'削除行数'
+        }
+        if ($null -ne $c.'生存行数')
+        {
+            $totalSurvived += [double]$c.'生存行数'
+        }
+    }
+    $totalNet = $totalAdded - $totalDeleted
+    $totalChurn = $totalAdded + $totalDeleted
+
+    # Born 行数（blame ベース）を分母とする
+    $totalBorn = 0.0
+    if ($null -ne $AuthorBorn)
+    {
+        foreach ($bv in $AuthorBorn.Values)
+        {
+            $totalBorn += [double]$bv
+        }
+    }
+    $survivalRate = 0.0
+    if ($totalBorn -gt 0)
+    {
+        $survivalRate = $totalSurvived / $totalBorn
+    }
+    $reworkRate = 0.0
+    if ($totalChurn -gt 0)
+    {
+        $reworkRate = 1.0 - ([Math]::Abs($totalNet) / $totalChurn)
+    }
+
+    # 所有権集中度 (HHI)
+    $hhi = 0.0
+    $validOwnerCount = 0
+    foreach ($c in @($Committers))
+    {
+        if ($null -eq $c -or $null -eq $c.'所有割合')
+        {
+            continue
+        }
+        $ownerShare = [double]$c.'所有割合'
+        if ($ownerShare -gt 0)
+        {
+            $hhi += $ownerShare * $ownerShare
+            $validOwnerCount++
+        }
+    }
+    if ($validOwnerCount -le 1)
+    {
+        $hhi = 1.0
+    }
+
+    # コミット平均指標
+    $avgFilesPerCommit = 0.0
+    $avgEntropy = 0.0
+    if ($commitCount -gt 0)
+    {
+        $sumFiles = 0.0
+        $sumEntropy = 0.0
+        foreach ($cr in @($CommitRows))
+        {
+            if ($null -eq $cr)
+            {
+                continue
+            }
+            if ($null -ne $cr.'変更ファイル数')
+            {
+                $sumFiles += [double]$cr.'変更ファイル数'
+            }
+            if ($null -ne $cr.'エントロピー')
+            {
+                $sumEntropy += [double]$cr.'エントロピー'
+            }
+        }
+        $avgFilesPerCommit = $sumFiles / [double]$commitCount
+        $avgEntropy = $sumEntropy / [double]$commitCount
+    }
+
+    # SVG レイアウト
+    $svgW = 720
+    $svgH = 520
+    $cardW = 200
+    $cardH = 100
+    $gapX = 20
+    $gapY = 16
+    $startX = 30
+    $startY = 70
+
+    # KPI カード定義（3列×3行）
+    $cards = @(
+        @{ Label = 'コミット数'; Value = [string]$commitCount; Sub = 'FromRev〜ToRev のコミット総数' }
+        @{ Label = '作者数'; Value = [string]$authorCount; Sub = 'コミットした開発者のユニーク数' }
+        @{ Label = 'ファイル数'; Value = [string]$fileCount; Sub = '変更されたファイルのユニーク数' }
+        @{ Label = '追加行数 (diff)'; Value = ('{0:N0}' -f [int]$totalAdded); Sub = '全 diff の + 行合計' }
+        @{ Label = '削除行数 (diff)'; Value = ('{0:N0}' -f [int]$totalDeleted); Sub = '全 diff の - 行合計（既存コード削除含む）' }
+        @{ Label = '純増行数'; Value = ('{0:N0}' -f [int]$totalNet); Sub = ('diff 追加 - diff 削除 / チャーン: {0:N0}' -f [int]$totalChurn) }
+        @{ Label = 'コード生存率'; Value = ('{0:F1}%' -f ($survivalRate * 100)); Sub = ('blame 追跡: 生存/誕生 = {0:N0}/{1:N0}' -f [int]$totalSurvived, [int]$totalBorn) }
+        @{ Label = 'リワーク率'; Value = ('{0:F1}%' -f ($reworkRate * 100)); Sub = '1 - |純増| / チャーン（低いほど効率的）' }
+        @{ Label = '所有権集中度 (HHI)'; Value = ('{0:F3}' -f $hhi); Sub = ('Σ(所有割合²) / 平均F/C: {0:F1} / エントロピー: {1:F2}' -f $avgFilesPerCommit, $avgEntropy) }
+    )
+
+    # 色割り当て
+    $cardColors = @('#42a5f5', '#42a5f5', '#42a5f5', '#66bb6a', '#ef5350', '#ffa726', '#4caf50', '#ff7043', '#ab47bc')
+
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine('<?xml version="1.0" encoding="UTF-8"?>')
+    [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" width="{0}" height="{1}" viewBox="0 0 {0} {1}">' -f $svgW, $svgH))
+    [void]$sb.AppendLine(@'
+<defs><style>
+  text { font-family: "Segoe UI", "Meiryo UI", sans-serif; }
+  .title { font-size: 16px; font-weight: bold; fill: #333; }
+  .subtitle { font-size: 11px; fill: #888; }
+  .card-label { font-size: 11px; fill: #fff; font-weight: bold; }
+  .card-value { font-size: 28px; font-weight: bold; fill: #333; }
+  .card-sub { font-size: 10px; fill: #888; }
+</style></defs>
+'@)
+    [void]$sb.AppendLine('<rect width="100%" height="100%" fill="#fafafa"/>')
+    [void]$sb.AppendLine('<text class="title" x="20" y="28">プロジェクトサマリーダッシュボード</text>')
+
+    for ($i = 0; $i -lt $cards.Count; $i++)
+    {
+        $col = $i % 3
+        $row = [Math]::Floor($i / 3)
+        $cx = $startX + $col * ($cardW + $gapX)
+        $cy = $startY + $row * ($cardH + $gapY)
+        $card = $cards[$i]
+        $color = $cardColors[$i % $cardColors.Count]
+
+        # カード背景
+        [void]$sb.AppendLine(('<rect x="{0}" y="{1}" width="{2}" height="{3}" rx="8" fill="#fff" stroke="#e0e0e0" stroke-width="1"/>' -f [int]$cx, [int]$cy, $cardW, $cardH))
+        # ヘッダーバー
+        [void]$sb.AppendLine(('<rect x="{0}" y="{1}" width="{2}" height="24" rx="8" fill="{3}"/>' -f [int]$cx, [int]$cy, $cardW, $color))
+        [void]$sb.AppendLine(('<rect x="{0}" y="{1}" width="{2}" height="12" fill="{3}"/>' -f [int]$cx, [int]($cy + 12), $cardW, $color))
+        # ラベル
+        [void]$sb.AppendLine(('<text class="card-label" x="{0}" y="{1}">{2}</text>' -f [int]($cx + 10), [int]($cy + 17), (ConvertTo-SvgEscapedText -Text $card.Label)))
+        # 値
+        [void]$sb.AppendLine(('<text class="card-value" x="{0}" y="{1}">{2}</text>' -f [int]($cx + 10), [int]($cy + 62), (ConvertTo-SvgEscapedText -Text $card.Value)))
+        # サブ情報
+        if ($card.Sub)
+        {
+            [void]$sb.AppendLine(('<text class="card-sub" x="{0}" y="{1}">{2}</text>' -f [int]($cx + 10), [int]($cy + 80), (ConvertTo-SvgEscapedText -Text $card.Sub)))
+        }
+    }
+
+    [void]$sb.AppendLine('</svg>')
+    Write-TextFile -FilePath (Join-Path $OutDirectory 'project_summary_dashboard.svg') -Content $sb.ToString() -EncodingName $EncodingName
+}
+
+function Write-ContributorBalanceChart
+{
+    <#
+    .SYNOPSIS
+        コミッター別の投入量と最終成果を左右対称バタフライチャートで描画する。
+    .DESCRIPTION
+        左側に総チャーン（投入量）、右側に生存行数（最終成果）を横棒で描画し、
+        中央に作者名を配置する。投入に対して成果が少ない作者は視覚的に非対称になり、
+        チームの貢献バランスを一目で把握できる。
+        開発完了後の「誰がどれだけ投入し、どれだけ成果として残ったか」を示す。
+    .PARAMETER OutDirectory
+        出力先ディレクトリを指定する。
+    .PARAMETER Committers
+        Get-CommitterMetric が返すコミッター行配列を指定する。
+    .PARAMETER TopNCount
+        総チャーン上位として表示する件数を指定する。0 で全件。
+    .PARAMETER EncodingName
+        出力時に使用する文字エンコーディングを指定する。
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$OutDirectory,
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [object[]]$Committers,
+        [Parameter(Mandatory = $false)]
+        [int]$TopNCount = 0,
+        [Parameter(Mandatory = $false)]
+        [string]$EncodingName = 'UTF-8'
+    )
+    if ([string]::IsNullOrWhiteSpace($OutDirectory))
+    {
+        return
+    }
+    if (-not $Committers -or @($Committers).Count -eq 0)
+    {
+        return
+    }
+
+    # データ抽出
+    $data = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($c in @($Committers))
+    {
+        if ($null -eq $c)
+        {
+            continue
+        }
+        $churn = 0.0
+        if ($null -ne $c.'総チャーン')
+        {
+            $churn = [double]$c.'総チャーン'
+        }
+        $survived = 0.0
+        if ($null -ne $c.'生存行数')
+        {
+            $survived = [double]$c.'生存行数'
+        }
+        if ($churn -le 0 -and $survived -le 0)
+        {
+            continue
+        }
+        [void]$data.Add([pscustomobject][ordered]@{
+                Author = (Get-NormalizedAuthorName -Author ([string]$c.'作者'))
+                TotalChurn = $churn
+                Survived = $survived
+            })
+    }
+    if ($data.Count -eq 0)
+    {
+        return
+    }
+    $sorted = @($data.ToArray() | Sort-Object -Property @{Expression = 'TotalChurn'; Descending = $true }, 'Author')
+    if ($TopNCount -gt 0 -and $sorted.Count -gt $TopNCount)
+    {
+        $sorted = @($sorted | Select-Object -First $TopNCount)
+    }
+    if (-not (Test-Path -LiteralPath $OutDirectory))
+    {
+        New-Item -Path $OutDirectory -ItemType Directory -Force | Out-Null
+    }
+
+    $n = $sorted.Count
+    $barHeight = 28
+    $barGap = 8
+    $centerX = 340.0
+    $barMaxW = 240.0
+    $marginTop = 80
+    $marginBottom = 40
+
+    $maxVal = 1.0
+    foreach ($d in $sorted)
+    {
+        if ($d.TotalChurn -gt $maxVal)
+        {
+            $maxVal = $d.TotalChurn
+        }
+        if ($d.Survived -gt $maxVal)
+        {
+            $maxVal = $d.Survived
+        }
+    }
+
+    $svgW = 720
+    $svgH = $marginTop + $n * ($barHeight + $barGap) + $marginBottom + 20
+
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine('<?xml version="1.0" encoding="UTF-8"?>')
+    [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" width="{0}" height="{1}" viewBox="0 0 {0} {1}">' -f $svgW, $svgH))
+    [void]$sb.AppendLine(@'
+<defs><style>
+  text { font-family: "Segoe UI", "Meiryo UI", sans-serif; }
+  .title { font-size: 16px; font-weight: bold; fill: #333; }
+  .subtitle { font-size: 11px; fill: #888; }
+  .author-label { font-size: 12px; fill: #333; text-anchor: middle; dominant-baseline: central; }
+  .bar-value { font-size: 10px; fill: #555; dominant-baseline: central; }
+  .header-label { font-size: 11px; fill: #666; font-weight: bold; text-anchor: middle; }
+  .legend-text { font-size: 11px; fill: #333; }
+</style></defs>
+'@)
+    [void]$sb.AppendLine('<rect width="100%" height="100%" fill="#fafafa"/>')
+    [void]$sb.AppendLine('<text class="title" x="20" y="28">投入量 vs 最終成果（コミッター別バランス）</text>')
+    [void]$sb.AppendLine('<text class="subtitle" x="20" y="46">左: 総チャーン（投入量） / 右: 生存行数（最終成果） / 非対称 = 歩留まり差</text>')
+
+    # ヘッダー
+    $headerY = $marginTop - 16
+    [void]$sb.AppendLine(('<text class="header-label" x="{0}" y="{1}">← 総チャーン（投入）</text>' -f [int]($centerX - $barMaxW / 2.0), [int]$headerY))
+    [void]$sb.AppendLine(('<text class="header-label" x="{0}" y="{1}">生存行数（成果）→</text>' -f [int]($centerX + $barMaxW / 2.0), [int]$headerY))
+
+    # 中央線
+    [void]$sb.AppendLine(('<line x1="{0}" y1="{1}" x2="{0}" y2="{2}" stroke="#bdbdbd" stroke-width="1" stroke-dasharray="4,3"/>' -f [int]$centerX, [int]($marginTop - 6), [int]($marginTop + $n * ($barHeight + $barGap))))
+
+    $churnColor = '#ff7043'
+    $survivedColor = '#4caf50'
+
+    for ($i = 0; $i -lt $n; $i++)
+    {
+        $d = $sorted[$i]
+        $yBase = $marginTop + $i * ($barHeight + $barGap)
+        $yCtr = $yBase + $barHeight / 2.0
+
+        # 左バー (チャーン) — 右から左へ伸びる
+        $churnW = 0.0
+        if ($maxVal -gt 0)
+        {
+            $churnW = ($d.TotalChurn / $maxVal) * $barMaxW
+        }
+        $churnX = $centerX - 4 - $churnW
+        if ($churnW -gt 0)
+        {
+            $tooltip = ('総チャーン: {0:N0}' -f [int]$d.TotalChurn)
+            [void]$sb.AppendLine(('<rect x="{0:F1}" y="{1}" width="{2:F1}" height="{3}" rx="4" fill="{4}" fill-opacity="0.8"><title>{5}</title></rect>' -f $churnX, [int]$yBase, $churnW, $barHeight, $churnColor, (ConvertTo-SvgEscapedText -Text $tooltip)))
+            [void]$sb.AppendLine(('<text class="bar-value" x="{0:F1}" y="{1:F0}" text-anchor="end">{2:N0}</text>' -f ($churnX - 4), $yCtr, [int]$d.TotalChurn))
+        }
+
+        # 右バー (生存行数) — 左から右へ伸びる
+        $survW = 0.0
+        if ($maxVal -gt 0)
+        {
+            $survW = ($d.Survived / $maxVal) * $barMaxW
+        }
+        $survX = $centerX + 4
+        if ($survW -gt 0)
+        {
+            $tooltip = ('生存行数: {0:N0}' -f [int]$d.Survived)
+            [void]$sb.AppendLine(('<rect x="{0}" y="{1}" width="{2:F1}" height="{3}" rx="4" fill="{4}" fill-opacity="0.8"><title>{5}</title></rect>' -f [int]$survX, [int]$yBase, $survW, $barHeight, $survivedColor, (ConvertTo-SvgEscapedText -Text $tooltip)))
+            [void]$sb.AppendLine(('<text class="bar-value" x="{0:F1}" y="{1:F0}">{2:N0}</text>' -f ($survX + $survW + 4), $yCtr, [int]$d.Survived))
+        }
+
+        # 中央: 作者名
+        [void]$sb.AppendLine(('<text class="author-label" x="{0}" y="{1:F0}">{2}</text>' -f [int]$centerX, $yCtr, (ConvertTo-SvgEscapedText -Text $d.Author)))
+    }
+
+    # 凡例
+    $legendY = $marginTop + $n * ($barHeight + $barGap) + 16
+    [void]$sb.AppendLine(('<rect x="{0}" y="{1}" width="14" height="14" rx="3" fill="{2}"/>' -f [int]($centerX - 120), [int]$legendY, $churnColor))
+    [void]$sb.AppendLine(('<text class="legend-text" x="{0}" y="{1}">総チャーン（投入量）</text>' -f [int]($centerX - 102), [int]($legendY + 12)))
+    [void]$sb.AppendLine(('<rect x="{0}" y="{1}" width="14" height="14" rx="3" fill="{2}"/>' -f [int]($centerX + 30), [int]$legendY, $survivedColor))
+    [void]$sb.AppendLine(('<text class="legend-text" x="{0}" y="{1}">生存行数（最終成果）</text>' -f [int]($centerX + 48), [int]($legendY + 12)))
+
+    [void]$sb.AppendLine('</svg>')
+    Write-TextFile -FilePath (Join-Path $OutDirectory 'contributor_balance.svg') -Content $sb.ToString() -EncodingName $EncodingName
+}
+
 # endregion PlantUML 出力
 # region SVG 出力
 function ConvertTo-SvgEscapedText
@@ -8277,6 +9129,7 @@ function Update-StrictAttributionMetric
     return [pscustomobject]@{
         KillMatrix = $strictDetail.KillMatrix
         AuthorSelfDead = $strictDetail.AuthorSelfDead
+        AuthorBorn = $strictDetail.AuthorBorn
     }
 }
 # endregion Strict メトリクス更新
@@ -8420,6 +9273,10 @@ function New-RunMetaData
             TeamActivityProfileSvg = 'team_activity_profile.svg'
             CommitTimelineSvg = 'commit_timeline.svg'
             CommitScatterSvg = 'commit_scatter.svg'
+            ProjectCodeFateSvg = 'project_code_fate.svg'
+            ProjectEfficiencyQuadrantSvg = 'project_efficiency_quadrant.svg'
+            ProjectSummaryDashboardSvg = 'project_summary_dashboard.svg'
+            ContributorBalanceSvg = 'contributor_balance.svg'
         }
     }
 }
@@ -8582,6 +9439,10 @@ try
     Write-FileQualityScatterChart -OutDirectory $OutDir -Files $fileRows -TopNCount $TopN -EncodingName $Encoding
     Write-CommitTimelineChart -OutDirectory $OutDir -Commits $commitRows -EncodingName $Encoding
     Write-CommitScatterChart -OutDirectory $OutDir -Commits $commitRows -EncodingName $Encoding
+    Write-ProjectCodeFateChart -OutDirectory $OutDir -Committers $committerRows -EncodingName $Encoding
+    Write-ProjectEfficiencyQuadrantChart -OutDirectory $OutDir -Files $fileRows -TopNCount $TopN -EncodingName $Encoding
+    Write-ProjectSummaryDashboard -OutDirectory $OutDir -Committers $committerRows -FileRows $fileRows -CommitRows $commitRows -AuthorBorn $strictResult.AuthorBorn -EncodingName $Encoding
+    Write-ContributorBalanceChart -OutDirectory $OutDir -Committers $committerRows -TopNCount $TopN -EncodingName $Encoding
 
     # --- ステップ 8: 実行メタデータとサマリーの書き出し ---
     Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 8/8: メタデータ出力' -PercentComplete 95
