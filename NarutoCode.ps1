@@ -420,6 +420,56 @@ function Add-Count
     }
     $Table[$Key] = [int]$Table[$Key] + $Delta
 }
+function Merge-CountTable
+{
+    <#
+    .SYNOPSIS
+        カウンター用ハッシュテーブルを加算統合する。
+    .PARAMETER Target
+        統合先のハッシュテーブルを指定する。
+    .PARAMETER Source
+        統合元のハッシュテーブルを指定する。
+    #>
+    param([hashtable]$Target, [hashtable]$Source)
+    if ($null -eq $Target -or $null -eq $Source)
+    {
+        return
+    }
+    foreach ($key in @($Source.Keys))
+    {
+        Add-Count -Table $Target -Key ([string]$key) -Delta ([int]$Source[$key])
+    }
+}
+function Merge-NestedCountTable
+{
+    <#
+    .SYNOPSIS
+        2 階層のカウンターハッシュテーブルを加算統合する。
+    .PARAMETER Target
+        統合先のハッシュテーブルを指定する。
+    .PARAMETER Source
+        統合元のハッシュテーブルを指定する。
+    #>
+    param([hashtable]$Target, [hashtable]$Source)
+    if ($null -eq $Target -or $null -eq $Source)
+    {
+        return
+    }
+    foreach ($outerKey in @($Source.Keys))
+    {
+        $outerName = [string]$outerKey
+        if (-not $Target.ContainsKey($outerName))
+        {
+            $Target[$outerName] = @{}
+        }
+        $outerTarget = $Target[$outerName]
+        $outerSource = $Source[$outerKey]
+        foreach ($innerKey in @($outerSource.Keys))
+        {
+            Add-Count -Table $outerTarget -Key ([string]$innerKey) -Delta ([int]$outerSource[$innerKey])
+        }
+    }
+}
 # endregion 数値と書式
 # region 並列実行
 function Invoke-ParallelWork
@@ -3271,6 +3321,360 @@ function Invoke-StrictBlameCachePrefetch
         $script:StrictBlameCacheMisses += [int]$entry.CacheMisses
     }
 }
+function Invoke-StrictCommitAttribution
+{
+    <#
+    .SYNOPSIS
+        Strict 帰属解析のコミット単位計算を実行する。
+    .DESCRIPTION
+        1コミット分の before/after blame 比較を行い、born/dead/move を集計する。
+        並列実行と逐次実行の両方で再利用できるよう集計結果をまとめて返す。
+    .PARAMETER Commit
+        対象コミットを指定する。
+    .PARAMETER RevToAuthor
+        リビジョン番号と作者の対応表を指定する。
+    .PARAMETER TargetUrl
+        対象 SVN リポジトリ URL を指定する。
+    .PARAMETER FromRevision
+        処理対象のリビジョン値を指定する。
+    .PARAMETER ToRevision
+        処理対象のリビジョン値を指定する。
+    .PARAMETER CacheDir
+        キャッシュディレクトリのパスを指定する。
+    .PARAMETER RenameMap
+        RenameMap の値を指定する。
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [object]$Commit,
+        [hashtable]$RevToAuthor,
+        [string]$TargetUrl,
+        [int]$FromRevision,
+        [int]$ToRevision,
+        [string]$CacheDir,
+        [hashtable]$RenameMap = @{}
+    )
+
+    $authorBorn = @{}
+    $authorDead = @{}
+    $authorSelfDead = @{}
+    $authorOtherDead = @{}
+    $authorSurvived = @{}
+    $authorCrossRevert = @{}
+    $authorRemovedByOthers = @{}
+
+    $fileBorn = @{}
+    $fileDead = @{}
+    $fileSurvived = @{}
+    $fileSelfCancel = @{}
+    $fileCrossRevert = @{}
+
+    $authorInternalMove = @{}
+    $fileInternalMove = @{}
+
+    $authorModifiedOthersCode = @{}
+    $revsWhereKilledOthers = New-Object 'System.Collections.Generic.HashSet[string]'
+    $killMatrix = @{}
+
+    $c = $Commit
+    $rev = [int]$c.Revision
+    if ($rev -lt $FromRevision -or $rev -gt $ToRevision)
+    {
+        return [pscustomobject]@{
+            AuthorBorn = $authorBorn
+            AuthorDead = $authorDead
+            AuthorSurvived = $authorSurvived
+            AuthorSelfDead = $authorSelfDead
+            AuthorOtherDead = $authorOtherDead
+            AuthorCrossRevert = $authorCrossRevert
+            AuthorRemovedByOthers = $authorRemovedByOthers
+            FileBorn = $fileBorn
+            FileDead = $fileDead
+            FileSurvived = $fileSurvived
+            FileSelfCancel = $fileSelfCancel
+            FileCrossRevert = $fileCrossRevert
+            AuthorInternalMoveCount = $authorInternalMove
+            FileInternalMoveCount = $fileInternalMove
+            AuthorModifiedOthersCode = $authorModifiedOthersCode
+            RevsWhereKilledOthers = @()
+            KillMatrix = $killMatrix
+        }
+    }
+
+    $killer = if ($RevToAuthor.ContainsKey($rev))
+    {
+        Get-NormalizedAuthorName -Author ([string]$RevToAuthor[$rev])
+    }
+    else
+    {
+        Get-NormalizedAuthorName -Author ([string]$c.Author)
+    }
+    $transitions = @(Get-CommitFileTransition -Commit $c)
+    foreach ($t in $transitions)
+    {
+        try
+        {
+            $beforePath = if ($null -ne $t.BeforePath)
+            {
+                ConvertTo-PathKey -Path ([string]$t.BeforePath)
+            }
+            else
+            {
+                $null
+            }
+            $afterPath = if ($null -ne $t.AfterPath)
+            {
+                ConvertTo-PathKey -Path ([string]$t.AfterPath)
+            }
+            else
+            {
+                $null
+            }
+            if ([string]::IsNullOrWhiteSpace($beforePath) -and [string]::IsNullOrWhiteSpace($afterPath))
+            {
+                continue
+            }
+
+            $isBinary = $false
+            foreach ($bp in @($beforePath, $afterPath))
+            {
+                if (-not $bp)
+                {
+                    continue
+                }
+                if ($c.FileDiffStats.ContainsKey($bp))
+                {
+                    $d = $c.FileDiffStats[$bp]
+                    if ($null -ne $d -and $d.PSObject.Properties.Match('IsBinary') -and [bool]$d.IsBinary)
+                    {
+                        $isBinary = $true
+                    }
+                }
+            }
+            if ($isBinary)
+            {
+                continue
+            }
+
+            $metricFile = if ($afterPath)
+            {
+                Resolve-PathByRenameMap -FilePath $afterPath -RenameMap $RenameMap
+            }
+            else
+            {
+                Resolve-PathByRenameMap -FilePath $beforePath -RenameMap $RenameMap
+            }
+
+            $transitionAdded = 0
+            $transitionDeleted = 0
+            $transitionStat = $null
+            if ($afterPath -and $c.FileDiffStats.ContainsKey($afterPath))
+            {
+                $transitionStat = $c.FileDiffStats[$afterPath]
+            }
+            elseif ($beforePath -and $c.FileDiffStats.ContainsKey($beforePath))
+            {
+                $transitionStat = $c.FileDiffStats[$beforePath]
+            }
+            if ($null -ne $transitionStat)
+            {
+                $transitionAdded = [int]$transitionStat.AddedLines
+                $transitionDeleted = [int]$transitionStat.DeletedLines
+            }
+            $hasTransitionStat = ($null -ne $transitionStat)
+
+            if ($hasTransitionStat -and $transitionAdded -eq 0 -and $transitionDeleted -eq 0)
+            {
+                continue
+            }
+
+            $cmp = $null
+            if ($hasTransitionStat -and $transitionAdded -gt 0 -and $transitionDeleted -eq 0 -and $afterPath)
+            {
+                $currBlame = Get-SvnBlameLine -Repo $TargetUrl -FilePath $afterPath -Revision $rev -CacheDir $CacheDir
+                $currLines = @($currBlame.Lines)
+                $bornOnly = New-Object 'System.Collections.Generic.List[object]'
+                for ($currIdx = 0
+                    $currIdx -lt $currLines.Count
+                    $currIdx++)
+                {
+                    $line = $currLines[$currIdx]
+                    $lineRevision = $null
+                    try
+                    {
+                        $lineRevision = [int]$line.Revision
+                    }
+                    catch
+                    {
+                        $lineRevision = $null
+                    }
+                    if ($lineRevision -eq $rev)
+                    {
+                        [void]$bornOnly.Add([pscustomobject]@{
+                                Index = $currIdx
+                                Line = $line
+                            })
+                    }
+                }
+                $cmp = [pscustomobject]@{
+                    KilledLines = @()
+                    BornLines = @($bornOnly.ToArray())
+                    MatchedPairs = @()
+                    MovedPairs = @()
+                    ReattributedPairs = @()
+                }
+            }
+            elseif ($hasTransitionStat -and $transitionDeleted -gt 0 -and $transitionAdded -eq 0 -and $beforePath -and (-not $afterPath))
+            {
+                $prevBlame = Get-SvnBlameLine -Repo $TargetUrl -FilePath $beforePath -Revision ($rev - 1) -CacheDir $CacheDir
+                $prevLines = @($prevBlame.Lines)
+                $killedOnly = New-Object 'System.Collections.Generic.List[object]'
+                for ($prevIdx = 0
+                    $prevIdx -lt $prevLines.Count
+                    $prevIdx++)
+                {
+                    [void]$killedOnly.Add([pscustomobject]@{
+                            Index = $prevIdx
+                            Line = $prevLines[$prevIdx]
+                        })
+                }
+                $cmp = [pscustomobject]@{
+                    KilledLines = @($killedOnly.ToArray())
+                    BornLines = @()
+                    MatchedPairs = @()
+                    MovedPairs = @()
+                    ReattributedPairs = @()
+                }
+            }
+            else
+            {
+                $prevLines = @()
+                if ($beforePath)
+                {
+                    $prevBlame = Get-SvnBlameLine -Repo $TargetUrl -FilePath $beforePath -Revision ($rev - 1) -CacheDir $CacheDir
+                    $prevLines = @($prevBlame.Lines)
+                }
+                $currLines = @()
+                if ($afterPath)
+                {
+                    $currBlame = Get-SvnBlameLine -Repo $TargetUrl -FilePath $afterPath -Revision $rev -CacheDir $CacheDir
+                    $currLines = @($currBlame.Lines)
+                }
+                $cmp = Compare-BlameOutput -PreviousLines $prevLines -CurrentLines $currLines
+            }
+
+            $moveCount = @($cmp.MovedPairs).Count
+            if ($moveCount -gt 0)
+            {
+                Add-Count -Table $authorInternalMove -Key $killer -Delta $moveCount
+                Add-Count -Table $fileInternalMove -Key $metricFile -Delta $moveCount
+            }
+
+            foreach ($born in @($cmp.BornLines))
+            {
+                $line = $born.Line
+                $bornRev = $null
+                try
+                {
+                    $bornRev = [int]$line.Revision
+                }
+                catch
+                {
+                    $bornRev = $null
+                }
+                if ($null -eq $bornRev -or $bornRev -ne $rev)
+                {
+                    continue
+                }
+                if ($bornRev -lt $FromRevision -or $bornRev -gt $ToRevision)
+                {
+                    continue
+                }
+                $bornAuthor = Get-NormalizedAuthorName -Author ([string]$line.Author)
+                Add-Count -Table $authorBorn -Key $bornAuthor
+                Add-Count -Table $authorSurvived -Key $bornAuthor
+                Add-Count -Table $fileBorn -Key $metricFile
+                Add-Count -Table $fileSurvived -Key $metricFile
+            }
+
+            foreach ($killed in @($cmp.KilledLines))
+            {
+                $line = $killed.Line
+                $bornRev = $null
+                try
+                {
+                    $bornRev = [int]$line.Revision
+                }
+                catch
+                {
+                    $bornRev = $null
+                }
+                if ($null -eq $bornRev -or $bornRev -lt $FromRevision -or $bornRev -gt $ToRevision)
+                {
+                    continue
+                }
+                $bornAuthor = Get-NormalizedAuthorName -Author ([string]$line.Author)
+                Add-Count -Table $authorDead -Key $bornAuthor
+                Add-Count -Table $fileDead -Key $metricFile
+                Add-Count -Table $authorSurvived -Key $bornAuthor -Delta (-1)
+                Add-Count -Table $fileSurvived -Key $metricFile -Delta (-1)
+                if ($bornAuthor -eq $killer)
+                {
+                    Add-Count -Table $authorSelfDead -Key $bornAuthor
+                    Add-Count -Table $fileSelfCancel -Key $metricFile
+                }
+                else
+                {
+                    Add-Count -Table $authorOtherDead -Key $bornAuthor
+                    Add-Count -Table $authorCrossRevert -Key $bornAuthor
+                    Add-Count -Table $authorRemovedByOthers -Key $bornAuthor
+                    Add-Count -Table $fileCrossRevert -Key $metricFile
+                    Add-Count -Table $authorModifiedOthersCode -Key $killer
+                    $null = $revsWhereKilledOthers.Add(([string]$rev + [char]31 + $killer))
+                    if (-not $killMatrix.ContainsKey($killer))
+                    {
+                        $killMatrix[$killer] = @{}
+                    }
+                    Add-Count -Table $killMatrix[$killer] -Key $bornAuthor
+                }
+            }
+        }
+        catch
+        {
+            throw ("Strict blame attribution failed at r{0} (before='{1}', after='{2}'): {3}" -f $rev, [string]$t.BeforePath, [string]$t.AfterPath, $_.Exception.Message)
+        }
+    }
+
+    if ($null -eq $script:SvnBlameLineMemoryCache)
+    {
+        $script:SvnBlameLineMemoryCache = @{}
+    }
+    else
+    {
+        $script:SvnBlameLineMemoryCache.Clear()
+    }
+
+    return [pscustomobject]@{
+        AuthorBorn = $authorBorn
+        AuthorDead = $authorDead
+        AuthorSurvived = $authorSurvived
+        AuthorSelfDead = $authorSelfDead
+        AuthorOtherDead = $authorOtherDead
+        AuthorCrossRevert = $authorCrossRevert
+        AuthorRemovedByOthers = $authorRemovedByOthers
+        FileBorn = $fileBorn
+        FileDead = $fileDead
+        FileSurvived = $fileSurvived
+        FileSelfCancel = $fileSelfCancel
+        FileCrossRevert = $fileCrossRevert
+        AuthorInternalMoveCount = $authorInternalMove
+        FileInternalMoveCount = $fileInternalMove
+        AuthorModifiedOthersCode = $authorModifiedOthersCode
+        RevsWhereKilledOthers = @($revsWhereKilledOthers.ToArray())
+        KillMatrix = $killMatrix
+    }
+}
 function Get-ExactDeathAttribution
 {
     <#
@@ -3334,277 +3738,139 @@ function Get-ExactDeathAttribution
     Invoke-StrictBlameCachePrefetch -Targets $prefetchTargets -TargetUrl $TargetUrl -CacheDir $CacheDir -Parallel $Parallel
 
     $sortedCommits = @($Commits | Sort-Object Revision)
-    $deathTotal = $sortedCommits.Count
-    $deathIdx = 0
-    foreach ($c in $sortedCommits)
+    $targetCommits = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($commit in $sortedCommits)
     {
-        $pct = [Math]::Min(100, [int](($deathIdx / [Math]::Max(1, $deathTotal)) * 100))
-        Write-Progress -Id 3 -Activity '行単位の帰属解析' -Status ('r{0} ({1}/{2})' -f [int]$c.Revision, ($deathIdx + 1), $deathTotal) -PercentComplete $pct
-        $rev = [int]$c.Revision
-        if ($rev -lt $FromRevision -or $rev -gt $ToRevision)
+        $rev = [int]$commit.Revision
+        if ($rev -ge $FromRevision -and $rev -le $ToRevision)
         {
-            continue
+            [void]$targetCommits.Add($commit)
         }
-        $killer = if ($RevToAuthor.ContainsKey($rev))
-        {
-            Get-NormalizedAuthorName -Author ([string]$RevToAuthor[$rev])
-        }
-        else
-        {
-            Get-NormalizedAuthorName -Author ([string]$c.Author)
-        }
-        $transitions = @(Get-CommitFileTransition -Commit $c)
-        foreach ($t in $transitions)
-        {
-            try
-            {
-                $beforePath = if ($null -ne $t.BeforePath)
-                {
-                    ConvertTo-PathKey -Path ([string]$t.BeforePath)
-                }
-                else
-                {
-                    $null
-                }
-                $afterPath = if ($null -ne $t.AfterPath)
-                {
-                    ConvertTo-PathKey -Path ([string]$t.AfterPath)
-                }
-                else
-                {
-                    $null
-                }
-                if ([string]::IsNullOrWhiteSpace($beforePath) -and [string]::IsNullOrWhiteSpace($afterPath))
-                {
-                    continue
-                }
-
-                $isBinary = $false
-                foreach ($bp in @($beforePath, $afterPath))
-                {
-                    if (-not $bp)
-                    {
-                        continue
-                    }
-                    if ($c.FileDiffStats.ContainsKey($bp))
-                    {
-                        $d = $c.FileDiffStats[$bp]
-                        if ($null -ne $d -and $d.PSObject.Properties.Match('IsBinary') -and [bool]$d.IsBinary)
-                        {
-                            $isBinary = $true
-                        }
-                    }
-                }
-                if ($isBinary)
-                {
-                    continue
-                }
-
-                $metricFile = if ($afterPath)
-                {
-                    Resolve-PathByRenameMap -FilePath $afterPath -RenameMap $RenameMap
-                }
-                else
-                {
-                    Resolve-PathByRenameMap -FilePath $beforePath -RenameMap $RenameMap
-                }
-
-                # --- Fast Path 分岐 ---
-                # diff 統計 (追加行数・削除行数) を事前に取得し、blame 比較の必要性を判定する。
-                # 典型的なコミットではファイルの大半が add-only や zero-change であり、
-                # 高コストな LCS (O(mn)) を回避できるケースが多い。
-                $transitionAdded = 0
-                $transitionDeleted = 0
-                $transitionStat = $null
-                if ($afterPath -and $c.FileDiffStats.ContainsKey($afterPath))
-                {
-                    $transitionStat = $c.FileDiffStats[$afterPath]
-                }
-                elseif ($beforePath -and $c.FileDiffStats.ContainsKey($beforePath))
-                {
-                    $transitionStat = $c.FileDiffStats[$beforePath]
-                }
-                if ($null -ne $transitionStat)
-                {
-                    $transitionAdded = [int]$transitionStat.AddedLines
-                    $transitionDeleted = [int]$transitionStat.DeletedLines
-                }
-                $hasTransitionStat = ($null -ne $transitionStat)
-
-                # Fast Path 1: zero-change — プロパティ変更のみ等。blame 取得自体を省略する。
-                if ($hasTransitionStat -and $transitionAdded -eq 0 -and $transitionDeleted -eq 0)
-                {
-                    continue
-                }
-
-                $cmp = $null
-                # Fast Path 2: add-only — 削除行なし。前リビジョンの blame 取得と LCS を省略し、
-                # 現リビジョンの blame から当該リビジョンで born された行だけを抽出する。
-                if ($hasTransitionStat -and $transitionAdded -gt 0 -and $transitionDeleted -eq 0 -and $afterPath)
-                {
-                    $currBlame = Get-SvnBlameLine -Repo $TargetUrl -FilePath $afterPath -Revision $rev -CacheDir $CacheDir
-                    $currLines = @($currBlame.Lines)
-                    $bornOnly = New-Object 'System.Collections.Generic.List[object]'
-                    for ($currIdx = 0
-                        $currIdx -lt $currLines.Count
-                        $currIdx++)
-                    {
-                        $line = $currLines[$currIdx]
-                        $lineRevision = $null
-                        try
-                        {
-                            $lineRevision = [int]$line.Revision
-                        }
-                        catch
-                        {
-                            $lineRevision = $null
-                        }
-                        if ($lineRevision -eq $rev)
-                        {
-                            [void]$bornOnly.Add([pscustomobject]@{
-                                    Index = $currIdx
-                                    Line = $line
-                                })
-                        }
-                    }
-                    $cmp = [pscustomobject]@{
-                        KilledLines = @()
-                        BornLines = @($bornOnly.ToArray())
-                        MatchedPairs = @()
-                        MovedPairs = @()
-                        ReattributedPairs = @()
-                    }
-                }
-                # Fast Path 3: delete-file — ファイル削除。現リビジョンの blame 取得と LCS を省略し、
-                # 前リビジョンの全行を killed として扱う。afterPath が null であることが条件。
-                elseif ($hasTransitionStat -and $transitionDeleted -gt 0 -and $transitionAdded -eq 0 -and $beforePath -and (-not $afterPath))
-                {
-                    $prevBlame = Get-SvnBlameLine -Repo $TargetUrl -FilePath $beforePath -Revision ($rev - 1) -CacheDir $CacheDir
-                    $prevLines = @($prevBlame.Lines)
-                    $killedOnly = New-Object 'System.Collections.Generic.List[object]'
-                    for ($prevIdx = 0
-                        $prevIdx -lt $prevLines.Count
-                        $prevIdx++)
-                    {
-                        [void]$killedOnly.Add([pscustomobject]@{
-                                Index = $prevIdx
-                                Line = $prevLines[$prevIdx]
-                            })
-                    }
-                    $cmp = [pscustomobject]@{
-                        KilledLines = @($killedOnly.ToArray())
-                        BornLines = @()
-                        MatchedPairs = @()
-                        MovedPairs = @()
-                        ReattributedPairs = @()
-                    }
-                }
-                else
-                {
-                    $prevLines = @()
-                    if ($beforePath)
-                    {
-                        $prevBlame = Get-SvnBlameLine -Repo $TargetUrl -FilePath $beforePath -Revision ($rev - 1) -CacheDir $CacheDir
-                        $prevLines = @($prevBlame.Lines)
-                    }
-                    $currLines = @()
-                    if ($afterPath)
-                    {
-                        $currBlame = Get-SvnBlameLine -Repo $TargetUrl -FilePath $afterPath -Revision $rev -CacheDir $CacheDir
-                        $currLines = @($currBlame.Lines)
-                    }
-                    $cmp = Compare-BlameOutput -PreviousLines $prevLines -CurrentLines $currLines
-                }
-
-                $moveCount = @($cmp.MovedPairs).Count
-                if ($moveCount -gt 0)
-                {
-                    Add-Count -Table $authorInternalMove -Key $killer -Delta $moveCount
-                    Add-Count -Table $fileInternalMove -Key $metricFile -Delta $moveCount
-                }
-
-                # bornは範囲内追加のみ加算し、初期生存行として保持する。
-                foreach ($born in @($cmp.BornLines))
-                {
-                    $line = $born.Line
-                    $bornRev = $null
-                    try
-                    {
-                        $bornRev = [int]$line.Revision
-                    }
-                    catch
-                    {
-                        $bornRev = $null
-                    }
-                    if ($null -eq $bornRev -or $bornRev -ne $rev)
-                    {
-                        continue
-                    }
-                    if ($bornRev -lt $FromRevision -or $bornRev -gt $ToRevision)
-                    {
-                        continue
-                    }
-                    $bornAuthor = Get-NormalizedAuthorName -Author ([string]$line.Author)
-                    Add-Count -Table $authorBorn -Key $bornAuthor
-                    Add-Count -Table $authorSurvived -Key $bornAuthor
-                    Add-Count -Table $fileBorn -Key $metricFile
-                    Add-Count -Table $fileSurvived -Key $metricFile
-                }
-
-                # deadは生存減算と自己/他者分類を同時更新し整合を保つ。
-                foreach ($killed in @($cmp.KilledLines))
-                {
-                    $line = $killed.Line
-                    $bornRev = $null
-                    try
-                    {
-                        $bornRev = [int]$line.Revision
-                    }
-                    catch
-                    {
-                        $bornRev = $null
-                    }
-                    if ($null -eq $bornRev -or $bornRev -lt $FromRevision -or $bornRev -gt $ToRevision)
-                    {
-                        continue
-                    }
-                    $bornAuthor = Get-NormalizedAuthorName -Author ([string]$line.Author)
-                    Add-Count -Table $authorDead -Key $bornAuthor
-                    Add-Count -Table $fileDead -Key $metricFile
-                    Add-Count -Table $authorSurvived -Key $bornAuthor -Delta (-1)
-                    Add-Count -Table $fileSurvived -Key $metricFile -Delta (-1)
-                    if ($bornAuthor -eq $killer)
-                    {
-                        Add-Count -Table $authorSelfDead -Key $bornAuthor
-                        Add-Count -Table $fileSelfCancel -Key $metricFile
-                    }
-                    else
-                    {
-                        Add-Count -Table $authorOtherDead -Key $bornAuthor
-                        Add-Count -Table $authorCrossRevert -Key $bornAuthor
-                        Add-Count -Table $authorRemovedByOthers -Key $bornAuthor
-                        Add-Count -Table $fileCrossRevert -Key $metricFile
-                        Add-Count -Table $authorModifiedOthersCode -Key $killer
-                        $null = $revsWhereKilledOthers.Add(([string]$rev + [char]31 + $killer))
-                        if (-not $killMatrix.ContainsKey($killer))
-                        {
-                            $killMatrix[$killer] = @{}
-                        }
-                        Add-Count -Table $killMatrix[$killer] -Key $bornAuthor
-                    }
-                }
-            }
-            catch
-            {
-                throw ("Strict blame attribution failed at r{0} (before='{1}', after='{2}'): {3}" -f $rev, [string]$t.BeforePath, [string]$t.AfterPath, $_.Exception.Message)
-            }
-        }
-        $deathIdx++
-        # コミット間でキャッシュキーの再利用はないため、コミット境界で安全にクリア可能。
-        # これによりメモリ使用量を O(N×K×L) から O(K×L) に削減する。
-        $script:SvnBlameLineMemoryCache.Clear()
     }
-    Write-Progress -Id 3 -Activity '行単位の帰属解析' -Completed
+
+    if ($Parallel -le 1 -or $targetCommits.Count -le 1)
+    {
+        $deathTotal = $sortedCommits.Count
+        $deathIdx = 0
+        foreach ($c in $sortedCommits)
+        {
+            $pct = [Math]::Min(100, [int](($deathIdx / [Math]::Max(1, $deathTotal)) * 100))
+            Write-Progress -Id 3 -Activity '行単位の帰属解析' -Status ('r{0} ({1}/{2})' -f [int]$c.Revision, ($deathIdx + 1), $deathTotal) -PercentComplete $pct
+            $result = Invoke-StrictCommitAttribution -Commit $c -RevToAuthor $RevToAuthor -TargetUrl $TargetUrl -FromRevision $FromRevision -ToRevision $ToRevision -CacheDir $CacheDir -RenameMap $RenameMap
+            Merge-CountTable -Target $authorBorn -Source $result.AuthorBorn
+            Merge-CountTable -Target $authorDead -Source $result.AuthorDead
+            Merge-CountTable -Target $authorSurvived -Source $result.AuthorSurvived
+            Merge-CountTable -Target $authorSelfDead -Source $result.AuthorSelfDead
+            Merge-CountTable -Target $authorOtherDead -Source $result.AuthorOtherDead
+            Merge-CountTable -Target $authorCrossRevert -Source $result.AuthorCrossRevert
+            Merge-CountTable -Target $authorRemovedByOthers -Source $result.AuthorRemovedByOthers
+            Merge-CountTable -Target $fileBorn -Source $result.FileBorn
+            Merge-CountTable -Target $fileDead -Source $result.FileDead
+            Merge-CountTable -Target $fileSurvived -Source $result.FileSurvived
+            Merge-CountTable -Target $fileSelfCancel -Source $result.FileSelfCancel
+            Merge-CountTable -Target $fileCrossRevert -Source $result.FileCrossRevert
+            Merge-CountTable -Target $authorInternalMove -Source $result.AuthorInternalMoveCount
+            Merge-CountTable -Target $fileInternalMove -Source $result.FileInternalMoveCount
+            Merge-CountTable -Target $authorModifiedOthersCode -Source $result.AuthorModifiedOthersCode
+            Merge-NestedCountTable -Target $killMatrix -Source $result.KillMatrix
+            foreach ($revKey in @($result.RevsWhereKilledOthers))
+            {
+                $null = $revsWhereKilledOthers.Add([string]$revKey)
+            }
+            $deathIdx++
+        }
+        Write-Progress -Id 3 -Activity '行単位の帰属解析' -Completed
+    }
+    else
+    {
+        $parallelItems = [System.Collections.Generic.List[object]]::new()
+        foreach ($c in @($targetCommits))
+        {
+            [void]$parallelItems.Add([pscustomobject]@{
+                    Commit = $c
+                    RevToAuthor = $RevToAuthor
+                    TargetUrl = $TargetUrl
+                    FromRevision = [int]$FromRevision
+                    ToRevision = [int]$ToRevision
+                    CacheDir = $CacheDir
+                    RenameMap = $RenameMap
+                })
+        }
+
+        $worker = {
+            param($Item, $Index)
+            $null = $Index # Required by Invoke-ParallelWork contract
+            $script:StrictBlameCacheHits = 0
+            $script:StrictBlameCacheMisses = 0
+            $result = Invoke-StrictCommitAttribution -Commit $Item.Commit -RevToAuthor $Item.RevToAuthor -TargetUrl $Item.TargetUrl -FromRevision ([int]$Item.FromRevision) -ToRevision ([int]$Item.ToRevision) -CacheDir $Item.CacheDir -RenameMap $Item.RenameMap
+            [pscustomobject]@{
+                Result = $result
+                CacheHits = [int]$script:StrictBlameCacheHits
+                CacheMisses = [int]$script:StrictBlameCacheMisses
+            }
+        }
+
+        $results = @(Invoke-ParallelWork -InputItems $parallelItems.ToArray() -WorkerScript $worker -MaxParallel $Parallel -RequiredFunctions @(
+                'Invoke-StrictCommitAttribution',
+                'Get-CommitFileTransition',
+                'Resolve-PathByRenameMap',
+                'ConvertTo-PathKey',
+                'Get-SvnBlameLine',
+                'Compare-BlameOutput',
+                'Add-Count',
+                'Get-NormalizedAuthorName',
+                'Get-LineIdentityKey',
+                'Get-LcsMatchedPair',
+                'Get-BlameMemoryCacheKey',
+                'Read-BlameCacheFile',
+                'Write-BlameCacheFile',
+                'Read-CatCacheFile',
+                'Write-CatCacheFile',
+                'ConvertFrom-SvnBlameXml',
+                'ConvertTo-TextLine',
+                'Get-EmptyBlameResult',
+                'Get-PathCacheHash',
+                'Get-Sha1Hex',
+                'Get-BlameCachePath',
+                'Get-CatCachePath',
+                'Join-CommandArgument',
+                'Invoke-SvnCommand',
+                'Test-SvnMissingTargetError',
+                'Invoke-SvnCommandAllowMissingTarget',
+                'ConvertFrom-SvnXmlText'
+            ) -SessionVariables @{
+                SvnExecutable = $script:SvnExecutable
+                SvnGlobalArguments = @($script:SvnGlobalArguments)
+            } -ErrorContext 'strict blame attribution')
+
+        foreach ($entry in @($results))
+        {
+            $result = $entry.Result
+            Merge-CountTable -Target $authorBorn -Source $result.AuthorBorn
+            Merge-CountTable -Target $authorDead -Source $result.AuthorDead
+            Merge-CountTable -Target $authorSurvived -Source $result.AuthorSurvived
+            Merge-CountTable -Target $authorSelfDead -Source $result.AuthorSelfDead
+            Merge-CountTable -Target $authorOtherDead -Source $result.AuthorOtherDead
+            Merge-CountTable -Target $authorCrossRevert -Source $result.AuthorCrossRevert
+            Merge-CountTable -Target $authorRemovedByOthers -Source $result.AuthorRemovedByOthers
+            Merge-CountTable -Target $fileBorn -Source $result.FileBorn
+            Merge-CountTable -Target $fileDead -Source $result.FileDead
+            Merge-CountTable -Target $fileSurvived -Source $result.FileSurvived
+            Merge-CountTable -Target $fileSelfCancel -Source $result.FileSelfCancel
+            Merge-CountTable -Target $fileCrossRevert -Source $result.FileCrossRevert
+            Merge-CountTable -Target $authorInternalMove -Source $result.AuthorInternalMoveCount
+            Merge-CountTable -Target $fileInternalMove -Source $result.FileInternalMoveCount
+            Merge-CountTable -Target $authorModifiedOthersCode -Source $result.AuthorModifiedOthersCode
+            Merge-NestedCountTable -Target $killMatrix -Source $result.KillMatrix
+            foreach ($revKey in @($result.RevsWhereKilledOthers))
+            {
+                $null = $revsWhereKilledOthers.Add([string]$revKey)
+            }
+            $script:StrictBlameCacheHits += [int]$entry.CacheHits
+            $script:StrictBlameCacheMisses += [int]$entry.CacheMisses
+        }
+        Write-Progress -Id 3 -Activity '行単位の帰属解析' -Completed
+    }
 
     try
     {
