@@ -1989,6 +1989,32 @@ Describe 'Invoke-ParallelWork' {
         $expected = @($items | ForEach-Object { [int]$_ * [int]$_ })
         $actual | Should -Be $expected
     }
+
+    It 'returns identical results between sequential and parallel execution' {
+        $items = 1..40
+        $worker = {
+            param($Item, $Index)
+            return ([int]$Item + [int]$Index)
+        }
+        $seq = @(Invoke-ParallelWork -InputItems $items -WorkerScript $worker -MaxParallel 1 -ErrorContext 'test seq')
+        $par = @(Invoke-ParallelWork -InputItems $items -WorkerScript $worker -MaxParallel 4 -ErrorContext 'test par')
+        $par | Should -Be $seq
+    }
+
+    It 'propagates worker exceptions with failed item count in parallel mode' {
+        $items = 1..8
+        $worker = {
+            param($Item, $Index)
+            if ([int]$Item -eq 5)
+            {
+                throw 'intentional failure'
+            }
+            return ([int]$Item * 2)
+        }
+        {
+            $null = Invoke-ParallelWork -InputItems $items -WorkerScript $worker -MaxParallel 4 -ErrorContext 'test fail'
+        } | Should -Throw '*failed for 1 item*'
+    }
 }
 
 Describe 'Initialize-CommitDiffData parallel consistency' {
@@ -2069,6 +2095,241 @@ Index: trunk/src/file$Revision.txt
                 [int]$sStat.DeletedLines | Should -Be ([int]$pStat.DeletedLines)
             }
         }
+    }
+}
+
+Describe 'Initialize-CommitDiffData skip non-target commit' {
+    BeforeAll {
+        $script:origGetCachedOrFetchDiffTextSkip = (Get-Item function:Get-CachedOrFetchDiffText).ScriptBlock.ToString()
+    }
+
+    AfterAll {
+        Set-Item -Path function:Get-CachedOrFetchDiffText -Value $script:origGetCachedOrFetchDiffTextSkip
+    }
+
+    It 'does not call svn diff fetch when filtered changed paths are empty' {
+        Set-Item -Path function:Get-CachedOrFetchDiffText -Value {
+            param([string]$CacheDir, [int]$Revision, [string]$TargetUrl, [string[]]$DiffArguments)
+            throw 'Get-CachedOrFetchDiffText should not be called for filtered-out commit'
+        }
+
+        $commit = [pscustomobject]@{
+            Revision = 100
+            Author = 'alice'
+            Date = [datetime]'2026-01-01'
+            Message = 'docs only'
+            ChangedPaths = @(
+                [pscustomobject]@{
+                    Path = 'docs/readme.md'
+                    Action = 'M'
+                    CopyFromPath = $null
+                    CopyFromRev = $null
+                    IsDirectory = $false
+                }
+            )
+            ChangedPathsFiltered = @()
+            FileDiffStats = @{}
+            FilesChanged = @()
+            AddedLines = 0
+            DeletedLines = 0
+            Churn = 0
+            Entropy = 0.0
+            MsgLen = 0
+            MessageShort = ''
+        }
+
+        $map = Initialize-CommitDiffData -Commits @($commit) -CacheDir 'dummy' -TargetUrl 'https://example.invalid/svn/repo' -DiffArguments @('diff') -IncludeExtensions @('cs') -ExcludeExtensions @() -IncludePathPatterns @() -ExcludePathPatterns @() -Parallel 4
+
+        $map.ContainsKey(100) | Should -BeTrue
+        @($commit.ChangedPathsFiltered).Count | Should -Be 0
+        @($commit.FileDiffStats.Keys).Count | Should -Be 0
+        @($commit.FilesChanged).Count | Should -Be 0
+        [int]$commit.AddedLines | Should -Be 0
+        [int]$commit.DeletedLines | Should -Be 0
+    }
+}
+
+Describe 'Blame memory cache' {
+    BeforeEach {
+        Initialize-StrictModeContext
+    }
+
+    It 'reuses Get-SvnBlameSummary result without extra svn command call' {
+        $xml = @"
+<blame>
+  <target path="trunk/src/A.cs">
+    <entry line-number="1"><commit revision="10"><author>alice</author></commit></entry>
+  </target>
+</blame>
+"@
+        Mock Read-BlameCacheFile {
+            return $null
+        }
+        Mock Invoke-SvnCommandAllowMissingTarget {
+            return $xml
+        }
+        Mock Write-BlameCacheFile {
+            param([string]$CacheDir, [int]$Revision, [string]$FilePath, [string]$Content)
+        }
+
+        $first = Get-SvnBlameSummary -Repo 'https://example.invalid/svn/repo' -FilePath 'trunk/src/A.cs' -ToRevision 10 -CacheDir 'dummy'
+        $second = Get-SvnBlameSummary -Repo 'https://example.invalid/svn/repo' -FilePath 'trunk/src/A.cs' -ToRevision 10 -CacheDir 'dummy'
+
+        $first.LineCountTotal | Should -Be 1
+        $second.LineCountTotal | Should -Be 1
+        Assert-MockCalled Invoke-SvnCommandAllowMissingTarget -Times 1 -Exactly
+    }
+
+    It 'reuses Get-SvnBlameLine result without extra svn blame/cat command call' {
+        $xml = @"
+<blame>
+  <target path="trunk/src/B.cs">
+    <entry line-number="1"><commit revision="20"><author>bob</author></commit></entry>
+  </target>
+</blame>
+"@
+        Mock Read-BlameCacheFile {
+            return $null
+        }
+        Mock Read-CatCacheFile {
+            return $null
+        }
+        Mock Invoke-SvnCommandAllowMissingTarget {
+            param([string[]]$Arguments, [string]$ErrorContext)
+            if ($Arguments[0] -eq 'blame')
+            {
+                return $xml
+            }
+            if ($Arguments[0] -eq 'cat')
+            {
+                return "line1`n"
+            }
+            return $null
+        }
+        Mock Write-BlameCacheFile {
+            param([string]$CacheDir, [int]$Revision, [string]$FilePath, [string]$Content)
+        }
+        Mock Write-CatCacheFile {
+            param([string]$CacheDir, [int]$Revision, [string]$FilePath, [string]$Content)
+        }
+
+        $first = Get-SvnBlameLine -Repo 'https://example.invalid/svn/repo' -FilePath 'trunk/src/B.cs' -Revision 20 -CacheDir 'dummy'
+        $second = Get-SvnBlameLine -Repo 'https://example.invalid/svn/repo' -FilePath 'trunk/src/B.cs' -Revision 20 -CacheDir 'dummy'
+
+        $first.LineCountTotal | Should -Be 1
+        $second.LineCountTotal | Should -Be 1
+        Assert-MockCalled Invoke-SvnCommandAllowMissingTarget -Times 2 -Exactly
+    }
+}
+
+Describe 'Get-ExactDeathAttribution fast path' {
+    BeforeAll {
+        $script:origGetStrictBlamePrefetchTargetFast = (Get-Item function:Get-StrictBlamePrefetchTarget).ScriptBlock.ToString()
+        $script:origInvokeStrictBlameCachePrefetchFast = (Get-Item function:Invoke-StrictBlameCachePrefetch).ScriptBlock.ToString()
+        $script:origGetCommitFileTransitionFast = (Get-Item function:Get-CommitFileTransition).ScriptBlock.ToString()
+        $script:origCompareBlameOutputFast = (Get-Item function:Compare-BlameOutput).ScriptBlock.ToString()
+        $script:origGetStrictHunkDetailFast = (Get-Item function:Get-StrictHunkDetail).ScriptBlock.ToString()
+    }
+
+    AfterAll {
+        Set-Item -Path function:Get-StrictBlamePrefetchTarget -Value $script:origGetStrictBlamePrefetchTargetFast
+        Set-Item -Path function:Invoke-StrictBlameCachePrefetch -Value $script:origInvokeStrictBlameCachePrefetchFast
+        Set-Item -Path function:Get-CommitFileTransition -Value $script:origGetCommitFileTransitionFast
+        Set-Item -Path function:Compare-BlameOutput -Value $script:origCompareBlameOutputFast
+        Set-Item -Path function:Get-StrictHunkDetail -Value $script:origGetStrictHunkDetailFast
+    }
+
+    It 'skips unnecessary blame side fetch for no-change/add-only/delete-file transitions' {
+        Set-Item -Path function:Get-StrictBlamePrefetchTarget -Value {
+            param([object[]]$Commits, [int]$FromRevision, [int]$ToRevision, [string]$CacheDir)
+            return @()
+        }
+        Set-Item -Path function:Invoke-StrictBlameCachePrefetch -Value {
+            param([object[]]$Targets, [string]$TargetUrl, [string]$CacheDir, [int]$Parallel)
+        }
+        Set-Item -Path function:Get-CommitFileTransition -Value {
+            param([object]$Commit)
+            switch ([int]$Commit.Revision) {
+                1 { return @([pscustomobject]@{ BeforePath = 'src/nochange.cs'; AfterPath = 'src/nochange.cs' }) }
+                2 { return @([pscustomobject]@{ BeforePath = 'src/addonly.cs'; AfterPath = 'src/addonly.cs' }) }
+                3 { return @([pscustomobject]@{ BeforePath = 'src/delete.cs'; AfterPath = $null }) }
+                default { return @() }
+            }
+        }
+        Set-Item -Path function:Compare-BlameOutput -Value {
+            param([object[]]$PreviousLines, [object[]]$CurrentLines)
+            throw 'Compare-BlameOutput should not be called in this fast-path test'
+        }
+        Set-Item -Path function:Get-StrictHunkDetail -Value {
+            param([object[]]$Commits, [hashtable]$RevToAuthor, [hashtable]$RenameMap)
+            [pscustomobject]@{
+                AuthorRepeatedHunk = @{}
+                AuthorPingPong = @{}
+                FileRepeatedHunk = @{}
+                FilePingPong = @{}
+            }
+        }
+
+        $commits = @(
+            [pscustomobject]@{
+                Revision = 1
+                Author = 'alice'
+                FileDiffStats = @{
+                    'src/nochange.cs' = [pscustomobject]@{ AddedLines = 0; DeletedLines = 0; Hunks = @(); IsBinary = $false }
+                }
+                FilesChanged = @('src/nochange.cs')
+                ChangedPathsFiltered = @()
+            },
+            [pscustomobject]@{
+                Revision = 2
+                Author = 'alice'
+                FileDiffStats = @{
+                    'src/addonly.cs' = [pscustomobject]@{ AddedLines = 2; DeletedLines = 0; Hunks = @(); IsBinary = $false }
+                }
+                FilesChanged = @('src/addonly.cs')
+                ChangedPathsFiltered = @()
+            },
+            [pscustomobject]@{
+                Revision = 3
+                Author = 'charlie'
+                FileDiffStats = @{
+                    'src/delete.cs' = [pscustomobject]@{ AddedLines = 0; DeletedLines = 2; Hunks = @(); IsBinary = $false }
+                }
+                FilesChanged = @('src/delete.cs')
+                ChangedPathsFiltered = @()
+            }
+        )
+        $revToAuthor = @{ 1 = 'alice'; 2 = 'alice'; 3 = 'charlie' }
+
+        Mock Get-SvnBlameLine {
+            param([string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir)
+            if ($FilePath -eq 'src/addonly.cs') {
+                return [pscustomobject]@{
+                    LineCountTotal = 3
+                    LineCountByRevision = @{}
+                    LineCountByAuthor = @{}
+                    Lines = @(
+                        [pscustomobject]@{ LineNumber = 1; Content = 'old'; Revision = 1; Author = 'alice' },
+                        [pscustomobject]@{ LineNumber = 2; Content = 'new-a'; Revision = 2; Author = 'alice' },
+                        [pscustomobject]@{ LineNumber = 3; Content = 'new-b'; Revision = 2; Author = 'alice' }
+                    )
+                }
+            }
+            return [pscustomobject]@{
+                LineCountTotal = 2
+                LineCountByRevision = @{}
+                LineCountByAuthor = @{}
+                Lines = @(
+                    [pscustomobject]@{ LineNumber = 1; Content = 'x'; Revision = 2; Author = 'bob' },
+                    [pscustomobject]@{ LineNumber = 2; Content = 'y'; Revision = 2; Author = 'bob' }
+                )
+            }
+        }
+
+        $result = Get-ExactDeathAttribution -Commits $commits -RevToAuthor $revToAuthor -TargetUrl 'https://example.invalid/svn/repo' -FromRevision 1 -ToRevision 3 -CacheDir 'dummy' -RenameMap @{} -Parallel 1
+
+        $result | Should -Not -BeNullOrEmpty
+        Assert-MockCalled Get-SvnBlameLine -Times 2 -Exactly
     }
 }
 
@@ -2737,5 +2998,104 @@ Describe 'Write-CommitScatterChart' {
 
         Write-CommitScatterChart -OutDirectory $script:commitScatterDir -Commits $commits -EncodingName 'UTF8'
         Test-Path (Join-Path $script:commitScatterDir 'commit_scatter.svg') | Should -BeFalse
+    }
+}
+
+Describe 'SvnBlameLineMemoryCache eviction at commit boundary' {
+    BeforeAll {
+        $script:origGetStrictBlamePrefetchTargetEvict = (Get-Item function:Get-StrictBlamePrefetchTarget).ScriptBlock.ToString()
+        $script:origInvokeStrictBlameCachePrefetchEvict = (Get-Item function:Invoke-StrictBlameCachePrefetch).ScriptBlock.ToString()
+        $script:origGetCommitFileTransitionEvict = (Get-Item function:Get-CommitFileTransition).ScriptBlock.ToString()
+        $script:origGetStrictHunkDetailEvict = (Get-Item function:Get-StrictHunkDetail).ScriptBlock.ToString()
+    }
+
+    AfterAll {
+        Set-Item -Path function:Get-StrictBlamePrefetchTarget -Value $script:origGetStrictBlamePrefetchTargetEvict
+        Set-Item -Path function:Invoke-StrictBlameCachePrefetch -Value $script:origInvokeStrictBlameCachePrefetchEvict
+        Set-Item -Path function:Get-CommitFileTransition -Value $script:origGetCommitFileTransitionEvict
+        Set-Item -Path function:Get-StrictHunkDetail -Value $script:origGetStrictHunkDetailEvict
+    }
+
+    It 'clears line memory cache after each commit so earlier entries do not persist' {
+        Initialize-StrictModeContext
+
+        Set-Item -Path function:Get-StrictBlamePrefetchTarget -Value {
+            param([object[]]$Commits, [int]$FromRevision, [int]$ToRevision, [string]$CacheDir)
+            return @()
+        }
+        Set-Item -Path function:Invoke-StrictBlameCachePrefetch -Value {
+            param([object[]]$Targets, [string]$TargetUrl, [string]$CacheDir, [int]$Parallel)
+        }
+        Set-Item -Path function:Get-CommitFileTransition -Value {
+            param([object]$Commit)
+            switch ([int]$Commit.Revision)
+            {
+                10 { return @([pscustomobject]@{ BeforePath = 'src/file1.cs'; AfterPath = 'src/file1.cs' }) }
+                20 { return @([pscustomobject]@{ BeforePath = 'src/file2.cs'; AfterPath = 'src/file2.cs' }) }
+                default { return @() }
+            }
+        }
+        Set-Item -Path function:Get-StrictHunkDetail -Value {
+            param([object[]]$Commits, [hashtable]$RevToAuthor, [hashtable]$RenameMap)
+            [pscustomobject]@{
+                AuthorRepeatedHunk = @{}
+                AuthorPingPong = @{}
+                FileRepeatedHunk = @{}
+                FilePingPong = @{}
+            }
+        }
+
+        $blameCallLog = New-Object 'System.Collections.Generic.List[string]'
+        Mock Get-SvnBlameLine {
+            param([string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir)
+            $blameCallLog.Add("$FilePath@$Revision")
+            return [pscustomobject]@{
+                LineCountTotal = 1
+                LineCountByRevision = @{}
+                LineCountByAuthor = @{}
+                Lines = @(
+                    [pscustomobject]@{ LineNumber = 1; Content = 'code'; Revision = $Revision; Author = 'alice' }
+                )
+            }
+        }
+
+        $commits = @(
+            [pscustomobject]@{
+                Revision = 10
+                Author = 'alice'
+                FileDiffStats = @{
+                    'src/file1.cs' = [pscustomobject]@{ AddedLines = 1; DeletedLines = 1; Hunks = @(); IsBinary = $false }
+                }
+                FilesChanged = @('src/file1.cs')
+                ChangedPathsFiltered = @()
+            },
+            [pscustomobject]@{
+                Revision = 20
+                Author = 'bob'
+                FileDiffStats = @{
+                    'src/file2.cs' = [pscustomobject]@{ AddedLines = 1; DeletedLines = 1; Hunks = @(); IsBinary = $false }
+                }
+                FilesChanged = @('src/file2.cs')
+                ChangedPathsFiltered = @()
+            }
+        )
+        $revToAuthor = @{ 10 = 'alice'; 20 = 'bob' }
+
+        $null = Get-ExactDeathAttribution -Commits $commits -RevToAuthor $revToAuthor -TargetUrl 'https://example.invalid/svn/repo' -FromRevision 10 -ToRevision 20 -CacheDir 'dummy' -RenameMap @{} -Parallel 1
+
+        # コミット1 (rev10) のキャッシュキーがエビクション済みであること
+        $key10 = Get-BlameMemoryCacheKey -Revision 10 -FilePath 'src/file1.cs'
+        $key9  = Get-BlameMemoryCacheKey -Revision 9  -FilePath 'src/file1.cs'
+        $script:SvnBlameLineMemoryCache.ContainsKey($key10) | Should -BeFalse
+        $script:SvnBlameLineMemoryCache.ContainsKey($key9)  | Should -BeFalse
+
+        # コミット2 (rev20) のキャッシュも最終コミット処理後にクリアされている
+        $key20 = Get-BlameMemoryCacheKey -Revision 20 -FilePath 'src/file2.cs'
+        $key19 = Get-BlameMemoryCacheKey -Revision 19 -FilePath 'src/file2.cs'
+        $script:SvnBlameLineMemoryCache.ContainsKey($key20) | Should -BeFalse
+        $script:SvnBlameLineMemoryCache.ContainsKey($key19) | Should -BeFalse
+
+        # blame 呼び出し自体は行われていることを確認(キャッシュではなく実際に呼ばれた)
+        $blameCallLog.Count | Should -BeGreaterOrEqual 4
     }
 }

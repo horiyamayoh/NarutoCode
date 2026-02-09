@@ -106,6 +106,13 @@ $script:ColSelfDead = '自己消滅行数'         # 追加した本人が後の
 $script:ColOtherDead = '被他者消滅行数'      # 別の作者によって削除された行数
 $script:StrictBlameCacheHits = 0
 $script:StrictBlameCacheMisses = 0
+# ディスクキャッシュ (blame XML / cat テキスト) の上位に配置するインメモリキャッシュ。
+# 同一 (revision, path) への繰り返しアクセスでディスク I/O と XML パースを回避する。
+# SvnBlameSummaryMemoryCache: 所有権分析フェーズで ToRevision の全ファイル分を保持 (Content 空文字のため軽量)。
+# SvnBlameLineMemoryCache: Get-ExactDeathAttribution 内で使用。コミット境界で Clear() されるため
+#   定常メモリは O(K×L) (K=1コミットあたり変更ファイル数, L=平均行数) に抑えられる。
+$script:SvnBlameSummaryMemoryCache = @{}
+$script:SvnBlameLineMemoryCache = @{}
 $script:SharedSha1 = New-Object System.Security.Cryptography.SHA1CryptoServiceProvider
 
 # region Utility
@@ -122,6 +129,8 @@ function Initialize-StrictModeContext
     $script:ColDeadAdded = '消滅追加行数'       # 追加されたが ToRev 時点で生存していない行数
     $script:ColSelfDead = '自己消滅行数'         # 追加した本人が後のコミットで削除した行数
     $script:ColOtherDead = '被他者消滅行数'      # 別の作者によって削除された行数
+    $script:SvnBlameSummaryMemoryCache = @{}
+    $script:SvnBlameLineMemoryCache = @{}
     if ($null -eq $script:SharedSha1)
     {
         $script:SharedSha1 = New-Object System.Security.Cryptography.SHA1CryptoServiceProvider
@@ -542,48 +551,85 @@ catch
     $null = $pool.SetMaxRunspaces($effectiveParallel)
     $jobs = [System.Collections.Generic.List[object]]::new()
     $wrappedResults = [System.Collections.Generic.List[object]]::new()
+    # 結果を元の入力順序で返すため、インデックスで管理する配列を事前確保する。
+    $wrappedByIndex = New-Object 'object[]' $items.Count
     try
     {
         $pool.Open()
-        for ($i = 0
-            $i -lt $items.Count
-            $i++)
-        {
-            $ps = [PowerShell]::Create()
-            $ps.RunspacePool = $pool
-            $null = $ps.AddScript($invokeScript).AddArgument($workerText).AddArgument($items[$i]).AddArgument($i)
-            $handle = $ps.BeginInvoke()
-            [void]$jobs.Add([pscustomobject]@{
-                    Index = $i
-                    PowerShell = $ps
-                    Handle = $handle
-                })
-        }
-
-        $jobTotal = @($jobs.ToArray()).Count
+        $jobTotal = $items.Count
+        $nextIndex = 0
         $jobDone = 0
-        foreach ($job in @($jobs.ToArray()))
+        # 遅延投入 (lazy submission): 全ジョブを一括投入せず、同時実行数を
+        # $effectiveParallel 以下に制限する。これにより PowerShell インスタンスの
+        # メモリ消費を O(items.Count) → O(effectiveParallel) に抑える。
+        # 完了したジョブから順にスロットを解放し、次のジョブを投入する。
+        while ($nextIndex -lt $items.Count -or $jobs.Count -gt 0)
         {
+            while ($nextIndex -lt $items.Count -and $jobs.Count -lt $effectiveParallel)
+            {
+                $ps = [PowerShell]::Create()
+                $ps.RunspacePool = $pool
+                $null = $ps.AddScript($invokeScript).AddArgument($workerText).AddArgument($items[$nextIndex]).AddArgument($nextIndex)
+                $handle = $ps.BeginInvoke()
+                [void]$jobs.Add([pscustomobject]@{
+                        Index = $nextIndex
+                        PowerShell = $ps
+                        Handle = $handle
+                    })
+                $nextIndex++
+            }
+
             $pct = [Math]::Min(100, [int](($jobDone / [Math]::Max(1, $jobTotal)) * 100))
             Write-Progress -Id $progressId -Activity $ErrorContext -Status ('{0}/{1}' -f ($jobDone + 1), $jobTotal) -PercentComplete $pct
-            if ($null -eq $job -or $null -eq $job.PowerShell)
+            if ($jobs.Count -eq 0)
             {
-                [void]$wrappedResults.Add([pscustomobject]@{
-                        Index = if ($null -ne $job)
-                        {
-                            [int]$job.Index
-                        }
-                        else
-                        {
-                            -1
-                        }
-                        Succeeded = $false
-                        Result = $null
-                        ErrorMessage = 'Worker handle was not initialized.'
-                        ErrorStack = $null
-                    })
                 continue
             }
+
+            $completedJobIndex = -1
+            for ($scan = 0
+                $scan -lt $jobs.Count
+                $scan++)
+            {
+                if ($null -ne $jobs[$scan] -and $null -ne $jobs[$scan].Handle -and $jobs[$scan].Handle.IsCompleted)
+                {
+                    $completedJobIndex = $scan
+                    break
+                }
+            }
+            if ($completedJobIndex -lt 0)
+            {
+                Start-Sleep -Milliseconds 1
+                continue
+            }
+
+            $job = $jobs[$completedJobIndex]
+            $jobs.RemoveAt($completedJobIndex)
+            if ($null -eq $job -or $null -eq $job.PowerShell)
+            {
+                $failedWrapped = [pscustomobject]@{
+                    Index = if ($null -ne $job)
+                    {
+                        [int]$job.Index
+                    }
+                    else
+                    {
+                        -1
+                    }
+                    Succeeded = $false
+                    Result = $null
+                    ErrorMessage = 'Worker handle was not initialized.'
+                    ErrorStack = $null
+                }
+                [void]$wrappedResults.Add($failedWrapped)
+                if ($failedWrapped.Index -ge 0 -and $failedWrapped.Index -lt $wrappedByIndex.Length)
+                {
+                    $wrappedByIndex[$failedWrapped.Index] = $failedWrapped
+                }
+                $jobDone++
+                continue
+            }
+
             $wrapped = $null
             try
             {
@@ -622,6 +668,10 @@ catch
                 }
             }
             [void]$wrappedResults.Add($wrapped)
+            if ($wrapped.Index -ge 0 -and $wrapped.Index -lt $wrappedByIndex.Length)
+            {
+                $wrappedByIndex[$wrapped.Index] = $wrapped
+            }
             $jobDone++
         }
         Write-Progress -Id $progressId -Activity $ErrorContext -Completed
@@ -652,8 +702,29 @@ catch
         }
     }
 
+    $orderedWrapped = [System.Collections.Generic.List[object]]::new()
+    for ($orderedIndex = 0
+        $orderedIndex -lt $wrappedByIndex.Length
+        $orderedIndex++)
+    {
+        if ($null -ne $wrappedByIndex[$orderedIndex])
+        {
+            [void]$orderedWrapped.Add($wrappedByIndex[$orderedIndex])
+        }
+        else
+        {
+            [void]$orderedWrapped.Add([pscustomobject]@{
+                    Index = $orderedIndex
+                    Succeeded = $false
+                    Result = $null
+                    ErrorMessage = 'Worker result is missing.'
+                    ErrorStack = $null
+                })
+        }
+    }
+
     $failed = [System.Collections.Generic.List[object]]::new()
-    foreach ($entry in @($wrappedResults.ToArray()))
+    foreach ($entry in @($orderedWrapped.ToArray()))
     {
         if ($null -eq $entry -or -not [bool]$entry.Succeeded)
         {
@@ -685,7 +756,7 @@ catch
     }
 
     $results = [System.Collections.Generic.List[object]]::new()
-    foreach ($entry in @($wrappedResults.ToArray()))
+    foreach ($entry in @($orderedWrapped.ToArray()))
     {
         [void]$results.Add($entry.Result)
     }
@@ -809,6 +880,71 @@ function Get-CatCachePath
     param([string]$CacheDir, [int]$Revision, [string]$FilePath)
     $dir = Join-Path (Join-Path $CacheDir 'cat') ("r{0}" -f $Revision)
     return Join-Path $dir ((Get-PathCacheHash -FilePath $FilePath) + '.txt')
+}
+function Test-BlameCacheFileExistence
+{
+    <#
+    .SYNOPSIS
+        blame XML キャッシュファイルの存在有無を判定する。
+    .DESCRIPTION
+        Read-BlameCacheFile はファイル全体を読み込むため、存在確認のみが目的の場合は
+        [System.IO.File]::Exists() で十分である。プリフェッチ対象スキャンでは
+        N 件のファイルに対して呼ばれるため、不要なファイル読み込みを回避して高速化する。
+    .PARAMETER CacheDir
+        キャッシュディレクトリのパスを指定する。
+    .PARAMETER Revision
+        処理対象のリビジョン値を指定する。
+    .PARAMETER FilePath
+        処理対象のファイルパスを指定する。
+    #>
+    param([string]$CacheDir, [int]$Revision, [string]$FilePath)
+    if ([string]::IsNullOrWhiteSpace($CacheDir))
+    {
+        return $false
+    }
+    $path = Get-BlameCachePath -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
+    return [System.IO.File]::Exists($path)
+}
+function Test-CatCacheFileExistence
+{
+    <#
+    .SYNOPSIS
+        cat テキストキャッシュファイルの存在有無を判定する。
+    .DESCRIPTION
+        Read-CatCacheFile はファイル全体を読み込むため、存在確認のみが目的の場合は
+        [System.IO.File]::Exists() で十分である。プリフェッチ対象スキャンでは
+        N 件のファイルに対して呼ばれるため、不要なファイル読み込みを回避して高速化する。
+    .PARAMETER CacheDir
+        キャッシュディレクトリのパスを指定する。
+    .PARAMETER Revision
+        処理対象のリビジョン値を指定する。
+    .PARAMETER FilePath
+        処理対象のファイルパスを指定する。
+    #>
+    param([string]$CacheDir, [int]$Revision, [string]$FilePath)
+    if ([string]::IsNullOrWhiteSpace($CacheDir))
+    {
+        return $false
+    }
+    $path = Get-CatCachePath -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
+    return [System.IO.File]::Exists($path)
+}
+function Get-BlameMemoryCacheKey
+{
+    <#
+    .SYNOPSIS
+        blame 結果のメモリキャッシュ参照キーを生成する。
+    .DESCRIPTION
+        "リビジョン + Unit Separator (U+001F) + 正規化パス" の文字列をキーとする。
+        Unit Separator はファイルパスに出現しない制御文字であり、キーの衝突を防ぐ。
+        ハッシュテーブルのキーとして使用することで O(1) のキャッシュ参照を実現する。
+    .PARAMETER Revision
+        処理対象のリビジョン値を指定する。
+    .PARAMETER FilePath
+        処理対象のファイルパスを指定する。
+    #>
+    param([int]$Revision, [string]$FilePath)
+    return ([string]$Revision + [char]31 + (ConvertTo-PathKey -Path $FilePath))
 }
 function Read-BlameCacheFile
 {
@@ -1980,6 +2116,19 @@ function Get-SvnBlameSummary
         キャッシュディレクトリのパスを指定する。
     #>
     [CmdletBinding()]param([string]$Repo, [string]$FilePath, [int]$ToRevision, [string]$CacheDir)
+    # インメモリキャッシュにヒットすればディスク読み込み・XML パースを完全に回避する。
+    # 所有権分析フェーズでは同一ファイルに複数回アクセスされるため効果が大きい。
+    if ($null -eq $script:SvnBlameSummaryMemoryCache)
+    {
+        $script:SvnBlameSummaryMemoryCache = @{}
+    }
+    $cacheKey = Get-BlameMemoryCacheKey -Revision $ToRevision -FilePath $FilePath
+    if ($script:SvnBlameSummaryMemoryCache.ContainsKey($cacheKey))
+    {
+        $script:StrictBlameCacheHits++
+        return $script:SvnBlameSummaryMemoryCache[$cacheKey]
+    }
+
     $url = $Repo.TrimEnd('/') + '/' + (ConvertTo-PathKey -Path $FilePath).TrimStart('/') + '@' + [string]$ToRevision
     $text = Read-BlameCacheFile -CacheDir $CacheDir -Revision $ToRevision -FilePath $FilePath
     if ([string]::IsNullOrEmpty($text))
@@ -1997,9 +2146,13 @@ function Get-SvnBlameSummary
     }
     if ([string]::IsNullOrEmpty($text))
     {
-        return (Get-EmptyBlameResult)
+        $empty = Get-EmptyBlameResult
+        $script:SvnBlameSummaryMemoryCache[$cacheKey] = $empty
+        return $empty
     }
-    return (ConvertFrom-SvnBlameXml -XmlText $text)
+    $parsed = ConvertFrom-SvnBlameXml -XmlText $text
+    $script:SvnBlameSummaryMemoryCache[$cacheKey] = $parsed
+    return $parsed
 }
 function Get-SvnBlameLine
 {
@@ -2017,6 +2170,20 @@ function Get-SvnBlameLine
     #>
     [CmdletBinding()]
     param([string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir)
+    # インメモリキャッシュにヒットすればディスク読み込み (blame XML + cat テキスト) と
+    # XML パースを完全に回避する。同一コミット内で同じファイルが複数トランジションから
+    # 参照されるケースで効果がある。コミット境界で Clear() されるため無制限には成長しない。
+    if ($null -eq $script:SvnBlameLineMemoryCache)
+    {
+        $script:SvnBlameLineMemoryCache = @{}
+    }
+    $cacheKey = Get-BlameMemoryCacheKey -Revision $Revision -FilePath $FilePath
+    if ($script:SvnBlameLineMemoryCache.ContainsKey($cacheKey))
+    {
+        $script:StrictBlameCacheHits++
+        return $script:SvnBlameLineMemoryCache[$cacheKey]
+    }
+
     $path = (ConvertTo-PathKey -Path $FilePath).TrimStart('/')
     $url = $Repo.TrimEnd('/') + '/' + $path + '@' + [string]$Revision
 
@@ -2046,10 +2213,14 @@ function Get-SvnBlameLine
     }
     if ([string]::IsNullOrEmpty($blameXml) -or $null -eq $catText)
     {
-        return (Get-EmptyBlameResult)
+        $empty = Get-EmptyBlameResult
+        $script:SvnBlameLineMemoryCache[$cacheKey] = $empty
+        return $empty
     }
     $contentLines = ConvertTo-TextLine -Text $catText
-    return (ConvertFrom-SvnBlameXml -XmlText $blameXml -ContentLines $contentLines)
+    $parsed = ConvertFrom-SvnBlameXml -XmlText $blameXml -ContentLines $contentLines
+    $script:SvnBlameLineMemoryCache[$cacheKey] = $parsed
+    return $parsed
 }
 function Initialize-SvnBlameLineCache
 {
@@ -2345,6 +2516,46 @@ function Compare-BlameOutput
     $matchedPairs = New-Object 'System.Collections.Generic.List[object]'
     $prevMatched = New-Object 'bool[]' $m
     $currMatched = New-Object 'bool[]' $n
+
+    # 前後一致の prefix/suffix は LCS せずに固定し、中央差分区間だけを探索する。
+    $prefix = 0
+    while ($prefix -lt $m -and $prefix -lt $n -and $prevIdentity[$prefix] -ceq $currIdentity[$prefix])
+    {
+        $prevMatched[$prefix] = $true
+        $currMatched[$prefix] = $true
+        [void]$matchedPairs.Add([pscustomobject]@{
+                PrevIndex = $prefix
+                CurrIndex = $prefix
+                PrevLine = $prev[$prefix]
+                CurrLine = $curr[$prefix]
+                MatchType = 'LcsIdentity'
+            })
+        $prefix++
+    }
+
+    $suffixPrev = $m - 1
+    $suffixCurr = $n - 1
+    $suffixPairs = New-Object 'System.Collections.Generic.List[object]'
+    while ($suffixPrev -ge $prefix -and $suffixCurr -ge $prefix -and $prevIdentity[$suffixPrev] -ceq $currIdentity[$suffixCurr])
+    {
+        $prevMatched[$suffixPrev] = $true
+        $currMatched[$suffixCurr] = $true
+        [void]$suffixPairs.Add([pscustomobject]@{
+                PrevIndex = $suffixPrev
+                CurrIndex = $suffixCurr
+                PrevLine = $prev[$suffixPrev]
+                CurrLine = $curr[$suffixCurr]
+                MatchType = 'LcsIdentity'
+            })
+        $suffixPrev--
+        $suffixCurr--
+    }
+    for ($suffixIdx = $suffixPairs.Count - 1
+        $suffixIdx -ge 0
+        $suffixIdx--)
+    {
+        [void]$matchedPairs.Add($suffixPairs[$suffixIdx])
+    }
 
     # まず identity LCS で帰属が同じ行を優先一致させる。
     foreach ($pair in @(Get-LcsMatchedPair -PreviousKeys $prevIdentity -CurrentKeys $currIdentity -PreviousLocked $prevMatched -CurrentLocked $currMatched))
@@ -2919,9 +3130,9 @@ function Get-StrictBlamePrefetchTarget
                 $key = [string]($rev - 1) + [char]31 + $beforePath
                 if ($seen.Add($key))
                 {
-                    $blameXml = Read-BlameCacheFile -CacheDir $CacheDir -Revision ($rev - 1) -FilePath $beforePath
-                    $catText = Read-CatCacheFile -CacheDir $CacheDir -Revision ($rev - 1) -FilePath $beforePath
-                    if ([string]::IsNullOrEmpty($blameXml) -or $null -eq $catText)
+                    $hasBlameCache = Test-BlameCacheFileExistence -CacheDir $CacheDir -Revision ($rev - 1) -FilePath $beforePath
+                    $hasCatCache = Test-CatCacheFileExistence -CacheDir $CacheDir -Revision ($rev - 1) -FilePath $beforePath
+                    if ((-not $hasBlameCache) -or (-not $hasCatCache))
                     {
                         [void]$targets.Add([pscustomobject]@{
                                 FilePath = $beforePath
@@ -2936,9 +3147,9 @@ function Get-StrictBlamePrefetchTarget
                 $key = [string]$rev + [char]31 + $afterPath
                 if ($seen.Add($key))
                 {
-                    $blameXml = Read-BlameCacheFile -CacheDir $CacheDir -Revision $rev -FilePath $afterPath
-                    $catText = Read-CatCacheFile -CacheDir $CacheDir -Revision $rev -FilePath $afterPath
-                    if ([string]::IsNullOrEmpty($blameXml) -or $null -eq $catText)
+                    $hasBlameCache = Test-BlameCacheFileExistence -CacheDir $CacheDir -Revision $rev -FilePath $afterPath
+                    $hasCatCache = Test-CatCacheFileExistence -CacheDir $CacheDir -Revision $rev -FilePath $afterPath
+                    if ((-not $hasBlameCache) -or (-not $hasCatCache))
                     {
                         [void]$targets.Add([pscustomobject]@{
                                 FilePath = $afterPath
@@ -3198,20 +3409,113 @@ function Get-ExactDeathAttribution
                     Resolve-PathByRenameMap -FilePath $beforePath -RenameMap $RenameMap
                 }
 
-                $prevLines = @()
-                if ($beforePath)
+                # --- Fast Path 分岐 ---
+                # diff 統計 (追加行数・削除行数) を事前に取得し、blame 比較の必要性を判定する。
+                # 典型的なコミットではファイルの大半が add-only や zero-change であり、
+                # 高コストな LCS (O(mn)) を回避できるケースが多い。
+                $transitionAdded = 0
+                $transitionDeleted = 0
+                $transitionStat = $null
+                if ($afterPath -and $c.FileDiffStats.ContainsKey($afterPath))
                 {
-                    $prevBlame = Get-SvnBlameLine -Repo $TargetUrl -FilePath $beforePath -Revision ($rev - 1) -CacheDir $CacheDir
-                    $prevLines = @($prevBlame.Lines)
+                    $transitionStat = $c.FileDiffStats[$afterPath]
                 }
-                $currLines = @()
-                if ($afterPath)
+                elseif ($beforePath -and $c.FileDiffStats.ContainsKey($beforePath))
+                {
+                    $transitionStat = $c.FileDiffStats[$beforePath]
+                }
+                if ($null -ne $transitionStat)
+                {
+                    $transitionAdded = [int]$transitionStat.AddedLines
+                    $transitionDeleted = [int]$transitionStat.DeletedLines
+                }
+                $hasTransitionStat = ($null -ne $transitionStat)
+
+                # Fast Path 1: zero-change — プロパティ変更のみ等。blame 取得自体を省略する。
+                if ($hasTransitionStat -and $transitionAdded -eq 0 -and $transitionDeleted -eq 0)
+                {
+                    continue
+                }
+
+                $cmp = $null
+                # Fast Path 2: add-only — 削除行なし。前リビジョンの blame 取得と LCS を省略し、
+                # 現リビジョンの blame から当該リビジョンで born された行だけを抽出する。
+                if ($hasTransitionStat -and $transitionAdded -gt 0 -and $transitionDeleted -eq 0 -and $afterPath)
                 {
                     $currBlame = Get-SvnBlameLine -Repo $TargetUrl -FilePath $afterPath -Revision $rev -CacheDir $CacheDir
                     $currLines = @($currBlame.Lines)
+                    $bornOnly = New-Object 'System.Collections.Generic.List[object]'
+                    for ($currIdx = 0
+                        $currIdx -lt $currLines.Count
+                        $currIdx++)
+                    {
+                        $line = $currLines[$currIdx]
+                        $lineRevision = $null
+                        try
+                        {
+                            $lineRevision = [int]$line.Revision
+                        }
+                        catch
+                        {
+                            $lineRevision = $null
+                        }
+                        if ($lineRevision -eq $rev)
+                        {
+                            [void]$bornOnly.Add([pscustomobject]@{
+                                    Index = $currIdx
+                                    Line = $line
+                                })
+                        }
+                    }
+                    $cmp = [pscustomobject]@{
+                        KilledLines = @()
+                        BornLines = @($bornOnly.ToArray())
+                        MatchedPairs = @()
+                        MovedPairs = @()
+                        ReattributedPairs = @()
+                    }
+                }
+                # Fast Path 3: delete-file — ファイル削除。現リビジョンの blame 取得と LCS を省略し、
+                # 前リビジョンの全行を killed として扱う。afterPath が null であることが条件。
+                elseif ($hasTransitionStat -and $transitionDeleted -gt 0 -and $transitionAdded -eq 0 -and $beforePath -and (-not $afterPath))
+                {
+                    $prevBlame = Get-SvnBlameLine -Repo $TargetUrl -FilePath $beforePath -Revision ($rev - 1) -CacheDir $CacheDir
+                    $prevLines = @($prevBlame.Lines)
+                    $killedOnly = New-Object 'System.Collections.Generic.List[object]'
+                    for ($prevIdx = 0
+                        $prevIdx -lt $prevLines.Count
+                        $prevIdx++)
+                    {
+                        [void]$killedOnly.Add([pscustomobject]@{
+                                Index = $prevIdx
+                                Line = $prevLines[$prevIdx]
+                            })
+                    }
+                    $cmp = [pscustomobject]@{
+                        KilledLines = @($killedOnly.ToArray())
+                        BornLines = @()
+                        MatchedPairs = @()
+                        MovedPairs = @()
+                        ReattributedPairs = @()
+                    }
+                }
+                else
+                {
+                    $prevLines = @()
+                    if ($beforePath)
+                    {
+                        $prevBlame = Get-SvnBlameLine -Repo $TargetUrl -FilePath $beforePath -Revision ($rev - 1) -CacheDir $CacheDir
+                        $prevLines = @($prevBlame.Lines)
+                    }
+                    $currLines = @()
+                    if ($afterPath)
+                    {
+                        $currBlame = Get-SvnBlameLine -Repo $TargetUrl -FilePath $afterPath -Revision $rev -CacheDir $CacheDir
+                        $currLines = @($currBlame.Lines)
+                    }
+                    $cmp = Compare-BlameOutput -PreviousLines $prevLines -CurrentLines $currLines
                 }
 
-                $cmp = Compare-BlameOutput -PreviousLines $prevLines -CurrentLines $currLines
                 $moveCount = @($cmp.MovedPairs).Count
                 if ($moveCount -gt 0)
                 {
@@ -3296,6 +3600,9 @@ function Get-ExactDeathAttribution
             }
         }
         $deathIdx++
+        # コミット間でキャッシュキーの再利用はないため、コミット境界で安全にクリア可能。
+        # これによりメモリ使用量を O(N×K×L) から O(K×L) に削減する。
+        $script:SvnBlameLineMemoryCache.Clear()
     }
     Write-Progress -Id 3 -Activity '行単位の帰属解析' -Completed
 
@@ -7379,6 +7686,15 @@ function Initialize-CommitDiffData
     {
         $revision = [int]$commit.Revision
         $revToAuthor[$revision] = [string]$commit.Author
+        # 早期フィルタスキップ: 拡張子・パスフィルタを diff 取得前に適用し、
+        # 対象ファイルが0件のコミットは svn diff の並列取得キューに入れない。
+        # ドキュメントのみ変更等、対象外コミットが多いリポジトリでネットワーク往復を大幅に削減する。
+        $filteredChangedPaths = @(Get-FilteredChangedPathEntry -ChangedPaths @($commit.ChangedPaths) -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns)
+        $commit.ChangedPathsFiltered = $filteredChangedPaths
+        if ($filteredChangedPaths.Count -le 0)
+        {
+            continue
+        }
         [void]$phaseAItems.Add([pscustomobject]@{
                 Revision = $revision
                 CacheDir = $CacheDir
@@ -7443,7 +7759,10 @@ function Initialize-CommitDiffData
         }
         $commit.FileDiffStats = $filteredDiffByPath
 
-        $commit.ChangedPathsFiltered = Get-FilteredChangedPathEntry -ChangedPaths @($commit.ChangedPaths) -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns
+        if ($null -eq $commit.ChangedPathsFiltered)
+        {
+            $commit.ChangedPathsFiltered = Get-FilteredChangedPathEntry -ChangedPaths @($commit.ChangedPaths) -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns
+        }
 
         $allowedFilePathSet = New-Object 'System.Collections.Generic.HashSet[string]'
         foreach ($pathEntry in @($commit.ChangedPathsFiltered))
@@ -7931,6 +8250,7 @@ function Update-StrictAttributionMetric
                 'Test-SvnMissingTargetError',
                 'Invoke-SvnCommandAllowMissingTarget',
                 'Get-EmptyBlameResult',
+                'Get-BlameMemoryCacheKey',
                 'Get-SvnBlameSummary'
             ) -SessionVariables @{
                 SvnExecutable = $script:SvnExecutable
