@@ -5,23 +5,23 @@ salt
 {
 {T
 + ホットスポット順位 | ファイルパス | ホットスポットスコア
-| 1 | src/parser.cpp | 476
-| 2 | src/calculator.cpp | 364
-| 3 | src/utils.cpp | 225
-| 4 | src/main.cpp | 114
-| 5 | src/logger.cpp | 112
-| 6 | tests/test_calculator.cpp | 86
-| 7 | include/logger.h | 80
-| 8 | README.md | 78
-| 9 | src/formatter.cpp | 73
-| 10 | include/parser.h | 60
-| 11 | include/calculator.h | 54
-| 12 | include/utils.h | 54
-| 13 | CMakeLists.txt | 52
-| 14 | tests/test_parser.cpp | 28
-| 15 | include/formatter.h | 20
-| 16 | .gitignore | 7
-| 17 | include/string_utils.h | 6
+| 1 | src/calculator.cpp | 250.110429447853
+| 2 | src/parser.cpp | 207.945392491468
+| 3 | src/logger.cpp | 151.43661971831
+| 4 | include/logger.h | 108.169014084507
+| 5 | src/utils.cpp | 88.7671232876712
+| 6 | src/formatter.cpp | 73
+| 7 | tests/test_calculator.cpp | 65.7848605577689
+| 8 | include/parser.h | 38.1456953642384
+| 9 | src/main.cpp | 31.0028328611898
+| 10 | tests/test_parser.cpp | 28
+| 11 | include/utils.h | 21.3041095890411
+| 12 | include/formatter.h | 20
+| 13 | include/calculator.h | 8.30769230769231
+| 14 | README.md | 7.07082152974504
+| 15 | .gitignore | 7
+| 16 | include/string_utils.h | 6
+| 17 | CMakeLists.txt | 5.47368421052632
 | 18 | src/string_utils.cpp | 2
 | 19 | assets/logo.png | 0
 }

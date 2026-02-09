@@ -215,7 +215,7 @@ Describe 'Metrics functions' {
         $a = $rows | Where-Object { $_.'ファイルパス' -eq 'src/A.cs' }
         $a.'コミット数' | Should -Be 2
         $a.'作者数' | Should -Be 2
-        $a.'ホットスポットスコア' | Should -Be 14
+        $a.'ホットスポットスコア' | Should -Be 56
     }
 
     It 'computes co-change metrics' {
@@ -796,13 +796,20 @@ Describe 'Metrics functions — detailed verification' {
             $script:fileB.'最終変更リビジョン' | Should -Be 1
         }
 
-        It 'calculates HotspotScore = commits * churn' {
-            $script:fileA.'ホットスポットスコア' | Should -Be (3 * 16)   # 48
-            $script:fileB.'ホットスポットスコア' | Should -Be (1 * 10)   # 10
+        It 'calculates HotspotScore = commits * authors * churn * frequency' {
+            $script:fileA.'ホットスポットスコア' | Should -Be 144   # 3 * 2 * 16 * (3/2)
+            $script:fileB.'ホットスポットスコア' | Should -Be 10    # 1 * 1 * 10 * (1/1)
         }
 
         It 'assigns rank by hotspot descending' {
             $script:fileA.'ホットスポット順位' | Should -BeLessThan $script:fileB.'ホットスポット順位'
+        }
+
+        It 'calculates 活動期間日数' {
+            # src/A.cs changed on Jan 1, Jan 2, Jan 3 => span = 2 days
+            $script:fileA.'活動期間日数' | Should -Be 2.0
+            # src/B.cs changed only once => span = 0
+            $script:fileB.'活動期間日数' | Should -Be 0.0
         }
 
         It 'calculates TopAuthorShareByChurn' {
@@ -1072,6 +1079,8 @@ Describe 'Write-FileBubbleChart' {
                 '作者数' = 4
                 '総チャーン' = 180
                 'ホットスポット順位' = 1
+                'ホットスポットスコア' = 2160
+                '最多作者blame占有率' = 0.75
             },
             [pscustomobject]@{
                 'ファイルパス' = 'src/B.cs'
@@ -1079,117 +1088,19 @@ Describe 'Write-FileBubbleChart' {
                 '作者数' = 3
                 '総チャーン' = 90
                 'ホットスポット順位' = 2
+                'ホットスポットスコア' = 720
+                '最多作者blame占有率' = 0.50
             }
         )
 
         Write-FileBubbleChart -OutDirectory $script:svgDir -Files $files -TopNCount 50 -EncodingName 'UTF8'
 
-        $svgPath = Join-Path $script:svgDir 'file_bubble.svg'
+        $svgPath = Join-Path $script:svgDir 'file_hotspot.svg'
         Test-Path $svgPath | Should -BeTrue
         $content = Get-Content -Path $svgPath -Raw -Encoding UTF8
         $content | Should -Match '<circle'
-        $content | Should -Match 'コミット数'
-        $content | Should -Match '作者数'
-    }
-}
-
-Describe 'Write-FileHeatMap' {
-    BeforeEach {
-        $script:heatMapDir = Join-Path $env:TEMP ('narutocode_heatmap_' + [guid]::NewGuid().ToString('N'))
-        New-Item -Path $script:heatMapDir -ItemType Directory -Force | Out-Null
-    }
-
-    AfterEach {
-        Remove-Item -Path $script:heatMapDir -Recurse -Force -ErrorAction SilentlyContinue
-    }
-
-    It 'creates heatmap svg with base metric columns' {
-        $files = @(
-            [pscustomobject]@{
-                'ファイルパス' = 'src/very/long/path/to/module/FileA.cs'
-                'ホットスポット順位' = 2
-                'コミット数' = 10
-                '作者数' = 2
-                '総チャーン' = 120
-                '消滅追加行数' = 30
-                '最多作者チャーン占有率' = 0.75
-                '最多作者blame占有率' = 0.80
-                '平均変更間隔日数' = 3.5
-                'ホットスポットスコア' = 1200
-            },
-            [pscustomobject]@{
-                'ファイルパス' = 'src/FileB.cs'
-                'ホットスポット順位' = 1
-                'コミット数' = 5
-                '作者数' = 3
-                '総チャーン' = 60
-                '消滅追加行数' = 12
-                '最多作者チャーン占有率' = 0.55
-                '最多作者blame占有率' = 0.50
-                '平均変更間隔日数' = 8.0
-                'ホットスポットスコア' = 300
-            }
-        )
-
-        Write-FileHeatMap -OutDirectory $script:heatMapDir -Files $files -TopNCount 2 -EncodingName 'UTF8'
-
-        $svgPath = Join-Path $script:heatMapDir 'file_heatmap.svg'
-        Test-Path $svgPath | Should -BeTrue
-
-        $content = Get-Content -Path $svgPath -Raw -Encoding UTF8
-        $content | Should -Match '<rect'
-        $content | Should -Match 'コミット数'
         $content | Should -Match 'ホットスポットスコア'
-        $content | Should -Match 'FileB\.cs'
-        $content | Should -Not -Match '自己相殺行数 \(合計\)'
-    }
-
-    It 'includes phase 2 metric columns when properties exist' {
-        $files = @(
-            [pscustomobject]@{
-                'ファイルパス' = 'src/FileC.cs'
-                'ホットスポット順位' = 1
-                'コミット数' = 9
-                '作者数' = 2
-                '総チャーン' = 90
-                '消滅追加行数' = 20
-                '最多作者チャーン占有率' = 0.60
-                '最多作者blame占有率' = 0.65
-                '平均変更間隔日数' = 2.0
-                'ホットスポットスコア' = 810
-                '自己相殺行数 (合計)' = 3
-                '他者差戻行数 (合計)' = 4
-                '同一箇所反復編集数 (合計)' = 5
-                'ピンポン回数 (合計)' = 6
-            },
-            [pscustomobject]@{
-                'ファイルパス' = 'src/FileD.cs'
-                'ホットスポット順位' = 2
-                'コミット数' = 3
-                '作者数' = 1
-                '総チャーン' = 25
-                '消滅追加行数' = 3
-                '最多作者チャーン占有率' = 0.50
-                '最多作者blame占有率' = 0.52
-                '平均変更間隔日数' = 10.0
-                'ホットスポットスコア' = 75
-                '自己相殺行数 (合計)' = 0
-                '他者差戻行数 (合計)' = 1
-                '同一箇所反復編集数 (合計)' = 0
-                'ピンポン回数 (合計)' = 2
-            }
-        )
-
-        Write-FileHeatMap -OutDirectory $script:heatMapDir -Files $files -TopNCount 2 -EncodingName 'UTF8'
-
-        $svgPath = Join-Path $script:heatMapDir 'file_heatmap.svg'
-        $content = Get-Content -Path $svgPath -Raw -Encoding UTF8
-
-        $content | Should -Match '自己相殺行数 \(合計\)'
-        $content | Should -Match '他者差戻行数 \(合計\)'
-        $content | Should -Match '同一箇所反復編集数 \(合計\)'
-        $content | Should -Match 'ピンポン回数 \(合計\)'
-        $content | Should -Match 'FileC\.cs'
+        $content | Should -Match '最多作者blame占有率'
     }
 }
 
@@ -1376,35 +1287,6 @@ Describe 'Write-CommitterScatterChart' {
 
         Test-Path (Join-Path $script:scatterDir 'committer_scatter_no-rework.svg') | Should -BeFalse
         Test-Path (Join-Path $script:scatterDir 'committer_scatter_combined.svg') | Should -BeFalse
-    }
-}
-
-Describe 'Write-FileTreeMap' {
-    BeforeEach {
-        $script:treemapDir = Join-Path $env:TEMP ('narutocode_treemap_' + [guid]::NewGuid().ToString('N'))
-        New-Item -Path $script:treemapDir -ItemType Directory -Force | Out-Null
-    }
-    AfterEach {
-        Remove-Item -Path $script:treemapDir -Recurse -Force -ErrorAction SilentlyContinue
-    }
-
-    It 'creates SVG with rectangles and directory labels' {
-        $files = @(
-            [pscustomobject]@{ 'ファイルパス' = 'src/core/A.cs'; '総チャーン' = 12; 'コミット数' = 3; '作者数' = 2; 'ホットスポット順位' = 1 },
-            [pscustomobject]@{ 'ファイルパス' = 'src/core/B.cs'; '総チャーン' = 5; 'コミット数' = 2; '作者数' = 1; 'ホットスポット順位' = 2 },
-            [pscustomobject]@{ 'ファイルパス' = 'docs/readme.md'; '総チャーン' = 3; 'コミット数' = 1; '作者数' = 1; 'ホットスポット順位' = 3 }
-        )
-
-        Write-FileTreeMap -OutDirectory $script:treemapDir -Files $files -EncodingName 'UTF8'
-
-        $svgPath = Join-Path $script:treemapDir 'file_treemap.svg'
-        Test-Path $svgPath | Should -BeTrue
-        $content = Get-Content -Path $svgPath -Raw -Encoding UTF8
-        $content | Should -Match '<svg'
-        $content | Should -Match '<rect'
-        $content | Should -Match 'src/core'
-        $content | Should -Match 'docs'
-        $content | Should -Match 'A\.cs: 総チャーン='
     }
 }
 
@@ -2593,5 +2475,203 @@ Describe 'Write-TeamActivityProfileChart' {
     It 'does not create SVG when Committers is empty' {
         Write-TeamActivityProfileChart -OutDirectory $script:profileDir -Committers @() -EncodingName 'UTF8'
         Test-Path (Join-Path $script:profileDir 'team_activity_profile.svg') | Should -BeFalse
+    }
+}
+
+Describe 'Write-FileQualityScatterChart' {
+    BeforeEach {
+        $script:fqsDir = Join-Path $env:TEMP ('narutocode_fqs_' + [guid]::NewGuid().ToString('N'))
+        New-Item -Path $script:fqsDir -ItemType Directory -Force | Out-Null
+    }
+    AfterEach {
+        Remove-Item -Path $script:fqsDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'creates scatter SVG with quadrant labels and axis labels' {
+        $files = @(
+            [pscustomobject]@{
+                'ファイルパス' = 'src/A.cs'
+                '追加行数' = 100
+                '消滅追加行数' = 40
+                '総チャーン' = 200
+                '自己相殺行数(合計)' = 10
+                '他者差戻行数(合計)' = 5
+                'ピンポン回数(合計)' = 3
+                'ホットスポット順位' = 1
+            },
+            [pscustomobject]@{
+                'ファイルパス' = 'src/B.cs'
+                '追加行数' = 80
+                '消滅追加行数' = 10
+                '総チャーン' = 120
+                '自己相殺行数(合計)' = 2
+                '他者差戻行数(合計)' = 1
+                'ピンポン回数(合計)' = 0
+                'ホットスポット順位' = 2
+            }
+        )
+
+        Write-FileQualityScatterChart -OutDirectory $script:fqsDir -Files $files -TopNCount 10 -EncodingName 'UTF8'
+
+        $svgPath = Join-Path $script:fqsDir 'file_quality_scatter.svg'
+        Test-Path $svgPath | Should -BeTrue
+        $content = Get-Content -Path $svgPath -Raw -Encoding UTF8
+        $content | Should -Match '<svg'
+        $content | Should -Match '<circle'
+        $content | Should -Match 'コード消滅率'
+        $content | Should -Match '無駄チャーン率'
+        $content | Should -Match '安定型'
+        $content | Should -Match '高リスク'
+    }
+
+    It 'does not create SVG when Files is empty' {
+        Write-FileQualityScatterChart -OutDirectory $script:fqsDir -Files @() -EncodingName 'UTF8'
+        Test-Path (Join-Path $script:fqsDir 'file_quality_scatter.svg') | Should -BeFalse
+    }
+
+    It 'skips files with zero added lines' {
+        $files = @(
+            [pscustomobject]@{
+                'ファイルパス' = 'src/Zero.cs'
+                '追加行数' = 0
+                '消滅追加行数' = 0
+                '総チャーン' = 50
+                '自己相殺行数(合計)' = 0
+                '他者差戻行数(合計)' = 0
+                'ピンポン回数(合計)' = 0
+                'ホットスポット順位' = 1
+            }
+        )
+
+        Write-FileQualityScatterChart -OutDirectory $script:fqsDir -Files $files -TopNCount 10 -EncodingName 'UTF8'
+        Test-Path (Join-Path $script:fqsDir 'file_quality_scatter.svg') | Should -BeFalse
+    }
+}
+
+Describe 'Write-CommitTimelineChart' {
+    BeforeEach {
+        $script:timelineDir = Join-Path $env:TEMP ('narutocode_timeline_' + [guid]::NewGuid().ToString('N'))
+        New-Item -Path $script:timelineDir -ItemType Directory -Force | Out-Null
+    }
+    AfterEach {
+        Remove-Item -Path $script:timelineDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'creates timeline SVG with bars and axis labels' {
+        $commits = @(
+            [pscustomobject]@{
+                'リビジョン' = '1'
+                '日時' = '2025-01-10T10:00:00'
+                '作者' = 'alice'
+                'チャーン' = 50
+                '変更ファイル数' = 3
+            },
+            [pscustomobject]@{
+                'リビジョン' = '2'
+                '日時' = '2025-01-15T14:30:00'
+                '作者' = 'bob'
+                'チャーン' = 120
+                '変更ファイル数' = 5
+            },
+            [pscustomobject]@{
+                'リビジョン' = '3'
+                '日時' = '2025-01-20T09:00:00'
+                '作者' = 'alice'
+                'チャーン' = 30
+                '変更ファイル数' = 1
+            }
+        )
+
+        Write-CommitTimelineChart -OutDirectory $script:timelineDir -Commits $commits -EncodingName 'UTF8'
+
+        $svgPath = Join-Path $script:timelineDir 'commit_timeline.svg'
+        Test-Path $svgPath | Should -BeTrue
+        $content = Get-Content -Path $svgPath -Raw -Encoding UTF8
+        $content | Should -Match '<svg'
+        $content | Should -Match '<rect'
+        $content | Should -Match '日時'
+        $content | Should -Match 'チャーン'
+        $content | Should -Match 'alice'
+        $content | Should -Match 'bob'
+    }
+
+    It 'does not create SVG when Commits is empty' {
+        Write-CommitTimelineChart -OutDirectory $script:timelineDir -Commits @() -EncodingName 'UTF8'
+        Test-Path (Join-Path $script:timelineDir 'commit_timeline.svg') | Should -BeFalse
+    }
+
+    It 'skips commits with unparseable dates' {
+        $commits = @(
+            [pscustomobject]@{
+                'リビジョン' = '1'
+                '日時' = 'not-a-date'
+                '作者' = 'alice'
+                'チャーン' = 50
+            }
+        )
+
+        Write-CommitTimelineChart -OutDirectory $script:timelineDir -Commits $commits -EncodingName 'UTF8'
+        Test-Path (Join-Path $script:timelineDir 'commit_timeline.svg') | Should -BeFalse
+    }
+}
+
+Describe 'Write-CommitScatterChart' {
+    BeforeEach {
+        $script:commitScatterDir = Join-Path $env:TEMP ('narutocode_cs_' + [guid]::NewGuid().ToString('N'))
+        New-Item -Path $script:commitScatterDir -ItemType Directory -Force | Out-Null
+    }
+    AfterEach {
+        Remove-Item -Path $script:commitScatterDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'creates scatter SVG with bubbles and axis labels' {
+        $commits = @(
+            [pscustomobject]@{
+                'リビジョン' = '1'
+                '作者' = 'alice'
+                '変更ファイル数' = 5
+                'エントロピー' = 1.2
+                'チャーン' = 80
+            },
+            [pscustomobject]@{
+                'リビジョン' = '2'
+                '作者' = 'bob'
+                '変更ファイル数' = 2
+                'エントロピー' = 0.5
+                'チャーン' = 30
+            }
+        )
+
+        Write-CommitScatterChart -OutDirectory $script:commitScatterDir -Commits $commits -EncodingName 'UTF8'
+
+        $svgPath = Join-Path $script:commitScatterDir 'commit_scatter.svg'
+        Test-Path $svgPath | Should -BeTrue
+        $content = Get-Content -Path $svgPath -Raw -Encoding UTF8
+        $content | Should -Match '<svg'
+        $content | Should -Match '<circle'
+        $content | Should -Match '変更ファイル数'
+        $content | Should -Match 'エントロピー'
+        $content | Should -Match 'alice'
+        $content | Should -Match 'bob'
+    }
+
+    It 'does not create SVG when Commits is empty' {
+        Write-CommitScatterChart -OutDirectory $script:commitScatterDir -Commits @() -EncodingName 'UTF8'
+        Test-Path (Join-Path $script:commitScatterDir 'commit_scatter.svg') | Should -BeFalse
+    }
+
+    It 'skips commits with zero file count and zero churn' {
+        $commits = @(
+            [pscustomobject]@{
+                'リビジョン' = '1'
+                '作者' = 'alice'
+                '変更ファイル数' = 0
+                'エントロピー' = 0
+                'チャーン' = 0
+            }
+        )
+
+        Write-CommitScatterChart -OutDirectory $script:commitScatterDir -Commits $commits -EncodingName 'UTF8'
+        Test-Path (Join-Path $script:commitScatterDir 'commit_scatter.svg') | Should -BeFalse
     }
 }
