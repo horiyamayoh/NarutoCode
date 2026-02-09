@@ -844,10 +844,27 @@ Index: trunk/src/Main.cs
 ## 16. 出力物一覧（最終成果物）
 - `committers.csv`
 - `files.csv`
-- `commits.csv`（任意だが強く推奨）
+- `commits.csv`
 - `couplings.csv`
-- `run_meta.json`（実行条件、svn バージョン、開始/終了時刻、NoBlame 等のメタ）
-- `*.puml`（`-EmitPlantUml` 指定時）
+- `kill_matrix.csv`
+- `run_meta.json`（実行条件、svn バージョン、開始/終了時刻などのメタ）
+- `contributors_summary.puml`
+- `hotspots.puml`
+- `cochange_network.puml`
+- `file_hotspot.svg`
+- `file_quality_scatter.svg`
+- `committer_outcome_combined.svg`
+- `committer_outcome_*.svg`
+- `committer_scatter_combined.svg`
+- `committer_scatter_*.svg`
+- `team_survived_share.svg`
+- `team_interaction_heatmap.svg`
+- `team_activity_profile.svg`
+- `commit_timeline.svg`
+- `commit_scatter.svg`
+- `cache/`（`diff` / `blame` / `cat` キャッシュ）
+
+`-TopN` は可視化出力の表示件数だけを制御し、CSV は常に全件を出力する。
 
 ---
 

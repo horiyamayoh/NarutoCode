@@ -534,6 +534,47 @@ Describe 'Write-JsonFile' {
     }
 }
 
+Describe 'New-RunMetaData' {
+    BeforeEach {
+        $script:runMetaDir = Join-Path $env:TEMP ('narutocode_runmeta_' + [guid]::NewGuid().ToString('N'))
+        New-Item -Path $script:runMetaDir -ItemType Directory -Force | Out-Null
+    }
+    AfterEach {
+        Remove-Item -Path $script:runMetaDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'lists output file names that match generated artifacts' {
+        $start = [datetime]'2026-01-01T00:00:00Z'
+        $end = [datetime]'2026-01-01T00:00:02Z'
+
+        $meta = New-RunMetaData `
+            -StartTime $start `
+            -EndTime $end `
+            -TargetUrl 'https://example.invalid/svn/repo/trunk' `
+            -FromRevision 1 `
+            -ToRevision 2 `
+            -SvnVersion '1.14.2' `
+            -Parallel 4 `
+            -TopN 10 `
+            -Encoding 'UTF8' `
+            -Commits @() `
+            -FileRows @() `
+            -OutDir $script:runMetaDir `
+            -IncludePaths @() `
+            -ExcludePaths @() `
+            -IncludeExtensions @() `
+            -ExcludeExtensions @() `
+            -NonInteractive:$false `
+            -TrustServerCert:$false `
+            -IgnoreWhitespace:$false
+
+        $meta.Outputs.CouplingsCsv | Should -Be 'couplings.csv'
+        $meta.Outputs.KillMatrixCsv | Should -Be 'kill_matrix.csv'
+        $meta.Outputs.SurvivedShareDonutSvg | Should -Be 'team_survived_share.svg'
+        $meta.Outputs.CommitTimelineSvg | Should -Be 'commit_timeline.svg'
+    }
+}
+
 Describe 'ConvertFrom-SvnLogXml edge cases' {
     It 'handles empty log (no entries)' {
         $xml = '<log></log>'
@@ -1910,6 +1951,29 @@ Describe 'Integration — test SVN repo output matches baseline' -Tag 'Integrati
         $meta.FileCount     | Should -Be 19
         $meta.StrictMode    | Should -BeTrue
         $meta.Encoding      | Should -Be 'UTF8'
+        $meta.Outputs.SurvivedShareDonutSvg | Should -Be 'team_survived_share.svg'
+    }
+
+    It 'keeps couplings.csv full even when TopN is 1' -Skip:($null -ne $script:skipReason) {
+        $topNDir = Join-Path $env:TEMP ('narutocode_integ_topn_' + [guid]::NewGuid().ToString('N'))
+        try {
+            $repoUrl = 'file:///' + ($script:repoDir -replace '\\', '/')
+            $null = & $script:ScriptPath `
+                -RepoUrl $repoUrl `
+                -FromRev 1 -ToRev 20 `
+                -OutDir $topNDir `
+                -SvnExecutable $script:svnExe `
+                -TopN 1 `
+                -Encoding UTF8 `
+                -NoProgress `
+                -ErrorAction Stop
+
+            $couplingLineCount = (Get-Content (Join-Path $topNDir 'couplings.csv') -Encoding UTF8).Count
+            $couplingLineCount | Should -BeGreaterThan 2 -Because '-TopN は可視化だけを制御し、CSV は全件出力するため'
+        }
+        finally {
+            Remove-Item -Path $topNDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 

@@ -29,17 +29,28 @@ NarutoCode が出力する CSV / JSON / PlantUML の各指標について、
 ├── files.csv                  ← ファイルごとの集計
 ├── commits.csv                ← コミット単位の生ログ
 ├── couplings.csv              ← ファイル同時変更ペアの関連度
+├── kill_matrix.csv            ← 作者間削除関係（行列）
 ├── contributors_summary.puml  ← コミッター表（PlantUML）
 ├── hotspots.puml              ← ホットスポット表（PlantUML）
 ├── cochange_network.puml      ← 共変更ネットワーク図（PlantUML）
-├── contributors_summary.svg   ← コミッター表（SVG）
-├── hotspots.svg               ← ホットスポット表（SVG）
-├── cochange_network.svg       ← 共変更ネットワーク図（SVG）
+├── file_hotspot.svg           ← ファイルホットスポット散布図
+├── file_quality_scatter.svg   ← ファイル品質散布図
+├── committer_outcome_combined.svg
+├── committer_outcome_*.svg    ← 作者別成果/差戻可視化
+├── committer_scatter_combined.svg
+├── committer_scatter_*.svg    ← 作者別リワーク散布図
+├── team_survived_share.svg    ← 生存行数シェア（ドーナツ）
+├── team_interaction_heatmap.svg
+├── team_activity_profile.svg  ← チーム活動プロファイル
+├── commit_timeline.svg        ← 時系列コミット量
+├── commit_scatter.svg         ← コミット粒度散布図
 └── cache/
     ├── diff_r{N}.txt          ← svn diff の生出力キャッシュ
     ├── blame/r{N}/            ← svn blame XML のキャッシュ
     └── cat/r{N}/              ← svn cat テキストのキャッシュ
 ```
+
+`-TopN` は可視化ファイルの表示件数だけを制御し、CSV は常に全件を出力します。
 
 ### 解析パイプラインと出力ファイルの関係
 
@@ -752,6 +763,17 @@ CSV の集計結果を元に、以下の PlantUML テキストと SVG 画像が�
 | `contributors_summary.puml` | コミッター Top N の指標表 | salt テーブル |
 | `hotspots.puml` | ホットスポット Top N ファイルの表 | salt テーブル |
 | `cochange_network.puml` | ファイル間の共変更ネットワーク | コンポーネント図 |
+| `file_hotspot.svg` | ファイルのホットスポット散布図 | SVG |
+| `file_quality_scatter.svg` | ファイル品質散布図 | SVG |
+| `committer_outcome_*.svg` | 作者別の成果/差戻チャート | SVG |
+| `committer_outcome_combined.svg` | チーム比較の成果/差戻チャート | SVG |
+| `committer_scatter_*.svg` | 作者別のリワーク散布図 | SVG |
+| `committer_scatter_combined.svg` | チーム比較のリワーク散布図 | SVG |
+| `team_survived_share.svg` | チーム内の生存行数シェア | SVG |
+| `team_interaction_heatmap.svg` | 作者間の削除関係ヒートマップ | SVG |
+| `team_activity_profile.svg` | チーム活動プロファイル | SVG |
+| `commit_timeline.svg` | コミット量の時系列 | SVG |
+| `commit_scatter.svg` | コミット粒度の散布図 | SVG |
 
 ---
 

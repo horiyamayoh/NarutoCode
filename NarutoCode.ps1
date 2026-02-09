@@ -3746,6 +3746,10 @@ function Get-CoChangeMetric
     .DESCRIPTION
         各コミットの一意ファイル集合から共変更ペア回数を集計し、周辺頻度も同時に保持する。
         Jaccard と Lift を算出して関連度を数値化し、順位付け可能な行データへ整形する。
+    .PARAMETER Commits
+        集計対象のコミット配列を指定する。
+    .PARAMETER TopNCount
+        戻り値の上限件数。0 以下を指定すると全件を返す。
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -8091,7 +8095,7 @@ function New-RunMetaData
             CommitterOutcomeCombinedSvg = 'committer_outcome_combined.svg'
             CommitterScatterCharts = 'committer_scatter_*.svg'
             CommitterScatterCombinedSvg = 'committer_scatter_combined.svg'
-            SurvivedShareDonutSvg = 'survived_share_donut.svg'
+            SurvivedShareDonutSvg = 'team_survived_share.svg'
             TeamInteractionHeatmapSvg = 'team_interaction_heatmap.svg'
             TeamActivityProfileSvg = 'team_activity_profile.svg'
             CommitTimelineSvg = 'commit_timeline.svg'
@@ -8224,7 +8228,8 @@ try
     Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 4/8: 基本メトリクス算出' -PercentComplete 35
     $committerRows = @(Get-CommitterMetric -Commits $commits)
     $fileRows = @(Get-FileMetric -Commits $commits)
-    $couplingRows = @(Get-CoChangeMetric -Commits $commits -TopNCount $TopN)
+    # couplings.csv は常に全件を出力し、TopN は可視化側でのみ適用する。
+    $couplingRows = @(Get-CoChangeMetric -Commits $commits -TopNCount 0)
     $commitRows = @(New-CommitRowFromCommit -Commits $commits)
 
     # --- ステップ 5: Strict 死亡帰属（blame ベースの行追跡） ---
