@@ -737,6 +737,12 @@ Describe 'Metrics functions — detailed verification' {
             $script:alice.'チャーン対純増比' | Should -Be (24.0 / 12)
         }
 
+        It 'calculates ReworkRate' {
+            # alice: Added=18, Deleted=6, Net=12, TotalChurn=24
+            # ReworkRate = 1 - |12| / 24 = 0.5
+            $script:alice.'リワーク率' | Should -Be 0.5
+        }
+
         It 'detects action types' {
             $script:alice.'変更アクション数' | Should -Be 2   # M on A.cs in rev1 + M on A.cs in rev2
             $script:alice.'追加アクション数' | Should -Be 1   # A on B.cs in rev1
@@ -898,6 +904,7 @@ Describe 'Strict-only behavior' {
         $row = @(Get-CommitterMetric -Commits $commits)[0]
         $row.'削除対追加比' | Should -Be $null
         $row.'チャーン対純増比' | Should -Be $null
+        $row.'リワーク率' | Should -Be $null
     }
 
     It 'Get-CoChangeMetric does not skip large commits' {
@@ -1016,7 +1023,7 @@ Describe 'Write-PlantUmlFile' {
     }
 
     It 'creates all three puml files' {
-        $committers = @([pscustomobject]@{ '作者'='alice'; 'コミット数'=5; '総チャーン'=100 })
+        $committers = @([pscustomobject]@{ '作者'='alice'; 'コミット数'=5; '活動日数'=3; '総チャーン'=100; '所有割合'=0.4; '他者コード変更行数'=10; '他者コード変更生存率'=0.5; '変更エントロピー'=2.1; '平均共同作者数'=0.8 })
         $files = @([pscustomobject]@{ 'ファイルパス'='src/A.cs'; 'ホットスポット順位'=1; 'ホットスポットスコア'=500 })
         $couplings = @([pscustomobject]@{ 'ファイルA'='src/A.cs'; 'ファイルB'='src/B.cs'; '共変更回数'=3; 'Jaccard'=0.5 })
 
@@ -1028,7 +1035,7 @@ Describe 'Write-PlantUmlFile' {
     }
 
     It 'contributors puml contains @startuml/@enduml and author data' {
-        $committers = @([pscustomobject]@{ '作者'='bob'; 'コミット数'=3; '総チャーン'=50 })
+        $committers = @([pscustomobject]@{ '作者'='bob'; 'コミット数'=3; '活動日数'=2; '総チャーン'=50; '所有割合'=0.3; '他者コード変更行数'=5; '他者コード変更生存率'=0.6; '変更エントロピー'=1.5; '平均共同作者数'=0.5 })
         Write-PlantUmlFile -OutDirectory $script:pumlDir -Committers $committers -Files @() -Couplings @() -TopNCount 50 -EncodingName 'UTF8'
 
         $content = Get-Content -Path (Join-Path $script:pumlDir 'contributors_summary.puml') -Raw
@@ -1186,7 +1193,7 @@ Describe 'Write-FileHeatMap' {
     }
 }
 
-Describe 'Write-CommitterRadarChart' {
+Describe 'Write-CommitterOutcomeChart' {
     BeforeEach {
         $script:chartDir = Join-Path $env:TEMP ('narutocode_chart_' + [guid]::NewGuid().ToString('N'))
         New-Item -Path $script:chartDir -ItemType Directory -Force | Out-Null
@@ -1195,7 +1202,7 @@ Describe 'Write-CommitterRadarChart' {
         Remove-Item -Path $script:chartDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 
-    It 'creates committer radar svg files for top committers' {
+    It 'creates individual and combined outcome SVGs for top committers' {
         $committers = @(
             [pscustomobject]@{
                 '作者' = 'alice'
@@ -1203,13 +1210,9 @@ Describe 'Write-CommitterRadarChart' {
                 '追加行数' = 100
                 '削除行数' = 20
                 '生存行数' = 80
-                '変更エントロピー' = 2.5
                 '自己相殺行数' = 10
                 '被他者削除行数' = 5
-                '他者コード変更生存率' = 0.6
                 'ピンポン率' = 0.2
-                '所有割合' = 0.5
-                'ピンポン回数' = 2
                 'コミット数' = 10
             },
             [pscustomobject]@{
@@ -1218,13 +1221,9 @@ Describe 'Write-CommitterRadarChart' {
                 '追加行数' = 80
                 '削除行数' = 30
                 '生存行数' = 40
-                '変更エントロピー' = 1.8
                 '自己相殺行数' = 20
                 '被他者削除行数' = 10
-                '他者コード変更生存率' = 0
                 'ピンポン率' = 0.25
-                '所有割合' = 0.3
-                'ピンポン回数' = 3
                 'コミット数' = 12
             },
             [pscustomobject]@{
@@ -1233,25 +1232,22 @@ Describe 'Write-CommitterRadarChart' {
                 '追加行数' = 0
                 '削除行数' = 0
                 '生存行数' = 0
-                '変更エントロピー' = 0
                 '自己相殺行数' = 0
                 '被他者削除行数' = 0
-                '他者コード変更生存率' = 0
                 'ピンポン率' = 0
-                '所有割合' = 0
-                'ピンポン回数' = 0
                 'コミット数' = 1
             }
         )
 
-        Write-CommitterRadarChart -OutDirectory $script:chartDir -Committers $committers -TopNCount 2 -EncodingName 'UTF8'
+        Write-CommitterOutcomeChart -OutDirectory $script:chartDir -Committers $committers -TopNCount 2 -EncodingName 'UTF8'
 
-        Test-Path (Join-Path $script:chartDir 'committer_radar_alice.svg') | Should -BeTrue
-        Test-Path (Join-Path $script:chartDir 'committer_radar_bob.svg') | Should -BeTrue
-        Test-Path (Join-Path $script:chartDir 'committer_radar_binary-only.svg') | Should -BeFalse
+        Test-Path (Join-Path $script:chartDir 'committer_outcome_alice.svg') | Should -BeTrue
+        Test-Path (Join-Path $script:chartDir 'committer_outcome_bob.svg') | Should -BeTrue
+        Test-Path (Join-Path $script:chartDir 'committer_outcome_binary-only.svg') | Should -BeFalse
+        Test-Path (Join-Path $script:chartDir 'committer_outcome_combined.svg') | Should -BeTrue
     }
 
-    It 'svg contains expected tags, author, and axis labels' {
+    It 'individual svg contains stacked bar segments and author name' {
         $committers = @(
             [pscustomobject]@{
                 '作者' = 'charlie'
@@ -1259,34 +1255,127 @@ Describe 'Write-CommitterRadarChart' {
                 '追加行数' = 20
                 '削除行数' = 5
                 '生存行数' = 15
-                '変更エントロピー' = 1.2
                 '自己相殺行数' = 1
                 '被他者削除行数' = 2
-                '他者コード変更生存率' = 0.75
                 'ピンポン率' = 0.2
-                '所有割合' = 0.4
-                'ピンポン回数' = 1
                 'コミット数' = 5
             }
         )
 
-        Write-CommitterRadarChart -OutDirectory $script:chartDir -Committers $committers -TopNCount 1 -EncodingName 'UTF8'
+        Write-CommitterOutcomeChart -OutDirectory $script:chartDir -Committers $committers -TopNCount 1 -EncodingName 'UTF8'
 
-        $content = Get-Content -Path (Join-Path $script:chartDir 'committer_radar_charlie.svg') -Raw -Encoding UTF8
+        $content = Get-Content -Path (Join-Path $script:chartDir 'committer_outcome_charlie.svg') -Raw -Encoding UTF8
         $content | Should -Match '<svg'
         $content | Should -Match '</svg>'
         $content | Should -Match 'charlie'
-        $content | Should -Match 'コード生存率'
-        $content | Should -Match '他者コード変更生存率'
+        $content | Should -Match '<rect'
+        $content | Should -Match '生存'
+        $content | Should -Match '自己相殺'
+        $content | Should -Match '被他者削除'
         $content | Should -Match 'ピンポン率'
-        $content | Should -Match '所有集中度'
-        $content | Should -Match '定着コミット量'
-        $content | Should -Match 'トータルコミット量'
-        $content | Should -Match '指標定義'
-        $content | Should -Match '生存行数 / コミット数'
-        $content | Should -Match '追加行数 \+ 削除行数'
-        $content | Should -Match '被他者削除行数 / 追加行数'
-        $content | Should -Match '低いほど良いため反転'
+    }
+
+    It 'combined svg contains team comparison title' {
+        $committers = @(
+            [pscustomobject]@{
+                '作者' = 'alice'
+                '総チャーン' = 100
+                '追加行数' = 50
+                '削除行数' = 10
+                '生存行数' = 40
+                '自己相殺行数' = 5
+                '被他者削除行数' = 3
+                'ピンポン率' = 0.1
+                'コミット数' = 5
+            }
+        )
+
+        Write-CommitterOutcomeChart -OutDirectory $script:chartDir -Committers $committers -TopNCount 1 -EncodingName 'UTF8'
+
+        $content = Get-Content -Path (Join-Path $script:chartDir 'committer_outcome_combined.svg') -Raw -Encoding UTF8
+        $content | Should -Match 'チーム比較'
+    }
+}
+
+Describe 'Write-CommitterScatterChart' {
+    BeforeEach {
+        $script:scatterDir = Join-Path $env:TEMP ('narutocode_scatter_' + [guid]::NewGuid().ToString('N'))
+        New-Item -Path $script:scatterDir -ItemType Directory -Force | Out-Null
+    }
+    AfterEach {
+        Remove-Item -Path $script:scatterDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'creates individual and combined scatter SVGs' {
+        $committers = @(
+            [pscustomobject]@{
+                '作者' = 'alice'
+                '総チャーン' = 200
+                '追加行数' = 100
+                '削除行数' = 20
+                '生存行数' = 80
+                'リワーク率' = 0.333
+                'コミット数' = 10
+            },
+            [pscustomobject]@{
+                '作者' = 'bob'
+                '総チャーン' = 150
+                '追加行数' = 80
+                '削除行数' = 30
+                '生存行数' = 40
+                'リワーク率' = 0.545
+                'コミット数' = 12
+            }
+        )
+
+        Write-CommitterScatterChart -OutDirectory $script:scatterDir -Committers $committers -TopNCount 2 -EncodingName 'UTF8'
+
+        Test-Path (Join-Path $script:scatterDir 'committer_scatter_alice.svg') | Should -BeTrue
+        Test-Path (Join-Path $script:scatterDir 'committer_scatter_bob.svg') | Should -BeTrue
+        Test-Path (Join-Path $script:scatterDir 'committer_scatter_combined.svg') | Should -BeTrue
+    }
+
+    It 'scatter svg contains quadrant labels and axis labels' {
+        $committers = @(
+            [pscustomobject]@{
+                '作者' = 'charlie'
+                '総チャーン' = 50
+                '追加行数' = 30
+                '削除行数' = 10
+                '生存行数' = 20
+                'リワーク率' = 0.5
+                'コミット数' = 5
+            }
+        )
+
+        Write-CommitterScatterChart -OutDirectory $script:scatterDir -Committers $committers -TopNCount 1 -EncodingName 'UTF8'
+
+        $content = Get-Content -Path (Join-Path $script:scatterDir 'committer_scatter_charlie.svg') -Raw -Encoding UTF8
+        $content | Should -Match '<svg'
+        $content | Should -Match '</svg>'
+        $content | Should -Match 'charlie'
+        $content | Should -Match 'リワーク率'
+        $content | Should -Match 'コード生存率'
+        $content | Should -Match '<circle'
+    }
+
+    It 'skips committers without rework rate' {
+        $committers = @(
+            [pscustomobject]@{
+                '作者' = 'no-rework'
+                '総チャーン' = 0
+                '追加行数' = 0
+                '削除行数' = 0
+                '生存行数' = $null
+                'リワーク率' = $null
+                'コミット数' = 0
+            }
+        )
+
+        Write-CommitterScatterChart -OutDirectory $script:scatterDir -Committers $committers -TopNCount 1 -EncodingName 'UTF8'
+
+        Test-Path (Join-Path $script:scatterDir 'committer_scatter_no-rework.svg') | Should -BeFalse
+        Test-Path (Join-Path $script:scatterDir 'committer_scatter_combined.svg') | Should -BeFalse
     }
 }
 
@@ -2071,6 +2160,7 @@ Describe 'Update-StrictAttributionMetric parallel consistency' {
                 FilePingPong = @{}
                 AuthorModifiedOthersCode = @{}
                 RevsWhereKilledOthers = (New-Object 'System.Collections.Generic.HashSet[string]')
+                KillMatrix = @{}
             }
         }
         Set-Item -Path function:Get-AllRepositoryFile -Value {
@@ -2255,5 +2345,253 @@ Describe 'Get-EmptyBlameResult' {
         $result.LineCountByAuthor | Should -BeOfType [hashtable]
         $result.LineCountByAuthor.Keys.Count | Should -Be 0
         @($result.Lines).Count | Should -Be 0
+    }
+}
+
+Describe 'Write-KillMatrixCsv' {
+    BeforeEach {
+        $script:kmDir = Join-Path $env:TEMP ('narutocode_km_' + [guid]::NewGuid().ToString('N'))
+        New-Item -Path $script:kmDir -ItemType Directory -Force | Out-Null
+    }
+    AfterEach {
+        Remove-Item -Path $script:kmDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'creates kill_matrix.csv with correct cross-kill values and self-dead diagonal' {
+        $killMatrix = @{
+            'alice' = @{ 'bob' = 5; 'charlie' = 3 }
+            'charlie' = @{ 'bob' = 10 }
+        }
+        $authorSelfDead = @{ 'alice' = 8; 'bob' = 2; 'charlie' = 1 }
+        $committers = @(
+            [pscustomobject]@{ '作者' = 'alice' }
+            [pscustomobject]@{ '作者' = 'bob' }
+            [pscustomobject]@{ '作者' = 'charlie' }
+        )
+
+        Write-KillMatrixCsv -OutDirectory $script:kmDir -KillMatrix $killMatrix -AuthorSelfDead $authorSelfDead -Committers $committers -EncodingName 'UTF8'
+
+        $csvPath = Join-Path $script:kmDir 'kill_matrix.csv'
+        Test-Path $csvPath | Should -BeTrue
+
+        $rows = @(Import-Csv -Path $csvPath -Encoding UTF8)
+        $rows.Count | Should -Be 3
+
+        # alice row: self=8, killed bob=5, killed charlie=3
+        $aliceRow = $rows | Where-Object { $_.'削除者＼被削除者' -eq 'alice' }
+        $aliceRow.'alice' | Should -Be '8'
+        $aliceRow.'bob' | Should -Be '5'
+        $aliceRow.'charlie' | Should -Be '3'
+
+        # bob row: self=2, no kills
+        $bobRow = $rows | Where-Object { $_.'削除者＼被削除者' -eq 'bob' }
+        $bobRow.'bob' | Should -Be '2'
+        $bobRow.'alice' | Should -Be '0'
+
+        # charlie row: self=1, killed bob=10
+        $charlieRow = $rows | Where-Object { $_.'削除者＼被削除者' -eq 'charlie' }
+        $charlieRow.'charlie' | Should -Be '1'
+        $charlieRow.'bob' | Should -Be '10'
+        $charlieRow.'alice' | Should -Be '0'
+    }
+
+    It 'returns without output when KillMatrix is null' {
+        Write-KillMatrixCsv -OutDirectory $script:kmDir -KillMatrix $null -AuthorSelfDead @{} -Committers @([pscustomobject]@{ '作者' = 'x' }) -EncodingName 'UTF8'
+        Test-Path (Join-Path $script:kmDir 'kill_matrix.csv') | Should -BeFalse
+    }
+}
+
+Describe 'Write-SurvivedShareDonutChart' {
+    BeforeEach {
+        $script:donutDir = Join-Path $env:TEMP ('narutocode_donut_' + [guid]::NewGuid().ToString('N'))
+        New-Item -Path $script:donutDir -ItemType Directory -Force | Out-Null
+    }
+    AfterEach {
+        Remove-Item -Path $script:donutDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'creates donut SVG with correct author segments' {
+        $committers = @(
+            [pscustomobject]@{ '作者' = 'alice'; '生存行数' = 350 }
+            [pscustomobject]@{ '作者' = 'bob'; '生存行数' = 68 }
+            [pscustomobject]@{ '作者' = 'charlie'; '生存行数' = 113 }
+        )
+
+        Write-SurvivedShareDonutChart -OutDirectory $script:donutDir -Committers $committers -EncodingName 'UTF8'
+
+        $svgPath = Join-Path $script:donutDir 'team_survived_share.svg'
+        Test-Path $svgPath | Should -BeTrue
+
+        $content = Get-Content -Path $svgPath -Raw -Encoding UTF8
+        $content | Should -Match '<svg'
+        $content | Should -Match '</svg>'
+        $content | Should -Match '<path'
+        $content | Should -Match 'alice'
+        $content | Should -Match 'bob'
+        $content | Should -Match 'charlie'
+        $content | Should -Match '生存行数'
+        $content | Should -Match '531'
+    }
+
+    It 'skips committers with zero survived lines' {
+        $committers = @(
+            [pscustomobject]@{ '作者' = 'alice'; '生存行数' = 100 }
+            [pscustomobject]@{ '作者' = 'zero'; '生存行数' = 0 }
+        )
+
+        Write-SurvivedShareDonutChart -OutDirectory $script:donutDir -Committers $committers -EncodingName 'UTF8'
+
+        $content = Get-Content -Path (Join-Path $script:donutDir 'team_survived_share.svg') -Raw -Encoding UTF8
+        $content | Should -Match 'alice'
+        $content | Should -Not -Match 'zero'
+    }
+
+    It 'does not create SVG when Committers is empty' {
+        Write-SurvivedShareDonutChart -OutDirectory $script:donutDir -Committers @() -EncodingName 'UTF8'
+        Test-Path (Join-Path $script:donutDir 'team_survived_share.svg') | Should -BeFalse
+    }
+}
+
+Describe 'Write-TeamInteractionHeatMap' {
+    BeforeEach {
+        $script:teamHmDir = Join-Path $env:TEMP ('narutocode_teamhm_' + [guid]::NewGuid().ToString('N'))
+        New-Item -Path $script:teamHmDir -ItemType Directory -Force | Out-Null
+    }
+    AfterEach {
+        Remove-Item -Path $script:teamHmDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'creates team interaction heatmap SVG with correct cell values' {
+        $killMatrix = @{
+            'alice' = @{ 'bob' = 13 }
+            'charlie' = @{ 'bob' = 49 }
+        }
+        $authorSelfDead = @{ 'alice' = 16; 'bob' = 0; 'charlie' = 2 }
+        $committers = @(
+            [pscustomobject]@{ '作者' = 'alice' }
+            [pscustomobject]@{ '作者' = 'bob' }
+            [pscustomobject]@{ '作者' = 'charlie' }
+        )
+
+        Write-TeamInteractionHeatMap -OutDirectory $script:teamHmDir -KillMatrix $killMatrix -AuthorSelfDead $authorSelfDead -Committers $committers -EncodingName 'UTF8'
+
+        $svgPath = Join-Path $script:teamHmDir 'team_interaction_heatmap.svg'
+        Test-Path $svgPath | Should -BeTrue
+
+        $content = Get-Content -Path $svgPath -Raw -Encoding UTF8
+        $content | Should -Match '<svg'
+        $content | Should -Match '</svg>'
+        $content | Should -Match '<rect'
+        $content | Should -Match 'alice'
+        $content | Should -Match 'bob'
+        $content | Should -Match 'charlie'
+        $content | Should -Match '削除者'
+        $content | Should -Match '被削除者'
+        # Check that cell values appear
+        $content | Should -Match '49'
+        $content | Should -Match '16'
+        $content | Should -Match '13'
+    }
+
+    It 'does not create SVG when only one committer' {
+        $killMatrix = @{}
+        $authorSelfDead = @{ 'solo' = 5 }
+        $committers = @(
+            [pscustomobject]@{ '作者' = 'solo' }
+        )
+
+        Write-TeamInteractionHeatMap -OutDirectory $script:teamHmDir -KillMatrix $killMatrix -AuthorSelfDead $authorSelfDead -Committers $committers -EncodingName 'UTF8'
+        Test-Path (Join-Path $script:teamHmDir 'team_interaction_heatmap.svg') | Should -BeFalse
+    }
+}
+
+Describe 'Get-TeamActivityProfileData' {
+    It 'calculates intervention rate from deleted and others-modified lines' {
+        $committers = @(
+            [pscustomobject]@{
+                '作者' = 'alice'; '削除行数' = 20; '他者コード変更行数' = 1
+                '他者コード変更生存率' = 0; '総チャーン' = 400
+            }
+            [pscustomobject]@{
+                '作者' = 'bob'; '削除行数' = 6; '他者コード変更行数' = 6
+                '他者コード変更生存率' = 0.833; '総チャーン' = 123
+            }
+            [pscustomobject]@{
+                '作者' = 'charlie'; '削除行数' = 58; '他者コード変更行数' = 55
+                '他者コード変更生存率' = 0.382; '総チャーン' = 174
+            }
+        )
+
+        $data = @(Get-TeamActivityProfileData -Committers $committers)
+        $data.Count | Should -Be 3
+
+        $alice = $data | Where-Object { $_.Author -eq 'alice' }
+        $alice.InterventionRate | Should -BeGreaterThan 0.04
+        $alice.InterventionRate | Should -BeLessThan 0.06
+
+        $bob = $data | Where-Object { $_.Author -eq 'bob' }
+        $bob.InterventionRate | Should -Be 1.0
+
+        $charlie = $data | Where-Object { $_.Author -eq 'charlie' }
+        $charlie.InterventionRate | Should -BeGreaterThan 0.94
+        $charlie.InterventionRate | Should -BeLessThan 0.96
+    }
+
+    It 'returns 0 intervention rate when deleted is 0' {
+        $committers = @(
+            [pscustomobject]@{
+                '作者' = 'newbie'; '削除行数' = 0; '他者コード変更行数' = 0
+                '他者コード変更生存率' = 0; '総チャーン' = 10
+            }
+        )
+
+        $data = @(Get-TeamActivityProfileData -Committers $committers)
+        $data[0].InterventionRate | Should -Be 0.0
+    }
+}
+
+Describe 'Write-TeamActivityProfileChart' {
+    BeforeEach {
+        $script:profileDir = Join-Path $env:TEMP ('narutocode_profile_' + [guid]::NewGuid().ToString('N'))
+        New-Item -Path $script:profileDir -ItemType Directory -Force | Out-Null
+    }
+    AfterEach {
+        Remove-Item -Path $script:profileDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'creates team activity profile SVG with quadrant labels' {
+        $committers = @(
+            [pscustomobject]@{
+                '作者' = 'alice'; '削除行数' = 20; '他者コード変更行数' = 1
+                '他者コード変更生存率' = 0; '総チャーン' = 400
+            }
+            [pscustomobject]@{
+                '作者' = 'bob'; '削除行数' = 6; '他者コード変更行数' = 6
+                '他者コード変更生存率' = 0.833; '総チャーン' = 123
+            }
+        )
+
+        Write-TeamActivityProfileChart -OutDirectory $script:profileDir -Committers $committers -EncodingName 'UTF8'
+
+        $svgPath = Join-Path $script:profileDir 'team_activity_profile.svg'
+        Test-Path $svgPath | Should -BeTrue
+
+        $content = Get-Content -Path $svgPath -Raw -Encoding UTF8
+        $content | Should -Match '<svg'
+        $content | Should -Match '</svg>'
+        $content | Should -Match '<circle'
+        $content | Should -Match 'alice'
+        $content | Should -Match 'bob'
+        $content | Should -Match '独立型'
+        $content | Should -Match '改善者'
+        $content | Should -Match '孤立型'
+        $content | Should -Match '破壊者'
+        $content | Should -Match '他者コード削除介入度'
+        $content | Should -Match '他者コード変更生存率'
+    }
+
+    It 'does not create SVG when Committers is empty' {
+        Write-TeamActivityProfileChart -OutDirectory $script:profileDir -Committers @() -EncodingName 'UTF8'
+        Test-Path (Join-Path $script:profileDir 'team_activity_profile.svg') | Should -BeFalse
     }
 }

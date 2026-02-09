@@ -43,6 +43,7 @@ CSV / PlantUML の見出しを日本語化した際の対訳一覧です。
 | ChurnPerCommit | コミットあたりチャーン | |
 | DeletedToAddedRatio | 削除対追加比 | |
 | ChurnToNetRatio | チャーン対純増比 | |
+| ReworkRate | リワーク率 | 1 − |純増行数| ÷ 総チャーン |
 | BinaryChangeCount | バイナリ変更回数 | |
 | ActionAddCount | 追加アクション数 | |
 | ActionModCount | 変更アクション数 | |

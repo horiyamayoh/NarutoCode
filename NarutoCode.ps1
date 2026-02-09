@@ -3117,6 +3117,7 @@ function Get-ExactDeathAttribution
 
     $authorModifiedOthersCode = @{}
     $revsWhereKilledOthers = New-Object 'System.Collections.Generic.HashSet[string]'
+    $killMatrix = @{}
 
     $prefetchTargets = @(Get-StrictBlamePrefetchTarget -Commits $Commits -FromRevision $FromRevision -ToRevision $ToRevision -CacheDir $CacheDir)
     Invoke-StrictBlameCachePrefetch -Targets $prefetchTargets -TargetUrl $TargetUrl -CacheDir $CacheDir -Parallel $Parallel
@@ -3281,6 +3282,11 @@ function Get-ExactDeathAttribution
                         Add-Count -Table $fileCrossRevert -Key $metricFile
                         Add-Count -Table $authorModifiedOthersCode -Key $killer
                         $null = $revsWhereKilledOthers.Add(([string]$rev + [char]31 + $killer))
+                        if (-not $killMatrix.ContainsKey($killer))
+                        {
+                            $killMatrix[$killer] = @{}
+                        }
+                        Add-Count -Table $killMatrix[$killer] -Key $bornAuthor
                     }
                 }
             }
@@ -3322,6 +3328,7 @@ function Get-ExactDeathAttribution
         FilePingPong = $strictHunk.FilePingPong
         AuthorModifiedOthersCode = $authorModifiedOthersCode
         RevsWhereKilledOthers = $revsWhereKilledOthers
+        KillMatrix = $killMatrix
     }
 }
 # endregion Strict 帰属
@@ -3511,6 +3518,14 @@ function Get-CommitterMetric
                 'チャーン対純増比' = if ([Math]::Abs($net) -gt 0)
                 {
                     Format-MetricValue -Value ($ch / [double][Math]::Abs($net))
+                }
+                else
+                {
+                    $null
+                }
+                'リワーク率' = if ($ch -gt 0)
+                {
+                    Format-MetricValue -Value (1 - [Math]::Abs($net) / [double]$ch)
                 }
                 else
                 {
@@ -3857,10 +3872,75 @@ function Write-PlantUmlFile
     [void]$sb1.AppendLine('salt')
     [void]$sb1.AppendLine('{')
     [void]$sb1.AppendLine('{T')
-    [void]$sb1.AppendLine('+ 作者 | コミット数 | 総チャーン')
+    [void]$sb1.AppendLine('+ 作者 | コミット数 | 活動日数 | 総チャーン | 所有割合 | 他者コード変更行数 | 他者変更生存率 | 変更エントロピー | 平均共同作者数')
     foreach ($r in $topCommitters)
     {
-        [void]$sb1.AppendLine(("| {0} | {1} | {2}" -f ([string]$r.'作者').Replace('|', '\|'), $r.'コミット数', $r.'総チャーン'))
+        $escAuthor = ([string]$r.'作者').Replace('|', '\|')
+        $commitCount = if ($null -ne $r.'コミット数')
+        {
+            $r.'コミット数'
+        }
+        else
+        {
+            ''
+        }
+        $activeDays = if ($null -ne $r.'活動日数')
+        {
+            $r.'活動日数'
+        }
+        else
+        {
+            ''
+        }
+        $totalChurn = if ($null -ne $r.'総チャーン')
+        {
+            $r.'総チャーン'
+        }
+        else
+        {
+            ''
+        }
+        $ownerShare = if ($null -ne $r.'所有割合')
+        {
+            '{0:P1}' -f [double]$r.'所有割合'
+        }
+        else
+        {
+            '-'
+        }
+        $modOthers = if ($null -ne $r.'他者コード変更行数')
+        {
+            $r.'他者コード変更行数'
+        }
+        else
+        {
+            '-'
+        }
+        $modOthersSurv = if ($null -ne $r.'他者コード変更生存率')
+        {
+            '{0:P1}' -f [double]$r.'他者コード変更生存率'
+        }
+        else
+        {
+            '-'
+        }
+        $entropy = if ($null -ne $r.'変更エントロピー')
+        {
+            '{0:F2}' -f [double]$r.'変更エントロピー'
+        }
+        else
+        {
+            '-'
+        }
+        $avgCoAuth = if ($null -ne $r.'平均共同作者数')
+        {
+            '{0:F1}' -f [double]$r.'平均共同作者数'
+        }
+        else
+        {
+            '-'
+        }
+        [void]$sb1.AppendLine(("| {0} | {1} | {2} | {3} | {4} | {5} | {6} | {7} | {8}" -f $escAuthor, $commitCount, $activeDays, $totalChurn, $ownerShare, $modOthers, $modOthersSurv, $entropy, $avgCoAuth))
     }
     [void]$sb1.AppendLine('}')
     [void]$sb1.AppendLine('}')
@@ -4710,35 +4790,127 @@ function Get-SafeFileName
 
     return $safe + $Extension
 }
-function Write-CommitterRadarChart
+function Get-CommitterOutcomeData
 {
     <#
     .SYNOPSIS
-        コミッター品質を 9 軸レーダーチャート SVG として出力する。
+        コミッター行データからコード帰結チャート用のデータを抽出する。
     .DESCRIPTION
-        追加行数が 0 を超えるコミッターを対象に品質指標を算出し、
-        全コミッター間で min-max 正規化した値を作者別 SVG として保存する。
-        各データポイント付近に生値を表示し、下部パネルに計算式・表示方向を併記する。
-        各軸の意味:
-        - コード生存率: 追加したコードが最終的に残っている割合
-        - 変更エントロピー: 変更がファイル間で分散している度合い（高いほど良い）
-        - 自己相殺率: 自分で追加したコードを自分で削除した割合（低いほど良い）
-        - 被削除率: 他者に削除されたコードの割合（低いほど良い）
-        - 他者コード変更生存率: 他者のコードを変更した後の生存率（高いほど良い）
-        - ピンポン率: 反復編集の頻度（低いほど良い）
-        - 所有集中度: コードベースへの貢献割合（高いほど良い）
-        - 定着コミット量: 1コミットあたりで最終的に残したコード量（高いほど良い）
-        - トータルコミット量: 追加+削除を合算したコミット総量（高いほど良い）
-    .PARAMETER OutDirectory
-        SVG ファイルを保存する出力先ディレクトリを指定する（必須）。
+        追加行数が 0 を超えるコミッターを対象に、生存・自己相殺・被他者削除・
+        その他の内訳データとピンポン率を算出する。
     .PARAMETER Committers
-        Get-CommitterMetric が返すコミッター行配列を指定する（必須）。
+        Get-CommitterMetric が返すコミッター行配列を指定する。
     .PARAMETER TopNCount
-        総チャーン上位として SVG を生成する件数を指定する（0以下の場合は出力しない）。
+        総チャーン上位として抽出する件数を指定する。0 で全件。
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [object[]]$Committers,
+        [int]$TopNCount = 0
+    )
+    $rows = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($c in @($Committers))
+    {
+        if ($null -eq $c)
+        {
+            continue
+        }
+        $added = 0.0
+        if ($null -ne $c.'追加行数')
+        {
+            $added = [double]$c.'追加行数'
+        }
+        if ($added -le 0)
+        {
+            continue
+        }
+        $survived = 0.0
+        if ($null -ne $c.'生存行数')
+        {
+            $survived = [double]$c.'生存行数'
+        }
+        $selfCancel = 0.0
+        if ($null -ne $c.'自己相殺行数')
+        {
+            $selfCancel = [double]$c.'自己相殺行数'
+        }
+        $removedByOthers = 0.0
+        if ($null -ne $c.'被他者削除行数')
+        {
+            $removedByOthers = [double]$c.'被他者削除行数'
+        }
+        $other = $added - ($survived + $selfCancel + $removedByOthers)
+        if ($other -lt 0)
+        {
+            $other = 0.0
+        }
+        $pingPongRate = 0.0
+        if ($null -ne $c.'ピンポン率')
+        {
+            $pingPongRate = [double]$c.'ピンポン率'
+        }
+        $totalChurn = 0.0
+        if ($null -ne $c.'総チャーン')
+        {
+            $totalChurn = [double]$c.'総チャーン'
+        }
+        [void]$rows.Add([pscustomobject][ordered]@{
+                Author = (Get-NormalizedAuthorName -Author ([string]$c.'作者'))
+                AddedLines = $added
+                Survived = $survived
+                SelfCancel = $selfCancel
+                RemovedByOthers = $removedByOthers
+                Other = $other
+                SurvivedRate = $survived / $added
+                SelfCancelRate = $selfCancel / $added
+                RemovedByOthersRate = $removedByOthers / $added
+                OtherRate = $other / $added
+                PingPongRate = $pingPongRate
+                TotalChurn = $totalChurn
+            })
+    }
+    if ($rows.Count -eq 0)
+    {
+        return @()
+    }
+    $sorted = @($rows.ToArray() | Sort-Object -Property @{Expression = 'TotalChurn'
+            Descending = $true
+        }, 'Author')
+    if ($TopNCount -gt 0 -and $sorted.Count -gt $TopNCount)
+    {
+        return @($sorted | Select-Object -First $TopNCount)
+    }
+    return $sorted
+}
+function Write-CommitterOutcomeChart
+{
+    <#
+    .SYNOPSIS
+        コミッター別コード帰結を積み上げ横棒グラフ SVG として出力する。
+    .DESCRIPTION
+        追加行数を 100% として、生存・自己相殺・被他者削除・その他の内訳を
+        積み上げ横棒グラフで表示する。個人用 SVG（自分のデータのみ）を
+        コミッター数分、およびリーダー用 SVG（全員比較）を 1 枚出力する。
+        各セグメントの色:
+        - 生存: 緑 — 最終時点で生き残っているコード
+        - 自己相殺: 黄 — 自分で追加した後に自分で削除したコード
+        - 被他者削除: 赤 — 自分が追加した後に他者に削除されたコード
+        - その他: グレー — 上記に分類できない消滅分
+        ピンポン率を棒の右側にマーカーで表示する。
+    .PARAMETER OutDirectory
+        SVG ファイルを保存する出力先ディレクトリを指定する。
+    .PARAMETER Committers
+        Get-CommitterMetric が返すコミッター行配列を指定する。
+    .PARAMETER TopNCount
+        総チャーン上位として SVG を生成する件数を指定する。
     .PARAMETER EncodingName
         出力時に使用する文字エンコーディング名を指定する。
     .EXAMPLE
-        Write-CommitterRadarChart -OutDirectory '.\output' -Committers $committers -TopNCount 10 -EncodingName 'UTF8'
+        Write-CommitterOutcomeChart -OutDirectory '.\output' -Committers $committers -TopNCount 10 -EncodingName 'UTF8'
     #>
     [CmdletBinding()]
     param(
@@ -4755,506 +4927,323 @@ function Write-CommitterRadarChart
         [Parameter(Mandatory = $false)]
         [string]$EncodingName = 'UTF-8'
     )
-
-    # 入力検証
     if ([string]::IsNullOrWhiteSpace($OutDirectory))
     {
-        Write-Warning 'Write-CommitterRadarChart: OutDirectory が空です。'
+        Write-Warning 'Write-CommitterOutcomeChart: OutDirectory が空です。'
         return
     }
-
     if ($TopNCount -le 0)
     {
-        Write-Verbose 'Write-CommitterRadarChart: TopNCount が 0 以下のため、出力しません。'
+        Write-Verbose 'Write-CommitterOutcomeChart: TopNCount が 0 以下のため、出力しません。'
         return
     }
-
     if (-not $Committers -or @($Committers).Count -eq 0)
     {
-        Write-Verbose 'Write-CommitterRadarChart: Committers が空です。SVG を生成しません。'
+        Write-Verbose 'Write-CommitterOutcomeChart: Committers が空です。'
         return
     }
-
-    # 出力ディレクトリの作成
     if (-not (Test-Path -LiteralPath $OutDirectory))
     {
         try
         {
-            $null = New-Item -LiteralPath $OutDirectory -ItemType Directory -Force -ErrorAction Stop
+            New-Item -Path $OutDirectory -ItemType Directory -Force -ErrorAction Stop | Out-Null
         }
         catch
         {
-            Write-Warning "Write-CommitterRadarChart: 出力ディレクトリの作成に失敗しました: $_"
+            Write-Warning "Write-CommitterOutcomeChart: ディレクトリ作成失敗: $_"
             return
         }
     }
 
-    # レーダーチャートの 9 軸定義（Invert は値が小さいほど良い場合に true）
-
-    $axisDefinitions = @(
-        [pscustomobject][ordered]@{
-            Label = 'コード生存率'
-            Formula = '生存行数 / 追加行数'
-            Unit = '率'
-            Invert = $false
-        },
-        [pscustomobject][ordered]@{
-            Label = '変更エントロピー'
-            Formula = 'ファイル別チャーンのエントロピー'
-            Unit = 'bit'
-            Invert = $false
-        },
-        [pscustomobject][ordered]@{
-            Label = '自己相殺率'
-            Formula = '自己相殺行数 / 追加行数'
-            Unit = '率'
-            Invert = $true
-        },
-        [pscustomobject][ordered]@{
-            Label = '被削除率'
-            Formula = '被他者削除行数 / 追加行数'
-            Unit = '率'
-            Invert = $true
-        },
-        [pscustomobject][ordered]@{
-            Label = '他者コード変更生存率'
-            Formula = '他者コード変更生存行数 / 他者コード変更行数'
-            Unit = '率'
-            Invert = $false
-        },
-        [pscustomobject][ordered]@{
-            Label = 'ピンポン率'
-            Formula = 'ピンポン回数 / コミット数'
-            Unit = '率'
-            Invert = $true
-        },
-        [pscustomobject][ordered]@{
-            Label = '所有集中度'
-            Formula = '所有行数 / 全所有行数'
-            Unit = '率'
-            Invert = $false
-        },
-        [pscustomobject][ordered]@{
-            Label = '定着コミット量'
-            Formula = '生存行数 / コミット数'
-            Unit = '行'
-            Invert = $false
-        },
-        [pscustomobject][ordered]@{
-            Label = 'トータルコミット量'
-            Formula = '追加行数 + 削除行数'
-            Unit = '行'
-            Invert = $false
-        }
-    )
-
-    $chartRows = New-Object 'System.Collections.Generic.List[object]'
-    foreach ($committer in @($Committers))
-    {
-        if ($null -eq $committer)
-        {
-            continue
-        }
-
-        $addedLines = 0.0
-        if ($null -ne $committer.'追加行数')
-        {
-            $addedLines = [double]$committer.'追加行数'
-        }
-        if ($addedLines -le 0)
-        {
-            continue
-        }
-
-        $survivedLines = 0.0
-        if ($null -ne $committer.'生存行数')
-        {
-            $survivedLines = [double]$committer.'生存行数'
-        }
-        $changeEntropy = 0.0
-        if ($null -ne $committer.'変更エントロピー')
-        {
-            $changeEntropy = [double]$committer.'変更エントロピー'
-        }
-        $deletedLines = 0.0
-        if ($null -ne $committer.'削除行数')
-        {
-            $deletedLines = [double]$committer.'削除行数'
-        }
-        $selfCancelLines = 0.0
-        if ($null -ne $committer.'自己相殺行数')
-        {
-            $selfCancelLines = [double]$committer.'自己相殺行数'
-        }
-        $removedByOthers = 0.0
-        if ($null -ne $committer.'被他者削除行数')
-        {
-            $removedByOthers = [double]$committer.'被他者削除行数'
-        }
-        $otherChangeRate = 0.0
-        if ($null -ne $committer.'他者コード変更生存率')
-        {
-            $otherChangeRate = [double]$committer.'他者コード変更生存率'
-        }
-        $pingPongPerCommit = 0.0
-        if ($null -ne $committer.'ピンポン率')
-        {
-            $pingPongPerCommit = [double]$committer.'ピンポン率'
-        }
-        elseif ($null -ne $committer.'コミットあたりピンポン')
-        {
-            $pingPongPerCommit = [double]$committer.'コミットあたりピンポン'
-        }
-        $ownershipShare = 0.0
-        if ($null -ne $committer.'所有割合')
-        {
-            $ownershipShare = [double]$committer.'所有割合'
-        }
-        $totalChurn = 0.0
-        if ($null -ne $committer.'総チャーン')
-        {
-            $totalChurn = [double]$committer.'総チャーン'
-        }
-        $commitCount = 0.0
-        if ($null -ne $committer.'コミット数')
-        {
-            $commitCount = [double]$committer.'コミット数'
-        }
-        $retainedVolumePerCommit = 0.0
-        if ($commitCount -gt 0.0)
-        {
-            $retainedVolumePerCommit = $survivedLines / $commitCount
-        }
-        $totalCommitVolume = $addedLines + $deletedLines
-
-        $rawScores = [ordered]@{
-            'コード生存率' = $survivedLines / $addedLines
-            '変更エントロピー' = $changeEntropy
-            '自己相殺率' = $selfCancelLines / $addedLines
-            '被削除率' = $removedByOthers / $addedLines
-            '他者コード変更生存率' = $otherChangeRate
-            'ピンポン率' = $pingPongPerCommit
-            '所有集中度' = $ownershipShare
-            '定着コミット量' = $retainedVolumePerCommit
-            'トータルコミット量' = $totalCommitVolume
-        }
-        [void]$chartRows.Add([pscustomobject][ordered]@{
-                Author = (Get-NormalizedAuthorName -Author ([string]$committer.'作者'))
-                TotalChurn = $totalChurn
-                RawScores = $rawScores
-            })
-    }
-
-    if ($chartRows.Count -eq 0)
+    $chartData = @(Get-CommitterOutcomeData -Committers $Committers -TopNCount $TopNCount)
+    if ($chartData.Count -eq 0)
     {
         return
     }
 
-    $axisMinMax = @{}
-    foreach ($axis in $axisDefinitions)
-    {
-        $axisLabel = [string]$axis.Label
-        $axisValues = @($chartRows.ToArray() | ForEach-Object { [double]$_.RawScores[$axisLabel] })
-        $stats = $axisValues | Measure-Object -Minimum -Maximum
-        $axisMinMax[$axisLabel] = [pscustomobject][ordered]@{
-            Min = [double]$stats.Minimum
-            Max = [double]$stats.Maximum
-        }
-    }
+    # --- 色定義 ---
+    $colorSurvived = '#4caf50'
+    $colorSelfCancel = '#ffc107'
+    $colorRemovedByOthers = '#f44336'
+    $colorOther = '#bdbdbd'
 
-    $topChartRows = @($chartRows.ToArray() | Sort-Object -Property @{Expression = 'TotalChurn'
-            Descending = $true
-        }, 'Author' | Select-Object -First $TopNCount)
-    if ($topChartRows.Count -eq 0)
-    {
-        return
-    }
-
-    $axisCount = $axisDefinitions.Count
-    $svgWidth = 760.0
-    $metricPanelX = 20.0
-    $metricPanelY = 504.0
-    $metricPanelWidth = $svgWidth - ($metricPanelX * 2.0)
-    $metricBodyFontSize = 11.0
-    $metricRowHeight = 18.0
-    $metricPanelHeight = 52.0 + ($axisCount * $metricRowHeight)
-    $svgHeight = [Math]::Ceiling($metricPanelY + $metricPanelHeight + 16.0)
-    $centerX = $svgWidth / 2.0
-    $centerY = 272.0
-    $radius = 166.0
-    $titleFontSize = 24.0
-    $axisLabelFontSize = 13.0
-    $guideLevels = @(0.25, 0.5, 0.75, 1.0)
-    $labelRadius = 202.0
+    # --- 個人用 SVG（1人分のみ表示） ---
     $usedNames = New-Object 'System.Collections.Generic.HashSet[string]'
-
-    foreach ($row in $topChartRows)
+    foreach ($row in $chartData)
     {
-        $outerPoints = New-Object 'System.Collections.Generic.List[object]'
-        $dataPoints = New-Object 'System.Collections.Generic.List[object]'
-        for ($i = 0; $i -lt $axisCount; $i++)
+        $authorDisplay = [string]$row.Author
+        $baseName = 'committer_outcome_' + $authorDisplay
+        $fileName = Get-SafeFileName -BaseName $baseName -Extension '.svg'
+        while (-not $usedNames.Add($fileName))
         {
-            $angle = (((2.0 * [Math]::PI) * $i) / [double]$axisCount) - ([Math]::PI / 2.0)
-            $xOuter = $centerX + ($radius * [Math]::Cos($angle))
-            $yOuter = $centerY + ($radius * [Math]::Sin($angle))
-            $axisLabel = [string]$axisDefinitions[$i].Label
-            $rawValue = [double]$row.RawScores[$axisLabel]
-            # 生値の表示用フォーマット
-            $rawDisplayOuter = if ([string]$axisDefinitions[$i].Unit -eq '行')
-            {
-                if ($rawValue -ge 10000)
-                {
-                    '{0:N0}' -f $rawValue
-                }
-                else
-                {
-                    '{0:F1}' -f $rawValue
-                }
-            }
-            elseif ([string]$axisDefinitions[$i].Unit -eq 'bit')
-            {
-                '{0:F2} bit' -f $rawValue
-            }
-            else
-            {
-                '{0:P1}' -f $rawValue
-            }
-            [void]$outerPoints.Add([pscustomobject][ordered]@{
-                    X = $xOuter
-                    Y = $yOuter
-                    Angle = $angle
-                    Label = $axisLabel
-                    Invert = [bool]$axisDefinitions[$i].Invert
-                    RawDisplay = $rawDisplayOuter
-                })
-            $normalized = ConvertTo-NormalizedScore -Value $rawValue -Min ([double]$axisMinMax[$axisLabel].Min) -Max ([double]$axisMinMax[$axisLabel].Max) -Invert:$axisDefinitions[$i].Invert
-            $xData = $centerX + (($radius * $normalized) * [Math]::Cos($angle))
-            $yData = $centerY + (($radius * $normalized) * [Math]::Sin($angle))
-            [void]$dataPoints.Add([pscustomobject][ordered]@{
-                    X = $xData
-                    Y = $yData
-                    Value = $normalized
-                })
+            $baseName = $baseName + '_dup'
+            $fileName = Get-SafeFileName -BaseName $baseName -Extension '.svg'
         }
 
-        $dataPolygonPoints = @($dataPoints.ToArray() | ForEach-Object { '{0:F2},{1:F2}' -f $_.X, $_.Y }) -join ' '
-        $authorName = [string]$row.Author
-        if ([string]::IsNullOrWhiteSpace($authorName))
-        {
-            $authorName = '(unknown)'
-        }
-        $fittedAuthorTitle = Get-SvgFittedText -Text $authorName -MaxWidth ($svgWidth - 64.0) -FontSize $titleFontSize
-        $authorTitle = ConvertTo-SvgEscapedText -Text $fittedAuthorTitle
-        if ([string]::IsNullOrEmpty($authorTitle))
-        {
-            $authorTitle = '(unknown)'
-        }
-
-        # 安全なファイル名を生成（予約名・長さ制限対応）
-        # 著者名のみを先にサニタイズ（予約名処理のため、長さ制限なし）
-        $safeAuthor = Get-SafeFileName -BaseName $authorName -Extension '' -MaxLength 999
-        # フルファイル名を生成し、長さ制限を適用
-        $fileName = Get-SafeFileName -BaseName "committer_radar_$safeAuthor" -Extension '.svg' -MaxLength 100
-        if (-not $usedNames.Add($fileName))
-        {
-            $index = 2
-            while ($true)
-            {
-                $candidateBase = "committer_radar_{0}_{1}" -f $safeAuthor, $index
-                $candidate = Get-SafeFileName -BaseName $candidateBase -Extension '.svg' -MaxLength 100
-                if ($usedNames.Add($candidate))
-                {
-                    $fileName = $candidate
-                    break
-                }
-                $index++
-            }
-        }
-
+        $barWidth = 500.0
+        $barHeight = 40.0
+        $barX = 160.0
+        $barY = 70.0
+        $svgWidth = 820.0
+        $svgHeight = 200.0
         $sb = New-Object System.Text.StringBuilder
-        [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {0} {1}" width="{0}" height="{1}" role="img" aria-label="コミッター品質レーダーチャート">' -f $svgWidth, $svgHeight))
-        [void]$sb.AppendLine('  <defs>')
-        [void]$sb.AppendLine('    <style><![CDATA[')
-        [void]$sb.AppendLine('      text { font-family: "Segoe UI", "Yu Gothic UI", "Meiryo", sans-serif; }')
-        [void]$sb.AppendLine('      .chart-title { font-size: 24px; font-weight: 700; fill: #1f2937; text-anchor: middle; }')
-        [void]$sb.AppendLine('      .chart-subtitle { font-size: 13px; font-weight: 600; fill: #475569; text-anchor: middle; }')
-        [void]$sb.AppendLine('      .guide-line { stroke: #d7dee9; stroke-width: 1; fill: none; }')
-        [void]$sb.AppendLine('      .axis-line { stroke: #d0d8e4; stroke-width: 1; }')
-        [void]$sb.AppendLine('      .axis-label { font-size: 13px; fill: #334155; dominant-baseline: middle; }')
-        [void]$sb.AppendLine('      .radar-area { fill: rgba(37, 99, 235, 0.25); stroke: #2563eb; stroke-width: 2.4; }')
-        [void]$sb.AppendLine('      .radar-point { fill: #1d4ed8; stroke: #ffffff; stroke-width: 1.2; }')
-        [void]$sb.AppendLine('      .raw-value { font-size: 10px; fill: #1e40af; font-weight: 600; }')
-        [void]$sb.AppendLine('      .metric-panel { fill: #ffffff; stroke: #d8e1eb; stroke-width: 1.1; }')
-        [void]$sb.AppendLine('      .metric-title { font-size: 15px; font-weight: 700; fill: #1f2937; }')
-        [void]$sb.AppendLine('      .metric-note { font-size: 11px; fill: #475569; }')
-        [void]$sb.AppendLine('      .metric-label { font-size: 11px; font-weight: 700; fill: #334155; }')
-        [void]$sb.AppendLine('      .metric-formula { font-size: 11px; fill: #475569; }')
-        [void]$sb.AppendLine('    ]]></style>')
-        [void]$sb.AppendLine('  </defs>')
-        [void]$sb.AppendLine(('  <rect x="0" y="0" width="{0}" height="{1}" fill="#f8fafc" />' -f $svgWidth, $svgHeight))
-        [void]$sb.AppendLine(('  <circle cx="{0}" cy="{1}" r="{2}" fill="#ffffff" stroke="#d9e2ee" stroke-width="1.1" />' -f $centerX, $centerY, ($radius + 28.0)))
-        [void]$sb.AppendLine(("  <text class=""chart-title"" x=""{0:F2}"" y=""44"">{1}</text>" -f $centerX, $authorTitle))
+        [void]$sb.AppendLine(('<?xml version="1.0" encoding="UTF-8"?>'))
+        [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" width="{0}" height="{1}" viewBox="0 0 {0} {1}">' -f [int]$svgWidth, [int]$svgHeight))
+        [void]$sb.AppendLine('<defs><style>')
+        [void]$sb.AppendLine('  text { font-family: "Segoe UI", "Meiryo UI", sans-serif; }')
+        [void]$sb.AppendLine('  .title { font-size: 16px; font-weight: bold; fill: #333; }')
+        [void]$sb.AppendLine('  .bar-label { font-size: 12px; fill: #333; }')
+        [void]$sb.AppendLine('  .pct-label { font-size: 11px; fill: #fff; font-weight: bold; }')
+        [void]$sb.AppendLine('  .pct-label-dark { font-size: 11px; fill: #333; font-weight: bold; }')
+        [void]$sb.AppendLine('  .legend-text { font-size: 11px; fill: #555; }')
+        [void]$sb.AppendLine('  .ping-pong { font-size: 11px; fill: #666; }')
+        [void]$sb.AppendLine('</style></defs>')
+        [void]$sb.AppendLine('<rect width="100%" height="100%" fill="#fafafa"/>')
+        $titleText = ConvertTo-SvgEscapedText -Text ('{0} — コード帰結チャート' -f $authorDisplay)
+        [void]$sb.AppendLine(('<text class="title" x="20" y="30">{0}</text>' -f $titleText))
+        [void]$sb.AppendLine(('<text class="bar-label" x="20" y="60" style="font-size:11px;fill:#888;">追加行数: {0} 行</text>' -f [int]$row.AddedLines))
 
-        foreach ($level in $guideLevels)
+        # 棒グラフ描画
+        $segments = @(
+            [pscustomobject]@{ Rate = $row.SurvivedRate; Color = $colorSurvived; Label = '生存' }
+            [pscustomobject]@{ Rate = $row.SelfCancelRate; Color = $colorSelfCancel; Label = '自己相殺' }
+            [pscustomobject]@{ Rate = $row.RemovedByOthersRate; Color = $colorRemovedByOthers; Label = '被他者削除' }
+            [pscustomobject]@{ Rate = $row.OtherRate; Color = $colorOther; Label = 'その他' }
+        )
+        $offsetX = $barX
+        foreach ($seg in $segments)
         {
-            $guidePoints = @()
-            foreach ($point in @($outerPoints.ToArray()))
+            $segWidth = $seg.Rate * $barWidth
+            if ($segWidth -gt 0.5)
             {
-                $gx = $centerX + (($point.X - $centerX) * $level)
-                $gy = $centerY + (($point.Y - $centerY) * $level)
-                $guidePoints += ('{0:F2},{1:F2}' -f $gx, $gy)
+                [void]$sb.AppendLine(('<rect x="{0:F1}" y="{1}" width="{2:F1}" height="{3}" fill="{4}" rx="2"/>' -f $offsetX, [int]$barY, $segWidth, [int]$barHeight, $seg.Color))
+                if ($segWidth -gt 35)
+                {
+                    $pctText = '{0:F0}%' -f ($seg.Rate * 100)
+                    $textX = $offsetX + ($segWidth / 2.0)
+                    $textY = $barY + ($barHeight / 2.0) + 4.0
+                    $textClass = if ($seg.Color -eq $colorSelfCancel -or $seg.Color -eq $colorOther)
+                    {
+                        'pct-label-dark'
+                    }
+                    else
+                    {
+                        'pct-label'
+                    }
+                    [void]$sb.AppendLine(('<text class="{0}" x="{1:F1}" y="{2:F1}" text-anchor="middle">{3}</text>' -f $textClass, $textX, $textY, (ConvertTo-SvgEscapedText -Text $pctText)))
+                }
             }
-            [void]$sb.AppendLine(("  <polygon class=""guide-line"" points=""{0}"" />" -f ($guidePoints -join ' ')))
+            $offsetX += $segWidth
         }
+        # ピンポン率マーカー
+        $ppText = '🔄 ピンポン率: {0:F1}%' -f ($row.PingPongRate * 100)
+        [void]$sb.AppendLine(('<text class="ping-pong" x="{0}" y="{1}">{2}</text>' -f [int]($barX), [int]($barY + $barHeight + 20), (ConvertTo-SvgEscapedText -Text $ppText)))
 
-        foreach ($point in @($outerPoints.ToArray()))
+        # 凡例
+        $legendY = $barY + $barHeight + 44
+        $legendItems = @(
+            [pscustomobject]@{ Color = $colorSurvived; Label = '生存' }
+            [pscustomobject]@{ Color = $colorSelfCancel; Label = '自己相殺' }
+            [pscustomobject]@{ Color = $colorRemovedByOthers; Label = '被他者削除' }
+            [pscustomobject]@{ Color = $colorOther; Label = 'その他' }
+        )
+        $legendX = $barX
+        foreach ($item in $legendItems)
         {
-            [void]$sb.AppendLine(("  <line class=""axis-line"" x1=""{0:F2}"" y1=""{1:F2}"" x2=""{2:F2}"" y2=""{3:F2}"" />" -f $centerX, $centerY, $point.X, $point.Y))
-        }
-
-        [void]$sb.AppendLine(("  <polygon class=""radar-area"" points=""{0}"" />" -f $dataPolygonPoints))
-
-        foreach ($point in @($dataPoints.ToArray()))
-        {
-            [void]$sb.AppendLine(("  <circle class=""radar-point"" cx=""{0:F2}"" cy=""{1:F2}"" r=""4.2"" />" -f $point.X, $point.Y))
-        }
-
-        # 軸ラベルの初期座標を算出し、下部で重なるラベルを垂直方向に離す
-        $labelItems = New-Object 'System.Collections.Generic.List[object]'
-        foreach ($point in @($outerPoints.ToArray()))
-        {
-            $labelX = $centerX + ($labelRadius * [Math]::Cos($point.Angle))
-            $labelY = $centerY + ($labelRadius * [Math]::Sin($point.Angle))
-            $anchor = 'middle'
-            $axisCos = [Math]::Cos($point.Angle)
-            if ($axisCos -gt 0.2)
-            {
-                $anchor = 'start'
-            }
-            elseif ($axisCos -lt -0.2)
-            {
-                $anchor = 'end'
-            }
-            [void]$labelItems.Add([pscustomobject][ordered]@{
-                    X = $labelX
-                    Y = $labelY
-                    Anchor = $anchor
-                    Label = [string]$point.Label
-                    Angle = $point.Angle
-                    Invert = [bool]$point.Invert
-                    RawDisplay = [string]$point.RawDisplay
-                })
-        }
-
-        # Y が下半分 (center より下) のラベルを Y 昇順に並べ、近すぎるペアを離す
-        $minGap = 20.0
-        $bottomLabels = @($labelItems.ToArray() | Where-Object { $_.Y -gt $centerY })
-        $bottomSorted = @($bottomLabels | Sort-Object -Property Y)
-        for ($bi = 1; $bi -lt $bottomSorted.Count; $bi++)
-        {
-            $prev = $bottomSorted[$bi - 1]
-            $curr = $bottomSorted[$bi]
-            $gap = $curr.Y - $prev.Y
-            if ($gap -lt $minGap)
-            {
-                $curr.Y = $prev.Y + $minGap
-            }
-        }
-
-        # Y が上半分 (center より上) のラベルを Y 降順に並べ、近すぎるペアを離す
-        $topLabels = @($labelItems.ToArray() | Where-Object { $_.Y -lt $centerY })
-        $topSorted = @($topLabels | Sort-Object -Property Y -Descending)
-        for ($ti = 1; $ti -lt $topSorted.Count; $ti++)
-        {
-            $prev = $topSorted[$ti - 1]
-            $curr = $topSorted[$ti]
-            $gap = $prev.Y - $curr.Y
-            if ($gap -lt $minGap)
-            {
-                $curr.Y = $prev.Y - $minGap
-            }
-        }
-
-        foreach ($item in @($labelItems.ToArray()))
-        {
-            $maxLabelWidth = 0.0
-            if ($item.Anchor -eq 'start')
-            {
-                $maxLabelWidth = [Math]::Max(40.0, ($svgWidth - 14.0) - $item.X)
-            }
-            elseif ($item.Anchor -eq 'end')
-            {
-                $maxLabelWidth = [Math]::Max(40.0, $item.X - 14.0)
-            }
-            else
-            {
-                $maxLabelWidth = [Math]::Max(60.0, [Math]::Min($item.X - 14.0, ($svgWidth - 14.0) - $item.X) * 2.0)
-            }
-            $dirMark = if ([bool]$item.Invert)
-            {
-                '↕'
-            }
-            else
-            {
-                '↗'
-            }
-            $labelWithDir = '{0} {1}' -f [string]$item.Label, $dirMark
-            $fittedAxisLabel = Get-SvgFittedText -Text $labelWithDir -MaxWidth $maxLabelWidth -FontSize $axisLabelFontSize
-            $escapedLabel = ConvertTo-SvgEscapedText -Text $fittedAxisLabel
-            $escapedRawValue = ConvertTo-SvgEscapedText -Text ([string]$item.RawDisplay)
-            [void]$sb.AppendLine(("  <text class=""axis-label"" x=""{0:F2}"" y=""{1:F2}"" text-anchor=""{2}""><tspan>{3}</tspan><tspan x=""{0:F2}"" dy=""1.2em"" class=""raw-value"">{4}</tspan></text>" -f $item.X, $item.Y, $item.Anchor, $escapedLabel, $escapedRawValue))
-        }
-
-        [void]$sb.AppendLine(("  <rect class=""metric-panel"" x=""{0:F2}"" y=""{1:F2}"" width=""{2:F2}"" height=""{3:F2}"" rx=""10"" ry=""10"" />" -f $metricPanelX, $metricPanelY, $metricPanelWidth, $metricPanelHeight))
-        [void]$sb.AppendLine(("  <text class=""metric-title"" x=""{0:F2}"" y=""{1:F2}"">指標定義</text>" -f ($metricPanelX + 12.0), ($metricPanelY + 20.0)))
-        $panelNote = '※全軸とも外側ほど高評価。↕が付いた指標は低いほど良いため反転表示。'
-        $panelNoteFitted = Get-SvgFittedText -Text $panelNote -MaxWidth ($metricPanelWidth - 20.0) -FontSize 10.0
-        [void]$sb.AppendLine(("  <text class=""metric-note"" x=""{0:F2}"" y=""{1:F2}"">{2}</text>" -f ($metricPanelX + 12.0), ($metricPanelY + 36.0), (ConvertTo-SvgEscapedText -Text $panelNoteFitted)))
-        for ($metricIndex = 0
-            $metricIndex -lt $axisDefinitions.Count
-            $metricIndex++)
-        {
-            $axis = $axisDefinitions[$metricIndex]
-            $dirMark = if ([bool]$axis.Invert)
-            {
-                '↕'
-            }
-            else
-            {
-                '↗'
-            }
-            $metricLineRaw = '{0}. {1} {2} ＝ {3}' -f ($metricIndex + 1), [string]$axis.Label, $dirMark, [string]$axis.Formula
-            $lineY = $metricPanelY + 52.0 + ($metricIndex * $metricRowHeight)
-            $metricLine = Get-SvgFittedText -Text $metricLineRaw -MaxWidth ($metricPanelWidth - 20.0) -FontSize $metricBodyFontSize
-            [void]$sb.AppendLine(("  <text class=""metric-formula"" x=""{0:F2}"" y=""{1:F2}"">{2}</text>" -f ($metricPanelX + 12.0), $lineY, (ConvertTo-SvgEscapedText -Text $metricLine)))
+            [void]$sb.AppendLine(('<rect x="{0}" y="{1}" width="12" height="12" fill="{2}" rx="2"/>' -f [int]$legendX, [int]$legendY, $item.Color))
+            [void]$sb.AppendLine(('<text class="legend-text" x="{0}" y="{1}">{2}</text>' -f [int]($legendX + 16), [int]($legendY + 11), (ConvertTo-SvgEscapedText -Text $item.Label)))
+            $legendX += 90
         }
 
         [void]$sb.AppendLine('</svg>')
         Write-TextFile -FilePath (Join-Path $OutDirectory $fileName) -Content $sb.ToString() -EncodingName $EncodingName
     }
-}
 
-function Write-CommitterRadarChartCombined
+    # --- リーダー用 SVG（全員比較） ---
+    $rowHeight = 36.0
+    $labelWidth = 140.0
+    $barAreaWidth = 460.0
+    $addedLabelWidth = 80.0
+    $ppLabelWidth = 100.0
+    $svgWidthAll = $labelWidth + $barAreaWidth + $addedLabelWidth + $ppLabelWidth + 40.0
+    $headerHeight = 60.0
+    $legendHeight = 50.0
+    $svgHeightAll = $headerHeight + ($chartData.Count * $rowHeight) + $legendHeight + 20.0
+
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine('<?xml version="1.0" encoding="UTF-8"?>')
+    [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" width="{0}" height="{1}" viewBox="0 0 {0} {1}">' -f [int]$svgWidthAll, [int]$svgHeightAll))
+    [void]$sb.AppendLine('<defs><style>')
+    [void]$sb.AppendLine('  text { font-family: "Segoe UI", "Meiryo UI", sans-serif; }')
+    [void]$sb.AppendLine('  .title { font-size: 18px; font-weight: bold; fill: #333; }')
+    [void]$sb.AppendLine('  .subtitle { font-size: 11px; fill: #888; }')
+    [void]$sb.AppendLine('  .author-label { font-size: 12px; fill: #333; }')
+    [void]$sb.AppendLine('  .added-label { font-size: 11px; fill: #666; }')
+    [void]$sb.AppendLine('  .pct-label { font-size: 10px; fill: #fff; font-weight: bold; }')
+    [void]$sb.AppendLine('  .pct-label-dark { font-size: 10px; fill: #333; font-weight: bold; }')
+    [void]$sb.AppendLine('  .pp-label { font-size: 10px; fill: #666; }')
+    [void]$sb.AppendLine('  .legend-text { font-size: 11px; fill: #555; }')
+    [void]$sb.AppendLine('</style></defs>')
+    [void]$sb.AppendLine('<rect width="100%" height="100%" fill="#fafafa"/>')
+    [void]$sb.AppendLine('<text class="title" x="20" y="28">コード帰結チャート（チーム比較）</text>')
+    [void]$sb.AppendLine('<text class="subtitle" x="20" y="46">追加行数に対する生存・消滅の内訳</text>')
+
+    for ($i = 0; $i -lt $chartData.Count; $i++)
+    {
+        $d = $chartData[$i]
+        $rowY = $headerHeight + ($i * $rowHeight)
+        $barY2 = $rowY + 6.0
+        $barH = $rowHeight - 12.0
+        $authorEscaped = ConvertTo-SvgEscapedText -Text ([string]$d.Author)
+        [void]$sb.AppendLine(('<text class="author-label" x="20" y="{0:F1}">{1}</text>' -f ($barY2 + $barH / 2.0 + 4.0), $authorEscaped))
+        $segments = @(
+            [pscustomobject]@{ Rate = $d.SurvivedRate; Color = $colorSurvived; Label = '生存' }
+            [pscustomobject]@{ Rate = $d.SelfCancelRate; Color = $colorSelfCancel; Label = '自己相殺' }
+            [pscustomobject]@{ Rate = $d.RemovedByOthersRate; Color = $colorRemovedByOthers; Label = '被他者削除' }
+            [pscustomobject]@{ Rate = $d.OtherRate; Color = $colorOther; Label = 'その他' }
+        )
+        $ox = $labelWidth
+        foreach ($seg in $segments)
+        {
+            $sw = $seg.Rate * $barAreaWidth
+            if ($sw -gt 0.5)
+            {
+                [void]$sb.AppendLine(('<rect x="{0:F1}" y="{1:F1}" width="{2:F1}" height="{3:F1}" fill="{4}" rx="1"/>' -f $ox, $barY2, $sw, $barH, $seg.Color))
+                if ($sw -gt 30)
+                {
+                    $ptxt = '{0:F0}%' -f ($seg.Rate * 100)
+                    $txC = if ($seg.Color -eq $colorSelfCancel -or $seg.Color -eq $colorOther)
+                    {
+                        'pct-label-dark'
+                    }
+                    else
+                    {
+                        'pct-label'
+                    }
+                    [void]$sb.AppendLine(('<text class="{0}" x="{1:F1}" y="{2:F1}" text-anchor="middle">{3}</text>' -f $txC, ($ox + $sw / 2.0), ($barY2 + $barH / 2.0 + 3.5), (ConvertTo-SvgEscapedText -Text $ptxt)))
+                }
+            }
+            $ox += $sw
+        }
+        # 追加行数ラベル
+        [void]$sb.AppendLine(('<text class="added-label" x="{0:F1}" y="{1:F1}">{2} 行</text>' -f ($labelWidth + $barAreaWidth + 8.0), ($barY2 + $barH / 2.0 + 4.0), [int]$d.AddedLines))
+        # ピンポン率
+        $ppVal = '🔄 {0:F1}%' -f ($d.PingPongRate * 100)
+        [void]$sb.AppendLine(('<text class="pp-label" x="{0:F1}" y="{1:F1}">{2}</text>' -f ($labelWidth + $barAreaWidth + $addedLabelWidth + 8.0), ($barY2 + $barH / 2.0 + 4.0), (ConvertTo-SvgEscapedText -Text $ppVal)))
+    }
+
+    # 凡例
+    $legY = $headerHeight + ($chartData.Count * $rowHeight) + 12.0
+    $legItems = @(
+        [pscustomobject]@{ Color = $colorSurvived; Label = '生存' }
+        [pscustomobject]@{ Color = $colorSelfCancel; Label = '自己相殺' }
+        [pscustomobject]@{ Color = $colorRemovedByOthers; Label = '被他者削除' }
+        [pscustomobject]@{ Color = $colorOther; Label = 'その他' }
+    )
+    $legX = $labelWidth
+    foreach ($item in $legItems)
+    {
+        [void]$sb.AppendLine(('<rect x="{0}" y="{1}" width="12" height="12" fill="{2}" rx="2"/>' -f [int]$legX, [int]$legY, $item.Color))
+        [void]$sb.AppendLine(('<text class="legend-text" x="{0}" y="{1}">{2}</text>' -f [int]($legX + 16), [int]($legY + 11), (ConvertTo-SvgEscapedText -Text $item.Label)))
+        $legX += 90
+    }
+
+    [void]$sb.AppendLine('</svg>')
+    Write-TextFile -FilePath (Join-Path $OutDirectory 'committer_outcome_combined.svg') -Content $sb.ToString() -EncodingName $EncodingName
+}
+function Get-CommitterScatterData
 {
     <#
     .SYNOPSIS
-        全コミッターのレーダーチャートを横並びグリッドで 1 つの SVG にまとめて出力する。
+        コミッター行データからリワーク特性マップ用のデータを抽出する。
     .DESCRIPTION
-        TopN のコミッターごとに独立したレーダーチャートを描画し、
-        横並びのグリッドとして 1 枚の SVG に配置する。
-        各チャートの下部にレーダー面積スコア（総合指標）を併記し、
-        チーム全体の傾向を俯瞰できるようにする。
-        各指標は全コミッター間で min-max 正規化した相対評価値を使用する。
-    .PARAMETER OutDirectory
-        SVG ファイルを保存する出力先ディレクトリを指定する（必須）。
+        リワーク率とコード生存率を持つコミッターを抽出し、
+        散布図描画用のデータオブジェクトを返す。
     .PARAMETER Committers
-        Get-CommitterMetric が返すコミッター行配列を指定する（必須）。
+        Get-CommitterMetric が返すコミッター行配列を指定する。
     .PARAMETER TopNCount
-        総チャーン上位として SVG に描画する件数を指定する（0以下の場合は出力しない）。
+        総チャーン上位として抽出する件数を指定する。0 で全件。
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [object[]]$Committers,
+        [int]$TopNCount = 0
+    )
+    $rows = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($c in @($Committers))
+    {
+        if ($null -eq $c)
+        {
+            continue
+        }
+        $added = 0.0
+        if ($null -ne $c.'追加行数')
+        {
+            $added = [double]$c.'追加行数'
+        }
+        if ($added -le 0)
+        {
+            continue
+        }
+        if ($null -eq $c.'リワーク率' -or $null -eq $c.'生存行数')
+        {
+            continue
+        }
+        $reworkRate = [double]$c.'リワーク率'
+        $survivalRate = [double]$c.'生存行数' / $added
+        $totalChurn = 0.0
+        if ($null -ne $c.'総チャーン')
+        {
+            $totalChurn = [double]$c.'総チャーン'
+        }
+        [void]$rows.Add([pscustomobject][ordered]@{
+                Author = (Get-NormalizedAuthorName -Author ([string]$c.'作者'))
+                ReworkRate = $reworkRate
+                SurvivalRate = $survivalRate
+                TotalChurn = $totalChurn
+            })
+    }
+    if ($rows.Count -eq 0)
+    {
+        return @()
+    }
+    $sorted = @($rows.ToArray() | Sort-Object -Property @{Expression = 'TotalChurn'
+            Descending = $true
+        }, 'Author')
+    if ($TopNCount -gt 0 -and $sorted.Count -gt $TopNCount)
+    {
+        return @($sorted | Select-Object -First $TopNCount)
+    }
+    return $sorted
+}
+function Write-CommitterScatterChart
+{
+    <#
+    .SYNOPSIS
+        リワーク率 × コード生存率の散布図 SVG を出力する。
+    .DESCRIPTION
+        X 軸にリワーク率、Y 軸にコード生存率を取り、バブルサイズに総チャーンを
+        反映した散布図を生成する。個人用 SVG（自分のデータのみ＋象限ラベル）を
+        コミッター数分、およびリーダー用 SVG（全員プロット）を 1 枚出力する。
+        4 象限の解釈:
+        - 左上: 積み上げ型（新規追加中心で定着）
+        - 右上: 耕し型（書き換え多いが結果が定着）
+        - 左下: 使い捨て型（追加中心だが消されている）
+        - 右下: 手戻り型（書いては消すの繰り返し）
+    .PARAMETER OutDirectory
+        SVG ファイルを保存する出力先ディレクトリを指定する。
+    .PARAMETER Committers
+        Get-CommitterMetric が返すコミッター行配列を指定する。
+    .PARAMETER TopNCount
+        総チャーン上位として SVG を生成する件数を指定する。
     .PARAMETER EncodingName
         出力時に使用する文字エンコーディング名を指定する。
     .EXAMPLE
-        Write-CommitterRadarChartCombined -OutDirectory '.\output' -Committers $committers -TopNCount 10 -EncodingName 'UTF8'
+        Write-CommitterScatterChart -OutDirectory '.\output' -Committers $committers -TopNCount 10 -EncodingName 'UTF8'
     #>
     [CmdletBinding()]
     param(
@@ -5271,448 +5260,825 @@ function Write-CommitterRadarChartCombined
         [Parameter(Mandatory = $false)]
         [string]$EncodingName = 'UTF-8'
     )
-
     if ([string]::IsNullOrWhiteSpace($OutDirectory))
     {
-        Write-Warning 'Write-CommitterRadarChartCombined: OutDirectory が空です。'
+        Write-Warning 'Write-CommitterScatterChart: OutDirectory が空です。'
         return
     }
-
     if ($TopNCount -le 0)
     {
-        Write-Verbose 'Write-CommitterRadarChartCombined: TopNCount が 0 以下のため、出力しません。'
+        Write-Verbose 'Write-CommitterScatterChart: TopNCount が 0 以下のため、出力しません。'
         return
     }
-
     if (-not $Committers -or @($Committers).Count -eq 0)
     {
-        Write-Verbose 'Write-CommitterRadarChartCombined: Committers が空です。SVG を生成しません。'
+        Write-Verbose 'Write-CommitterScatterChart: Committers が空です。'
         return
     }
-
     if (-not (Test-Path -LiteralPath $OutDirectory))
     {
         try
         {
-            $null = New-Item -LiteralPath $OutDirectory -ItemType Directory -Force -ErrorAction Stop
+            New-Item -Path $OutDirectory -ItemType Directory -Force -ErrorAction Stop | Out-Null
         }
         catch
         {
-            Write-Warning "Write-CommitterRadarChartCombined: 出力ディレクトリの作成に失敗しました: $_"
+            Write-Warning "Write-CommitterScatterChart: ディレクトリ作成失敗: $_"
             return
         }
     }
 
-    # 軸定義（個別チャートと同一）
-    $axisDefinitions = @(
-        [pscustomobject][ordered]@{ Label = 'コード生存率'; Formula = '生存行数 / 追加行数'; Unit = '率'; Invert = $false },
-        [pscustomobject][ordered]@{ Label = '変更エントロピー'; Formula = 'ファイル別チャーンのエントロピー'; Unit = 'bit'; Invert = $false },
-        [pscustomobject][ordered]@{ Label = '自己相殺率'; Formula = '自己相殺行数 / 追加行数'; Unit = '率'; Invert = $true },
-        [pscustomobject][ordered]@{ Label = '被削除率'; Formula = '被他者削除行数 / 追加行数'; Unit = '率'; Invert = $true },
-        [pscustomobject][ordered]@{ Label = '他者コード変更生存率'; Formula = '他者コード変更生存行数 / 他者コード変更行数'; Unit = '率'; Invert = $false },
-        [pscustomobject][ordered]@{ Label = 'ピンポン率'; Formula = 'ピンポン回数 / コミット数'; Unit = '率'; Invert = $true },
-        [pscustomobject][ordered]@{ Label = '所有集中度'; Formula = '所有行数 / 全所有行数'; Unit = '率'; Invert = $false },
-        [pscustomobject][ordered]@{ Label = '定着コミット量'; Formula = '生存行数 / コミット数'; Unit = '行'; Invert = $false },
-        [pscustomobject][ordered]@{ Label = 'トータルコミット量'; Formula = '追加行数 + 削除行数'; Unit = '行'; Invert = $false }
+    $scatterData = @(Get-CommitterScatterData -Committers $Committers -TopNCount $TopNCount)
+    if ($scatterData.Count -eq 0)
+    {
+        return
+    }
+
+    # 描画定数
+    $plotLeft = 80.0
+    $plotTop = 60.0
+    $plotWidth = 400.0
+    $plotHeight = 400.0
+    $plotRight = $plotLeft + $plotWidth
+    $plotBottom = $plotTop + $plotHeight
+    $midX = $plotLeft + $plotWidth / 2.0
+    $midY = $plotTop + $plotHeight / 2.0
+
+    # バブルサイズ
+    $maxChurn = ($scatterData | Measure-Object -Property TotalChurn -Maximum).Maximum
+    if ($maxChurn -le 0)
+    {
+        $maxChurn = 1.0
+    }
+    $minBubble = 8.0
+    $maxBubble = 36.0
+
+    # 象限ラベル
+    $quadrants = @(
+        [pscustomobject]@{ X = $plotLeft + $plotWidth * 0.25; Y = $plotTop + $plotHeight * 0.2; Label = '🧱 積み上げ型' }
+        [pscustomobject]@{ X = $plotLeft + $plotWidth * 0.75; Y = $plotTop + $plotHeight * 0.2; Label = '🌱 耕し型' }
+        [pscustomobject]@{ X = $plotLeft + $plotWidth * 0.25; Y = $plotTop + $plotHeight * 0.8; Label = '🪦 使い捨て型' }
+        [pscustomobject]@{ X = $plotLeft + $plotWidth * 0.75; Y = $plotTop + $plotHeight * 0.8; Label = '🔥 手戻り型' }
     )
 
-    # データ収集
-    $chartRows = New-Object 'System.Collections.Generic.List[object]'
-    foreach ($committer in @($Committers))
-    {
-        if ($null -eq $committer)
-        {
-            continue
-        }
-        $addedLines = 0.0
-        if ($null -ne $committer.'追加行数')
-        {
-            $addedLines = [double]$committer.'追加行数'
-        }
-        if ($addedLines -le 0)
-        {
-            continue
-        }
-        $survivedLines = 0.0
-        if ($null -ne $committer.'生存行数')
-        {
-            $survivedLines = [double]$committer.'生存行数'
-        }
-        $changeEntropy = 0.0
-        if ($null -ne $committer.'変更エントロピー')
-        {
-            $changeEntropy = [double]$committer.'変更エントロピー'
-        }
-        $deletedLines = 0.0
-        if ($null -ne $committer.'削除行数')
-        {
-            $deletedLines = [double]$committer.'削除行数'
-        }
-        $selfCancelLines = 0.0
-        if ($null -ne $committer.'自己相殺行数')
-        {
-            $selfCancelLines = [double]$committer.'自己相殺行数'
-        }
-        $removedByOthers = 0.0
-        if ($null -ne $committer.'被他者削除行数')
-        {
-            $removedByOthers = [double]$committer.'被他者削除行数'
-        }
-        $otherChangeRate = 0.0
-        if ($null -ne $committer.'他者コード変更生存率')
-        {
-            $otherChangeRate = [double]$committer.'他者コード変更生存率'
-        }
-        $pingPongPerCommit = 0.0
-        if ($null -ne $committer.'ピンポン率')
-        {
-            $pingPongPerCommit = [double]$committer.'ピンポン率'
-        }
-        elseif ($null -ne $committer.'コミットあたりピンポン')
-        {
-            $pingPongPerCommit = [double]$committer.'コミットあたりピンポン'
-        }
-        $ownershipShare = 0.0
-        if ($null -ne $committer.'所有割合')
-        {
-            $ownershipShare = [double]$committer.'所有割合'
-        }
-        $totalChurn = 0.0
-        if ($null -ne $committer.'総チャーン')
-        {
-            $totalChurn = [double]$committer.'総チャーン'
-        }
-        $commitCount = 0.0
-        if ($null -ne $committer.'コミット数')
-        {
-            $commitCount = [double]$committer.'コミット数'
-        }
-        $retainedVolumePerCommit = 0.0
-        if ($commitCount -gt 0.0)
-        {
-            $retainedVolumePerCommit = $survivedLines / $commitCount
-        }
-        $totalCommitVolume = $addedLines + $deletedLines
+    # SVG CSS 共通
+    $cssBlock = @'
+<defs><style>
+  text { font-family: "Segoe UI", "Meiryo UI", sans-serif; }
+  .title { font-size: 16px; font-weight: bold; fill: #333; }
+  .subtitle { font-size: 11px; fill: #888; }
+  .axis-label { font-size: 12px; fill: #555; }
+  .tick-label { font-size: 10px; fill: #888; }
+  .quadrant-label { font-size: 13px; fill: #aaa; text-anchor: middle; }
+  .author-label { font-size: 11px; fill: #333; text-anchor: middle; }
+  .bubble { fill: #42a5f5; fill-opacity: 0.55; stroke: #1e88e5; stroke-width: 1.2; }
+  .bubble-self { fill: #ef5350; fill-opacity: 0.6; stroke: #c62828; stroke-width: 1.8; }
+  .grid-line { stroke: #e0e0e0; stroke-width: 0.6; }
+  .mid-line { stroke: #bdbdbd; stroke-width: 1; stroke-dasharray: 6,4; }
+  .axis-line { stroke: #999; stroke-width: 1.2; }
+</style></defs>
+'@
 
-        $rawScores = [ordered]@{
-            'コード生存率' = $survivedLines / $addedLines
-            '変更エントロピー' = $changeEntropy
-            '自己相殺率' = $selfCancelLines / $addedLines
-            '被削除率' = $removedByOthers / $addedLines
-            '他者コード変更生存率' = $otherChangeRate
-            'ピンポン率' = $pingPongPerCommit
-            '所有集中度' = $ownershipShare
-            '定着コミット量' = $retainedVolumePerCommit
-            'トータルコミット量' = $totalCommitVolume
+    # --- 個人用 SVG ---
+    $usedNames = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($row in $scatterData)
+    {
+        $authorDisplay = [string]$row.Author
+        $baseName = 'committer_scatter_' + $authorDisplay
+        $fileName = Get-SafeFileName -BaseName $baseName -Extension '.svg'
+        while (-not $usedNames.Add($fileName))
+        {
+            $baseName = $baseName + '_dup'
+            $fileName = Get-SafeFileName -BaseName $baseName -Extension '.svg'
         }
-        [void]$chartRows.Add([pscustomobject][ordered]@{
-                Author = (Get-NormalizedAuthorName -Author ([string]$committer.'作者'))
-                TotalChurn = $totalChurn
-                RawScores = $rawScores
-            })
+
+        $svgW = 600
+        $svgH = 560
+        $sb = New-Object System.Text.StringBuilder
+        [void]$sb.AppendLine('<?xml version="1.0" encoding="UTF-8"?>')
+        [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" width="{0}" height="{1}" viewBox="0 0 {0} {1}">' -f $svgW, $svgH))
+        [void]$sb.Append($cssBlock)
+        [void]$sb.AppendLine('<rect width="100%" height="100%" fill="#fafafa"/>')
+        $titleEscaped = ConvertTo-SvgEscapedText -Text ('{0} — リワーク特性マップ' -f $authorDisplay)
+        [void]$sb.AppendLine(('<text class="title" x="20" y="28">{0}</text>' -f $titleEscaped))
+        [void]$sb.AppendLine('<text class="subtitle" x="20" y="46">X: リワーク率 / Y: コード生存率 / 円の大きさ: 総チャーン</text>')
+
+        # プロットエリア
+        [void]$sb.AppendLine(('<rect x="{0}" y="{1}" width="{2}" height="{3}" fill="#fff" stroke="#ddd"/>' -f [int]$plotLeft, [int]$plotTop, [int]$plotWidth, [int]$plotHeight))
+        # 中央線（0.5）
+        [void]$sb.AppendLine(('<line class="mid-line" x1="{0}" y1="{1}" x2="{0}" y2="{2}"/>' -f [int]$midX, [int]$plotTop, [int]$plotBottom))
+        [void]$sb.AppendLine(('<line class="mid-line" x1="{0}" y1="{1}" x2="{2}" y2="{1}"/>' -f [int]$plotLeft, [int]$midY, [int]$plotRight))
+        # 軸ラベル
+        [void]$sb.AppendLine(('<text class="axis-label" x="{0}" y="{1}" text-anchor="middle">リワーク率</text>' -f [int]($plotLeft + $plotWidth / 2.0), [int]($plotBottom + 36)))
+        [void]$sb.AppendLine(('<text class="axis-label" x="16" y="{0}" text-anchor="middle" transform="rotate(-90,16,{0})">コード生存率</text>' -f [int]($plotTop + $plotHeight / 2.0)))
+        # 目盛り
+        for ($tick = 0.0; $tick -le 1.01; $tick += 0.25)
+        {
+            $tx = $plotLeft + $tick * $plotWidth
+            $ty = $plotBottom - $tick * $plotHeight
+            [void]$sb.AppendLine(('<text class="tick-label" x="{0:F0}" y="{1}" text-anchor="middle">{2:F0}%</text>' -f $tx, [int]($plotBottom + 16), ($tick * 100)))
+            [void]$sb.AppendLine(('<text class="tick-label" x="{0}" y="{1:F0}" text-anchor="end">{2:F0}%</text>' -f [int]($plotLeft - 6), ($ty + 4), ($tick * 100)))
+        }
+        # 象限ラベル
+        foreach ($q in $quadrants)
+        {
+            [void]$sb.AppendLine(('<text class="quadrant-label" x="{0:F0}" y="{1:F0}">{2}</text>' -f $q.X, $q.Y, (ConvertTo-SvgEscapedText -Text $q.Label)))
+        }
+        # 自分のバブル
+        $bx = $plotLeft + $row.ReworkRate * $plotWidth
+        $by = $plotBottom - $row.SurvivalRate * $plotHeight
+        $br = $minBubble + ($maxBubble - $minBubble) * [Math]::Sqrt($row.TotalChurn / $maxChurn)
+        [void]$sb.AppendLine(('<circle class="bubble-self" cx="{0:F1}" cy="{1:F1}" r="{2:F1}"><title>{3} (リワーク率:{4:F1}%, 生存率:{5:F1}%, チャーン:{6})</title></circle>' -f $bx, $by, $br, (ConvertTo-SvgEscapedText -Text $authorDisplay), ($row.ReworkRate * 100), ($row.SurvivalRate * 100), [int]$row.TotalChurn))
+        [void]$sb.AppendLine(('<text class="author-label" x="{0:F1}" y="{1:F1}">{2}</text>' -f $bx, ($by - $br - 4.0), (ConvertTo-SvgEscapedText -Text $authorDisplay)))
+
+        [void]$sb.AppendLine('</svg>')
+        Write-TextFile -FilePath (Join-Path $OutDirectory $fileName) -Content $sb.ToString() -EncodingName $EncodingName
     }
 
-    if ($chartRows.Count -eq 0)
-    {
-        return
-    }
-
-    # min-max 算出（全コミッター横断で相対評価）
-    $axisMinMax = @{}
-    foreach ($axis in $axisDefinitions)
-    {
-        $axisLabel = [string]$axis.Label
-        $axisValues = @($chartRows.ToArray() | ForEach-Object { [double]$_.RawScores[$axisLabel] })
-        $stats = $axisValues | Measure-Object -Minimum -Maximum
-        $axisMinMax[$axisLabel] = [pscustomobject][ordered]@{
-            Min = [double]$stats.Minimum
-            Max = [double]$stats.Maximum
-        }
-    }
-
-    $topChartRows = @($chartRows.ToArray() | Sort-Object -Property @{Expression = 'TotalChurn'
-            Descending = $true
-        }, 'Author')
-    if ($topChartRows.Count -eq 0)
-    {
-        return
-    }
-
-    # グリッドレイアウト定数
-    $axisCount = $axisDefinitions.Count
-    $gridColumns = [Math]::Min(3, $topChartRows.Count)
-    $gridRowCount = [Math]::Ceiling($topChartRows.Count / [double]$gridColumns)
-    $cellWidth = 420.0
-    $cellHeight = 440.0
-    $cellPadding = 16.0
-    $radius = 110.0
-    $labelRadius = 144.0
-    $axisLabelFontSize = 9.0
-    $titleFontSize = 13.0
-    $guideLevels = @(0.25, 0.5, 0.75, 1.0)
-    $headerHeight = 52.0
-    $svgWidth = ($cellWidth * $gridColumns) + ($cellPadding * ($gridColumns + 1))
-    $svgHeight = $headerHeight + ($cellHeight * $gridRowCount) + ($cellPadding * ($gridRowCount + 1))
-
-    # 各コミッターの正規化スコアとレーダー面積スコアを事前計算
-    $rowDataList = New-Object 'System.Collections.Generic.List[object]'
-    foreach ($row in $topChartRows)
-    {
-        $normalizedValues = New-Object 'System.Collections.Generic.List[double]'
-        for ($i = 0; $i -lt $axisCount; $i++)
-        {
-            $axisLabel = [string]$axisDefinitions[$i].Label
-            $rawValue = [double]$row.RawScores[$axisLabel]
-            $normalized = ConvertTo-NormalizedScore -Value $rawValue -Min ([double]$axisMinMax[$axisLabel].Min) -Max ([double]$axisMinMax[$axisLabel].Max) -Invert:$axisDefinitions[$i].Invert
-            [void]$normalizedValues.Add($normalized)
-        }
-        # レーダー面積スコア: Shoelace 公式による多角形面積 / 最大面積 * 100
-        $radarArea = 0.0
-        $angleStep = (2.0 * [Math]::PI) / [double]$axisCount
-        for ($i = 0; $i -lt $axisCount; $i++)
-        {
-            $j = ($i + 1) % $axisCount
-            $radarArea += $normalizedValues[$i] * $normalizedValues[$j] * [Math]::Sin($angleStep)
-        }
-        $radarArea = $radarArea / 2.0
-        # 最大面積 = 全軸が 1.0 の正 n 角形
-        $maxArea = ($axisCount / 2.0) * [Math]::Sin($angleStep)
-        $areaScore = 0.0
-        if ($maxArea -gt 0.0)
-        {
-            $areaScore = ($radarArea / $maxArea) * 100.0
-        }
-        [void]$rowDataList.Add([pscustomobject][ordered]@{
-                Row = $row
-                NormalizedValues = $normalizedValues.ToArray()
-                AreaScore = $areaScore
-            })
-    }
-
+    # --- リーダー用 SVG（全員プロット） ---
+    $svgW2 = 640
+    $svgH2 = 580
     $sb = New-Object System.Text.StringBuilder
-    [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {0} {1}" width="{0}" height="{1}" role="img" aria-label="チーム全体レーダーチャート（グリッド）">' -f $svgWidth, $svgHeight))
-    [void]$sb.AppendLine('  <defs>')
-    [void]$sb.AppendLine('    <style><![CDATA[')
-    [void]$sb.AppendLine('      text { font-family: "Segoe UI", "Yu Gothic UI", "Meiryo", sans-serif; }')
-    [void]$sb.AppendLine('      .page-title { font-size: 18px; font-weight: 700; fill: #1f2937; text-anchor: middle; }')
-    [void]$sb.AppendLine('      .page-subtitle { font-size: 11px; fill: #64748b; text-anchor: middle; }')
-    [void]$sb.AppendLine('      .cell-bg { fill: #ffffff; stroke: #e2e8f0; stroke-width: 1; rx: 8; ry: 8; }')
-    [void]$sb.AppendLine('      .cell-title { font-size: 13px; font-weight: 700; fill: #1f2937; text-anchor: middle; }')
-    [void]$sb.AppendLine('      .guide-line { stroke: #e2e8f0; stroke-width: 0.7; fill: none; }')
-    [void]$sb.AppendLine('      .axis-line { stroke: #d0d8e4; stroke-width: 0.7; }')
-    [void]$sb.AppendLine('      .axis-label { font-size: 9px; fill: #475569; dominant-baseline: middle; }')
-    [void]$sb.AppendLine('      .radar-area { fill: rgba(37, 99, 235, 0.25); stroke: #2563eb; stroke-width: 1.8; }')
-    [void]$sb.AppendLine('      .radar-point { fill: #1d4ed8; stroke: #ffffff; stroke-width: 0.8; }')
-    [void]$sb.AppendLine('      .raw-value { font-size: 9px; fill: #1e40af; font-weight: 600; }')
-    [void]$sb.AppendLine('      .area-score { font-size: 12px; font-weight: 700; fill: #1e40af; text-anchor: middle; }')
-    [void]$sb.AppendLine('      .area-label { font-size: 10px; fill: #64748b; text-anchor: middle; }')
-    [void]$sb.AppendLine('    ]]></style>')
-    [void]$sb.AppendLine('  </defs>')
-    [void]$sb.AppendLine(('  <rect x="0" y="0" width="{0}" height="{1}" fill="#f1f5f9" />' -f $svgWidth, $svgHeight))
-    [void]$sb.AppendLine(("  <text class=""page-title"" x=""{0:F2}"" y=""24"">チーム品質レーダーチャート</text>" -f ($svgWidth / 2.0)))
-    $subtitleText = '{0} 名 ─ 外側ほど高評価（相対比較）' -f $topChartRows.Count
-    [void]$sb.AppendLine(("  <text class=""page-subtitle"" x=""{0:F2}"" y=""42"">{1}</text>" -f ($svgWidth / 2.0), (ConvertTo-SvgEscapedText -Text $subtitleText)))
+    [void]$sb.AppendLine('<?xml version="1.0" encoding="UTF-8"?>')
+    [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" width="{0}" height="{1}" viewBox="0 0 {0} {1}">' -f $svgW2, $svgH2))
+    [void]$sb.Append($cssBlock)
+    [void]$sb.AppendLine('<rect width="100%" height="100%" fill="#fafafa"/>')
+    [void]$sb.AppendLine('<text class="title" x="20" y="28">リワーク特性マップ（チーム比較）</text>')
+    [void]$sb.AppendLine('<text class="subtitle" x="20" y="46">X: リワーク率 / Y: コード生存率 / 円の大きさ: 総チャーン</text>')
 
-    # 各セルの描画
-    for ($cellIdx = 0; $cellIdx -lt $topChartRows.Count; $cellIdx++)
+    # プロットエリア
+    [void]$sb.AppendLine(('<rect x="{0}" y="{1}" width="{2}" height="{3}" fill="#fff" stroke="#ddd"/>' -f [int]$plotLeft, [int]$plotTop, [int]$plotWidth, [int]$plotHeight))
+    [void]$sb.AppendLine(('<line class="mid-line" x1="{0}" y1="{1}" x2="{0}" y2="{2}"/>' -f [int]$midX, [int]$plotTop, [int]$plotBottom))
+    [void]$sb.AppendLine(('<line class="mid-line" x1="{0}" y1="{1}" x2="{2}" y2="{1}"/>' -f [int]$plotLeft, [int]$midY, [int]$plotRight))
+    # 軸ラベル
+    [void]$sb.AppendLine(('<text class="axis-label" x="{0}" y="{1}" text-anchor="middle">リワーク率</text>' -f [int]($plotLeft + $plotWidth / 2.0), [int]($plotBottom + 36)))
+    [void]$sb.AppendLine(('<text class="axis-label" x="16" y="{0}" text-anchor="middle" transform="rotate(-90,16,{0})">コード生存率</text>' -f [int]($plotTop + $plotHeight / 2.0)))
+    # 目盛り
+    for ($tick = 0.0; $tick -le 1.01; $tick += 0.25)
     {
-        $rowData = $rowDataList[$cellIdx]
-        $row = $rowData.Row
-        $normalizedValues = $rowData.NormalizedValues
-        $areaScore = $rowData.AreaScore
-
-        $colIdx = $cellIdx % $gridColumns
-        $gridRow = [Math]::Floor($cellIdx / [double]$gridColumns)
-        $cellX = $cellPadding + ($colIdx * ($cellWidth + $cellPadding))
-        $cellY = $headerHeight + $cellPadding + ($gridRow * ($cellHeight + $cellPadding))
-        $cellCenterX = $cellX + ($cellWidth / 2.0)
-        $cellCenterY = $cellY + 34.0 + $labelRadius + 10.0
-
-        # セル背景
-        [void]$sb.AppendLine(("  <rect class=""cell-bg"" x=""{0:F2}"" y=""{1:F2}"" width=""{2:F2}"" height=""{3:F2}"" />" -f $cellX, $cellY, $cellWidth, $cellHeight))
-
-        # 作者名タイトル
-        $authorName = [string]$row.Author
-        if ([string]::IsNullOrWhiteSpace($authorName))
-        {
-            $authorName = '(unknown)'
-        }
-        $fittedTitle = Get-SvgFittedText -Text $authorName -MaxWidth ($cellWidth - 40.0) -FontSize $titleFontSize
-        $escapedTitle = ConvertTo-SvgEscapedText -Text $fittedTitle
-        [void]$sb.AppendLine(("  <text class=""cell-title"" x=""{0:F2}"" y=""{1:F2}"">{2}</text>" -f $cellCenterX, ($cellY + 22.0), $escapedTitle))
-
-        # ガイドライン背景円
-        [void]$sb.AppendLine(("  <circle cx=""{0:F2}"" cy=""{1:F2}"" r=""{2:F2}"" fill=""#fafbfc"" stroke=""#e8ecf1"" stroke-width=""0.7"" />" -f $cellCenterX, $cellCenterY, ($radius + 6.0)))
-
-        # 外周ポイント計算
-        $outerPoints = New-Object 'System.Collections.Generic.List[object]'
-        for ($i = 0; $i -lt $axisCount; $i++)
-        {
-            $angle = (((2.0 * [Math]::PI) * $i) / [double]$axisCount) - ([Math]::PI / 2.0)
-            $xOuter = $cellCenterX + ($radius * [Math]::Cos($angle))
-            $yOuter = $cellCenterY + ($radius * [Math]::Sin($angle))
-            $axisLabel = [string]$axisDefinitions[$i].Label
-            $rawValue = [double]$row.RawScores[$axisLabel]
-            $rawDisplayCombined = if ([string]$axisDefinitions[$i].Unit -eq '行')
-            {
-                if ($rawValue -ge 10000)
-                {
-                    '{0:N0}' -f $rawValue
-                }
-                else
-                {
-                    '{0:F1}' -f $rawValue
-                }
-            }
-            elseif ([string]$axisDefinitions[$i].Unit -eq 'bit')
-            {
-                '{0:F2} bit' -f $rawValue
-            }
-            else
-            {
-                '{0:P1}' -f $rawValue
-            }
-            [void]$outerPoints.Add([pscustomobject][ordered]@{
-                    X = $xOuter
-                    Y = $yOuter
-                    Angle = $angle
-                    Label = $axisLabel
-                    Invert = [bool]$axisDefinitions[$i].Invert
-                    RawDisplay = $rawDisplayCombined
-                })
-        }
-
-        # ガイドライン（同心多角形）
-        foreach ($level in $guideLevels)
-        {
-            $guidePoints = @()
-            foreach ($point in @($outerPoints.ToArray()))
-            {
-                $gx = $cellCenterX + (($point.X - $cellCenterX) * $level)
-                $gy = $cellCenterY + (($point.Y - $cellCenterY) * $level)
-                $guidePoints += ('{0:F2},{1:F2}' -f $gx, $gy)
-            }
-            [void]$sb.AppendLine(("  <polygon class=""guide-line"" points=""{0}"" />" -f ($guidePoints -join ' ')))
-        }
-
-        # 軸線
-        foreach ($point in @($outerPoints.ToArray()))
-        {
-            [void]$sb.AppendLine(("  <line class=""axis-line"" x1=""{0:F2}"" y1=""{1:F2}"" x2=""{2:F2}"" y2=""{3:F2}"" />" -f $cellCenterX, $cellCenterY, $point.X, $point.Y))
-        }
-
-        # データポリゴン
-        $dataPoints = New-Object 'System.Collections.Generic.List[object]'
-        for ($i = 0; $i -lt $axisCount; $i++)
-        {
-            $angle = (((2.0 * [Math]::PI) * $i) / [double]$axisCount) - ([Math]::PI / 2.0)
-            $nv = $normalizedValues[$i]
-            $xData = $cellCenterX + (($radius * $nv) * [Math]::Cos($angle))
-            $yData = $cellCenterY + (($radius * $nv) * [Math]::Sin($angle))
-            [void]$dataPoints.Add([pscustomobject][ordered]@{
-                    X = $xData
-                    Y = $yData
-                })
-        }
-        $polygonPoints = @($dataPoints.ToArray() | ForEach-Object { '{0:F2},{1:F2}' -f $_.X, $_.Y }) -join ' '
-        [void]$sb.AppendLine(("  <polygon class=""radar-area"" points=""{0}"" />" -f $polygonPoints))
-        foreach ($point in @($dataPoints.ToArray()))
-        {
-            [void]$sb.AppendLine(("  <circle class=""radar-point"" cx=""{0:F2}"" cy=""{1:F2}"" r=""2.8"" />" -f $point.X, $point.Y))
-        }
-
-        # 軸ラベル（下部の重なり回避）
-        $labelItems2 = New-Object 'System.Collections.Generic.List[object]'
-        foreach ($point in @($outerPoints.ToArray()))
-        {
-            $labelX = $cellCenterX + ($labelRadius * [Math]::Cos($point.Angle))
-            $labelY = $cellCenterY + ($labelRadius * [Math]::Sin($point.Angle))
-            $anchor = 'middle'
-            $axisCos = [Math]::Cos($point.Angle)
-            if ($axisCos -gt 0.2)
-            {
-                $anchor = 'start'
-            }
-            elseif ($axisCos -lt -0.2)
-            {
-                $anchor = 'end'
-            }
-            [void]$labelItems2.Add([pscustomobject][ordered]@{
-                    X = $labelX
-                    Y = $labelY
-                    Anchor = $anchor
-                    Label = [string]$point.Label
-                    Invert = [bool]$point.Invert
-                    RawDisplay = [string]$point.RawDisplay
-                })
-        }
-
-        $minGap2 = 14.0
-        $bottomLabels2 = @($labelItems2.ToArray() | Where-Object { $_.Y -gt $cellCenterY })
-        $bottomSorted2 = @($bottomLabels2 | Sort-Object -Property Y)
-        for ($bi2 = 1; $bi2 -lt $bottomSorted2.Count; $bi2++)
-        {
-            $prev2 = $bottomSorted2[$bi2 - 1]
-            $curr2 = $bottomSorted2[$bi2]
-            $gap2 = $curr2.Y - $prev2.Y
-            if ($gap2 -lt $minGap2)
-            {
-                $curr2.Y = $prev2.Y + $minGap2
-            }
-        }
-
-        # Y が上半分のラベル重なり回避
-        $topLabels2 = @($labelItems2.ToArray() | Where-Object { $_.Y -lt $cellCenterY })
-        $topSorted2 = @($topLabels2 | Sort-Object -Property Y -Descending)
-        for ($ti2 = 1; $ti2 -lt $topSorted2.Count; $ti2++)
-        {
-            $prev2 = $topSorted2[$ti2 - 1]
-            $curr2 = $topSorted2[$ti2]
-            $gap2 = $prev2.Y - $curr2.Y
-            if ($gap2 -lt $minGap2)
-            {
-                $curr2.Y = $prev2.Y - $minGap2
-            }
-        }
-
-        foreach ($item2 in @($labelItems2.ToArray()))
-        {
-            $maxLabelWidth2 = 0.0
-            if ($item2.Anchor -eq 'start')
-            {
-                $maxLabelWidth2 = [Math]::Max(60.0, ($cellX + $cellWidth - 6.0) - $item2.X)
-            }
-            elseif ($item2.Anchor -eq 'end')
-            {
-                $maxLabelWidth2 = [Math]::Max(60.0, $item2.X - ($cellX + 6.0))
-            }
-            else
-            {
-                $maxLabelWidth2 = [Math]::Max(60.0, [Math]::Min($item2.X - ($cellX + 6.0), ($cellX + $cellWidth - 6.0) - $item2.X) * 2.0)
-            }
-            $dirMark2 = if ([bool]$item2.Invert)
-            {
-                '↕'
-            }
-            else
-            {
-                '↗'
-            }
-            $labelWithDir2 = '{0} {1}' -f [string]$item2.Label, $dirMark2
-            $fittedLabel = Get-SvgFittedText -Text $labelWithDir2 -MaxWidth $maxLabelWidth2 -FontSize $axisLabelFontSize
-            $escapedLabel = ConvertTo-SvgEscapedText -Text $fittedLabel
-            $escapedRawValue2 = ConvertTo-SvgEscapedText -Text ([string]$item2.RawDisplay)
-            [void]$sb.AppendLine(("  <text class=""axis-label"" x=""{0:F2}"" y=""{1:F2}"" text-anchor=""{2}""><tspan>{3}</tspan><tspan x=""{0:F2}"" dy=""1.1em"" class=""raw-value"">{4}</tspan></text>" -f $item2.X, $item2.Y, $item2.Anchor, $escapedLabel, $escapedRawValue2))
-        }
-
-        # レーダー面積スコア
-        $areaDisplayY = $cellY + $cellHeight - 28.0
-        [void]$sb.AppendLine(("  <text class=""area-label"" x=""{0:F2}"" y=""{1:F2}"">総合スコア（レーダー面積）</text>" -f $cellCenterX, $areaDisplayY))
-        [void]$sb.AppendLine(("  <text class=""area-score"" x=""{0:F2}"" y=""{1:F2}"">{2:F1}%</text>" -f $cellCenterX, ($areaDisplayY + 16.0), $areaScore))
+        $tx = $plotLeft + $tick * $plotWidth
+        $ty = $plotBottom - $tick * $plotHeight
+        [void]$sb.AppendLine(('<text class="tick-label" x="{0:F0}" y="{1}" text-anchor="middle">{2:F0}%</text>' -f $tx, [int]($plotBottom + 16), ($tick * 100)))
+        [void]$sb.AppendLine(('<text class="tick-label" x="{0}" y="{1:F0}" text-anchor="end">{2:F0}%</text>' -f [int]($plotLeft - 6), ($ty + 4), ($tick * 100)))
+    }
+    # 象限ラベル
+    foreach ($q in $quadrants)
+    {
+        [void]$sb.AppendLine(('<text class="quadrant-label" x="{0:F0}" y="{1:F0}">{2}</text>' -f $q.X, $q.Y, (ConvertTo-SvgEscapedText -Text $q.Label)))
+    }
+    # 全員のバブル（大きい順に描画して小さい方が前面に来る）
+    $sortedByChurn = @($scatterData | Sort-Object -Property TotalChurn -Descending)
+    $colorPalette = @('#42a5f5', '#66bb6a', '#ffa726', '#ab47bc', '#ef5350', '#26c6da', '#8d6e63', '#78909c', '#d4e157', '#ec407a')
+    for ($ci = 0; $ci -lt $sortedByChurn.Count; $ci++)
+    {
+        $d = $sortedByChurn[$ci]
+        $bx = $plotLeft + $d.ReworkRate * $plotWidth
+        $by = $plotBottom - $d.SurvivalRate * $plotHeight
+        $br = $minBubble + ($maxBubble - $minBubble) * [Math]::Sqrt($d.TotalChurn / $maxChurn)
+        $cIdx = $ci % $colorPalette.Count
+        $bColor = $colorPalette[$cIdx]
+        [void]$sb.AppendLine(('<circle cx="{0:F1}" cy="{1:F1}" r="{2:F1}" fill="{3}" fill-opacity="0.55" stroke="{3}" stroke-width="1.2"><title>{4} (リワーク率:{5:F1}%, 生存率:{6:F1}%, チャーン:{7})</title></circle>' -f $bx, $by, $br, $bColor, (ConvertTo-SvgEscapedText -Text $d.Author), ($d.ReworkRate * 100), ($d.SurvivalRate * 100), [int]$d.TotalChurn))
+        [void]$sb.AppendLine(('<text class="author-label" x="{0:F1}" y="{1:F1}">{2}</text>' -f $bx, ($by - $br - 4.0), (ConvertTo-SvgEscapedText -Text $d.Author)))
     }
 
     [void]$sb.AppendLine('</svg>')
-    Write-TextFile -FilePath (Join-Path $OutDirectory 'committer_radar_combined.svg') -Content $sb.ToString() -EncodingName $EncodingName
+    Write-TextFile -FilePath (Join-Path $OutDirectory 'committer_scatter_combined.svg') -Content $sb.ToString() -EncodingName $EncodingName
+}
+
+function Write-KillMatrixCsv
+{
+    <#
+    .SYNOPSIS
+        Kill Matrix（誰が誰のコードを何行消したか）を CSV ファイルに出力する。
+    .DESCRIPTION
+        Kill Matrix の pairwise データを CSV 形式で出力する。
+        行 = killer（消した人）、列 = victim（消された人）のクロス集計表。
+        対角線には自己相殺行数を配置する。
+    .PARAMETER OutDirectory
+        出力先ディレクトリを指定する。
+    .PARAMETER KillMatrix
+        killer → victim → lineCount のネストハッシュテーブルを指定する。
+    .PARAMETER AuthorSelfDead
+        作者 → 自己相殺行数のハッシュテーブルを指定する。
+    .PARAMETER Committers
+        Get-CommitterMetric が返すコミッター行配列を指定する。
+    .PARAMETER EncodingName
+        出力時に使用する文字エンコーディングを指定する。
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$OutDirectory,
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [hashtable]$KillMatrix,
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [hashtable]$AuthorSelfDead,
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [object[]]$Committers,
+        [Parameter(Mandatory = $false)]
+        [string]$EncodingName = 'UTF-8'
+    )
+    if ($null -eq $KillMatrix -or $null -eq $AuthorSelfDead)
+    {
+        return
+    }
+    if (-not $Committers -or @($Committers).Count -eq 0)
+    {
+        return
+    }
+    $authors = @($Committers | ForEach-Object { Get-NormalizedAuthorName -Author ([string]$_.'作者') } | Sort-Object)
+    if ($authors.Count -eq 0)
+    {
+        return
+    }
+    $rows = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($killer in $authors)
+    {
+        $row = [ordered]@{
+            '削除者＼被削除者' = $killer
+        }
+        foreach ($victim in $authors)
+        {
+            $count = 0
+            if ($killer -eq $victim)
+            {
+                $count = Get-HashtableIntValue -Table $AuthorSelfDead -Key $killer
+            }
+            elseif ($KillMatrix.ContainsKey($killer) -and $KillMatrix[$killer].ContainsKey($victim))
+            {
+                $count = [int]$KillMatrix[$killer][$victim]
+            }
+            $row[$victim] = $count
+        }
+        [void]$rows.Add([pscustomobject]$row)
+    }
+    $headers = @('削除者＼被削除者') + $authors
+    Write-CsvFile -FilePath (Join-Path $OutDirectory 'kill_matrix.csv') -Rows $rows.ToArray() -Headers $headers -EncodingName $EncodingName
+}
+
+function Write-SurvivedShareDonutChart
+{
+    <#
+    .SYNOPSIS
+        チーム全体の生存行数を作者別割合でドーナツチャートに描画する。
+    .DESCRIPTION
+        各コミッターの生存行数をドーナツチャートとして可視化する。
+        チームの最終的なコード資産が誰の手によるものかを一目で把握できる。
+    .PARAMETER OutDirectory
+        出力先ディレクトリを指定する。
+    .PARAMETER Committers
+        Get-CommitterMetric が返すコミッター行配列を指定する。
+    .PARAMETER EncodingName
+        出力時に使用する文字エンコーディングを指定する。
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$OutDirectory,
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [object[]]$Committers,
+        [Parameter(Mandatory = $false)]
+        [string]$EncodingName = 'UTF-8'
+    )
+    if ([string]::IsNullOrWhiteSpace($OutDirectory))
+    {
+        return
+    }
+    if (-not $Committers -or @($Committers).Count -eq 0)
+    {
+        return
+    }
+    $data = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($c in @($Committers))
+    {
+        if ($null -eq $c)
+        {
+            continue
+        }
+        $survived = 0.0
+        if ($null -ne $c.'生存行数')
+        {
+            $survived = [double]$c.'生存行数'
+        }
+        if ($survived -le 0)
+        {
+            continue
+        }
+        [void]$data.Add([pscustomobject]@{
+                Author = (Get-NormalizedAuthorName -Author ([string]$c.'作者'))
+                Survived = $survived
+            })
+    }
+    if ($data.Count -eq 0)
+    {
+        return
+    }
+    $sorted = @($data.ToArray() | Sort-Object -Property @{Expression = 'Survived'; Descending = $true }, 'Author')
+    $total = ($sorted | Measure-Object -Property Survived -Sum).Sum
+    if ($total -le 0)
+    {
+        return
+    }
+    if (-not (Test-Path -LiteralPath $OutDirectory))
+    {
+        New-Item -Path $OutDirectory -ItemType Directory -Force | Out-Null
+    }
+
+    $colorPalette = @('#42a5f5', '#66bb6a', '#ffa726', '#ab47bc', '#ef5350', '#26c6da', '#8d6e63', '#78909c', '#d4e157', '#ec407a')
+    $svgW = 640
+    $svgH = 420
+    $cx = 240.0
+    $cy = 220.0
+    $outerR = 140.0
+    $innerR = 80.0
+    $legendX = 420.0
+    $legendY = 80.0
+
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine('<?xml version="1.0" encoding="UTF-8"?>')
+    [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" width="{0}" height="{1}" viewBox="0 0 {0} {1}">' -f $svgW, $svgH))
+    [void]$sb.AppendLine(@'
+<defs><style>
+  text { font-family: "Segoe UI", "Meiryo UI", sans-serif; }
+  .title { font-size: 16px; font-weight: bold; fill: #333; }
+  .subtitle { font-size: 11px; fill: #888; }
+  .legend-text { font-size: 12px; fill: #333; }
+  .center-label { font-size: 14px; fill: #555; text-anchor: middle; }
+  .center-value { font-size: 22px; font-weight: bold; fill: #333; text-anchor: middle; }
+</style></defs>
+'@)
+    [void]$sb.AppendLine('<rect width="100%" height="100%" fill="#fafafa"/>')
+    [void]$sb.AppendLine('<text class="title" x="20" y="28">コード資産の帰属分布（生存行数）</text>')
+    [void]$sb.AppendLine(('<text class="subtitle" x="20" y="46">チーム全体の生存コード {0} 行の作者別内訳</text>' -f [int]$total))
+
+    # ドーナツ描画
+    $startAngle = -90.0
+    for ($i = 0; $i -lt $sorted.Count; $i++)
+    {
+        $d = $sorted[$i]
+        $share = $d.Survived / $total
+        $sweepAngle = $share * 360.0
+        if ($sweepAngle -lt 0.1)
+        {
+            continue
+        }
+        $cIdx = $i % $colorPalette.Count
+        $color = $colorPalette[$cIdx]
+
+        $startRad = $startAngle * [Math]::PI / 180.0
+        $endRad = ($startAngle + $sweepAngle) * [Math]::PI / 180.0
+        $largeArc = if ($sweepAngle -gt 180.0)
+        {
+            1
+        }
+        else
+        {
+            0
+        }
+
+        $ox1 = $cx + $outerR * [Math]::Cos($startRad)
+        $oy1 = $cy + $outerR * [Math]::Sin($startRad)
+        $ox2 = $cx + $outerR * [Math]::Cos($endRad)
+        $oy2 = $cy + $outerR * [Math]::Sin($endRad)
+        $ix1 = $cx + $innerR * [Math]::Cos($endRad)
+        $iy1 = $cy + $innerR * [Math]::Sin($endRad)
+        $ix2 = $cx + $innerR * [Math]::Cos($startRad)
+        $iy2 = $cy + $innerR * [Math]::Sin($startRad)
+
+        $pathD = ('M {0:F1} {1:F1} A {2:F1} {2:F1} 0 {3} 1 {4:F1} {5:F1} L {6:F1} {7:F1} A {8:F1} {8:F1} 0 {3} 0 {9:F1} {10:F1} Z' -f $ox1, $oy1, $outerR, $largeArc, $ox2, $oy2, $ix1, $iy1, $innerR, $ix2, $iy2)
+        $tooltipText = ('{0}: {1} 行 ({2:F1}%)' -f (ConvertTo-SvgEscapedText -Text $d.Author), [int]$d.Survived, ($share * 100))
+        [void]$sb.AppendLine(('<path d="{0}" fill="{1}" stroke="#fff" stroke-width="2"><title>{2}</title></path>' -f $pathD, $color, $tooltipText))
+
+        $startAngle += $sweepAngle
+    }
+
+    # 中央テキスト
+    [void]$sb.AppendLine(('<text class="center-value" x="{0}" y="{1}">{2}</text>' -f [int]$cx, [int]($cy + 4), [int]$total))
+    [void]$sb.AppendLine(('<text class="center-label" x="{0}" y="{1}">生存行数</text>' -f [int]$cx, [int]($cy + 24)))
+
+    # 凡例
+    for ($i = 0; $i -lt $sorted.Count; $i++)
+    {
+        $d = $sorted[$i]
+        $cIdx = $i % $colorPalette.Count
+        $color = $colorPalette[$cIdx]
+        $ly = $legendY + $i * 28
+        $share = $d.Survived / $total
+        [void]$sb.AppendLine(('<rect x="{0}" y="{1}" width="16" height="16" rx="3" fill="{2}"/>' -f [int]$legendX, [int]$ly, $color))
+        $legendLabel = ('{0}: {1} 行 ({2:F1}%)' -f (ConvertTo-SvgEscapedText -Text $d.Author), [int]$d.Survived, ($share * 100))
+        [void]$sb.AppendLine(('<text class="legend-text" x="{0}" y="{1}">{2}</text>' -f [int]($legendX + 22), [int]($ly + 13), $legendLabel))
+    }
+
+    [void]$sb.AppendLine('</svg>')
+    Write-TextFile -FilePath (Join-Path $OutDirectory 'team_survived_share.svg') -Content $sb.ToString() -EncodingName $EncodingName
+}
+
+function Write-TeamInteractionHeatMap
+{
+    <#
+    .SYNOPSIS
+        チーム内のコード削除関係をヒートマップで可視化する。
+    .DESCRIPTION
+        Kill Matrix（誰が誰のコードを何行消したか）をヒートマップとして描画する。
+        行 = 削除者（killer）、列 = 被削除者（victim）。
+        対角線には自己相殺行数を配置し、チーム内の相互作用パターンを可視化する。
+    .PARAMETER OutDirectory
+        出力先ディレクトリを指定する。
+    .PARAMETER KillMatrix
+        killer → victim → lineCount のネストハッシュテーブルを指定する。
+    .PARAMETER AuthorSelfDead
+        作者 → 自己相殺行数のハッシュテーブルを指定する。
+    .PARAMETER Committers
+        Get-CommitterMetric が返すコミッター行配列を指定する。
+    .PARAMETER EncodingName
+        出力時に使用する文字エンコーディングを指定する。
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$OutDirectory,
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [hashtable]$KillMatrix,
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [hashtable]$AuthorSelfDead,
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [object[]]$Committers,
+        [Parameter(Mandatory = $false)]
+        [string]$EncodingName = 'UTF-8'
+    )
+    if ([string]::IsNullOrWhiteSpace($OutDirectory))
+    {
+        return
+    }
+    if ($null -eq $KillMatrix -or $null -eq $AuthorSelfDead)
+    {
+        return
+    }
+    if (-not $Committers -or @($Committers).Count -eq 0)
+    {
+        return
+    }
+    $authors = @($Committers | ForEach-Object { Get-NormalizedAuthorName -Author ([string]$_.'作者') } | Sort-Object)
+    if ($authors.Count -lt 2)
+    {
+        return
+    }
+    if (-not (Test-Path -LiteralPath $OutDirectory))
+    {
+        New-Item -Path $OutDirectory -ItemType Directory -Force | Out-Null
+    }
+
+    # 値マトリクスの構築と最大値の取得
+    $matrix = @{}
+    $maxVal = 0
+    foreach ($killer in $authors)
+    {
+        $matrix[$killer] = @{}
+        foreach ($victim in $authors)
+        {
+            $val = 0
+            if ($killer -eq $victim)
+            {
+                $val = Get-HashtableIntValue -Table $AuthorSelfDead -Key $killer
+            }
+            elseif ($KillMatrix.ContainsKey($killer) -and $KillMatrix[$killer].ContainsKey($victim))
+            {
+                $val = [int]$KillMatrix[$killer][$victim]
+            }
+            $matrix[$killer][$victim] = $val
+            if ($val -gt $maxVal)
+            {
+                $maxVal = $val
+            }
+        }
+    }
+    if ($maxVal -le 0)
+    {
+        return
+    }
+
+    # レイアウト定数
+    $cellSize = 80
+    $headerSize = 100
+    $marginLeft = 30
+    $marginTop = 70
+    $n = $authors.Count
+    $gridLeft = $marginLeft + $headerSize
+    $gridTop = $marginTop + $headerSize
+    $svgW = $gridLeft + $n * $cellSize + 40
+    $svgH = $gridTop + $n * $cellSize + 40
+
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine('<?xml version="1.0" encoding="UTF-8"?>')
+    [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" width="{0}" height="{1}" viewBox="0 0 {0} {1}">' -f $svgW, $svgH))
+    [void]$sb.AppendLine(@'
+<defs><style>
+  text { font-family: "Segoe UI", "Meiryo UI", sans-serif; }
+  .title { font-size: 16px; font-weight: bold; fill: #333; }
+  .subtitle { font-size: 11px; fill: #888; }
+  .header-label { font-size: 12px; fill: #333; }
+  .cell-value { font-size: 13px; fill: #333; text-anchor: middle; dominant-baseline: central; }
+  .cell-value-light { font-size: 13px; fill: #fff; text-anchor: middle; dominant-baseline: central; }
+  .axis-title { font-size: 12px; fill: #666; font-weight: bold; }
+</style></defs>
+'@)
+    [void]$sb.AppendLine('<rect width="100%" height="100%" fill="#fafafa"/>')
+    [void]$sb.AppendLine('<text class="title" x="20" y="28">チーム相互作用ヒートマップ（コード削除関係）</text>')
+    [void]$sb.AppendLine('<text class="subtitle" x="20" y="46">行 = 削除者 / 列 = 被削除者（対角線 = 自己相殺）</text>')
+
+    # 軸タイトル
+    [void]$sb.AppendLine(('<text class="axis-title" x="{0}" y="{1}" text-anchor="middle">被削除者 →</text>' -f [int]($gridLeft + $n * $cellSize / 2), [int]($marginTop + $headerSize - 60)))
+    $rotateY = $gridTop + $n * $cellSize / 2
+    [void]$sb.AppendLine(('<text class="axis-title" x="{0}" y="{1}" text-anchor="middle" transform="rotate(-90,{0},{1})">削除者 →</text>' -f [int]($marginLeft + 10), [int]$rotateY))
+
+    # 列ヘッダー（被削除者）
+    for ($ci = 0; $ci -lt $n; $ci++)
+    {
+        $hx = $gridLeft + $ci * $cellSize + $cellSize / 2
+        $hy = $marginTop + $headerSize - 10
+        [void]$sb.AppendLine(('<text class="header-label" x="{0}" y="{1}" text-anchor="middle">{2}</text>' -f [int]$hx, [int]$hy, (ConvertTo-SvgEscapedText -Text $authors[$ci])))
+    }
+
+    # 行ヘッダーとセル
+    for ($ri = 0; $ri -lt $n; $ri++)
+    {
+        $killer = $authors[$ri]
+        $ry = $gridTop + $ri * $cellSize + $cellSize / 2
+        [void]$sb.AppendLine(('<text class="header-label" x="{0}" y="{1}" text-anchor="end" dominant-baseline="central">{2}</text>' -f [int]($gridLeft - 8), [int]$ry, (ConvertTo-SvgEscapedText -Text $killer)))
+
+        for ($ci = 0; $ci -lt $n; $ci++)
+        {
+            $victim = $authors[$ci]
+            $val = $matrix[$killer][$victim]
+            $cellX = $gridLeft + $ci * $cellSize
+            $cellY = $gridTop + $ri * $cellSize
+            $centerX = $cellX + $cellSize / 2
+            $centerY = $cellY + $cellSize / 2
+
+            # 色計算（白→赤グラデーション）
+            $t = 0.0
+            if ($maxVal -gt 0)
+            {
+                $t = [double]$val / [double]$maxVal
+            }
+            $rVal = 255
+            $gVal = [int][Math]::Round(255 * (1.0 - $t))
+            $bVal = [int][Math]::Round(255 * (1.0 - $t))
+            $cellColor = ('#{0}{1}{2}' -f $rVal.ToString('X2'), $gVal.ToString('X2'), $bVal.ToString('X2')).ToLowerInvariant()
+
+            # 対角線は青系統で区別
+            if ($ri -eq $ci)
+            {
+                $rVal = [int][Math]::Round(255 * (1.0 - $t * 0.6))
+                $gVal = [int][Math]::Round(255 * (1.0 - $t * 0.3))
+                $bVal = 255
+                $cellColor = ('#{0}{1}{2}' -f $rVal.ToString('X2'), $gVal.ToString('X2'), $bVal.ToString('X2')).ToLowerInvariant()
+            }
+
+            $textClass = if ($t -gt 0.6)
+            {
+                'cell-value-light'
+            }
+            else
+            {
+                'cell-value'
+            }
+            $tooltipText = ('{0} → {1}: {2} 行' -f (ConvertTo-SvgEscapedText -Text $killer), (ConvertTo-SvgEscapedText -Text $victim), $val)
+            [void]$sb.AppendLine(('<rect x="{0}" y="{1}" width="{2}" height="{2}" fill="{3}" stroke="#e0e0e0" stroke-width="1"><title>{4}</title></rect>' -f [int]$cellX, [int]$cellY, $cellSize, $cellColor, $tooltipText))
+            if ($val -gt 0)
+            {
+                [void]$sb.AppendLine(('<text class="{0}" x="{1}" y="{2}"><title>{3}</title>{4}</text>' -f $textClass, [int]$centerX, [int]$centerY, $tooltipText, $val))
+            }
+        }
+    }
+
+    [void]$sb.AppendLine('</svg>')
+    Write-TextFile -FilePath (Join-Path $OutDirectory 'team_interaction_heatmap.svg') -Content $sb.ToString() -EncodingName $EncodingName
+}
+
+function Get-TeamActivityProfileData
+{
+    <#
+    .SYNOPSIS
+        チーム活動プロファイル散布図用のデータを抽出する。
+    .DESCRIPTION
+        X 軸: 他者コード削除介入度（他者コード変更行数 / 削除行数）
+        Y 軸: 他者コード変更生存率
+        バブルサイズ: 総チャーン
+    .PARAMETER Committers
+        Get-CommitterMetric が返すコミッター行配列を指定する。
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [object[]]$Committers
+    )
+    $rows = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($c in @($Committers))
+    {
+        if ($null -eq $c)
+        {
+            continue
+        }
+        $deleted = 0.0
+        if ($null -ne $c.'削除行数')
+        {
+            $deleted = [double]$c.'削除行数'
+        }
+        $othersModified = 0.0
+        if ($null -ne $c.'他者コード変更行数')
+        {
+            $othersModified = [double]$c.'他者コード変更行数'
+        }
+        $othersSurvivalRate = 0.0
+        if ($null -ne $c.'他者コード変更生存率')
+        {
+            $othersSurvivalRate = [double]$c.'他者コード変更生存率'
+        }
+        $totalChurn = 0.0
+        if ($null -ne $c.'総チャーン')
+        {
+            $totalChurn = [double]$c.'総チャーン'
+        }
+        # 削除行数が 0 の場合は介入度を 0 とする
+        $interventionRate = 0.0
+        if ($deleted -gt 0)
+        {
+            $interventionRate = $othersModified / $deleted
+            if ($interventionRate -gt 1.0)
+            {
+                $interventionRate = 1.0
+            }
+        }
+        [void]$rows.Add([pscustomobject][ordered]@{
+                Author = (Get-NormalizedAuthorName -Author ([string]$c.'作者'))
+                InterventionRate = $interventionRate
+                OthersSurvivalRate = $othersSurvivalRate
+                TotalChurn = $totalChurn
+            })
+    }
+    if ($rows.Count -eq 0)
+    {
+        return @()
+    }
+    return @($rows.ToArray() | Sort-Object -Property @{Expression = 'TotalChurn'; Descending = $true }, 'Author')
+}
+
+function Write-TeamActivityProfileChart
+{
+    <#
+    .SYNOPSIS
+        チーム活動プロファイルの散布図 SVG を出力する。
+    .DESCRIPTION
+        X 軸に他者コード削除介入度（他者コード変更行数 / 削除行数）、
+        Y 軸に他者コード変更生存率を取り、バブルサイズに総チャーンを反映した
+        散布図を生成する。4 象限の解釈:
+        - 左上: 独立型（他者コードをあまり触らない）
+        - 右上: 改善者（他者コードを積極的に改善し、結果が定着）
+        - 左下: 孤立型（活動が少なく他者との接点も少ない）
+        - 右下: 破壊者（他者コードを積極的に消すが定着しない）
+    .PARAMETER OutDirectory
+        出力先ディレクトリを指定する。
+    .PARAMETER Committers
+        Get-CommitterMetric が返すコミッター行配列を指定する。
+    .PARAMETER EncodingName
+        出力時に使用する文字エンコーディングを指定する。
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$OutDirectory,
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [object[]]$Committers,
+        [Parameter(Mandatory = $false)]
+        [string]$EncodingName = 'UTF-8'
+    )
+    if ([string]::IsNullOrWhiteSpace($OutDirectory))
+    {
+        return
+    }
+    if (-not $Committers -or @($Committers).Count -eq 0)
+    {
+        return
+    }
+    if (-not (Test-Path -LiteralPath $OutDirectory))
+    {
+        New-Item -Path $OutDirectory -ItemType Directory -Force | Out-Null
+    }
+
+    $profileData = @(Get-TeamActivityProfileData -Committers $Committers)
+    if ($profileData.Count -eq 0)
+    {
+        return
+    }
+
+    # 描画定数
+    $plotLeft = 80.0
+    $plotTop = 60.0
+    $plotWidth = 400.0
+    $plotHeight = 400.0
+    $plotRight = $plotLeft + $plotWidth
+    $plotBottom = $plotTop + $plotHeight
+    $midX = $plotLeft + $plotWidth / 2.0
+    $midY = $plotTop + $plotHeight / 2.0
+
+    $maxChurn = ($profileData | Measure-Object -Property TotalChurn -Maximum).Maximum
+    if ($maxChurn -le 0)
+    {
+        $maxChurn = 1.0
+    }
+    $minBubble = 8.0
+    $maxBubble = 36.0
+
+    # 象限ラベル
+    $quadrants = @(
+        [pscustomobject]@{ X = $plotLeft + $plotWidth * 0.25; Y = $plotTop + $plotHeight * 0.2; Label = '🏠 独立型' }
+        [pscustomobject]@{ X = $plotLeft + $plotWidth * 0.75; Y = $plotTop + $plotHeight * 0.2; Label = '🌟 改善者' }
+        [pscustomobject]@{ X = $plotLeft + $plotWidth * 0.25; Y = $plotTop + $plotHeight * 0.8; Label = '🏝️ 孤立型' }
+        [pscustomobject]@{ X = $plotLeft + $plotWidth * 0.75; Y = $plotTop + $plotHeight * 0.8; Label = '💥 破壊者' }
+    )
+
+    $cssBlock = @'
+<defs><style>
+  text { font-family: "Segoe UI", "Meiryo UI", sans-serif; }
+  .title { font-size: 16px; font-weight: bold; fill: #333; }
+  .subtitle { font-size: 11px; fill: #888; }
+  .axis-label { font-size: 12px; fill: #555; }
+  .tick-label { font-size: 10px; fill: #888; }
+  .quadrant-label { font-size: 13px; fill: #aaa; text-anchor: middle; }
+  .author-label { font-size: 11px; fill: #333; text-anchor: middle; }
+  .grid-line { stroke: #e0e0e0; stroke-width: 0.6; }
+  .mid-line { stroke: #bdbdbd; stroke-width: 1; stroke-dasharray: 6,4; }
+  .axis-line { stroke: #999; stroke-width: 1.2; }
+</style></defs>
+'@
+
+    $svgW = 640
+    $svgH = 580
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine('<?xml version="1.0" encoding="UTF-8"?>')
+    [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" width="{0}" height="{1}" viewBox="0 0 {0} {1}">' -f $svgW, $svgH))
+    [void]$sb.Append($cssBlock)
+    [void]$sb.AppendLine('<rect width="100%" height="100%" fill="#fafafa"/>')
+    [void]$sb.AppendLine('<text class="title" x="20" y="28">チーム活動プロファイル</text>')
+    [void]$sb.AppendLine('<text class="subtitle" x="20" y="46">X: 他者コード削除介入度（他者変更行数÷削除行数） / Y: 他者コード変更生存率 / 円: 総チャーン</text>')
+
+    # プロットエリア
+    [void]$sb.AppendLine(('<rect x="{0}" y="{1}" width="{2}" height="{3}" fill="#fff" stroke="#ddd"/>' -f [int]$plotLeft, [int]$plotTop, [int]$plotWidth, [int]$plotHeight))
+    [void]$sb.AppendLine(('<line class="mid-line" x1="{0}" y1="{1}" x2="{0}" y2="{2}"/>' -f [int]$midX, [int]$plotTop, [int]$plotBottom))
+    [void]$sb.AppendLine(('<line class="mid-line" x1="{0}" y1="{1}" x2="{2}" y2="{1}"/>' -f [int]$plotLeft, [int]$midY, [int]$plotRight))
+    # 軸ラベル
+    [void]$sb.AppendLine(('<text class="axis-label" x="{0}" y="{1}" text-anchor="middle">他者コード削除介入度</text>' -f [int]($plotLeft + $plotWidth / 2.0), [int]($plotBottom + 36)))
+    [void]$sb.AppendLine(('<text class="axis-label" x="16" y="{0}" text-anchor="middle" transform="rotate(-90,16,{0})">他者コード変更生存率</text>' -f [int]($plotTop + $plotHeight / 2.0)))
+    # 目盛り
+    for ($tick = 0.0; $tick -le 1.01; $tick += 0.25)
+    {
+        $tx = $plotLeft + $tick * $plotWidth
+        $ty = $plotBottom - $tick * $plotHeight
+        [void]$sb.AppendLine(('<text class="tick-label" x="{0:F0}" y="{1}" text-anchor="middle">{2:F0}%</text>' -f $tx, [int]($plotBottom + 16), ($tick * 100)))
+        [void]$sb.AppendLine(('<text class="tick-label" x="{0}" y="{1:F0}" text-anchor="end">{2:F0}%</text>' -f [int]($plotLeft - 6), ($ty + 4), ($tick * 100)))
+    }
+    # 象限ラベル
+    foreach ($q in $quadrants)
+    {
+        [void]$sb.AppendLine(('<text class="quadrant-label" x="{0:F0}" y="{1:F0}">{2}</text>' -f $q.X, $q.Y, (ConvertTo-SvgEscapedText -Text $q.Label)))
+    }
+    # 全員のバブル
+    $colorPalette = @('#42a5f5', '#66bb6a', '#ffa726', '#ab47bc', '#ef5350', '#26c6da', '#8d6e63', '#78909c', '#d4e157', '#ec407a')
+    $sortedByChurn = @($profileData | Sort-Object -Property TotalChurn -Descending)
+    for ($ci = 0; $ci -lt $sortedByChurn.Count; $ci++)
+    {
+        $d = $sortedByChurn[$ci]
+        $bx = $plotLeft + $d.InterventionRate * $plotWidth
+        $by = $plotBottom - $d.OthersSurvivalRate * $plotHeight
+        $br = $minBubble + ($maxBubble - $minBubble) * [Math]::Sqrt($d.TotalChurn / $maxChurn)
+        $cIdx = $ci % $colorPalette.Count
+        $bColor = $colorPalette[$cIdx]
+        [void]$sb.AppendLine(('<circle cx="{0:F1}" cy="{1:F1}" r="{2:F1}" fill="{3}" fill-opacity="0.55" stroke="{3}" stroke-width="1.2"><title>{4} (介入度:{5:F1}%, 生存率:{6:F1}%, チャーン:{7})</title></circle>' -f $bx, $by, $br, $bColor, (ConvertTo-SvgEscapedText -Text $d.Author), ($d.InterventionRate * 100), ($d.OthersSurvivalRate * 100), [int]$d.TotalChurn))
+        [void]$sb.AppendLine(('<text class="author-label" x="{0:F1}" y="{1:F1}">{2}</text>' -f $bx, ($by - $br - 4.0), (ConvertTo-SvgEscapedText -Text $d.Author)))
+    }
+
+    [void]$sb.AppendLine('</svg>')
+    Write-TextFile -FilePath (Join-Path $OutDirectory 'team_activity_profile.svg') -Content $sb.ToString() -EncodingName $EncodingName
 }
 
 # endregion PlantUML 出力
@@ -7904,6 +8270,11 @@ function Update-StrictAttributionMetric
     $authorModifiedOthersSurvived = Get-AuthorModifiedOthersSurvivedCount -BlameByFile $blameByFile -RevsWhereKilledOthers $strictDetail.RevsWhereKilledOthers -FromRevision $FromRevision -ToRevision $ToRevision
     Update-FileRowWithStrictMetric -FileRows $FileRows -RenameMap $renameMap -StrictDetail $strictDetail -ExistingFileSet $existingFileSet -BlameByFile $blameByFile -TargetUrl $TargetUrl -ToRevision $ToRevision -CacheDir $CacheDir
     Update-CommitterRowWithStrictMetric -CommitterRows $CommitterRows -AuthorSurvived $authorSurvived -AuthorOwned $authorOwned -OwnedTotal $ownedTotal -StrictDetail $strictDetail -AuthorModifiedOthersSurvived $authorModifiedOthersSurvived
+
+    return [pscustomobject]@{
+        KillMatrix = $strictDetail.KillMatrix
+        AuthorSelfDead = $strictDetail.AuthorSelfDead
+    }
 }
 # endregion Strict メトリクス更新
 # region ヘッダーとメタデータ
@@ -7917,7 +8288,7 @@ function Get-MetricHeader
     [OutputType([object])]
     param()
     return [pscustomobject]@{
-        Committer = @('作者', 'コミット数', '活動日数', '変更ファイル数', '変更ディレクトリ数', '追加行数', '削除行数', '純増行数', '総チャーン', 'コミットあたりチャーン', '削除対追加比', 'チャーン対純増比', 'バイナリ変更回数', '追加アクション数', '変更アクション数', '削除アクション数', '置換アクション数', '生存行数', $script:ColDeadAdded, '所有行数', '所有割合', '自己相殺行数', '自己差戻行数', '他者差戻行数', '被他者削除行数', '同一箇所反復編集数', 'ピンポン回数', '内部移動行数', $script:ColSelfDead, $script:ColOtherDead, '他者コード変更行数', '他者コード変更生存行数', '他者コード変更生存率', 'ピンポン率', '変更エントロピー', '平均共同作者数', '最大共同作者数', 'メッセージ総文字数', 'メッセージ平均文字数', '課題ID言及数', '修正キーワード数', '差戻キーワード数', 'マージキーワード数')
+        Committer = @('作者', 'コミット数', '活動日数', '変更ファイル数', '変更ディレクトリ数', '追加行数', '削除行数', '純増行数', '総チャーン', 'コミットあたりチャーン', '削除対追加比', 'チャーン対純増比', 'リワーク率', 'バイナリ変更回数', '追加アクション数', '変更アクション数', '削除アクション数', '置換アクション数', '生存行数', $script:ColDeadAdded, '所有行数', '所有割合', '自己相殺行数', '自己差戻行数', '他者差戻行数', '被他者削除行数', '同一箇所反復編集数', 'ピンポン回数', '内部移動行数', $script:ColSelfDead, $script:ColOtherDead, '他者コード変更行数', '他者コード変更生存行数', '他者コード変更生存率', 'ピンポン率', '変更エントロピー', '平均共同作者数', '最大共同作者数', 'メッセージ総文字数', 'メッセージ平均文字数', '課題ID言及数', '修正キーワード数', '差戻キーワード数', 'マージキーワード数')
         File = @('ファイルパス', 'コミット数', '作者数', '追加行数', '削除行数', '純増行数', '総チャーン', 'バイナリ変更回数', '作成回数', '削除回数', '置換回数', '初回変更リビジョン', '最終変更リビジョン', '平均変更間隔日数', '生存行数 (範囲指定)', $script:ColDeadAdded, '最多作者チャーン占有率', '最多作者blame占有率', '自己相殺行数 (合計)', '他者差戻行数 (合計)', '同一箇所反復編集数 (合計)', 'ピンポン回数 (合計)', '内部移動行数 (合計)', 'ホットスポットスコア', 'ホットスポット順位')
         Commit = @('リビジョン', '日時', '作者', 'メッセージ文字数', 'メッセージ', '変更ファイル数', '追加行数', '削除行数', 'チャーン', 'エントロピー')
         Coupling = @('ファイルA', 'ファイルB', '共変更回数', 'Jaccard', 'リフト値')
@@ -8172,7 +8543,7 @@ try
 
     # --- ステップ 5: Strict 死亡帰属（blame ベースの行追跡） ---
     Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 5/8: Strict 帰属解析' -PercentComplete 45
-    Update-StrictAttributionMetric -Commits $commits -RevToAuthor $revToAuthor -TargetUrl $targetUrl -FromRevision $FromRev -ToRevision $ToRev -CacheDir $cacheDir -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -FileRows $fileRows -CommitterRows $committerRows -Parallel $Parallel
+    $strictResult = Update-StrictAttributionMetric -Commits $commits -RevToAuthor $revToAuthor -TargetUrl $targetUrl -FromRevision $FromRev -ToRevision $ToRev -CacheDir $cacheDir -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -FileRows $fileRows -CommitterRows $committerRows -Parallel $Parallel
 
     # --- ステップ 6: CSV レポート出力 ---
     Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 6/8: CSV レポート出力' -PercentComplete 80
@@ -8181,14 +8552,24 @@ try
     Write-CsvFile -FilePath (Join-Path $OutDir 'files.csv') -Rows $fileRows -Headers $headers.File -EncodingName $Encoding
     Write-CsvFile -FilePath (Join-Path $OutDir 'commits.csv') -Rows $commitRows -Headers $headers.Commit -EncodingName $Encoding
     Write-CsvFile -FilePath (Join-Path $OutDir 'couplings.csv') -Rows $couplingRows -Headers $headers.Coupling -EncodingName $Encoding
+    if ($null -ne $strictResult)
+    {
+        Write-KillMatrixCsv -OutDirectory $OutDir -KillMatrix $strictResult.KillMatrix -AuthorSelfDead $strictResult.AuthorSelfDead -Committers $committerRows -EncodingName $Encoding
+    }
     # --- ステップ 7: 可視化出力 ---
     Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 7/8: 可視化出力' -PercentComplete 88
     Write-PlantUmlFile -OutDirectory $OutDir -Committers $committerRows -Files $fileRows -Couplings $couplingRows -TopNCount $TopN -EncodingName $Encoding
     Write-FileBubbleChart -OutDirectory $OutDir -Files $fileRows -TopNCount $TopN -EncodingName $Encoding
     Write-FileHeatMap -OutDirectory $OutDir -Files $fileRows -TopNCount $TopN -EncodingName $Encoding
-    Write-CommitterRadarChart -OutDirectory $OutDir -Committers $committerRows -TopNCount $TopN -EncodingName $Encoding
-    Write-CommitterRadarChartCombined -OutDirectory $OutDir -Committers $committerRows -TopNCount $TopN -EncodingName $Encoding
+    Write-CommitterOutcomeChart -OutDirectory $OutDir -Committers $committerRows -TopNCount $TopN -EncodingName $Encoding
+    Write-CommitterScatterChart -OutDirectory $OutDir -Committers $committerRows -TopNCount $TopN -EncodingName $Encoding
     Write-FileTreeMap -OutDirectory $OutDir -Files $fileRows -EncodingName $Encoding
+    Write-SurvivedShareDonutChart -OutDirectory $OutDir -Committers $committerRows -EncodingName $Encoding
+    if ($null -ne $strictResult)
+    {
+        Write-TeamInteractionHeatMap -OutDirectory $OutDir -KillMatrix $strictResult.KillMatrix -AuthorSelfDead $strictResult.AuthorSelfDead -Committers $committerRows -EncodingName $Encoding
+    }
+    Write-TeamActivityProfileChart -OutDirectory $OutDir -Committers $committerRows -EncodingName $Encoding
 
     # --- ステップ 8: 実行メタデータとサマリーの書き出し ---
     Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 8/8: メタデータ出力' -PercentComplete 95
