@@ -116,6 +116,42 @@ $script:SvnBlameLineMemoryCache = @{}
 $script:SharedSha1 = New-Object System.Security.Cryptography.SHA1CryptoServiceProvider
 $script:DefaultColorPalette = @('#42a5f5', '#66bb6a', '#ffa726', '#ab47bc', '#ef5350', '#26c6da', '#8d6e63', '#78909c', '#d4e157', '#ec407a')
 
+# region SVG チャート共通レイアウト定数
+$script:SvgPlotLeft = 80.0
+$script:SvgPlotTop = 60.0
+$script:SvgPlotTopLarge = 72.0
+$script:SvgPlotWidth = 400.0
+$script:SvgPlotHeight = 400.0
+$script:SvgBubbleMin = 8.0
+$script:SvgBubbleMax = 36.0
+$script:SvgQuadrantTickStep = 0.25
+# endregion SVG チャート共通レイアウト定数
+
+# region セマンティックカラー（コード運命の意味的な色）
+$script:ColorSurvived = '#4caf50'
+$script:ColorSelfCancel = '#ffc107'
+$script:ColorRemovedByOthers = '#f44336'
+$script:ColorOtherDead = '#bdbdbd'
+$script:ColorChurn = '#ff7043'
+# endregion セマンティックカラー
+
+# region アルゴリズム閾値
+$script:RenameChainMaxDepth = 4096
+$script:TrivialLineMaxLength = 3
+$script:ContextHashNeighborK = 3
+$script:CommitMessageMaxLength = 140
+$script:HashTruncateLength = 8
+$script:HeatmapLightTextThreshold = 0.6
+# endregion アルゴリズム閾値
+
+# region SVG 文字幅推定比率
+$script:SvgCharWidthDefault = 0.56
+$script:SvgCharWidthSpace = 0.33
+$script:SvgCharWidthCjk = 1.00
+$script:SvgCharWidthNarrow = 0.34
+$script:SvgCharWidthWide = 0.82
+# endregion SVG 文字幅推定比率
+
 # region Utility
 # region 初期化
 function Initialize-StrictModeContext
@@ -1124,7 +1160,7 @@ function Resolve-PathByRenameMap
         return $resolved
     }
     $guard = 0
-    while ($RenameMap.ContainsKey($resolved) -and $guard -lt 4096)
+    while ($RenameMap.ContainsKey($resolved) -and $guard -lt $script:RenameChainMaxDepth)
     {
         $next = [string]$RenameMap[$resolved]
         if ([string]::IsNullOrWhiteSpace($next) -or $next -eq $resolved)
@@ -1758,7 +1794,7 @@ function Test-IsTrivialLine
     #>
     param([string]$Content)
     $t = $Content.Trim()
-    if ($t.Length -le 3)
+    if ($t.Length -le $script:TrivialLineMaxLength)
     {
         return $true
     }
@@ -1783,7 +1819,7 @@ function ConvertTo-ContextHash
     .PARAMETER K
         K の値を指定する。
     #>
-    param([string]$FilePath, [string[]]$ContextLines, [int]$K = 3)
+    param([string]$FilePath, [string[]]$ContextLines, [int]$K = $script:ContextHashNeighborK)
     $first = @()
     $last = @()
     if ($ContextLines -and $ContextLines.Count -gt 0)
@@ -4464,8 +4500,8 @@ function Write-FileBubbleChart
 
     $svgWidth = 640.0
     $svgHeight = 592.0
-    $plotLeft = 80.0
-    $plotTop = 72.0
+    $plotLeft = $script:SvgPlotLeft
+    $plotTop = $script:SvgPlotTopLarge
     $plotWidth = 480.0
     $plotHeight = 440.0
     $plotRight = $plotLeft + $plotWidth
@@ -4826,10 +4862,10 @@ function Write-FileQualityScatterChart
     }
 
     # 描画定数
-    $plotLeft = 80.0
-    $plotTop = 72.0
-    $plotWidth = 400.0
-    $plotHeight = 400.0
+    $plotLeft = $script:SvgPlotLeft
+    $plotTop = $script:SvgPlotTopLarge
+    $plotWidth = $script:SvgPlotWidth
+    $plotHeight = $script:SvgPlotHeight
     $plotRight = $plotLeft + $plotWidth
     $plotBottom = $plotTop + $plotHeight
     $midX = $plotLeft + $plotWidth / 2.0
@@ -4845,8 +4881,8 @@ function Write-FileQualityScatterChart
     {
         $maxRank = 1
     }
-    $minBubble = 8.0
-    $maxBubble = 36.0
+    $minBubble = $script:SvgBubbleMin
+    $maxBubble = $script:SvgBubbleMax
 
     $quadrants = @(
         [pscustomobject]@{ X = $plotLeft + $plotWidth * 0.25; Y = $plotTop + $plotHeight * 0.2; Label = '⚠️ 過剰修正型' }
@@ -4879,7 +4915,7 @@ function Write-FileQualityScatterChart
     [void]$sb.AppendLine(('<text class="axis-label" x="{0}" y="{1}" text-anchor="middle">コード消滅率</text>' -f [int]($plotLeft + $plotWidth / 2.0), [int]($plotBottom + 36)))
     [void]$sb.AppendLine(('<text class="axis-label" x="16" y="{0}" text-anchor="middle" transform="rotate(-90,16,{0})">無駄チャーン率</text>' -f [int]($plotTop + $plotHeight / 2.0)))
     # 目盛り
-    for ($tick = 0.0; $tick -le 1.01; $tick += 0.25)
+    for ($tick = 0.0; $tick -le 1.01; $tick += $script:SvgQuadrantTickStep)
     {
         $tx = $plotLeft + $tick * $plotWidth
         $ty = $plotBottom - $tick * $plotHeight
@@ -5029,7 +5065,7 @@ function Write-CommitTimelineChart
 
     # 描画定数
     $plotLeft = 100.0
-    $plotTop = 60.0
+    $plotTop = $script:SvgPlotTop
     $plotWidth = 560.0
     $plotHeight = 340.0
     $plotRight = $plotLeft + $plotWidth
@@ -5237,10 +5273,10 @@ function Write-CommitScatterChart
     }
 
     # 描画定数
-    $plotLeft = 80.0
-    $plotTop = 60.0
-    $plotWidth = 400.0
-    $plotHeight = 400.0
+    $plotLeft = $script:SvgPlotLeft
+    $plotTop = $script:SvgPlotTop
+    $plotWidth = $script:SvgPlotWidth
+    $plotHeight = $script:SvgPlotHeight
     $plotRight = $plotLeft + $plotWidth
     $plotBottom = $plotTop + $plotHeight
     $legendX = $plotRight + 20.0
@@ -5423,7 +5459,7 @@ function Get-SafeFileName
     {
         # 長すぎる場合は切り詰めてハッシュを付与
         # NOTE: MD5 はセキュリティ目的ではなく、ファイル名の一意性確保のみに使用
-        $hash = [BitConverter]::ToString([System.Security.Cryptography.MD5]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($safe))).Replace('-', '').Substring(0, 8).ToLowerInvariant()
+        $hash = [BitConverter]::ToString([System.Security.Cryptography.MD5]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($safe))).Replace('-', '').Substring(0, $script:HashTruncateLength).ToLowerInvariant()
         $truncLen = $maxBaseLen - 9
         if ($truncLen -lt 1)
         {
@@ -5599,10 +5635,10 @@ function Write-CommitterOutcomeChart
     }
 
     # --- 色定義 ---
-    $colorSurvived = '#4caf50'
-    $colorSelfCancel = '#ffc107'
-    $colorRemovedByOthers = '#f44336'
-    $colorOther = '#bdbdbd'
+    $colorSurvived = $script:ColorSurvived
+    $colorSelfCancel = $script:ColorSelfCancel
+    $colorRemovedByOthers = $script:ColorRemovedByOthers
+    $colorOther = $script:ColorOtherDead
 
     # --- 個人用 SVG（1人分のみ表示） ---
     $usedNames = New-Object 'System.Collections.Generic.HashSet[string]'
@@ -5920,10 +5956,10 @@ function Write-CommitterScatterChart
     }
 
     # 描画定数
-    $plotLeft = 80.0
-    $plotTop = 60.0
-    $plotWidth = 400.0
-    $plotHeight = 400.0
+    $plotLeft = $script:SvgPlotLeft
+    $plotTop = $script:SvgPlotTop
+    $plotWidth = $script:SvgPlotWidth
+    $plotHeight = $script:SvgPlotHeight
     $plotRight = $plotLeft + $plotWidth
     $plotBottom = $plotTop + $plotHeight
     $midX = $plotLeft + $plotWidth / 2.0
@@ -5935,8 +5971,8 @@ function Write-CommitterScatterChart
     {
         $maxChurn = 1.0
     }
-    $minBubble = 8.0
-    $maxBubble = 36.0
+    $minBubble = $script:SvgBubbleMin
+    $maxBubble = $script:SvgBubbleMax
 
     # 象限ラベル
     $quadrants = @(
@@ -5989,7 +6025,7 @@ function Write-CommitterScatterChart
         [void]$sb.AppendLine(('<text class="axis-label" x="{0}" y="{1}" text-anchor="middle">リワーク率</text>' -f [int]($plotLeft + $plotWidth / 2.0), [int]($plotBottom + 36)))
         [void]$sb.AppendLine(('<text class="axis-label" x="16" y="{0}" text-anchor="middle" transform="rotate(-90,16,{0})">コード生存率</text>' -f [int]($plotTop + $plotHeight / 2.0)))
         # 目盛り
-        for ($tick = 0.0; $tick -le 1.01; $tick += 0.25)
+        for ($tick = 0.0; $tick -le 1.01; $tick += $script:SvgQuadrantTickStep)
         {
             $tx = $plotLeft + $tick * $plotWidth
             $ty = $plotBottom - $tick * $plotHeight
@@ -6031,7 +6067,7 @@ function Write-CommitterScatterChart
     [void]$sb.AppendLine(('<text class="axis-label" x="{0}" y="{1}" text-anchor="middle">リワーク率</text>' -f [int]($plotLeft + $plotWidth / 2.0), [int]($plotBottom + 36)))
     [void]$sb.AppendLine(('<text class="axis-label" x="16" y="{0}" text-anchor="middle" transform="rotate(-90,16,{0})">コード生存率</text>' -f [int]($plotTop + $plotHeight / 2.0)))
     # 目盛り
-    for ($tick = 0.0; $tick -le 1.01; $tick += 0.25)
+    for ($tick = 0.0; $tick -le 1.01; $tick += $script:SvgQuadrantTickStep)
     {
         $tx = $plotLeft + $tick * $plotWidth
         $ty = $plotBottom - $tick * $plotHeight
@@ -6454,7 +6490,7 @@ function Write-TeamInteractionHeatMap
                 $cellColor = ('#{0}{1}{2}' -f $rVal.ToString('X2'), $gVal.ToString('X2'), $bVal.ToString('X2')).ToLowerInvariant()
             }
 
-            $textClass = if ($t -gt 0.6)
+            $textClass = if ($t -gt $script:HeatmapLightTextThreshold)
             {
                 'cell-value-light'
             }
@@ -6598,10 +6634,10 @@ function Write-TeamActivityProfileChart
     }
 
     # 描画定数
-    $plotLeft = 80.0
-    $plotTop = 60.0
-    $plotWidth = 400.0
-    $plotHeight = 400.0
+    $plotLeft = $script:SvgPlotLeft
+    $plotTop = $script:SvgPlotTop
+    $plotWidth = $script:SvgPlotWidth
+    $plotHeight = $script:SvgPlotHeight
     $plotRight = $plotLeft + $plotWidth
     $plotBottom = $plotTop + $plotHeight
     $midX = $plotLeft + $plotWidth / 2.0
@@ -6612,8 +6648,8 @@ function Write-TeamActivityProfileChart
     {
         $maxChurn = 1.0
     }
-    $minBubble = 8.0
-    $maxBubble = 36.0
+    $minBubble = $script:SvgBubbleMin
+    $maxBubble = $script:SvgBubbleMax
 
     # 象限ラベル
     $quadrants = @(
@@ -6646,7 +6682,7 @@ function Write-TeamActivityProfileChart
     [void]$sb.AppendLine(('<text class="axis-label" x="{0}" y="{1}" text-anchor="middle">他者コード削除介入度</text>' -f [int]($plotLeft + $plotWidth / 2.0), [int]($plotBottom + 36)))
     [void]$sb.AppendLine(('<text class="axis-label" x="16" y="{0}" text-anchor="middle" transform="rotate(-90,16,{0})">他者コード変更生存率</text>' -f [int]($plotTop + $plotHeight / 2.0)))
     # 目盛り
-    for ($tick = 0.0; $tick -le 1.01; $tick += 0.25)
+    for ($tick = 0.0; $tick -le 1.01; $tick += $script:SvgQuadrantTickStep)
     {
         $tx = $plotLeft + $tick * $plotWidth
         $ty = $plotBottom - $tick * $plotHeight
@@ -6760,10 +6796,10 @@ function Write-ProjectCodeFateChart
     }
 
     $segments = @(
-        [pscustomobject]@{ Label = '生存'; Value = $totalSurvived; Color = '#4caf50' }
-        [pscustomobject]@{ Label = '自己相殺'; Value = $totalSelfCancel; Color = '#ffc107' }
-        [pscustomobject]@{ Label = '被他者削除'; Value = $totalRemovedByOthers; Color = '#f44336' }
-        [pscustomobject]@{ Label = 'その他消滅'; Value = $totalOther; Color = '#bdbdbd' }
+        [pscustomobject]@{ Label = '生存'; Value = $totalSurvived; Color = $script:ColorSurvived }
+        [pscustomobject]@{ Label = '自己相殺'; Value = $totalSelfCancel; Color = $script:ColorSelfCancel }
+        [pscustomobject]@{ Label = '被他者削除'; Value = $totalRemovedByOthers; Color = $script:ColorRemovedByOthers }
+        [pscustomobject]@{ Label = 'その他消滅'; Value = $totalOther; Color = $script:ColorOtherDead }
     )
     # 値が 0 のセグメントを除外
     $segments = @($segments | Where-Object { $_.Value -gt 0 })
@@ -6998,10 +7034,10 @@ function Write-ProjectEfficiencyQuadrantChart
         return
     }
 
-    $plotLeft = 80.0
-    $plotTop = 72.0
-    $plotWidth = 400.0
-    $plotHeight = 400.0
+    $plotLeft = $script:SvgPlotLeft
+    $plotTop = $script:SvgPlotTopLarge
+    $plotWidth = $script:SvgPlotWidth
+    $plotHeight = $script:SvgPlotHeight
     $plotRight = $plotLeft + $plotWidth
     $plotBottom = $plotTop + $plotHeight
     $svgW = 600
@@ -7012,8 +7048,8 @@ function Write-ProjectEfficiencyQuadrantChart
     {
         $maxChurn = 1.0
     }
-    $minBubble = 8.0
-    $maxBubble = 36.0
+    $minBubble = $script:SvgBubbleMin
+    $maxBubble = $script:SvgBubbleMax
 
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine('<?xml version="1.0" encoding="UTF-8"?>')
@@ -7037,7 +7073,7 @@ function Write-ProjectEfficiencyQuadrantChart
     [void]$sb.AppendLine(('<line class="mid-line" x1="{0}" y1="{1}" x2="{0}" y2="{2}"/>' -f [int]$midX, [int]$plotTop, [int]$plotBottom))
     [void]$sb.AppendLine(('<line class="mid-line" x1="{0}" y1="{1}" x2="{2}" y2="{1}"/>' -f [int]$plotLeft, [int]$midY, [int]$plotRight))
     # 目盛りラベル
-    for ($tick = 0.0; $tick -le 1.01; $tick += 0.25)
+    for ($tick = 0.0; $tick -le 1.01; $tick += $script:SvgQuadrantTickStep)
     {
         $tx = $plotLeft + $tick * $plotWidth
         $ty = $plotBottom - $tick * $plotHeight
@@ -7277,7 +7313,7 @@ function Write-ProjectSummaryDashboard
     )
 
     # 色割り当て
-    $cardColors = @('#42a5f5', '#42a5f5', '#42a5f5', '#66bb6a', '#ef5350', '#ffa726', '#4caf50', '#ff7043', '#ab47bc')
+    $cardColors = @($script:DefaultColorPalette[0], $script:DefaultColorPalette[0], $script:DefaultColorPalette[0], $script:DefaultColorPalette[1], $script:DefaultColorPalette[4], $script:DefaultColorPalette[2], $script:ColorSurvived, $script:ColorChurn, $script:DefaultColorPalette[3])
 
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine('<?xml version="1.0" encoding="UTF-8"?>')
@@ -7448,8 +7484,8 @@ function Write-ContributorBalanceChart
     # 中央線
     [void]$sb.AppendLine(('<line x1="{0}" y1="{1}" x2="{0}" y2="{2}" stroke="#bdbdbd" stroke-width="1" stroke-dasharray="4,3"/>' -f [int]$centerX, [int]($marginTop - 6), [int]($marginTop + $n * ($barHeight + $barGap))))
 
-    $churnColor = '#ff7043'
-    $survivedColor = '#4caf50'
+    $churnColor = $script:ColorChurn
+    $survivedColor = $script:ColorSurvived
 
     for ($i = 0; $i -lt $n; $i++)
     {
@@ -7569,10 +7605,10 @@ function Get-SvgCharacterWidth
 
     $size = [Math]::Max(1.0, [double]$FontSize)
     $codePoint = [int]$Character
-    $ratio = 0.56
+    $ratio = $script:SvgCharWidthDefault
     if ([char]::IsWhiteSpace($Character))
     {
-        $ratio = 0.33
+        $ratio = $script:SvgCharWidthSpace
     }
     elseif (
         ($codePoint -ge 0x3000 -and $codePoint -le 0x303F) -or
@@ -7585,7 +7621,7 @@ function Get-SvgCharacterWidth
         ($codePoint -ge 0xFFE0 -and $codePoint -le 0xFFE6)
     )
     {
-        $ratio = 1.00
+        $ratio = $script:SvgCharWidthCjk
     }
     elseif (
         $Character -eq '.' -or
@@ -7599,7 +7635,7 @@ function Get-SvgCharacterWidth
         $Character -eq 'I'
     )
     {
-        $ratio = 0.34
+        $ratio = $script:SvgCharWidthNarrow
     }
     elseif (
         $Character -eq 'W' -or
@@ -7608,7 +7644,7 @@ function Get-SvgCharacterWidth
         $Character -eq '#'
     )
     {
-        $ratio = 0.82
+        $ratio = $script:SvgCharWidthWide
     }
 
     return [Math]::Round($ratio * $size, 2)
@@ -8430,9 +8466,9 @@ function Set-CommitDerivedMetric
     }
     $Commit.MsgLen = $message.Length
     $oneLineMessage = ($message -replace '(\r?\n)+', ' ').Trim()
-    if ($oneLineMessage.Length -gt 140)
+    if ($oneLineMessage.Length -gt $script:CommitMessageMaxLength)
     {
-        $oneLineMessage = $oneLineMessage.Substring(0, 140) + '...'
+        $oneLineMessage = $oneLineMessage.Substring(0, $script:CommitMessageMaxLength) + '...'
     }
     $Commit.MessageShort = $oneLineMessage
 }
