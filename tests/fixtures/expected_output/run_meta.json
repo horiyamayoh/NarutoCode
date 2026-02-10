@@ -12,7 +12,7 @@
     "NoBlame":  false,
     "DeadDetailLevel":  2,
     "Parallel":  16,
-    "TopN":  50,
+    "TopNCount":  50,
     "Encoding":  "UTF8",
     "CommitCount":  20,
     "FileCount":  23,

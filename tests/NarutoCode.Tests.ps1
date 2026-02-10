@@ -56,13 +56,13 @@ Describe 'ConvertTo-NormalizedExtension' {
 
 Describe 'Test-ShouldCountFile' {
     It 'applies include extension' {
-        Test-ShouldCountFile -FilePath 'src/a.cs' -IncludeExt @('cs') | Should -BeTrue
-        Test-ShouldCountFile -FilePath 'src/a.java' -IncludeExt @('cs') | Should -BeFalse
+        Test-ShouldCountFile -FilePath 'src/a.cs' -IncludeExtensions @('cs') | Should -BeTrue
+        Test-ShouldCountFile -FilePath 'src/a.java' -IncludeExtensions @('cs') | Should -BeFalse
     }
 
     It 'applies exclude extension' {
-        Test-ShouldCountFile -FilePath 'src/a.cs' -ExcludeExt @('cs') | Should -BeFalse
-        Test-ShouldCountFile -FilePath 'src/a.java' -ExcludeExt @('cs') | Should -BeTrue
+        Test-ShouldCountFile -FilePath 'src/a.cs' -ExcludeExtensions @('cs') | Should -BeFalse
+        Test-ShouldCountFile -FilePath 'src/a.java' -ExcludeExtensions @('cs') | Should -BeTrue
     }
 
     It 'applies include and exclude path patterns' {
@@ -231,21 +231,21 @@ Describe 'NarutoCode.ps1 parameter definition' {
         $script:cmd = Get-Command $script:ScriptPath
     }
 
-    It 'has required RepoUrl/FromRev/ToRev with compatibility aliases' {
+    It 'has required RepoUrl/FromRevision/ToRevision with compatibility aliases' {
         $script:cmd.Parameters['RepoUrl'] | Should -Not -BeNullOrEmpty
         $script:cmd.Parameters['RepoUrl'].Aliases -contains 'Path' | Should -BeTrue
 
-        $script:cmd.Parameters['FromRev'] | Should -Not -BeNullOrEmpty
-        $script:cmd.Parameters['FromRev'].Aliases -contains 'FromRevision' | Should -BeTrue
-        $script:cmd.Parameters['FromRev'].Aliases -contains 'From' | Should -BeTrue
+        $script:cmd.Parameters['FromRevision'] | Should -Not -BeNullOrEmpty
+        $script:cmd.Parameters['FromRevision'].Aliases -contains 'FromRev' | Should -BeTrue
+        $script:cmd.Parameters['FromRevision'].Aliases -contains 'From' | Should -BeTrue
 
-        $script:cmd.Parameters['ToRev'] | Should -Not -BeNullOrEmpty
-        $script:cmd.Parameters['ToRev'].Aliases -contains 'ToRevision' | Should -BeTrue
-        $script:cmd.Parameters['ToRev'].Aliases -contains 'To' | Should -BeTrue
+        $script:cmd.Parameters['ToRevision'] | Should -Not -BeNullOrEmpty
+        $script:cmd.Parameters['ToRevision'].Aliases -contains 'ToRev' | Should -BeTrue
+        $script:cmd.Parameters['ToRevision'].Aliases -contains 'To' | Should -BeTrue
     }
 
     It 'contains new Phase 1 parameters' {
-        $names = @('OutDir','Username','Password','NonInteractive','TrustServerCert','Parallel','IncludePaths','IgnoreWhitespace','TopN','Encoding')
+        $names = @('OutDirectory','Username','Password','NonInteractive','TrustServerCert','Parallel','IncludePaths','IgnoreWhitespace','TopNCount','Encoding')
         foreach ($name in $names) {
             $script:cmd.Parameters[$name] | Should -Not -BeNullOrEmpty
         }
@@ -555,11 +555,11 @@ Describe 'New-RunMetaData' {
             -ToRevision 2 `
             -SvnVersion '1.14.2' `
             -Parallel 4 `
-            -TopN 10 `
+            -TopNCount 10 `
             -Encoding 'UTF8' `
             -Commits @() `
             -FileRows @() `
-            -OutDir $script:runMetaDir `
+            -OutDirectory $script:runMetaDir `
             -IncludePaths @() `
             -ExcludePaths @() `
             -IncludeExtensions @() `
@@ -1016,12 +1016,12 @@ svn:mime-type = application/octet-stream
 }
 
 Describe 'Test-ShouldCountFile extended' {
-    It 'returns true for file with no extension when no IncludeExt specified' {
+    It 'returns true for file with no extension when no IncludeExtensions specified' {
         Test-ShouldCountFile -FilePath 'Makefile' | Should -BeTrue
     }
 
-    It 'returns false for file with no extension when IncludeExt specified' {
-        Test-ShouldCountFile -FilePath 'Makefile' -IncludeExt @('cs') | Should -BeFalse
+    It 'returns false for file with no extension when IncludeExtensions specified' {
+        Test-ShouldCountFile -FilePath 'Makefile' -IncludeExtensions @('cs') | Should -BeFalse
     }
 
     It 'returns false for blank/null path' {
@@ -1034,8 +1034,8 @@ Describe 'Test-ShouldCountFile extended' {
     }
 
     It 'combines include+exclude extensions' {
-        Test-ShouldCountFile -FilePath 'a.cs' -IncludeExt @('cs','java') -ExcludeExt @('cs') | Should -BeFalse
-        Test-ShouldCountFile -FilePath 'a.java' -IncludeExt @('cs','java') -ExcludeExt @('cs') | Should -BeTrue
+        Test-ShouldCountFile -FilePath 'a.cs' -IncludeExtensions @('cs','java') -ExcludeExtensions @('cs') | Should -BeFalse
+        Test-ShouldCountFile -FilePath 'a.java' -IncludeExtensions @('cs','java') -ExcludeExtensions @('cs') | Should -BeTrue
     }
 }
 
@@ -1338,8 +1338,8 @@ Describe 'NarutoCode.ps1 execution' {
             {
                 & $script:ScriptPath `
                     -RepoUrl 'https://svn.example.com/repos/proj/trunk' `
-                    -FromRev 1 -ToRev 2 `
-                    -OutDir $tempOut `
+                    -FromRevision 1 -ToRevision 2 `
+                    -OutDirectory $tempOut `
                     -SvnExecutable 'nonexistent_svn_command_xyz' `
                     -ErrorAction Stop
             } | Should -Throw -ExpectedMessage '*not found*'
@@ -1862,8 +1862,8 @@ Describe 'Integration — test SVN repo output matches baseline' -Tag 'Integrati
             $repoUrl = 'file:///' + ($script:repoDir -replace '\\', '/')
             & $script:ScriptPath `
                 -RepoUrl $repoUrl `
-                -FromRev 1 -ToRev 20 `
-                -OutDir $script:actualDir `
+                -FromRevision 1 -ToRevision 20 `
+                -OutDirectory $script:actualDir `
                 -SvnExecutable $script:svnExe `
                 -Encoding UTF8 `
                 -ErrorAction Stop
@@ -1954,22 +1954,22 @@ Describe 'Integration — test SVN repo output matches baseline' -Tag 'Integrati
         $meta.Outputs.SurvivedShareDonutSvg | Should -Be 'team_survived_share.svg'
     }
 
-    It 'keeps couplings.csv full even when TopN is 1' -Skip:($null -ne $script:skipReason) {
+    It 'keeps couplings.csv full even when TopNCount is 1' -Skip:($null -ne $script:skipReason) {
         $topNDir = Join-Path $env:TEMP ('narutocode_integ_topn_' + [guid]::NewGuid().ToString('N'))
         try {
             $repoUrl = 'file:///' + ($script:repoDir -replace '\\', '/')
             $null = & $script:ScriptPath `
                 -RepoUrl $repoUrl `
-                -FromRev 1 -ToRev 20 `
-                -OutDir $topNDir `
+                -FromRevision 1 -ToRevision 20 `
+                -OutDirectory $topNDir `
                 -SvnExecutable $script:svnExe `
-                -TopN 1 `
+                -TopNCount 1 `
                 -Encoding UTF8 `
                 -NoProgress `
                 -ErrorAction Stop
 
             $couplingLineCount = (Get-Content (Join-Path $topNDir 'couplings.csv') -Encoding UTF8).Count
-            $couplingLineCount | Should -BeGreaterThan 2 -Because '-TopN は可視化だけを制御し、CSV は全件出力するため'
+            $couplingLineCount | Should -BeGreaterThan 2 -Because '-TopNCount は可視化だけを制御し、CSV は全件出力するため'
         }
         finally {
             Remove-Item -Path $topNDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -2371,7 +2371,7 @@ Describe 'Update-StrictAttributionMetric parallel consistency' {
             }
         }
         Set-Item -Path function:Get-AllRepositoryFile -Value {
-            param([string]$Repo, [int]$Revision, [string[]]$IncludeExt, [string[]]$ExcludeExt, [string[]]$IncludePathPatterns, [string[]]$ExcludePathPatterns)
+            param([string]$TargetUrl, [int]$Revision, [string[]]$IncludeExtensions, [string[]]$ExcludeExtensions, [string[]]$IncludePathPatterns, [string[]]$ExcludePathPatterns)
             @('src/a.cs', 'src/b.cs', 'src/c.cs')
         }
         Set-Item -Path function:Get-SvnBlameSummary -Value {

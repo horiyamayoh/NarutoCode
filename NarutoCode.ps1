@@ -14,14 +14,14 @@
 .PARAMETER RepoUrl
     解析対象の SVN リポジトリ URL。trunk やブランチのパスまで含めて指定する。
     例: https://svn.example.com/repos/myproject/trunk
-.PARAMETER FromRev
+.PARAMETER FromRevision
     解析範囲の開始リビジョン番号。この番号のコミットから解析を開始する。
-.PARAMETER ToRev
+.PARAMETER ToRevision
     解析範囲の終了リビジョン番号。この番号のコミットまでを解析対象とする。
 .PARAMETER SvnExecutable
     使用する svn コマンドのパスまたは名前。デフォルトは 'svn'（PATH 上の svn を使用）。
     別バージョンの svn を使いたい場合はフルパスを指定する。
-.PARAMETER OutDir
+.PARAMETER OutDirectory
     解析結果（CSV / PlantUML / SVG / キャッシュ）の出力先ディレクトリ。
     未指定時はカレントディレクトリ直下に 'NarutoCode_out' を作成して使用する。
     同じディレクトリを再利用するとキャッシュが効き、再実行が高速になる。
@@ -56,7 +56,7 @@
 .PARAMETER ExcludeExtensions
     解析対象から除外する拡張子の配列。先頭のドットは省略可。
     例: @('dll', 'exe', 'png')
-.PARAMETER TopN
+.PARAMETER TopNCount
     可視化（ホットスポット図・共変更ネットワーク等）に表示する上位件数。
     デフォルトは 50。CSV レポートには全件出力されるため、このパラメータは
     可視化の見やすさ制御のみに影響する。
@@ -74,10 +74,10 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][Alias('Path')][string]$RepoUrl,
-    [Parameter(Mandatory = $true)][Alias('FromRevision', 'Pre', 'Start', 'StartRevision', 'From')][int]$FromRev,
-    [Parameter(Mandatory = $true)][Alias('ToRevision', 'Post', 'End', 'EndRevision', 'To')][int]$ToRev,
+    [Parameter(Mandatory = $true)][Alias('FromRev', 'Pre', 'Start', 'StartRevision', 'From')][int]$FromRevision,
+    [Parameter(Mandatory = $true)][Alias('ToRev', 'Post', 'End', 'EndRevision', 'To')][int]$ToRevision,
     [string]$SvnExecutable = 'svn',
-    [string]$OutDir = '',
+    [string]$OutDirectory = '',
     [string]$Username = '',
     [securestring]$Password = $null,
     [switch]$NonInteractive,
@@ -87,7 +87,7 @@ param(
     [string[]]$ExcludePaths = @(),
     [string[]]$IncludeExtensions = @(),
     [string[]]$ExcludeExtensions = @(),
-    [ValidateRange(1, 5000)][int]$TopN = 50,
+    [ValidateRange(1, 5000)][int]$TopNCount = 50,
     [ValidateSet('UTF8', 'UTF8BOM', 'Unicode', 'ASCII')][string]$Encoding = 'UTF8',
     [switch]$IgnoreWhitespace,
     [switch]$NoProgress
@@ -114,6 +114,7 @@ $script:StrictBlameCacheMisses = 0
 $script:SvnBlameSummaryMemoryCache = @{}
 $script:SvnBlameLineMemoryCache = @{}
 $script:SharedSha1 = New-Object System.Security.Cryptography.SHA1CryptoServiceProvider
+$script:DefaultColorPalette = @('#42a5f5', '#66bb6a', '#ffa726', '#ab47bc', '#ef5350', '#26c6da', '#8d6e63', '#78909c', '#d4e157', '#ec407a')
 
 # region Utility
 # region 初期化
@@ -162,7 +163,7 @@ function ConvertTo-NormalizedExtension
         $x = $x.ToLowerInvariant()
         if ($x)
         {
-            $null = $list.Add($x)
+            [void]$list.Add($x)
         }
     }
     return $list.ToArray() | Select-Object -Unique
@@ -188,10 +189,50 @@ function ConvertTo-NormalizedPatternList
         $x = $p.Trim()
         if ($x)
         {
-            $null = $list.Add($x)
+            [void]$list.Add($x)
         }
     }
     return $list.ToArray() | Select-Object -Unique
+}
+function Initialize-OutputDirectory
+{
+    <#
+    .SYNOPSIS
+        出力先ディレクトリが存在しない場合に作成する。
+    .PARAMETER Path
+        作成対象のディレクトリパスを指定する。
+    .PARAMETER CallerName
+        呼び出し元の関数名を指定する（エラーメッセージ用）。
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [Parameter(Mandatory = $false)]
+        [string]$CallerName = ''
+    )
+    if (-not (Test-Path -LiteralPath $Path))
+    {
+        try
+        {
+            New-Item -Path $Path -ItemType Directory -Force -ErrorAction Stop | Out-Null
+        }
+        catch
+        {
+            $context = if ($CallerName)
+            {
+                "${CallerName}: "
+            }
+            else
+            {
+                ''
+            }
+            Write-Warning "${context}ディレクトリ作成失敗: $_"
+            return $false
+        }
+    }
+    return $true
 }
 # endregion 初期化
 # region エンコーディングと入出力
@@ -547,8 +588,8 @@ catch
 '@
 
     $pool = [runspacefactory]::CreateRunspacePool($iss)
-    $null = $pool.SetMinRunspaces(1)
-    $null = $pool.SetMaxRunspaces($effectiveParallel)
+    [void]$pool.SetMinRunspaces(1)
+    [void]$pool.SetMaxRunspaces($effectiveParallel)
     $jobs = [System.Collections.Generic.List[object]]::new()
     $wrappedResults = [System.Collections.Generic.List[object]]::new()
     # 結果を元の入力順序で返すため、インデックスで管理する配列を事前確保する。
@@ -569,7 +610,7 @@ catch
             {
                 $ps = [PowerShell]::Create()
                 $ps.RunspacePool = $pool
-                $null = $ps.AddScript($invokeScript).AddArgument($workerText).AddArgument($items[$nextIndex]).AddArgument($nextIndex)
+                [void]$ps.AddScript($invokeScript).AddArgument($workerText).AddArgument($items[$nextIndex]).AddArgument($nextIndex)
                 $handle = $ps.BeginInvoke()
                 [void]$jobs.Add([pscustomobject]@{
                         Index = $nextIndex
@@ -692,7 +733,7 @@ catch
                 }
                 catch
                 {
-                    $null = $_
+                    [void]$_
                 }
             }
         }
@@ -1104,7 +1145,7 @@ function Get-DiffLineStat
     param([string]$DiffText)
     $added = 0
     $deleted = 0
-    if ([string]::IsNullOrEmpty($DiffText))
+    if ([string]::IsNullOrWhiteSpace($DiffText))
     {
         return [pscustomobject]@{ AddedLines = 0; DeletedLines = 0 }
     }
@@ -1137,13 +1178,13 @@ function Get-AllRepositoryFile
     <#
     .SYNOPSIS
         対象リビジョンのリポジトリ内ファイル一覧を条件付きで取得する。
-    .PARAMETER Repo
+    .PARAMETER TargetUrl
         対象 SVN リポジトリ URL を指定する。
     .PARAMETER Revision
         処理対象のリビジョン値を指定する。
-    .PARAMETER IncludeExt
+    .PARAMETER IncludeExtensions
         対象を絞り込むための包含または除外条件を指定する。
-    .PARAMETER ExcludeExt
+    .PARAMETER ExcludeExtensions
         対象を絞り込むための包含または除外条件を指定する。
     .PARAMETER IncludePathPatterns
         対象を絞り込むための包含または除外条件を指定する。
@@ -1152,8 +1193,8 @@ function Get-AllRepositoryFile
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
-    param([string]$Repo, [int]$Revision, [string[]]$IncludeExt, [string[]]$ExcludeExt, [string[]]$IncludePathPatterns, [string[]]$ExcludePathPatterns)
-    $xmlText = Invoke-SvnCommand -Arguments @('list', '-R', '--xml', '-r', [string]$Revision, $Repo) -ErrorContext 'svn list'
+    param([string]$TargetUrl, [int]$Revision, [string[]]$IncludeExtensions, [string[]]$ExcludeExtensions, [string[]]$IncludePathPatterns, [string[]]$ExcludePathPatterns)
+    $xmlText = Invoke-SvnCommand -Arguments @('list', '-R', '--xml', '-r', [string]$Revision, $TargetUrl) -ErrorContext 'svn list'
     $xml = ConvertFrom-SvnXmlText -Text $xmlText -ContextLabel 'svn list'
     $nodes = @()
     if ($xml)
@@ -1181,7 +1222,7 @@ function Get-AllRepositoryFile
         {
             continue
         }
-        if (Test-ShouldCountFile -FilePath $path -IncludeExt $IncludeExt -ExcludeExt $ExcludeExt -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns)
+        if (Test-ShouldCountFile -FilePath $path -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns)
         {
             [void]$files.Add($path)
         }
@@ -1288,16 +1329,16 @@ function Test-ShouldCountFile
         この判定を共通化することで diff・blame・集計の対象ずれを防ぐ。
     .PARAMETER FilePath
         処理対象のファイルパスを指定する。
-    .PARAMETER IncludeExt
+    .PARAMETER IncludeExtensions
         対象を絞り込むための包含または除外条件を指定する。
-    .PARAMETER ExcludeExt
+    .PARAMETER ExcludeExtensions
         対象を絞り込むための包含または除外条件を指定する。
     .PARAMETER IncludePathPatterns
         対象を絞り込むための包含または除外条件を指定する。
     .PARAMETER ExcludePathPatterns
         対象を絞り込むための包含または除外条件を指定する。
     #>
-    param([string]$FilePath, [string[]]$IncludeExt, [string[]]$ExcludeExt, [string[]]$IncludePathPatterns, [string[]]$ExcludePathPatterns)
+    param([string]$FilePath, [string[]]$IncludeExtensions, [string[]]$ExcludeExtensions, [string[]]$IncludePathPatterns, [string[]]$ExcludePathPatterns)
     if ([string]::IsNullOrWhiteSpace($FilePath))
     {
         return $false
@@ -1334,20 +1375,20 @@ function Test-ShouldCountFile
         }
     }
     $ext = [System.IO.Path]::GetExtension($path)
-    if ([string]::IsNullOrEmpty($ext))
+    if ([string]::IsNullOrWhiteSpace($ext))
     {
-        if ($IncludeExt -and $IncludeExt.Count -gt 0)
+        if ($IncludeExtensions -and $IncludeExtensions.Count -gt 0)
         {
             return $false
         }
         return $true
     }
     $ext = $ext.TrimStart('.').ToLowerInvariant()
-    if ($IncludeExt -and $IncludeExt.Count -gt 0 -and -not ($IncludeExt -contains $ext))
+    if ($IncludeExtensions -and $IncludeExtensions.Count -gt 0 -and -not ($IncludeExtensions -contains $ext))
     {
         return $false
     }
-    if ($ExcludeExt -and $ExcludeExt.Count -gt 0 -and ($ExcludeExt -contains $ext))
+    if ($ExcludeExtensions -and $ExcludeExtensions.Count -gt 0 -and ($ExcludeExtensions -contains $ext))
     {
         return $false
     }
@@ -1372,11 +1413,11 @@ function Join-CommandArgument
         $t = [string]$a
         if ($t -match '[\s"]')
         {
-            $null = $parts.Add('"' + $t.Replace('"', '\"') + '"')
+            [void]$parts.Add('"' + $t.Replace('"', '\"') + '"')
         }
         else
         {
-            $null = $parts.Add($t)
+            [void]$parts.Add($t)
         }
     }
     return ($parts.ToArray() -join ' ')
@@ -1391,13 +1432,13 @@ function Invoke-SvnCommand
     $all = New-Object 'System.Collections.Generic.List[string]'
     foreach ($a in $Arguments)
     {
-        $null = $all.Add([string]$a)
+        [void]$all.Add([string]$a)
     }
     if ($script:SvnGlobalArguments)
     {
         foreach ($a in $script:SvnGlobalArguments)
         {
-            $null = $all.Add([string]$a)
+            [void]$all.Add([string]$a)
         }
     }
     try
@@ -1413,7 +1454,7 @@ function Invoke-SvnCommand
         $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo = $psi
-        $null = $process.Start()
+        [void]$process.Start()
         $errTask = $process.StandardError.ReadToEndAsync()
         $out = $process.StandardOutput.ReadToEnd()
         $errTask.Wait()
@@ -1575,7 +1616,7 @@ function ConvertFrom-SvnLogXml
         }
         catch
         {
-            $null = $_
+            [void]$_
         }
         $authorNode = $e.SelectSingleNode('author')
         $author = if ($authorNode)
@@ -1606,7 +1647,7 @@ function ConvertFrom-SvnLogXml
                 }
                 catch
                 {
-                    $null = $_
+                    [void]$_
                     $date = $null
                 }
             }
@@ -1649,7 +1690,7 @@ function ConvertFrom-SvnLogXml
                 }
                 catch
                 {
-                    $null = $_
+                    [void]$_
                 }
             }
             $isDirectory = $false
@@ -1775,7 +1816,7 @@ function ConvertFrom-SvnUnifiedDiff
     #>
     [CmdletBinding()]param([string]$DiffText, [int]$DetailLevel = 0)
     $result = @{}
-    if ([string]::IsNullOrEmpty($DiffText))
+    if ([string]::IsNullOrWhiteSpace($DiffText))
     {
         return $result
     }
@@ -2001,7 +2042,7 @@ function ConvertFrom-SvnBlameXml
         }
         catch
         {
-            $null = $_
+            [void]$_
         }
         if ($null -ne $rev)
         {
@@ -2131,11 +2172,11 @@ function Get-SvnBlameSummary
 
     $url = $Repo.TrimEnd('/') + '/' + (ConvertTo-PathKey -Path $FilePath).TrimStart('/') + '@' + [string]$ToRevision
     $text = Read-BlameCacheFile -CacheDir $CacheDir -Revision $ToRevision -FilePath $FilePath
-    if ([string]::IsNullOrEmpty($text))
+    if ([string]::IsNullOrWhiteSpace($text))
     {
         $script:StrictBlameCacheMisses++
         $text = Invoke-SvnCommandAllowMissingTarget -Arguments @('blame', '--xml', '-r', [string]$ToRevision, $url) -ErrorContext ("svn blame $FilePath")
-        if (-not [string]::IsNullOrEmpty($text))
+        if (-not [string]::IsNullOrWhiteSpace($text))
         {
             Write-BlameCacheFile -CacheDir $CacheDir -Revision $ToRevision -FilePath $FilePath -Content $text
         }
@@ -2144,7 +2185,7 @@ function Get-SvnBlameSummary
     {
         $script:StrictBlameCacheHits++
     }
-    if ([string]::IsNullOrEmpty($text))
+    if ([string]::IsNullOrWhiteSpace($text))
     {
         $empty = Get-EmptyBlameResult
         $script:SvnBlameSummaryMemoryCache[$cacheKey] = $empty
@@ -2188,11 +2229,11 @@ function Get-SvnBlameLine
     $url = $Repo.TrimEnd('/') + '/' + $path + '@' + [string]$Revision
 
     $blameXml = Read-BlameCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
-    if ([string]::IsNullOrEmpty($blameXml))
+    if ([string]::IsNullOrWhiteSpace($blameXml))
     {
         $script:StrictBlameCacheMisses++
         $blameXml = Invoke-SvnCommandAllowMissingTarget -Arguments @('blame', '--xml', '-r', [string]$Revision, $url) -ErrorContext ("svn blame $FilePath@$Revision")
-        if (-not [string]::IsNullOrEmpty($blameXml))
+        if (-not [string]::IsNullOrWhiteSpace($blameXml))
         {
             Write-BlameCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath -Content $blameXml
         }
@@ -2211,7 +2252,7 @@ function Get-SvnBlameLine
             Write-CatCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath -Content $catText
         }
     }
-    if ([string]::IsNullOrEmpty($blameXml) -or $null -eq $catText)
+    if ([string]::IsNullOrWhiteSpace($blameXml) -or $null -eq $catText)
     {
         $empty = Get-EmptyBlameResult
         $script:SvnBlameLineMemoryCache[$cacheKey] = $empty
@@ -2254,11 +2295,11 @@ function Initialize-SvnBlameLineCache
     $misses = 0
 
     $blameXml = Read-BlameCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
-    if ([string]::IsNullOrEmpty($blameXml))
+    if ([string]::IsNullOrWhiteSpace($blameXml))
     {
         $misses++
         $blameXml = Invoke-SvnCommandAllowMissingTarget -Arguments @('blame', '--xml', '-r', [string]$Revision, $url) -ErrorContext ("svn blame $FilePath@$Revision")
-        if (-not [string]::IsNullOrEmpty($blameXml))
+        if (-not [string]::IsNullOrWhiteSpace($blameXml))
         {
             Write-BlameCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath -Content $blameXml
         }
@@ -2724,7 +2765,7 @@ function Get-CommitFileTransition
         [void]$pathMap[$path].Add($p)
         if (([string]$p.Action).ToUpperInvariant() -eq 'D')
         {
-            $null = $deleted.Add($path)
+            [void]$deleted.Add($path)
         }
     }
 
@@ -2746,7 +2787,7 @@ function Get-CommitFileTransition
         if ($deleted.Contains($oldPath))
         {
             $renameNewToOld[$newPath] = $oldPath
-            $null = $consumedOld.Add($oldPath)
+            [void]$consumedOld.Add($oldPath)
         }
     }
 
@@ -2784,11 +2825,11 @@ function Get-CommitFileTransition
     $candidates = New-Object 'System.Collections.Generic.HashSet[string]'
     foreach ($f in @($Commit.FilesChanged))
     {
-        $null = $candidates.Add((ConvertTo-PathKey -Path ([string]$f)))
+        [void]$candidates.Add((ConvertTo-PathKey -Path ([string]$f)))
     }
     foreach ($path in $pathMap.Keys)
     {
-        $null = $candidates.Add($path)
+        [void]$candidates.Add($path)
     }
 
     foreach ($path in $candidates)
@@ -3230,7 +3271,7 @@ function Invoke-StrictBlameCachePrefetch
 
     $worker = {
         param($Item, $Index)
-        $null = $Index # Required by Invoke-ParallelWork contract
+        [void]$Index # Required by Invoke-ParallelWork contract
         try
         {
             $stats = Initialize-SvnBlameLineCache -Repo $Item.TargetUrl -FilePath ([string]$Item.FilePath) -Revision ([int]$Item.Revision) -CacheDir $Item.CacheDir
@@ -3585,7 +3626,7 @@ function Get-ExactDeathAttribution
                         Add-Count -Table $authorRemovedByOthers -Key $bornAuthor
                         Add-Count -Table $fileCrossRevert -Key $metricFile
                         Add-Count -Table $authorModifiedOthersCode -Key $killer
-                        $null = $revsWhereKilledOthers.Add(([string]$rev + [char]31 + $killer))
+                        [void]$revsWhereKilledOthers.Add(([string]$rev + [char]31 + $killer))
                         if (-not $killMatrix.ContainsKey($killer))
                         {
                             $killMatrix[$killer] = @{}
@@ -3665,7 +3706,7 @@ function Get-CommitterMetric
             {
                 $fileAuthors[$resolvedF] = New-Object 'System.Collections.Generic.HashSet[string]'
             }
-            $null = $fileAuthors[$resolvedF].Add($a)
+            [void]$fileAuthors[$resolvedF].Add($a)
         }
     }
     foreach ($c in $Commits)
@@ -3698,7 +3739,7 @@ function Get-CommitterMetric
         $s.CommitCount++
         if ($c.Date)
         {
-            $null = $s.ActiveDays.Add(([datetime]$c.Date).ToString('yyyy-MM-dd'))
+            [void]$s.ActiveDays.Add(([datetime]$c.Date).ToString('yyyy-MM-dd'))
         }
         $s.Added += [int]$c.AddedLines
         $s.Deleted += [int]$c.DeletedLines
@@ -3716,7 +3757,7 @@ function Get-CommitterMetric
         foreach ($f in @($c.FilesChanged))
         {
             $resolvedF = Resolve-PathByRenameMap -FilePath ([string]$f) -RenameMap $RenameMap
-            $null = $s.Files.Add($resolvedF)
+            [void]$s.Files.Add($resolvedF)
             $idx = $resolvedF.LastIndexOf('/')
             $dir = if ($idx -lt 0)
             {
@@ -3728,7 +3769,7 @@ function Get-CommitterMetric
             }
             if ($dir)
             {
-                $null = $s.Dirs.Add($dir)
+                [void]$s.Dirs.Add($dir)
             }
             $d = $c.FileDiffStats[$f]
             $ch = [int]$d.AddedLines + [int]$d.DeletedLines
@@ -3896,12 +3937,12 @@ function Get-FileMetric
         foreach ($f in @($c.FilesChanged))
         {
             $resolved = Resolve-PathByRenameMap -FilePath ([string]$f) -RenameMap $RenameMap
-            $null = $files.Add($resolved)
+            [void]$files.Add($resolved)
         }
         foreach ($p in @($c.ChangedPathsFiltered))
         {
             $resolved = Resolve-PathByRenameMap -FilePath ([string]$p.Path) -RenameMap $RenameMap
-            $null = $files.Add($resolved)
+            [void]$files.Add($resolved)
         }
         foreach ($f in $files)
         {
@@ -3924,9 +3965,9 @@ function Get-FileMetric
             $added = $s.Commits.Add([int]$c.Revision)
             if ($added -and $c.Date)
             {
-                $null = $s.Dates.Add([datetime]$c.Date)
+                [void]$s.Dates.Add([datetime]$c.Date)
             }
-            $null = $s.Authors.Add($author)
+            [void]$s.Authors.Add($author)
         }
         foreach ($f in @($c.FilesChanged))
         {
@@ -4076,7 +4117,7 @@ function Get-CoChangeMetric
         foreach ($f in @($c.FilesChanged))
         {
             $resolved = Resolve-PathByRenameMap -FilePath ([string]$f) -RenameMap $RenameMap
-            $null = $files.Add($resolved)
+            [void]$files.Add($resolved)
         }
         if ($files.Count -eq 0)
         {
@@ -4500,23 +4541,13 @@ function Write-FileBubbleChart
     # SVG 構築開始
     $sb = New-Object System.Text.StringBuilder
 
-    $cssBlock = @'
-<defs><style>
-  text { font-family: "Segoe UI", "Meiryo UI", sans-serif; }
-  .title { font-size: 16px; font-weight: bold; fill: #333; }
-  .subtitle { font-size: 11px; fill: #888; }
-  .axis-label { font-size: 12px; fill: #555; }
-  .tick-label { font-size: 10px; fill: #888; }
-  .file-label { font-size: 9px; fill: #333; text-anchor: middle; }
-  .grid-line { stroke: #e0e0e0; stroke-width: 0.6; }
-  .axis-line { stroke: #999; stroke-width: 1.2; }
-</style></defs>
-'@
-
     # XML 宣言と SVG ルート要素
     [void]$sb.AppendLine(('<?xml version="1.0" encoding="{0}"?>' -f $xmlEncoding))
     [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" width="{0}" height="{1}" viewBox="0 0 {0} {1}">' -f [int]$svgWidth, [int]$svgHeight))
-    [void]$sb.Append($cssBlock)
+    [void]$sb.Append((Get-SvgCommonStyle -AdditionalStyles @'
+  .file-label { font-size: 9px; fill: #333; text-anchor: middle; }
+  .axis-line { stroke: #999; stroke-width: 1.2; }
+'@))
     [void]$sb.AppendLine('<rect width="100%" height="100%" fill="#fafafa"/>')
     [void]$sb.AppendLine('<text class="title" x="20" y="28">ファイルホットスポット分析</text>')
     [void]$sb.AppendLine(('<text class="subtitle" x="20" y="44">X: ホットスポットスコア（コミット数{0}×作者数×総チャーン÷max(活動期間日数,1)） / Y: 最多作者blame占有率（max(作者別生存行数)÷生存行数合計）</text>' -f [char]0x00B2))
@@ -4590,7 +4621,7 @@ function Write-FileBubbleChart
             $label = $filePath
         }
         $safePath = ConvertTo-SvgEscapedText -Text $filePath
-        if ([string]::IsNullOrEmpty($safePath))
+        if ([string]::IsNullOrWhiteSpace($safePath))
         {
             $safePath = ''
         }
@@ -4637,7 +4668,7 @@ function Write-FileBubbleChart
                 $labelX = [Math]::Round([Math]::Min($svgWidth - 12.0, [Math]::Max(12.0, $labelX)), 2)
             }
             $safeLabel = ConvertTo-SvgEscapedText -Text $fittedLabel
-            if ([string]::IsNullOrEmpty($safeLabel))
+            if ([string]::IsNullOrWhiteSpace($safeLabel))
             {
                 $safeLabel = ''
             }
@@ -4697,17 +4728,9 @@ function Write-FileQualityScatterChart
         Write-Verbose 'Write-FileQualityScatterChart: Files が空です。'
         return
     }
-    if (-not (Test-Path -LiteralPath $OutDirectory))
+    if (-not (Initialize-OutputDirectory -Path $OutDirectory -CallerName 'Write-FileQualityScatterChart'))
     {
-        try
-        {
-            New-Item -Path $OutDirectory -ItemType Directory -Force -ErrorAction Stop | Out-Null
-        }
-        catch
-        {
-            Write-Warning "Write-FileQualityScatterChart: ディレクトリ作成失敗: $_"
-            return
-        }
+        return
     }
 
     $topFiles = @(
@@ -4832,27 +4855,17 @@ function Write-FileQualityScatterChart
         [pscustomobject]@{ X = $plotLeft + $plotWidth * 0.75; Y = $plotTop + $plotHeight * 0.8; Label = '🍂 自然淘汰型' }
     )
 
-    $cssBlock = @'
-<defs><style>
-  text { font-family: "Segoe UI", "Meiryo UI", sans-serif; }
-  .title { font-size: 16px; font-weight: bold; fill: #333; }
-  .subtitle { font-size: 11px; fill: #888; }
-  .axis-label { font-size: 12px; fill: #555; }
-  .tick-label { font-size: 10px; fill: #888; }
-  .quadrant-label { font-size: 13px; fill: #aaa; text-anchor: middle; }
-  .file-label { font-size: 9px; fill: #333; text-anchor: middle; }
-  .grid-line { stroke: #e0e0e0; stroke-width: 0.6; }
-  .mid-line { stroke: #bdbdbd; stroke-width: 1; stroke-dasharray: 6,4; }
-  .axis-line { stroke: #999; stroke-width: 1.2; }
-</style></defs>
-'@
-
     $svgW = 640
     $svgH = 592
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine('<?xml version="1.0" encoding="UTF-8"?>')
     [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" width="{0}" height="{1}" viewBox="0 0 {0} {1}">' -f $svgW, $svgH))
-    [void]$sb.Append($cssBlock)
+    [void]$sb.Append((Get-SvgCommonStyle -AdditionalStyles @'
+  .quadrant-label { font-size: 13px; fill: #aaa; text-anchor: middle; }
+  .file-label { font-size: 9px; fill: #333; text-anchor: middle; }
+  .mid-line { stroke: #bdbdbd; stroke-width: 1; stroke-dasharray: 6,4; }
+  .axis-line { stroke: #999; stroke-width: 1.2; }
+'@))
     [void]$sb.AppendLine('<rect width="100%" height="100%" fill="#fafafa"/>')
     [void]$sb.AppendLine('<text class="title" x="20" y="28">ファイル手戻り分析</text>')
     [void]$sb.AppendLine('<text class="subtitle" x="20" y="44">X: コード消滅率（消滅追加行数÷追加行数） / Y: 無駄チャーン率（(自己相殺+他者差戻+ピンポン)÷総チャーン）</text>')
@@ -4939,17 +4952,9 @@ function Write-CommitTimelineChart
         Write-Verbose 'Write-CommitTimelineChart: Commits が空です。'
         return
     }
-    if (-not (Test-Path -LiteralPath $OutDirectory))
+    if (-not (Initialize-OutputDirectory -Path $OutDirectory -CallerName 'Write-CommitTimelineChart'))
     {
-        try
-        {
-            New-Item -Path $OutDirectory -ItemType Directory -Force -ErrorAction Stop | Out-Null
-        }
-        catch
-        {
-            Write-Warning "Write-CommitTimelineChart: ディレクトリ作成失敗: $_"
-            return
-        }
+        return
     }
 
     # コミットデータの解析
@@ -5010,7 +5015,7 @@ function Write-CommitTimelineChart
     $sorted = @($commitData | Sort-Object -Property DateTime)
 
     # 作者→色マッピング
-    $colorPalette = @('#42a5f5', '#66bb6a', '#ffa726', '#ab47bc', '#ef5350', '#26c6da', '#8d6e63', '#78909c', '#d4e157', '#ec407a')
+    $colorPalette = $script:DefaultColorPalette
     $authorColors = @{}
     $authorIndex = 0
     foreach ($d in $sorted)
@@ -5049,23 +5054,13 @@ function Write-CommitTimelineChart
     $svgW = [int]($legendX + 160)
     $svgH = [int]($plotBottom + 80)
 
-    $cssBlock = @'
-<defs><style>
-  text { font-family: "Segoe UI", "Meiryo UI", sans-serif; }
-  .title { font-size: 16px; font-weight: bold; fill: #333; }
-  .subtitle { font-size: 11px; fill: #888; }
-  .axis-label { font-size: 12px; fill: #555; }
-  .tick-label { font-size: 10px; fill: #888; }
-  .legend-text { font-size: 11px; fill: #333; }
-  .axis-line { stroke: #999; stroke-width: 1.2; }
-  .grid-line { stroke: #e0e0e0; stroke-width: 0.6; }
-</style></defs>
-'@
-
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine('<?xml version="1.0" encoding="UTF-8"?>')
     [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" width="{0}" height="{1}" viewBox="0 0 {0} {1}">' -f $svgW, $svgH))
-    [void]$sb.Append($cssBlock)
+    [void]$sb.Append((Get-SvgCommonStyle -AdditionalStyles @'
+  .legend-text { font-size: 11px; fill: #333; }
+  .axis-line { stroke: #999; stroke-width: 1.2; }
+'@))
     [void]$sb.AppendLine('<rect width="100%" height="100%" fill="#fafafa"/>')
     [void]$sb.AppendLine('<text class="title" x="20" y="28">コミットタイムライン</text>')
     [void]$sb.AppendLine('<text class="subtitle" x="20" y="46">X: 日時 / Y: チャーン（追加行数+削除行数） / 色: 作者</text>')
@@ -5168,17 +5163,9 @@ function Write-CommitScatterChart
         Write-Verbose 'Write-CommitScatterChart: Commits が空です。'
         return
     }
-    if (-not (Test-Path -LiteralPath $OutDirectory))
+    if (-not (Initialize-OutputDirectory -Path $OutDirectory -CallerName 'Write-CommitScatterChart'))
     {
-        try
-        {
-            New-Item -Path $OutDirectory -ItemType Directory -Force -ErrorAction Stop | Out-Null
-        }
-        catch
-        {
-            Write-Warning "Write-CommitScatterChart: ディレクトリ作成失敗: $_"
-            return
-        }
+        return
     }
 
     # データ構築
@@ -5237,7 +5224,7 @@ function Write-CommitScatterChart
     }
 
     # 作者→色マッピング
-    $colorPalette = @('#42a5f5', '#66bb6a', '#ffa726', '#ab47bc', '#ef5350', '#26c6da', '#8d6e63', '#78909c', '#d4e157', '#ec407a')
+    $colorPalette = $script:DefaultColorPalette
     $authorColors = @{}
     $authorIndex = 0
     foreach ($d in $scatterData)
@@ -5279,23 +5266,13 @@ function Write-CommitScatterChart
     $svgW = [int]($legendX + 160)
     $svgH = 580
 
-    $cssBlock = @'
-<defs><style>
-  text { font-family: "Segoe UI", "Meiryo UI", sans-serif; }
-  .title { font-size: 16px; font-weight: bold; fill: #333; }
-  .subtitle { font-size: 11px; fill: #888; }
-  .axis-label { font-size: 12px; fill: #555; }
-  .tick-label { font-size: 10px; fill: #888; }
-  .legend-text { font-size: 11px; fill: #333; }
-  .grid-line { stroke: #e0e0e0; stroke-width: 0.6; }
-  .axis-line { stroke: #999; stroke-width: 1.2; }
-</style></defs>
-'@
-
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine('<?xml version="1.0" encoding="UTF-8"?>')
     [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" width="{0}" height="{1}" viewBox="0 0 {0} {1}">' -f $svgW, $svgH))
-    [void]$sb.Append($cssBlock)
+    [void]$sb.Append((Get-SvgCommonStyle -AdditionalStyles @'
+  .legend-text { font-size: 11px; fill: #333; }
+  .axis-line { stroke: #999; stroke-width: 1.2; }
+'@))
     [void]$sb.AppendLine('<rect width="100%" height="100%" fill="#fafafa"/>')
     [void]$sb.AppendLine('<text class="title" x="20" y="28">コミット特性マップ</text>')
     [void]$sb.AppendLine('<text class="subtitle" x="20" y="46">X: 変更ファイル数 / Y: エントロピー（変更の分散度） / 円: チャーン（追加+削除） / 色: 作者</text>')
@@ -5610,17 +5587,9 @@ function Write-CommitterOutcomeChart
         Write-Verbose 'Write-CommitterOutcomeChart: Committers が空です。'
         return
     }
-    if (-not (Test-Path -LiteralPath $OutDirectory))
+    if (-not (Initialize-OutputDirectory -Path $OutDirectory -CallerName 'Write-CommitterOutcomeChart'))
     {
-        try
-        {
-            New-Item -Path $OutDirectory -ItemType Directory -Force -ErrorAction Stop | Out-Null
-        }
-        catch
-        {
-            Write-Warning "Write-CommitterOutcomeChart: ディレクトリ作成失敗: $_"
-            return
-        }
+        return
     }
 
     $chartData = @(Get-CommitterOutcomeData -Committers $Committers -TopNCount $TopNCount)
@@ -5657,15 +5626,13 @@ function Write-CommitterOutcomeChart
         $sb = New-Object System.Text.StringBuilder
         [void]$sb.AppendLine(('<?xml version="1.0" encoding="UTF-8"?>'))
         [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" width="{0}" height="{1}" viewBox="0 0 {0} {1}">' -f [int]$svgWidth, [int]$svgHeight))
-        [void]$sb.AppendLine('<defs><style>')
-        [void]$sb.AppendLine('  text { font-family: "Segoe UI", "Meiryo UI", sans-serif; }')
-        [void]$sb.AppendLine('  .title { font-size: 16px; font-weight: bold; fill: #333; }')
-        [void]$sb.AppendLine('  .bar-label { font-size: 12px; fill: #333; }')
-        [void]$sb.AppendLine('  .pct-label { font-size: 11px; fill: #fff; font-weight: bold; }')
-        [void]$sb.AppendLine('  .pct-label-dark { font-size: 11px; fill: #333; font-weight: bold; }')
-        [void]$sb.AppendLine('  .legend-text { font-size: 11px; fill: #555; }')
-        [void]$sb.AppendLine('  .ping-pong { font-size: 11px; fill: #666; }')
-        [void]$sb.AppendLine('</style></defs>')
+        [void]$sb.Append((Get-SvgCommonStyle -AdditionalStyles @'
+  .bar-label { font-size: 12px; fill: #333; }
+  .pct-label { font-size: 11px; fill: #fff; font-weight: bold; }
+  .pct-label-dark { font-size: 11px; fill: #333; font-weight: bold; }
+  .legend-text { font-size: 11px; fill: #555; }
+  .ping-pong { font-size: 11px; fill: #666; }
+'@))
         [void]$sb.AppendLine('<rect width="100%" height="100%" fill="#fafafa"/>')
         $titleText = ConvertTo-SvgEscapedText -Text ('{0} — コード帰結チャート' -f $authorDisplay)
         [void]$sb.AppendLine(('<text class="title" x="20" y="30">{0}</text>' -f $titleText))
@@ -5741,17 +5708,15 @@ function Write-CommitterOutcomeChart
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine('<?xml version="1.0" encoding="UTF-8"?>')
     [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" width="{0}" height="{1}" viewBox="0 0 {0} {1}">' -f [int]$svgWidthAll, [int]$svgHeightAll))
-    [void]$sb.AppendLine('<defs><style>')
-    [void]$sb.AppendLine('  text { font-family: "Segoe UI", "Meiryo UI", sans-serif; }')
-    [void]$sb.AppendLine('  .title { font-size: 18px; font-weight: bold; fill: #333; }')
-    [void]$sb.AppendLine('  .subtitle { font-size: 11px; fill: #888; }')
-    [void]$sb.AppendLine('  .author-label { font-size: 12px; fill: #333; }')
-    [void]$sb.AppendLine('  .added-label { font-size: 11px; fill: #666; }')
-    [void]$sb.AppendLine('  .pct-label { font-size: 10px; fill: #fff; font-weight: bold; }')
-    [void]$sb.AppendLine('  .pct-label-dark { font-size: 10px; fill: #333; font-weight: bold; }')
-    [void]$sb.AppendLine('  .pp-label { font-size: 10px; fill: #666; }')
-    [void]$sb.AppendLine('  .legend-text { font-size: 11px; fill: #555; }')
-    [void]$sb.AppendLine('</style></defs>')
+    [void]$sb.Append((Get-SvgCommonStyle -AdditionalStyles @'
+  .title { font-size: 18px; font-weight: bold; fill: #333; }
+  .author-label { font-size: 12px; fill: #333; }
+  .added-label { font-size: 11px; fill: #666; }
+  .pct-label { font-size: 10px; fill: #fff; font-weight: bold; }
+  .pct-label-dark { font-size: 10px; fill: #333; font-weight: bold; }
+  .pp-label { font-size: 10px; fill: #666; }
+  .legend-text { font-size: 11px; fill: #555; }
+'@))
     [void]$sb.AppendLine('<rect width="100%" height="100%" fill="#fafafa"/>')
     [void]$sb.AppendLine('<text class="title" x="20" y="28">コード帰結チャート（チーム比較）</text>')
     [void]$sb.AppendLine('<text class="subtitle" x="20" y="46">追加行数に対する生存・消滅の内訳</text>')
@@ -5943,17 +5908,9 @@ function Write-CommitterScatterChart
         Write-Verbose 'Write-CommitterScatterChart: Committers が空です。'
         return
     }
-    if (-not (Test-Path -LiteralPath $OutDirectory))
+    if (-not (Initialize-OutputDirectory -Path $OutDirectory -CallerName 'Write-CommitterScatterChart'))
     {
-        try
-        {
-            New-Item -Path $OutDirectory -ItemType Directory -Force -ErrorAction Stop | Out-Null
-        }
-        catch
-        {
-            Write-Warning "Write-CommitterScatterChart: ディレクトリ作成失敗: $_"
-            return
-        }
+        return
     }
 
     $scatterData = @(Get-CommitterScatterData -Committers $Committers -TopNCount $TopNCount)
@@ -5990,21 +5947,13 @@ function Write-CommitterScatterChart
     )
 
     # SVG CSS 共通
-    $cssBlock = @'
-<defs><style>
-  text { font-family: "Segoe UI", "Meiryo UI", sans-serif; }
-  .title { font-size: 16px; font-weight: bold; fill: #333; }
-  .subtitle { font-size: 11px; fill: #888; }
-  .axis-label { font-size: 12px; fill: #555; }
-  .tick-label { font-size: 10px; fill: #888; }
+    $cssBlock = Get-SvgCommonStyle -AdditionalStyles @'
   .quadrant-label { font-size: 13px; fill: #aaa; text-anchor: middle; }
   .author-label { font-size: 11px; fill: #333; text-anchor: middle; }
   .bubble { fill: #42a5f5; fill-opacity: 0.55; stroke: #1e88e5; stroke-width: 1.2; }
   .bubble-self { fill: #ef5350; fill-opacity: 0.6; stroke: #c62828; stroke-width: 1.8; }
-  .grid-line { stroke: #e0e0e0; stroke-width: 0.6; }
   .mid-line { stroke: #bdbdbd; stroke-width: 1; stroke-dasharray: 6,4; }
   .axis-line { stroke: #999; stroke-width: 1.2; }
-</style></defs>
 '@
 
     # --- 個人用 SVG ---
@@ -6096,7 +6045,7 @@ function Write-CommitterScatterChart
     }
     # 全員のバブル（大きい順に描画して小さい方が前面に来る）
     $sortedByChurn = @($scatterData | Sort-Object -Property TotalChurn -Descending)
-    $colorPalette = @('#42a5f5', '#66bb6a', '#ffa726', '#ab47bc', '#ef5350', '#26c6da', '#8d6e63', '#78909c', '#d4e157', '#ec407a')
+    $colorPalette = $script:DefaultColorPalette
     for ($ci = 0; $ci -lt $sortedByChurn.Count; $ci++)
     {
         $d = $sortedByChurn[$ci]
@@ -6255,12 +6204,12 @@ function Write-SurvivedShareDonutChart
     {
         return
     }
-    if (-not (Test-Path -LiteralPath $OutDirectory))
+    if (-not (Initialize-OutputDirectory -Path $OutDirectory))
     {
-        New-Item -Path $OutDirectory -ItemType Directory -Force | Out-Null
+        return
     }
 
-    $colorPalette = @('#42a5f5', '#66bb6a', '#ffa726', '#ab47bc', '#ef5350', '#26c6da', '#8d6e63', '#78909c', '#d4e157', '#ec407a')
+    $colorPalette = $script:DefaultColorPalette
     $svgW = 640
     $svgH = 420
     $cx = 240.0
@@ -6273,16 +6222,10 @@ function Write-SurvivedShareDonutChart
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine('<?xml version="1.0" encoding="UTF-8"?>')
     [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" width="{0}" height="{1}" viewBox="0 0 {0} {1}">' -f $svgW, $svgH))
-    [void]$sb.AppendLine(@'
-<defs><style>
-  text { font-family: "Segoe UI", "Meiryo UI", sans-serif; }
-  .title { font-size: 16px; font-weight: bold; fill: #333; }
-  .subtitle { font-size: 11px; fill: #888; }
-  .legend-text { font-size: 12px; fill: #333; }
+    [void]$sb.Append((Get-SvgCommonStyle -AdditionalStyles @'
   .center-label { font-size: 14px; fill: #555; text-anchor: middle; }
   .center-value { font-size: 22px; font-weight: bold; fill: #333; text-anchor: middle; }
-</style></defs>
-'@)
+'@))
     [void]$sb.AppendLine('<rect width="100%" height="100%" fill="#fafafa"/>')
     [void]$sb.AppendLine('<text class="title" x="20" y="28">コード資産の帰属分布（生存行数）</text>')
     [void]$sb.AppendLine(('<text class="subtitle" x="20" y="46">チーム全体の生存コード {0} 行の作者別内訳</text>' -f [int]$total))
@@ -6404,9 +6347,9 @@ function Write-TeamInteractionHeatMap
     {
         return
     }
-    if (-not (Test-Path -LiteralPath $OutDirectory))
+    if (-not (Initialize-OutputDirectory -Path $OutDirectory))
     {
-        New-Item -Path $OutDirectory -ItemType Directory -Force | Out-Null
+        return
     }
 
     # 値マトリクスの構築と最大値の取得
@@ -6452,17 +6395,12 @@ function Write-TeamInteractionHeatMap
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine('<?xml version="1.0" encoding="UTF-8"?>')
     [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" width="{0}" height="{1}" viewBox="0 0 {0} {1}">' -f $svgW, $svgH))
-    [void]$sb.AppendLine(@'
-<defs><style>
-  text { font-family: "Segoe UI", "Meiryo UI", sans-serif; }
-  .title { font-size: 16px; font-weight: bold; fill: #333; }
-  .subtitle { font-size: 11px; fill: #888; }
+    [void]$sb.Append((Get-SvgCommonStyle -AdditionalStyles @'
   .header-label { font-size: 12px; fill: #333; }
   .cell-value { font-size: 13px; fill: #333; text-anchor: middle; dominant-baseline: central; }
   .cell-value-light { font-size: 13px; fill: #fff; text-anchor: middle; dominant-baseline: central; }
   .axis-title { font-size: 12px; fill: #666; font-weight: bold; }
-</style></defs>
-'@)
+'@))
     [void]$sb.AppendLine('<rect width="100%" height="100%" fill="#fafafa"/>')
     [void]$sb.AppendLine('<text class="title" x="20" y="28">チーム相互作用ヒートマップ（コード削除関係）</text>')
     [void]$sb.AppendLine('<text class="subtitle" x="20" y="46">行 = 削除者 / 列 = 被削除者（対角線 = 自己相殺）</text>')
@@ -6648,9 +6586,9 @@ function Write-TeamActivityProfileChart
     {
         return
     }
-    if (-not (Test-Path -LiteralPath $OutDirectory))
+    if (-not (Initialize-OutputDirectory -Path $OutDirectory))
     {
-        New-Item -Path $OutDirectory -ItemType Directory -Force | Out-Null
+        return
     }
 
     $profileData = @(Get-TeamActivityProfileData -Committers $Committers)
@@ -6685,27 +6623,17 @@ function Write-TeamActivityProfileChart
         [pscustomobject]@{ X = $plotLeft + $plotWidth * 0.75; Y = $plotTop + $plotHeight * 0.8; Label = '💥 破壊者' }
     )
 
-    $cssBlock = @'
-<defs><style>
-  text { font-family: "Segoe UI", "Meiryo UI", sans-serif; }
-  .title { font-size: 16px; font-weight: bold; fill: #333; }
-  .subtitle { font-size: 11px; fill: #888; }
-  .axis-label { font-size: 12px; fill: #555; }
-  .tick-label { font-size: 10px; fill: #888; }
-  .quadrant-label { font-size: 13px; fill: #aaa; text-anchor: middle; }
-  .author-label { font-size: 11px; fill: #333; text-anchor: middle; }
-  .grid-line { stroke: #e0e0e0; stroke-width: 0.6; }
-  .mid-line { stroke: #bdbdbd; stroke-width: 1; stroke-dasharray: 6,4; }
-  .axis-line { stroke: #999; stroke-width: 1.2; }
-</style></defs>
-'@
-
     $svgW = 640
     $svgH = 580
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine('<?xml version="1.0" encoding="UTF-8"?>')
     [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" width="{0}" height="{1}" viewBox="0 0 {0} {1}">' -f $svgW, $svgH))
-    [void]$sb.Append($cssBlock)
+    [void]$sb.Append((Get-SvgCommonStyle -AdditionalStyles @'
+  .quadrant-label { font-size: 13px; fill: #aaa; text-anchor: middle; }
+  .author-label { font-size: 11px; fill: #333; text-anchor: middle; }
+  .mid-line { stroke: #bdbdbd; stroke-width: 1; stroke-dasharray: 6,4; }
+  .axis-line { stroke: #999; stroke-width: 1.2; }
+'@))
     [void]$sb.AppendLine('<rect width="100%" height="100%" fill="#fafafa"/>')
     [void]$sb.AppendLine('<text class="title" x="20" y="28">チーム活動プロファイル</text>')
     [void]$sb.AppendLine('<text class="subtitle" x="20" y="46">X: 他者コード削除介入度（他者変更行数÷削除行数） / Y: 他者コード変更生存率 / 円: 総チャーン</text>')
@@ -6731,7 +6659,7 @@ function Write-TeamActivityProfileChart
         [void]$sb.AppendLine(('<text class="quadrant-label" x="{0:F0}" y="{1:F0}">{2}</text>' -f $q.X, $q.Y, (ConvertTo-SvgEscapedText -Text $q.Label)))
     }
     # 全員のバブル
-    $colorPalette = @('#42a5f5', '#66bb6a', '#ffa726', '#ab47bc', '#ef5350', '#26c6da', '#8d6e63', '#78909c', '#d4e157', '#ec407a')
+    $colorPalette = $script:DefaultColorPalette
     $sortedByChurn = @($profileData | Sort-Object -Property TotalChurn -Descending)
     for ($ci = 0; $ci -lt $sortedByChurn.Count; $ci++)
     {
@@ -6826,9 +6754,9 @@ function Write-ProjectCodeFateChart
         Write-Warning ("CodeFate 'その他消滅' が負の値: totalAdded={0}, survived={1}, selfCancel={2}, removedByOthers={3}" -f $totalAdded, $totalSurvived, $totalSelfCancel, $totalRemovedByOthers)
         $totalOther = 0.0
     }
-    if (-not (Test-Path -LiteralPath $OutDirectory))
+    if (-not (Initialize-OutputDirectory -Path $OutDirectory))
     {
-        New-Item -Path $OutDirectory -ItemType Directory -Force | Out-Null
+        return
     }
 
     $segments = @(
@@ -6858,17 +6786,11 @@ function Write-ProjectCodeFateChart
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine('<?xml version="1.0" encoding="UTF-8"?>')
     [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" width="{0}" height="{1}" viewBox="0 0 {0} {1}">' -f $svgW, $svgH))
-    [void]$sb.AppendLine(@'
-<defs><style>
-  text { font-family: "Segoe UI", "Meiryo UI", sans-serif; }
-  .title { font-size: 16px; font-weight: bold; fill: #333; }
-  .subtitle { font-size: 11px; fill: #888; }
-  .legend-text { font-size: 12px; fill: #333; }
+    [void]$sb.Append((Get-SvgCommonStyle -AdditionalStyles @'
   .center-label { font-size: 13px; fill: #555; text-anchor: middle; }
   .center-value { font-size: 26px; font-weight: bold; fill: #333; text-anchor: middle; }
   .center-sub { font-size: 11px; fill: #888; text-anchor: middle; }
-</style></defs>
-'@)
+'@))
     [void]$sb.AppendLine('<rect width="100%" height="100%" fill="#fafafa"/>')
     [void]$sb.AppendLine('<text class="title" x="20" y="28">コード帰結サマリー（プロジェクト全体）</text>')
     [void]$sb.AppendLine(('<text class="subtitle" x="20" y="46">追加された {0} 行のうち、最終的にどこへ行ったか</text>' -f [int]$totalAdded))
@@ -7071,17 +6993,9 @@ function Write-ProjectEfficiencyQuadrantChart
         Write-Verbose 'Write-ProjectEfficiencyQuadrantChart: 有効なファイルデータがありません。'
         return
     }
-    if (-not (Test-Path -LiteralPath $OutDirectory))
+    if (-not (Initialize-OutputDirectory -Path $OutDirectory -CallerName 'Write-ProjectEfficiencyQuadrantChart'))
     {
-        try
-        {
-            New-Item -Path $OutDirectory -ItemType Directory -Force -ErrorAction Stop | Out-Null
-        }
-        catch
-        {
-            Write-Warning "Write-ProjectEfficiencyQuadrantChart: ディレクトリ作成失敗: $_"
-            return
-        }
+        return
     }
 
     $plotLeft = 80.0
@@ -7104,19 +7018,12 @@ function Write-ProjectEfficiencyQuadrantChart
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine('<?xml version="1.0" encoding="UTF-8"?>')
     [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" width="{0}" height="{1}" viewBox="0 0 {0} {1}">' -f $svgW, $svgH))
-    [void]$sb.AppendLine(@'
-<defs><style>
-  text { font-family: "Segoe UI", "Meiryo UI", sans-serif; }
-  .title { font-size: 16px; font-weight: bold; fill: #333; }
-  .subtitle { font-size: 11px; fill: #888; }
-  .axis-label { font-size: 12px; fill: #555; }
-  .tick-label { font-size: 10px; fill: #888; }
+    [void]$sb.Append((Get-SvgCommonStyle -AdditionalStyles @'
   .quadrant-label { font-size: 13px; fill: #aaa; text-anchor: middle; }
   .file-label { font-size: 9px; fill: #333; text-anchor: middle; }
   .mid-line { stroke: #bdbdbd; stroke-width: 1; stroke-dasharray: 6,4; }
   .axis-line { stroke: #999; stroke-width: 1.2; }
-</style></defs>
-'@)
+'@))
     [void]$sb.AppendLine('<rect width="100%" height="100%" fill="#fafafa"/>')
     [void]$sb.AppendLine('<text class="title" x="20" y="28">ファイル効率マップ（成果 × 生産性）</text>')
     [void]$sb.AppendLine(('<text class="subtitle" x="20" y="46">X: コード生存率 / Y: チャーン効率（|純増|÷チャーン） / バブル: 総チャーン / 上位{0}件</text>' -f $data.Count))
@@ -7244,9 +7151,9 @@ function Write-ProjectSummaryDashboard
     {
         return
     }
-    if (-not (Test-Path -LiteralPath $OutDirectory))
+    if (-not (Initialize-OutputDirectory -Path $OutDirectory))
     {
-        New-Item -Path $OutDirectory -ItemType Directory -Force | Out-Null
+        return
     }
 
     # 集計
@@ -7375,16 +7282,11 @@ function Write-ProjectSummaryDashboard
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine('<?xml version="1.0" encoding="UTF-8"?>')
     [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" width="{0}" height="{1}" viewBox="0 0 {0} {1}">' -f $svgW, $svgH))
-    [void]$sb.AppendLine(@'
-<defs><style>
-  text { font-family: "Segoe UI", "Meiryo UI", sans-serif; }
-  .title { font-size: 16px; font-weight: bold; fill: #333; }
-  .subtitle { font-size: 11px; fill: #888; }
+    [void]$sb.Append((Get-SvgCommonStyle -AdditionalStyles @'
   .card-label { font-size: 11px; fill: #fff; font-weight: bold; }
   .card-value { font-size: 28px; font-weight: bold; fill: #333; }
   .card-sub { font-size: 10px; fill: #888; }
-</style></defs>
-'@)
+'@))
     [void]$sb.AppendLine('<rect width="100%" height="100%" fill="#fafafa"/>')
     [void]$sb.AppendLine('<text class="title" x="20" y="28">プロジェクトサマリーダッシュボード</text>')
 
@@ -7496,9 +7398,9 @@ function Write-ContributorBalanceChart
     {
         $sorted = @($sorted | Select-Object -First $TopNCount)
     }
-    if (-not (Test-Path -LiteralPath $OutDirectory))
+    if (-not (Initialize-OutputDirectory -Path $OutDirectory))
     {
-        New-Item -Path $OutDirectory -ItemType Directory -Force | Out-Null
+        return
     }
 
     $n = $sorted.Count
@@ -7528,17 +7430,12 @@ function Write-ContributorBalanceChart
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine('<?xml version="1.0" encoding="UTF-8"?>')
     [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" width="{0}" height="{1}" viewBox="0 0 {0} {1}">' -f $svgW, $svgH))
-    [void]$sb.AppendLine(@'
-<defs><style>
-  text { font-family: "Segoe UI", "Meiryo UI", sans-serif; }
-  .title { font-size: 16px; font-weight: bold; fill: #333; }
-  .subtitle { font-size: 11px; fill: #888; }
+    [void]$sb.Append((Get-SvgCommonStyle -AdditionalStyles @'
   .author-label { font-size: 12px; fill: #333; text-anchor: middle; dominant-baseline: central; }
   .bar-value { font-size: 10px; fill: #555; dominant-baseline: central; }
   .header-label { font-size: 11px; fill: #666; font-weight: bold; text-anchor: middle; }
   .legend-text { font-size: 11px; fill: #333; }
-</style></defs>
-'@)
+'@))
     [void]$sb.AppendLine('<rect width="100%" height="100%" fill="#fafafa"/>')
     [void]$sb.AppendLine('<text class="title" x="20" y="28">投入量 vs 最終成果（コミッター別バランス）</text>')
     [void]$sb.AppendLine('<text class="subtitle" x="20" y="46">左: 総チャーン（投入量） / 右: 生存行数（最終成果） / 非対称 = 歩留まり差</text>')
@@ -7605,6 +7502,38 @@ function Write-ContributorBalanceChart
 
 # endregion PlantUML 出力
 # region SVG 出力
+function Get-SvgCommonStyle
+{
+    <#
+    .SYNOPSIS
+        SVG チャートで共通利用するスタイルブロックを返す。
+    .DESCRIPTION
+        各チャート関数で重複していた CSS ブロックを共通化する。
+        AdditionalStyles パラメータで追加 CSS ルールを差し込める。
+    .PARAMETER AdditionalStyles
+        共通スタイルに追加する CSS ルール文字列を指定する。
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $false)]
+        [string]$AdditionalStyles = ''
+    )
+    $base = @'
+  text { font-family: "Segoe UI", "Meiryo UI", sans-serif; }
+  .title { font-size: 16px; font-weight: bold; fill: #333; }
+  .subtitle { font-size: 11px; fill: #888; }
+  .axis-label { font-size: 12px; fill: #555; }
+  .tick-label { font-size: 10px; fill: #888; }
+  .grid-line { stroke: #e0e0e0; stroke-width: 0.6; }
+  .legend-text { font-size: 12px; fill: #333; }
+'@
+    if ([string]::IsNullOrWhiteSpace($AdditionalStyles))
+    {
+        return "<defs><style>`n${base}`n</style></defs>`n"
+    }
+    return "<defs><style>`n${base}`n${AdditionalStyles}`n</style></defs>`n"
+}
 function ConvertTo-SvgEscapedText
 {
     <#
@@ -7700,7 +7629,7 @@ function Measure-SvgTextWidth
         [double]$FontSize = 12.0
     )
 
-    if ([string]::IsNullOrEmpty($Text))
+    if ([string]::IsNullOrWhiteSpace($Text))
     {
         return 0.0
     }
@@ -7732,7 +7661,7 @@ function Get-SvgFittedText
         [string]$Ellipsis = '…'
     )
 
-    if ([string]::IsNullOrEmpty($Text))
+    if ([string]::IsNullOrWhiteSpace($Text))
     {
         return ''
     }
@@ -7749,7 +7678,7 @@ function Get-SvgFittedText
     }
 
     $ellipsisText = $Ellipsis
-    if ([string]::IsNullOrEmpty($ellipsisText))
+    if ([string]::IsNullOrWhiteSpace($ellipsisText))
     {
         $ellipsisText = '…'
     }
@@ -8090,25 +8019,25 @@ function Get-SvnGlobalArgumentList
     $ga = New-Object 'System.Collections.Generic.List[string]'
     if ($Username)
     {
-        $null = $ga.Add('--username')
-        $null = $ga.Add($Username)
+        [void]$ga.Add('--username')
+        [void]$ga.Add($Username)
     }
     if ($Password)
     {
         $plain = ConvertTo-PlainText -SecureValue $Password
         if ($plain)
         {
-            $null = $ga.Add('--password')
-            $null = $ga.Add($plain)
+            [void]$ga.Add('--password')
+            [void]$ga.Add($plain)
         }
     }
     if ($NonInteractive)
     {
-        $null = $ga.Add('--non-interactive')
+        [void]$ga.Add('--non-interactive')
     }
     if ($TrustServerCert)
     {
-        $null = $ga.Add('--trust-server-cert')
+        [void]$ga.Add('--trust-server-cert')
     }
     return $ga.ToArray()
 }
@@ -8142,13 +8071,13 @@ function Get-SvnDiffArgumentList
     [OutputType([string[]])]
     param([switch]$IgnoreWhitespace)
     $diffArgs = New-Object 'System.Collections.Generic.List[string]'
-    $null = $diffArgs.Add('diff')
-    $null = $diffArgs.Add('--internal-diff')
-    $null = $diffArgs.Add('--ignore-properties')
+    [void]$diffArgs.Add('diff')
+    [void]$diffArgs.Add('--internal-diff')
+    [void]$diffArgs.Add('--ignore-properties')
     if ($IgnoreWhitespace)
     {
-        $null = $diffArgs.Add('--extensions')
-        $null = $diffArgs.Add('--ignore-space-change --ignore-eol-style')
+        [void]$diffArgs.Add('--extensions')
+        [void]$diffArgs.Add('--ignore-space-change --ignore-eol-style')
     }
     return $diffArgs.ToArray()
 }
@@ -8178,11 +8107,11 @@ function Get-CachedOrFetchDiffText
     $fetchArgs = New-Object 'System.Collections.Generic.List[string]'
     foreach ($item in $DiffArguments)
     {
-        $null = $fetchArgs.Add([string]$item)
+        [void]$fetchArgs.Add([string]$item)
     }
-    $null = $fetchArgs.Add('-c')
-    $null = $fetchArgs.Add([string]$Revision)
-    $null = $fetchArgs.Add($TargetUrl)
+    [void]$fetchArgs.Add('-c')
+    [void]$fetchArgs.Add([string]$Revision)
+    [void]$fetchArgs.Add($TargetUrl)
     $diffText = Invoke-SvnCommand -Arguments $fetchArgs.ToArray() -ErrorContext ("svn diff -c {0}" -f $Revision)
     [System.IO.File]::WriteAllText($cacheFile, $diffText, [System.Text.Encoding]::UTF8)
     return $diffText
@@ -8224,7 +8153,7 @@ function Get-FilteredChangedPathEntry
         {
             continue
         }
-        if (Test-ShouldCountFile -FilePath $path -IncludeExt $IncludeExtensions -ExcludeExt $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns)
+        if (Test-ShouldCountFile -FilePath $path -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns)
         {
             [void]$filtered.Add([pscustomobject]@{
                     Path = $path
@@ -8397,7 +8326,7 @@ function Update-RenamePairDiffStat
     {
         if (([string]$pathEntry.Action).ToUpperInvariant() -eq 'D')
         {
-            $null = $deletedSet.Add((ConvertTo-PathKey -Path ([string]$pathEntry.Path)))
+            [void]$deletedSet.Add((ConvertTo-PathKey -Path ([string]$pathEntry.Path)))
         }
     }
 
@@ -8576,7 +8505,7 @@ function Initialize-CommitDiffData
     {
         $phaseAWorker = {
             param($Item, $Index)
-            $null = $Index # Required by Invoke-ParallelWork contract
+            [void]$Index # Required by Invoke-ParallelWork contract
             $diffText = Get-CachedOrFetchDiffText -CacheDir $Item.CacheDir -Revision ([int]$Item.Revision) -TargetUrl $Item.TargetUrl -DiffArguments @($Item.DiffArguments)
             $rawDiffByPath = ConvertFrom-SvnUnifiedDiff -DiffText $diffText -DetailLevel 2
             [pscustomobject]@{
@@ -8620,7 +8549,7 @@ function Initialize-CommitDiffData
         $filteredDiffByPath = @{}
         foreach ($path in $rawDiffByPath.Keys)
         {
-            if (Test-ShouldCountFile -FilePath $path -IncludeExt $IncludeExtensions -ExcludeExt $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns)
+            if (Test-ShouldCountFile -FilePath $path -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns)
             {
                 $filteredDiffByPath[$path] = $rawDiffByPath[$path]
             }
@@ -8638,7 +8567,7 @@ function Initialize-CommitDiffData
             $path = ConvertTo-PathKey -Path ([string]$pathEntry.Path)
             if ($path)
             {
-                $null = $allowedFilePathSet.Add($path)
+                [void]$allowedFilePathSet.Add($path)
             }
         }
 
@@ -9051,11 +8980,11 @@ function Update-StrictAttributionMetric
     $authorOwned = @{}
     $ownedTotal = 0
     $blameByFile = @{}
-    $ownershipTargets = @(Get-AllRepositoryFile -Repo $TargetUrl -Revision $ToRevision -IncludeExt $IncludeExtensions -ExcludeExt $ExcludeExtensions -IncludePathPatterns $IncludePaths -ExcludePathPatterns $ExcludePaths)
+    $ownershipTargets = @(Get-AllRepositoryFile -TargetUrl $TargetUrl -Revision $ToRevision -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePaths -ExcludePathPatterns $ExcludePaths)
     $existingFileSet = New-Object 'System.Collections.Generic.HashSet[string]'
     foreach ($file in $ownershipTargets)
     {
-        $null = $existingFileSet.Add([string]$file)
+        [void]$existingFileSet.Add([string]$file)
     }
     if ($Parallel -le 1)
     {
@@ -9098,7 +9027,7 @@ function Update-StrictAttributionMetric
 
         $ownershipWorker = {
             param($Item, $Index)
-            $null = $Index # Required by Invoke-ParallelWork contract
+            [void]$Index # Required by Invoke-ParallelWork contract
             try
             {
                 $blame = Get-SvnBlameSummary -Repo $Item.TargetUrl -FilePath ([string]$Item.FilePath) -ToRevision ([int]$Item.ToRevision) -CacheDir $Item.CacheDir
@@ -9197,7 +9126,7 @@ function New-RunMetaData
         SvnVersion の値を指定する。
     .PARAMETER Parallel
         並列実行時の最大ワーカー数を指定する。
-    .PARAMETER TopN
+    .PARAMETER TopNCount
         上位抽出件数を指定する。
     .PARAMETER Encoding
         出力時に使用する文字エンコーディングを指定する。
@@ -9205,7 +9134,7 @@ function New-RunMetaData
         解析対象のコミット配列を指定する。
     .PARAMETER FileRows
         更新対象となる出力行オブジェクト配列を指定する。
-    .PARAMETER OutDir
+    .PARAMETER OutDirectory
         出力先ディレクトリを指定する。
     .PARAMETER IncludePaths
         対象を絞り込むための包含または除外条件を指定する。
@@ -9233,11 +9162,11 @@ function New-RunMetaData
         [int]$ToRevision,
         [string]$SvnVersion,
         [int]$Parallel,
-        [int]$TopN,
+        [int]$TopNCount,
         [string]$Encoding,
         [object[]]$Commits,
         [object[]]$FileRows,
-        [string]$OutDir,
+        [string]$OutDirectory,
         [string[]]$IncludePaths,
         [string[]]$ExcludePaths,
         [string[]]$IncludeExtensions,
@@ -9257,11 +9186,11 @@ function New-RunMetaData
         SvnVersion = $SvnVersion
         StrictMode = $true
         Parallel = $Parallel
-        TopN = $TopN
+        TopNCount = $TopNCount
         Encoding = $Encoding
         CommitCount = @($Commits).Count
         FileCount = @($FileRows).Count
-        OutputDirectory = (Resolve-Path $OutDir).Path
+        OutputDirectory = (Resolve-Path $OutDirectory).Path
         StrictBlameCallCount = [int]($script:StrictBlameCacheHits + $script:StrictBlameCacheMisses)
         StrictBlameCacheHits = [int]$script:StrictBlameCacheHits
         StrictBlameCacheMisses = [int]$script:StrictBlameCacheMisses
@@ -9319,11 +9248,11 @@ function Write-RunSummary
         解析対象のコミット配列を指定する。
     .PARAMETER FileRows
         更新対象となる出力行オブジェクト配列を指定する。
-    .PARAMETER OutDir
+    .PARAMETER OutDirectory
         出力先ディレクトリを指定する。
     #>
     [CmdletBinding()]
-    param([string]$TargetUrl, [int]$FromRevision, [int]$ToRevision, [object[]]$Commits, [object[]]$FileRows, [string]$OutDir)
+    param([string]$TargetUrl, [int]$FromRevision, [int]$ToRevision, [object[]]$Commits, [object[]]$FileRows, [string]$OutDirectory)
     $phaseLabel = 'StrictMode'
     Write-Host ''
     Write-Host ("===== NarutoCode {0} =====" -f $phaseLabel)
@@ -9331,7 +9260,7 @@ function Write-RunSummary
     Write-Host ("Range        : r{0} -> r{1}" -f $FromRevision, $ToRevision)
     Write-Host ("Commits      : {0}" -f @($Commits).Count)
     Write-Host ("Files        : {0}" -f @($FileRows).Count)
-    Write-Host ("OutDir       : {0}" -f (Resolve-Path $OutDir).Path)
+    Write-Host ("OutDir       : {0}" -f (Resolve-Path $OutDirectory).Path)
 }
 function Get-RenameMap
 {
@@ -9382,20 +9311,20 @@ try
     # --- ステップ 1: パラメータの初期化と検証 ---
     $startedAt = Get-Date
     Initialize-StrictModeContext
-    if ($FromRev -gt $ToRev)
+    if ($FromRevision -gt $ToRevision)
     {
-        $tmp = $FromRev
-        $FromRev = $ToRev
-        $ToRev = $tmp
+        $tmp = $FromRevision
+        $FromRevision = $ToRevision
+        $ToRevision = $tmp
     }
-    if (-not $OutDir)
+    if (-not $OutDirectory)
     {
-        $OutDir = Join-Path (Get-Location) 'NarutoCode_out'
+        $OutDirectory = Join-Path (Get-Location) 'NarutoCode_out'
     }
 
-    # Resolve relative OutDir to absolute path based on PowerShell $PWD
-    $OutDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutDir)
-    $cacheDir = Join-Path $OutDir 'cache'
+    # Resolve relative OutDirectory to absolute path based on PowerShell $PWD
+    $OutDirectory = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutDirectory)
+    $cacheDir = Join-Path $OutDirectory 'cache'
     New-Item -Path $cacheDir -ItemType Directory -Force | Out-Null
 
     $IncludeExtensions = ConvertTo-NormalizedExtension -Extensions $IncludeExtensions
@@ -9417,7 +9346,7 @@ try
 
     # --- ステップ 2: SVN ログの取得とパース ---
     Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 2/8: SVN ログの取得' -PercentComplete 5
-    $logText = Invoke-SvnCommand -Arguments @('log', '--xml', '--verbose', '-r', "$FromRev`:$ToRev", $targetUrl) -ErrorContext 'svn log'
+    $logText = Invoke-SvnCommand -Arguments @('log', '--xml', '--verbose', '-r', "$FromRevision`:$ToRevision", $targetUrl) -ErrorContext 'svn log'
     $commits = @(ConvertFrom-SvnLogXml -XmlText $logText)
 
     # --- ステップ 3: 差分の取得とコミット単位の差分統計構築 ---
@@ -9438,50 +9367,50 @@ try
 
     # --- ステップ 5: Strict 死亡帰属（blame ベースの行追跡） ---
     Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 5/8: Strict 帰属解析' -PercentComplete 45
-    $strictResult = Update-StrictAttributionMetric -Commits $commits -RevToAuthor $revToAuthor -TargetUrl $targetUrl -FromRevision $FromRev -ToRevision $ToRev -CacheDir $cacheDir -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -FileRows $fileRows -CommitterRows $committerRows -Parallel $Parallel -RenameMap $renameMap
+    $strictResult = Update-StrictAttributionMetric -Commits $commits -RevToAuthor $revToAuthor -TargetUrl $targetUrl -FromRevision $FromRevision -ToRevision $ToRevision -CacheDir $cacheDir -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -FileRows $fileRows -CommitterRows $committerRows -Parallel $Parallel -RenameMap $renameMap
 
     # --- ステップ 6: CSV レポート出力 ---
     Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 6/8: CSV レポート出力' -PercentComplete 80
     $headers = Get-MetricHeader
-    Write-CsvFile -FilePath (Join-Path $OutDir 'committers.csv') -Rows $committerRows -Headers $headers.Committer -EncodingName $Encoding
-    Write-CsvFile -FilePath (Join-Path $OutDir 'files.csv') -Rows $fileRows -Headers $headers.File -EncodingName $Encoding
-    Write-CsvFile -FilePath (Join-Path $OutDir 'commits.csv') -Rows $commitRows -Headers $headers.Commit -EncodingName $Encoding
-    Write-CsvFile -FilePath (Join-Path $OutDir 'couplings.csv') -Rows $couplingRows -Headers $headers.Coupling -EncodingName $Encoding
+    Write-CsvFile -FilePath (Join-Path $OutDirectory 'committers.csv') -Rows $committerRows -Headers $headers.Committer -EncodingName $Encoding
+    Write-CsvFile -FilePath (Join-Path $OutDirectory 'files.csv') -Rows $fileRows -Headers $headers.File -EncodingName $Encoding
+    Write-CsvFile -FilePath (Join-Path $OutDirectory 'commits.csv') -Rows $commitRows -Headers $headers.Commit -EncodingName $Encoding
+    Write-CsvFile -FilePath (Join-Path $OutDirectory 'couplings.csv') -Rows $couplingRows -Headers $headers.Coupling -EncodingName $Encoding
     if ($null -ne $strictResult)
     {
-        Write-KillMatrixCsv -OutDirectory $OutDir -KillMatrix $strictResult.KillMatrix -AuthorSelfDead $strictResult.AuthorSelfDead -Committers $committerRows -EncodingName $Encoding
+        Write-KillMatrixCsv -OutDirectory $OutDirectory -KillMatrix $strictResult.KillMatrix -AuthorSelfDead $strictResult.AuthorSelfDead -Committers $committerRows -EncodingName $Encoding
     }
     # --- ステップ 7: 可視化出力 ---
     Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 7/8: 可視化出力' -PercentComplete 88
-    Write-PlantUmlFile -OutDirectory $OutDir -Committers $committerRows -Files $fileRows -Couplings $couplingRows -TopNCount $TopN -EncodingName $Encoding
-    Write-FileBubbleChart -OutDirectory $OutDir -Files $fileRows -TopNCount $TopN -EncodingName $Encoding
-    Write-CommitterOutcomeChart -OutDirectory $OutDir -Committers $committerRows -TopNCount $TopN -EncodingName $Encoding
-    Write-CommitterScatterChart -OutDirectory $OutDir -Committers $committerRows -TopNCount $TopN -EncodingName $Encoding
-    Write-SurvivedShareDonutChart -OutDirectory $OutDir -Committers $committerRows -EncodingName $Encoding
+    Write-PlantUmlFile -OutDirectory $OutDirectory -Committers $committerRows -Files $fileRows -Couplings $couplingRows -TopNCount $TopNCount -EncodingName $Encoding
+    Write-FileBubbleChart -OutDirectory $OutDirectory -Files $fileRows -TopNCount $TopNCount -EncodingName $Encoding
+    Write-CommitterOutcomeChart -OutDirectory $OutDirectory -Committers $committerRows -TopNCount $TopNCount -EncodingName $Encoding
+    Write-CommitterScatterChart -OutDirectory $OutDirectory -Committers $committerRows -TopNCount $TopNCount -EncodingName $Encoding
+    Write-SurvivedShareDonutChart -OutDirectory $OutDirectory -Committers $committerRows -EncodingName $Encoding
     if ($null -ne $strictResult)
     {
-        Write-TeamInteractionHeatMap -OutDirectory $OutDir -KillMatrix $strictResult.KillMatrix -AuthorSelfDead $strictResult.AuthorSelfDead -Committers $committerRows -EncodingName $Encoding
+        Write-TeamInteractionHeatMap -OutDirectory $OutDirectory -KillMatrix $strictResult.KillMatrix -AuthorSelfDead $strictResult.AuthorSelfDead -Committers $committerRows -EncodingName $Encoding
     }
-    Write-TeamActivityProfileChart -OutDirectory $OutDir -Committers $committerRows -EncodingName $Encoding
-    Write-FileQualityScatterChart -OutDirectory $OutDir -Files $fileRows -TopNCount $TopN -EncodingName $Encoding
-    Write-CommitTimelineChart -OutDirectory $OutDir -Commits $commitRows -EncodingName $Encoding
-    Write-CommitScatterChart -OutDirectory $OutDir -Commits $commitRows -EncodingName $Encoding
-    Write-ProjectCodeFateChart -OutDirectory $OutDir -Committers $committerRows -EncodingName $Encoding
-    Write-ProjectEfficiencyQuadrantChart -OutDirectory $OutDir -Files $fileRows -TopNCount $TopN -EncodingName $Encoding
-    Write-ProjectSummaryDashboard -OutDirectory $OutDir -Committers $committerRows -FileRows $fileRows -CommitRows $commitRows -AuthorBorn $strictResult.AuthorBorn -EncodingName $Encoding
-    Write-ContributorBalanceChart -OutDirectory $OutDir -Committers $committerRows -TopNCount $TopN -EncodingName $Encoding
+    Write-TeamActivityProfileChart -OutDirectory $OutDirectory -Committers $committerRows -EncodingName $Encoding
+    Write-FileQualityScatterChart -OutDirectory $OutDirectory -Files $fileRows -TopNCount $TopNCount -EncodingName $Encoding
+    Write-CommitTimelineChart -OutDirectory $OutDirectory -Commits $commitRows -EncodingName $Encoding
+    Write-CommitScatterChart -OutDirectory $OutDirectory -Commits $commitRows -EncodingName $Encoding
+    Write-ProjectCodeFateChart -OutDirectory $OutDirectory -Committers $committerRows -EncodingName $Encoding
+    Write-ProjectEfficiencyQuadrantChart -OutDirectory $OutDirectory -Files $fileRows -TopNCount $TopNCount -EncodingName $Encoding
+    Write-ProjectSummaryDashboard -OutDirectory $OutDirectory -Committers $committerRows -FileRows $fileRows -CommitRows $commitRows -AuthorBorn $strictResult.AuthorBorn -EncodingName $Encoding
+    Write-ContributorBalanceChart -OutDirectory $OutDirectory -Committers $committerRows -TopNCount $TopNCount -EncodingName $Encoding
 
     # --- ステップ 8: 実行メタデータとサマリーの書き出し ---
     Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 8/8: メタデータ出力' -PercentComplete 95
     $finishedAt = Get-Date
-    $meta = New-RunMetaData -StartTime $startedAt -EndTime $finishedAt -TargetUrl $targetUrl -FromRevision $FromRev -ToRevision $ToRev -SvnVersion $svnVersion -Parallel $Parallel -TopN $TopN -Encoding $Encoding -Commits $commits -FileRows $fileRows -OutDir $OutDir -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -IgnoreWhitespace:$IgnoreWhitespace
-    Write-JsonFile -Data $meta -FilePath (Join-Path $OutDir 'run_meta.json') -Depth 12 -EncodingName $Encoding
+    $meta = New-RunMetaData -StartTime $startedAt -EndTime $finishedAt -TargetUrl $targetUrl -FromRevision $FromRevision -ToRevision $ToRevision -SvnVersion $svnVersion -Parallel $Parallel -TopNCount $TopNCount -Encoding $Encoding -Commits $commits -FileRows $fileRows -OutDirectory $OutDirectory -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -IgnoreWhitespace:$IgnoreWhitespace
+    Write-JsonFile -Data $meta -FilePath (Join-Path $OutDirectory 'run_meta.json') -Depth 12 -EncodingName $Encoding
 
     Write-Progress -Id 0 -Activity 'NarutoCode' -Completed
-    Write-RunSummary -TargetUrl $targetUrl -FromRevision $FromRev -ToRevision $ToRev -Commits $commits -FileRows $fileRows -OutDir $OutDir
+    Write-RunSummary -TargetUrl $targetUrl -FromRevision $FromRevision -ToRevision $ToRevision -Commits $commits -FileRows $fileRows -OutDirectory $OutDirectory
 
     [pscustomobject]@{
-        OutDir = (Resolve-Path $OutDir).Path
+        OutDirectory = (Resolve-Path $OutDirectory).Path
         Committers = $committerRows
         Files = $fileRows
         Commits = $commitRows
