@@ -6,33 +6,8 @@ Pester tests for NarutoCode Phase 1.
 BeforeAll {
     $here = Split-Path -Parent $PSCommandPath
     $script:ScriptPath = Join-Path (Join-Path $here '..') 'NarutoCode.ps1'
-
-    $scriptContent = Get-Content -Path $script:ScriptPath -Raw -Encoding UTF8
-    # Extract the script-scope variables and all region blocks (functions) from
-    # NarutoCode.ps1, skipping the param() block at the top and the try/catch
-    # execution body at the bottom.
-    $regionPattern = '(?s)(\$script:StrictModeEnabled\b.*# endregion [^\r\n]+)'
-    if ($scriptContent -match $regionPattern)
-    {
-        $functionBlock = $Matches[1]
-        $script:SvnExecutable = 'svn'
-        $script:SvnGlobalArguments = @()
-        $script:StrictModeEnabled = $true
-        $script:ColDeadAdded = '消滅追加行数'
-        $script:ColSelfDead = '自己消滅行数'
-        $script:ColOtherDead = '被他者消滅行数'
-        $script:StrictBlameCacheHits = 0
-        $script:StrictBlameCacheMisses = 0
-        $tempFile = Join-Path $env:TEMP ('NarutoCode_functions_' + [guid]::NewGuid().ToString('N') + '.ps1')
-        Set-Content -Path $tempFile -Value $functionBlock -Encoding UTF8
-        . $tempFile
-        Remove-Item $tempFile -ErrorAction SilentlyContinue
-        Initialize-StrictModeContext
-    }
-    else
-    {
-        throw 'Could not extract function regions from NarutoCode.ps1.'
-    }
+    . $script:ScriptPath -RepoUrl 'https://example.invalid/repos/proj/trunk' -FromRevision 1 -ToRevision 1
+    Initialize-StrictModeContext
 }
 
 Describe 'ConvertTo-NormalizedExtension' {
@@ -257,23 +232,23 @@ Describe 'NarutoCode.ps1 parameter definition' {
 
 Describe 'Invoke-SvnCommand' {
     It 'returns stdout on success' {
-        $script:SvnExecutable = 'powershell'
+        $script:NarutoContext.Runtime.SvnExecutable = 'powershell'
         try {
             $text = Invoke-SvnCommand -Arguments @('-NoProfile','-Command','Write-Output hello') -ErrorContext 'test'
             $text.Trim() | Should -Be 'hello'
         }
         finally {
-            $script:SvnExecutable = 'svn'
+            $script:NarutoContext.Runtime.SvnExecutable = 'svn'
         }
     }
 
     It 'throws on non-zero exit code' {
-        $script:SvnExecutable = 'powershell'
+        $script:NarutoContext.Runtime.SvnExecutable = 'powershell'
         try {
             { Invoke-SvnCommand -Arguments @('-NoProfile','-Command','exit 1') -ErrorContext 'test fail' } | Should -Throw
         }
         finally {
-            $script:SvnExecutable = 'svn'
+            $script:NarutoContext.Runtime.SvnExecutable = 'svn'
         }
     }
 }
@@ -1374,21 +1349,6 @@ Describe 'ConvertTo-LineHash' {
     }
 }
 
-Describe 'Test-IsTrivialLine' {
-    It 'detects trivial lines' {
-        Test-IsTrivialLine -Content '{' | Should -BeTrue
-        Test-IsTrivialLine -Content '  }  ' | Should -BeTrue
-        Test-IsTrivialLine -Content 'return;' | Should -BeTrue
-        Test-IsTrivialLine -Content '' | Should -BeTrue
-        Test-IsTrivialLine -Content '  ' | Should -BeTrue
-    }
-
-    It 'rejects non-trivial lines' {
-        Test-IsTrivialLine -Content 'var x = 42;' | Should -BeFalse
-        Test-IsTrivialLine -Content 'public void Run()' | Should -BeFalse
-    }
-}
-
 Describe 'ConvertTo-ContextHash' {
     It 'produces consistent hash for same context' {
         $h1 = ConvertTo-ContextHash -FilePath 'src/A.cs' -ContextLines @('line1', 'line2', 'line3', 'line4')
@@ -2397,13 +2357,13 @@ Describe 'Invoke-StrictBlameCachePrefetch parallel consistency' {
 
         Initialize-StrictModeContext
         Invoke-StrictBlameCachePrefetch -Targets $targets -TargetUrl 'https://example.invalid/svn/repo' -CacheDir 'dummy' -Parallel 1
-        $seqHits = [int]$script:StrictBlameCacheHits
-        $seqMisses = [int]$script:StrictBlameCacheMisses
+        $seqHits = [int]$script:NarutoContext.Caches.StrictBlameCacheHits
+        $seqMisses = [int]$script:NarutoContext.Caches.StrictBlameCacheMisses
 
         Initialize-StrictModeContext
         Invoke-StrictBlameCachePrefetch -Targets $targets -TargetUrl 'https://example.invalid/svn/repo' -CacheDir 'dummy' -Parallel 4
-        $parHits = [int]$script:StrictBlameCacheHits
-        $parMisses = [int]$script:StrictBlameCacheMisses
+        $parHits = [int]$script:NarutoContext.Caches.StrictBlameCacheHits
+        $parMisses = [int]$script:NarutoContext.Caches.StrictBlameCacheMisses
 
         $seqHits | Should -Be $parHits
         $seqMisses | Should -Be $parMisses
@@ -3286,14 +3246,14 @@ Describe 'SvnBlameLineMemoryCache eviction at commit boundary' {
         # コミット1 (rev10) のキャッシュキーがエビクション済みであること
         $key10 = Get-BlameMemoryCacheKey -Revision 10 -FilePath 'src/file1.cs'
         $key9  = Get-BlameMemoryCacheKey -Revision 9  -FilePath 'src/file1.cs'
-        $script:SvnBlameLineMemoryCache.ContainsKey($key10) | Should -BeFalse
-        $script:SvnBlameLineMemoryCache.ContainsKey($key9)  | Should -BeFalse
+        $script:NarutoContext.Caches.SvnBlameLineMemoryCache.ContainsKey($key10) | Should -BeFalse
+        $script:NarutoContext.Caches.SvnBlameLineMemoryCache.ContainsKey($key9)  | Should -BeFalse
 
         # コミット2 (rev20) のキャッシュも最終コミット処理後にクリアされている
         $key20 = Get-BlameMemoryCacheKey -Revision 20 -FilePath 'src/file2.cs'
         $key19 = Get-BlameMemoryCacheKey -Revision 19 -FilePath 'src/file2.cs'
-        $script:SvnBlameLineMemoryCache.ContainsKey($key20) | Should -BeFalse
-        $script:SvnBlameLineMemoryCache.ContainsKey($key19) | Should -BeFalse
+        $script:NarutoContext.Caches.SvnBlameLineMemoryCache.ContainsKey($key20) | Should -BeFalse
+        $script:NarutoContext.Caches.SvnBlameLineMemoryCache.ContainsKey($key19) | Should -BeFalse
 
         # blame 呼び出し自体は行われていることを確認(キャッシュではなく実際に呼ばれた)
         $blameCallLog.Count | Should -BeGreaterOrEqual 4

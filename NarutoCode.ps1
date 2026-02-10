@@ -100,59 +100,129 @@ if ($NoProgress)
 }
 
 # region Utility
-$script:StrictModeEnabled = $true
-$script:ColDeadAdded = '消滅追加行数'       # 追加されたが ToRev 時点で生存していない行数
-$script:ColSelfDead = '自己消滅行数'         # 追加した本人が後のコミットで削除した行数
-$script:ColOtherDead = '被他者消滅行数'      # 別の作者によって削除された行数
-$script:StrictBlameCacheHits = 0
-$script:StrictBlameCacheMisses = 0
-# ディスクキャッシュ (blame XML / cat テキスト) の上位に配置するインメモリキャッシュ。
-# 同一 (revision, path) への繰り返しアクセスでディスク I/O と XML パースを回避する。
-# SvnBlameSummaryMemoryCache: 所有権分析フェーズで ToRevision の全ファイル分を保持 (Content 空文字のため軽量)。
-# SvnBlameLineMemoryCache: Get-ExactDeathAttribution 内で使用。コミット境界で Clear() されるため
-#   定常メモリは O(K×L) (K=1コミットあたり変更ファイル数, L=平均行数) に抑えられる。
-$script:SvnBlameSummaryMemoryCache = @{}
-$script:SvnBlameLineMemoryCache = @{}
-$script:SharedSha1 = New-Object System.Security.Cryptography.SHA1CryptoServiceProvider
-$script:DefaultColorPalette = @('#42a5f5', '#66bb6a', '#ffa726', '#ab47bc', '#ef5350', '#26c6da', '#8d6e63', '#78909c', '#d4e157', '#ec407a')
+function New-NarutoContext
+{
+    <#
+    .SYNOPSIS
+        NarutoCode のスクリプト状態を保持する Context を初期化する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [string]$SvnExecutable = 'svn',
+        [string[]]$SvnGlobalArguments = @()
+    )
 
-# region SVG チャート共通レイアウト定数
-$script:SvgPlotLeft = 80.0
-$script:SvgPlotTop = 60.0
-$script:SvgPlotTopLarge = 72.0
-$script:SvgPlotWidth = 400.0
-$script:SvgPlotHeight = 400.0
-$script:SvgBubbleMin = 8.0
-$script:SvgBubbleMax = 36.0
-$script:SvgQuadrantTickStep = 0.25
-# endregion SVG チャート共通レイアウト定数
+    return @{
+        Runtime = @{
+            StrictModeEnabled = $true
+            SvnExecutable = $SvnExecutable
+            SvnGlobalArguments = @($SvnGlobalArguments)
+        }
+        Metrics = @{
+            ColDeadAdded = '消滅追加行数'  # 追加されたが ToRev 時点で生存していない行数
+            ColSelfDead = '自己消滅行数'  # 追加した本人が後のコミットで削除した行数
+            ColOtherDead = '被他者消滅行数'  # 別の作者によって削除された行数
+        }
+        Caches = @{
+            StrictBlameCacheHits = 0
+            StrictBlameCacheMisses = 0
+            # ディスクキャッシュ (blame XML / cat テキスト) の上位に配置するインメモリキャッシュ。
+            # 同一 (revision, path) への繰り返しアクセスでディスク I/O と XML パースを回避する。
+            # SvnBlameSummaryMemoryCache: 所有権分析フェーズで ToRevision の全ファイル分を保持 (Content 空文字のため軽量)。
+            # SvnBlameLineMemoryCache: Get-ExactDeathAttribution 内で使用。コミット境界で Clear() されるため
+            #   定常メモリは O(K×L) (K=1コミットあたり変更ファイル数, L=平均行数) に抑えられる。
+            SvnBlameSummaryMemoryCache = @{}
+            SvnBlameLineMemoryCache = @{}
+            SharedSha1 = New-Object System.Security.Cryptography.SHA1CryptoServiceProvider
+        }
+        Constants = @{
+            DefaultColorPalette = @('#42a5f5', '#66bb6a', '#ffa726', '#ab47bc', '#ef5350', '#26c6da', '#8d6e63', '#78909c', '#d4e157', '#ec407a')
 
-# region セマンティックカラー（コード運命の意味的な色）
-$script:ColorSurvived = '#4caf50'
-$script:ColorSelfCancel = '#ffc107'
-$script:ColorRemovedByOthers = '#f44336'
-$script:ColorOtherDead = '#bdbdbd'
-$script:ColorChurn = '#ff7043'
-# endregion セマンティックカラー
+            # SVG チャート共通レイアウト定数
+            SvgPlotLeft = 80.0
+            SvgPlotTop = 60.0
+            SvgPlotTopLarge = 72.0
+            SvgPlotWidth = 400.0
+            SvgPlotHeight = 400.0
+            SvgBubbleMin = 8.0
+            SvgBubbleMax = 36.0
+            SvgQuadrantTickStep = 0.25
 
-# region アルゴリズム閾値
-$script:RenameChainMaxDepth = 4096
-$script:TrivialLineMaxLength = 3
-$script:ContextHashNeighborK = 3
-$script:CommitMessageMaxLength = 140
-$script:HashTruncateLength = 8
-$script:HeatmapLightTextThreshold = 0.6
-# endregion アルゴリズム閾値
+            # セマンティックカラー（コード運命の意味的な色）
+            ColorSurvived = '#4caf50'
+            ColorSelfCancel = '#ffc107'
+            ColorRemovedByOthers = '#f44336'
+            ColorOtherDead = '#bdbdbd'
+            ColorChurn = '#ff7043'
 
-# region SVG 文字幅推定比率
-$script:SvgCharWidthDefault = 0.56
-$script:SvgCharWidthSpace = 0.33
-$script:SvgCharWidthCjk = 1.00
-$script:SvgCharWidthNarrow = 0.34
-$script:SvgCharWidthWide = 0.82
-# endregion SVG 文字幅推定比率
+            # アルゴリズム閾値
+            RenameChainMaxDepth = 4096
+            TrivialLineMaxLength = 3
+            ContextHashNeighborK = 3
+            CommitMessageMaxLength = 140
+            HashTruncateLength = 8
+            HeatmapLightTextThreshold = 0.6
 
-# region Utility
+            # SVG 文字幅推定比率
+            SvgCharWidthDefault = 0.56
+            SvgCharWidthSpace = 0.33
+            SvgCharWidthCjk = 1.00
+            SvgCharWidthNarrow = 0.34
+            SvgCharWidthWide = 0.82
+        }
+    }
+}
+function Get-RunspaceNarutoContext
+{
+    <#
+    .SYNOPSIS
+        並列 runspace 用に分離した NarutoContext を生成する。
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param([hashtable]$Context = $script:NarutoContext)
+    $runtimeSvnExecutable = 'svn'
+    $runtimeSvnGlobalArguments = @()
+    if ($null -ne $Context -and $null -ne $Context.Runtime)
+    {
+        if (-not [string]::IsNullOrWhiteSpace([string]$Context.Runtime.SvnExecutable))
+        {
+            $runtimeSvnExecutable = [string]$Context.Runtime.SvnExecutable
+        }
+        if ($Context.Runtime.SvnGlobalArguments)
+        {
+            $runtimeSvnGlobalArguments = @($Context.Runtime.SvnGlobalArguments)
+        }
+    }
+    $runspaceContext = New-NarutoContext -SvnExecutable $runtimeSvnExecutable -SvnGlobalArguments $runtimeSvnGlobalArguments
+    if ($null -ne $Context -and $null -ne $Context.Constants)
+    {
+        foreach ($key in @($Context.Constants.Keys))
+        {
+            $value = $Context.Constants[$key]
+            if ($value -is [System.Array])
+            {
+                $runspaceContext.Constants[$key] = @($value)
+                continue
+            }
+            $runspaceContext.Constants[$key] = $value
+        }
+    }
+    if ($null -ne $Context -and $null -ne $Context.Metrics)
+    {
+        foreach ($key in @($Context.Metrics.Keys))
+        {
+            $runspaceContext.Metrics[$key] = $Context.Metrics[$key]
+        }
+    }
+    # SHA1 インスタンスは runspace 間共有しない
+    $runspaceContext.Caches.SharedSha1 = $null
+    return $runspaceContext
+}
+$script:NarutoContext = New-NarutoContext -SvnExecutable $SvnExecutable
+
 # region 初期化
 function Initialize-StrictModeContext
 {
@@ -160,18 +230,21 @@ function Initialize-StrictModeContext
     .SYNOPSIS
         Strict モード実行に必要なスクリプト状態を初期化する。
     #>
-    $script:StrictModeEnabled = $true
-    $script:StrictBlameCacheHits = 0
-    $script:StrictBlameCacheMisses = 0
-    $script:ColDeadAdded = '消滅追加行数'       # 追加されたが ToRev 時点で生存していない行数
-    $script:ColSelfDead = '自己消滅行数'         # 追加した本人が後のコミットで削除した行数
-    $script:ColOtherDead = '被他者消滅行数'      # 別の作者によって削除された行数
-    $script:SvnBlameSummaryMemoryCache = @{}
-    $script:SvnBlameLineMemoryCache = @{}
-    if ($null -eq $script:SharedSha1)
+    param([hashtable]$Context = $script:NarutoContext)
+    $runtimeSvnExecutable = 'svn'
+    $runtimeSvnGlobalArguments = @()
+    if ($null -ne $Context -and $null -ne $Context.Runtime)
     {
-        $script:SharedSha1 = New-Object System.Security.Cryptography.SHA1CryptoServiceProvider
+        if (-not [string]::IsNullOrWhiteSpace([string]$Context.Runtime.SvnExecutable))
+        {
+            $runtimeSvnExecutable = [string]$Context.Runtime.SvnExecutable
+        }
+        if ($Context.Runtime.SvnGlobalArguments)
+        {
+            $runtimeSvnGlobalArguments = @($Context.Runtime.SvnGlobalArguments)
+        }
     }
+    $script:NarutoContext = New-NarutoContext -SvnExecutable $runtimeSvnExecutable -SvnGlobalArguments $runtimeSvnGlobalArguments
 }
 function ConvertTo-NormalizedExtension
 {
@@ -411,14 +484,6 @@ function Write-JsonFile
 }
 # endregion エンコーディングと入出力
 # region 数値と書式
-function Get-RoundedNumber
-{
-    <#
-    .SYNOPSIS
-        指標表示用の数値を指定桁数で丸める。
-    #>
-    param([double]$Value, [int]$Digits = 4) [Math]::Round($Value, $Digits)
-}
 function Format-MetricValue
 {
     <#
@@ -427,52 +492,6 @@ function Format-MetricValue
     #>
     param([double]$Value)
     return $Value
-}
-function ConvertTo-NormalizedScore
-{
-    <#
-    .SYNOPSIS
-        最優秀者を 1 とした正規化スコアへ変換する。
-    .DESCRIPTION
-        非反転軸は value / max で正規化する。最大値の人が 1.0 になり、
-        他の人は実値の比率に応じた位置に配置される。
-        反転軸（低いほど良い指標）は (max - value) / (max - min) で
-        最小値の人が 1.0 になる。
-    .PARAMETER Value
-        正規化対象の実測値を指定する。
-    .PARAMETER Min
-        正規化に使用する最小値を指定する。
-    .PARAMETER Max
-        正規化に使用する最大値を指定する。
-    .PARAMETER Invert
-        指定時は正規化結果を反転し、低い値を高スコアとして扱う。
-    #>
-    param([double]$Value, [double]$Min, [double]$Max, [switch]$Invert)
-    if ($Invert)
-    {
-        if ($Max -eq $Min)
-        {
-            return 0.0
-        }
-        $normalized = ($Max - $Value) / ($Max - $Min)
-    }
-    else
-    {
-        if ($Max -le 0)
-        {
-            return 0.0
-        }
-        $normalized = $Value / $Max
-    }
-    if ($normalized -lt 0)
-    {
-        $normalized = 0.0
-    }
-    if ($normalized -gt 1)
-    {
-        $normalized = 1.0
-    }
-    return $normalized
 }
 function Add-Count
 {
@@ -933,16 +952,16 @@ function Get-Sha1Hex
         SHA1CryptoServiceProvider.ComputeHash はスレッドセーフでないため
         インスタンス共有は単一スレッド内に限定する。
     #>
-    param([string]$Text)
+    param( [hashtable]$Context = $script:NarutoContext, [string]$Text)
     if ($null -eq $Text)
     {
         $Text = ''
     }
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
     # 並列 runspace では SharedSha1 が存在しないため都度生成する
-    $sha = if ($script:SharedSha1)
+    $sha = if ($Context.Caches.SharedSha1)
     {
-        $script:SharedSha1
+        $Context.Caches.SharedSha1
     }
     else
     {
@@ -956,7 +975,7 @@ function Get-Sha1Hex
     finally
     {
         # 共有インスタンスは破棄せず、フォールバック生成分のみ Dispose する
-        if ($sha -ne $script:SharedSha1)
+        if ($sha -ne $Context.Caches.SharedSha1)
         {
             $sha.Dispose()
         }
@@ -1198,14 +1217,14 @@ function Resolve-PathByRenameMap
     .SYNOPSIS
         リネーム履歴をたどって最新側の論理パスへ解決する。
     #>
-    param([string]$FilePath, [hashtable]$RenameMap)
+    param( [hashtable]$Context = $script:NarutoContext, [string]$FilePath, [hashtable]$RenameMap)
     $resolved = ConvertTo-PathKey -Path $FilePath
     if ($null -eq $RenameMap -or -not $resolved)
     {
         return $resolved
     }
     $guard = 0
-    while ($RenameMap.ContainsKey($resolved) -and $guard -lt $script:RenameChainMaxDepth)
+    while ($RenameMap.ContainsKey($resolved) -and $guard -lt $Context.Constants.RenameChainMaxDepth)
     {
         $next = [string]$RenameMap[$resolved]
         if ([string]::IsNullOrWhiteSpace($next) -or $next -eq $resolved)
@@ -1216,43 +1235,6 @@ function Resolve-PathByRenameMap
         $guard++
     }
     return $resolved
-}
-function Get-DiffLineStat
-{
-    <#
-    .SYNOPSIS
-        Unified diff テキストから追加削除行数を高速に集計する。
-    #>
-    param([string]$DiffText)
-    $added = 0
-    $deleted = 0
-    if ([string]::IsNullOrWhiteSpace($DiffText))
-    {
-        return [pscustomobject]@{ AddedLines = 0; DeletedLines = 0 }
-    }
-    $lines = $DiffText -split "`r?`n"
-    foreach ($line in $lines)
-    {
-        if (-not $line)
-        {
-            continue
-        }
-        if ($line.StartsWith('+++') -or $line.StartsWith('---') -or $line.StartsWith('@@') -or $line.StartsWith('Index: ') -or $line.StartsWith('===') -or $line -eq '\ No newline at end of file')
-        {
-            continue
-        }
-        if ($line[0] -eq '+')
-        {
-            $added++
-            continue
-        }
-        if ($line[0] -eq '-')
-        {
-            $deleted++
-            continue
-        }
-    }
-    return [pscustomobject]@{ AddedLines = $added; DeletedLines = $deleted }
 }
 function Get-AllRepositoryFile
 {
@@ -1357,48 +1339,6 @@ function Add-CanonicalOffsetEvent
         return
     }
     [void]$OffsetEvents.Add([pscustomobject]@{ Threshold = $ThresholdLine; Delta = $ShiftDelta })
-}
-function Test-RangeOverlap
-{
-    <#
-    .SYNOPSIS
-        2つの行範囲が重なっているかを判定する。
-    .PARAMETER StartA
-        StartA の値を指定する。
-    .PARAMETER EndA
-        EndA の値を指定する。
-    .PARAMETER StartB
-        StartB の値を指定する。
-    .PARAMETER EndB
-        EndB の値を指定する。
-    #>
-    param([int]$StartA, [int]$EndA, [int]$StartB, [int]$EndB)
-    $left = [Math]::Max($StartA, $StartB)
-    $right = [Math]::Min($EndA, $EndB)
-    return ($left -le $right)
-}
-function Test-RangeTripleOverlap
-{
-    <#
-    .SYNOPSIS
-        3つの行範囲に共通重複があるかを判定する。
-    .PARAMETER StartA
-        StartA の値を指定する。
-    .PARAMETER EndA
-        EndA の値を指定する。
-    .PARAMETER StartB
-        StartB の値を指定する。
-    .PARAMETER EndB
-        EndB の値を指定する。
-    .PARAMETER StartC
-        StartC の値を指定する。
-    .PARAMETER EndC
-        EndC の値を指定する。
-    #>
-    param([int]$StartA, [int]$EndA, [int]$StartB, [int]$EndB, [int]$StartC, [int]$EndC)
-    $left = [Math]::Max([Math]::Max($StartA, $StartB), $StartC)
-    $right = [Math]::Min([Math]::Min($EndA, $EndB), $EndC)
-    return ($left -le $right)
 }
 function Test-ShouldCountFile
 {
@@ -1509,15 +1449,15 @@ function Invoke-SvnCommand
     .SYNOPSIS
         SVN コマンドを実行して標準出力と失敗情報を統一処理する。
     #>
-    [CmdletBinding()]param([string[]]$Arguments, [string]$ErrorContext = 'SVN command')
+    [CmdletBinding()]param( [hashtable]$Context = $script:NarutoContext, [string[]]$Arguments, [string]$ErrorContext = 'SVN command')
     $all = New-Object 'System.Collections.Generic.List[string]'
     foreach ($a in $Arguments)
     {
         [void]$all.Add([string]$a)
     }
-    if ($script:SvnGlobalArguments)
+    if ($Context.Runtime.SvnGlobalArguments)
     {
-        foreach ($a in $script:SvnGlobalArguments)
+        foreach ($a in $Context.Runtime.SvnGlobalArguments)
         {
             [void]$all.Add([string]$a)
         }
@@ -1525,7 +1465,7 @@ function Invoke-SvnCommand
     try
     {
         $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName = $script:SvnExecutable
+        $psi.FileName = $Context.Runtime.SvnExecutable
         $psi.Arguments = Join-CommandArgument -Arguments $all.ToArray()
         $psi.UseShellExecute = $false
         $psi.RedirectStandardOutput = $true
@@ -1831,25 +1771,6 @@ function ConvertTo-LineHash
     $raw = $FilePath + [char]0 + $norm
     return Get-Sha1Hex -Text $raw
 }
-function Test-IsTrivialLine
-{
-    <#
-    .SYNOPSIS
-        誤判定を避けるため比較対象外の自明行かを判定する。
-    #>
-    param([string]$Content)
-    $t = $Content.Trim()
-    if ($t.Length -le $script:TrivialLineMaxLength)
-    {
-        return $true
-    }
-    $trivials = @('{', '}', '};', 'else', 'else {', 'return;', 'break;', 'continue;', '});', ');', '(', ')', '')
-    if ($trivials -contains $t)
-    {
-        return $true
-    }
-    return $false
-}
 function ConvertTo-ContextHash
 {
     <#
@@ -1864,7 +1785,7 @@ function ConvertTo-ContextHash
     .PARAMETER K
         K の値を指定する。
     #>
-    param([string]$FilePath, [string[]]$ContextLines, [int]$K = $script:ContextHashNeighborK)
+    param( [hashtable]$Context = $script:NarutoContext, [string]$FilePath, [string[]]$ContextLines, [int]$K = $Context.Constants.ContextHashNeighborK)
     $first = @()
     $last = @()
     if ($ContextLines -and $ContextLines.Count -gt 0)
@@ -2237,25 +2158,25 @@ function Get-SvnBlameSummary
     .PARAMETER CacheDir
         キャッシュディレクトリのパスを指定する。
     #>
-    [CmdletBinding()]param([string]$Repo, [string]$FilePath, [int]$ToRevision, [string]$CacheDir)
+    [CmdletBinding()]param( [hashtable]$Context = $script:NarutoContext, [string]$Repo, [string]$FilePath, [int]$ToRevision, [string]$CacheDir)
     # インメモリキャッシュにヒットすればディスク読み込み・XML パースを完全に回避する。
     # 所有権分析フェーズでは同一ファイルに複数回アクセスされるため効果が大きい。
-    if ($null -eq $script:SvnBlameSummaryMemoryCache)
+    if ($null -eq $Context.Caches.SvnBlameSummaryMemoryCache)
     {
-        $script:SvnBlameSummaryMemoryCache = @{}
+        $Context.Caches.SvnBlameSummaryMemoryCache = @{}
     }
     $cacheKey = Get-BlameMemoryCacheKey -Revision $ToRevision -FilePath $FilePath
-    if ($script:SvnBlameSummaryMemoryCache.ContainsKey($cacheKey))
+    if ($Context.Caches.SvnBlameSummaryMemoryCache.ContainsKey($cacheKey))
     {
-        $script:StrictBlameCacheHits++
-        return $script:SvnBlameSummaryMemoryCache[$cacheKey]
+        $Context.Caches.StrictBlameCacheHits++
+        return $Context.Caches.SvnBlameSummaryMemoryCache[$cacheKey]
     }
 
     $url = $Repo.TrimEnd('/') + '/' + (ConvertTo-PathKey -Path $FilePath).TrimStart('/') + '@' + [string]$ToRevision
     $text = Read-BlameCacheFile -CacheDir $CacheDir -Revision $ToRevision -FilePath $FilePath
     if ([string]::IsNullOrWhiteSpace($text))
     {
-        $script:StrictBlameCacheMisses++
+        $Context.Caches.StrictBlameCacheMisses++
         $text = Invoke-SvnCommandAllowMissingTarget -Arguments @('blame', '--xml', '-r', [string]$ToRevision, $url) -ErrorContext ("svn blame $FilePath")
         if (-not [string]::IsNullOrWhiteSpace($text))
         {
@@ -2264,16 +2185,16 @@ function Get-SvnBlameSummary
     }
     else
     {
-        $script:StrictBlameCacheHits++
+        $Context.Caches.StrictBlameCacheHits++
     }
     if ([string]::IsNullOrWhiteSpace($text))
     {
         $empty = Get-EmptyBlameResult
-        $script:SvnBlameSummaryMemoryCache[$cacheKey] = $empty
+        $Context.Caches.SvnBlameSummaryMemoryCache[$cacheKey] = $empty
         return $empty
     }
     $parsed = ConvertFrom-SvnBlameXml -XmlText $text
-    $script:SvnBlameSummaryMemoryCache[$cacheKey] = $parsed
+    $Context.Caches.SvnBlameSummaryMemoryCache[$cacheKey] = $parsed
     return $parsed
 }
 function Get-SvnBlameLine
@@ -2291,19 +2212,19 @@ function Get-SvnBlameLine
         キャッシュディレクトリのパスを指定する。
     #>
     [CmdletBinding()]
-    param([string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir)
+    param( [hashtable]$Context = $script:NarutoContext, [string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir)
     # インメモリキャッシュにヒットすればディスク読み込み (blame XML + cat テキスト) と
     # XML パースを完全に回避する。同一コミット内で同じファイルが複数トランジションから
     # 参照されるケースで効果がある。コミット境界で Clear() されるため無制限には成長しない。
-    if ($null -eq $script:SvnBlameLineMemoryCache)
+    if ($null -eq $Context.Caches.SvnBlameLineMemoryCache)
     {
-        $script:SvnBlameLineMemoryCache = @{}
+        $Context.Caches.SvnBlameLineMemoryCache = @{}
     }
     $cacheKey = Get-BlameMemoryCacheKey -Revision $Revision -FilePath $FilePath
-    if ($script:SvnBlameLineMemoryCache.ContainsKey($cacheKey))
+    if ($Context.Caches.SvnBlameLineMemoryCache.ContainsKey($cacheKey))
     {
-        $script:StrictBlameCacheHits++
-        return $script:SvnBlameLineMemoryCache[$cacheKey]
+        $Context.Caches.StrictBlameCacheHits++
+        return $Context.Caches.SvnBlameLineMemoryCache[$cacheKey]
     }
 
     $path = (ConvertTo-PathKey -Path $FilePath).TrimStart('/')
@@ -2312,7 +2233,7 @@ function Get-SvnBlameLine
     $blameXml = Read-BlameCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
     if ([string]::IsNullOrWhiteSpace($blameXml))
     {
-        $script:StrictBlameCacheMisses++
+        $Context.Caches.StrictBlameCacheMisses++
         $blameXml = Invoke-SvnCommandAllowMissingTarget -Arguments @('blame', '--xml', '-r', [string]$Revision, $url) -ErrorContext ("svn blame $FilePath@$Revision")
         if (-not [string]::IsNullOrWhiteSpace($blameXml))
         {
@@ -2321,7 +2242,7 @@ function Get-SvnBlameLine
     }
     else
     {
-        $script:StrictBlameCacheHits++
+        $Context.Caches.StrictBlameCacheHits++
     }
 
     $catText = Read-CatCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
@@ -2336,12 +2257,12 @@ function Get-SvnBlameLine
     if ([string]::IsNullOrWhiteSpace($blameXml) -or $null -eq $catText)
     {
         $empty = Get-EmptyBlameResult
-        $script:SvnBlameLineMemoryCache[$cacheKey] = $empty
+        $Context.Caches.SvnBlameLineMemoryCache[$cacheKey] = $empty
         return $empty
     }
     $contentLines = ConvertTo-TextLine -Text $catText
     $parsed = ConvertFrom-SvnBlameXml -XmlText $blameXml -ContentLines $contentLines
-    $script:SvnBlameLineMemoryCache[$cacheKey] = $parsed
+    $Context.Caches.SvnBlameLineMemoryCache[$cacheKey] = $parsed
     return $parsed
 }
 function Initialize-SvnBlameLineCache
@@ -3322,7 +3243,7 @@ function Invoke-StrictBlameCachePrefetch
         並列実行時の最大ワーカー数を指定する。
     #>
     [CmdletBinding()]
-    param(
+    param( [hashtable]$Context = $script:NarutoContext,
         [object[]]$Targets,
         [string]$TargetUrl,
         [string]$CacheDir,
@@ -3345,8 +3266,8 @@ function Invoke-StrictBlameCachePrefetch
             try
             {
                 $prefetchStats = Initialize-SvnBlameLineCache -Repo $TargetUrl -FilePath ([string]$item.FilePath) -Revision ([int]$item.Revision) -CacheDir $CacheDir
-                $script:StrictBlameCacheHits += [int]$prefetchStats.CacheHits
-                $script:StrictBlameCacheMisses += [int]$prefetchStats.CacheMisses
+                $Context.Caches.StrictBlameCacheHits += [int]$prefetchStats.CacheHits
+                $Context.Caches.StrictBlameCacheMisses += [int]$prefetchStats.CacheMisses
             }
             catch
             {
@@ -3402,14 +3323,15 @@ function Invoke-StrictBlameCachePrefetch
             'Get-EmptyBlameResult',
             'Initialize-SvnBlameLineCache'
         ) -SessionVariables @{
-            SvnExecutable = $script:SvnExecutable
-            SvnGlobalArguments = @($script:SvnGlobalArguments)
+            NarutoContext = (Get-RunspaceNarutoContext -Context $Context)
+            SvnExecutable = $Context.Runtime.SvnExecutable
+            SvnGlobalArguments = @($Context.Runtime.SvnGlobalArguments)
         } -ErrorContext 'strict blame prefetch')
 
     foreach ($entry in @($results))
     {
-        $script:StrictBlameCacheHits += [int]$entry.CacheHits
-        $script:StrictBlameCacheMisses += [int]$entry.CacheMisses
+        $Context.Caches.StrictBlameCacheHits += [int]$entry.CacheHits
+        $Context.Caches.StrictBlameCacheMisses += [int]$entry.CacheMisses
     }
 }
 function New-StrictAttributionAccumulator
@@ -3798,7 +3720,7 @@ function Get-ExactDeathAttribution
         並列実行時の最大ワーカー数を指定する。
     #>
     [CmdletBinding()]
-    param(
+    param( [hashtable]$Context = $script:NarutoContext,
         [object[]]$Commits,
         [hashtable]$RevToAuthor,
         [string]$TargetUrl,
@@ -3859,7 +3781,7 @@ function Get-ExactDeathAttribution
         $deathIdx++
         # コミット間でキャッシュキーの再利用はないため、コミット境界で安全にクリア可能。
         # これによりメモリ使用量を O(N×K×L) から O(K×L) に削減する。
-        $script:SvnBlameLineMemoryCache.Clear()
+        $Context.Caches.SvnBlameLineMemoryCache.Clear()
     }
     Write-Progress -Id 3 -Activity '行単位の帰属解析' -Completed
 
@@ -3887,7 +3809,7 @@ function Get-CommitterMetric
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
-    param([object[]]$Commits, [hashtable]$RenameMap = @{})
+    param( [hashtable]$Context = $script:NarutoContext, [object[]]$Commits, [hashtable]$RenameMap = @{})
     $states = @{}
     $fileAuthors = @{}
     foreach ($c in $Commits)
@@ -4081,7 +4003,7 @@ function Get-CommitterMetric
                 '削除アクション数' = [int]$s.ActD
                 '置換アクション数' = [int]$s.ActR
                 '生存行数' = $null
-                $script:ColDeadAdded = $null
+                $Context.Metrics.ColDeadAdded = $null
                 '所有行数' = $null
                 '所有割合' = $null
                 '自己相殺行数' = $null
@@ -4091,8 +4013,8 @@ function Get-CommitterMetric
                 '同一箇所反復編集数' = $null
                 'ピンポン回数' = $null
                 '内部移動行数' = $null
-                $script:ColSelfDead = $null
-                $script:ColOtherDead = $null
+                $Context.Metrics.ColSelfDead = $null
+                $Context.Metrics.ColOtherDead = $null
                 '他者コード変更行数' = $null
                 '他者コード変更生存行数' = $null
                 '他者コード変更生存率' = $null
@@ -4122,7 +4044,7 @@ function Get-FileMetric
         変更間隔や最多作者占有率、ホットスポットスコアを算出して優先度付けに備える。
         strict で補完する blame 依存列は null 初期化し、後段更新との整合を保つ。
     #>
-    [CmdletBinding()]param([object[]]$Commits, [hashtable]$RenameMap = @{})
+    [CmdletBinding()]param( [hashtable]$Context = $script:NarutoContext, [object[]]$Commits, [hashtable]$RenameMap = @{})
     $states = @{}
     foreach ($c in $Commits)
     {
@@ -4261,7 +4183,7 @@ function Get-FileMetric
                 '平均変更間隔日数' = Format-MetricValue -Value $avg
                 '活動期間日数' = Format-MetricValue -Value $spanDays
                 '生存行数 (範囲指定)' = $null
-                $script:ColDeadAdded = $null
+                $Context.Metrics.ColDeadAdded = $null
                 '最多作者チャーン占有率' = Format-MetricValue -Value $topShare
                 '最多作者blame占有率' = $null
                 '自己相殺行数 (合計)' = $null
@@ -4613,7 +4535,7 @@ function Write-FileBubbleChart
         Write-FileBubbleChart -OutDirectory '.\output' -Files $fileMetrics -TopNCount 50 -EncodingName 'UTF8'
     #>
     [CmdletBinding()]
-    param(
+    param( [hashtable]$Context = $script:NarutoContext,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$OutDirectory,
@@ -4658,8 +4580,8 @@ function Write-FileBubbleChart
 
     $svgWidth = 640.0
     $svgHeight = 592.0
-    $plotLeft = $script:SvgPlotLeft
-    $plotTop = $script:SvgPlotTopLarge
+    $plotLeft = $Context.Constants.SvgPlotLeft
+    $plotTop = $Context.Constants.SvgPlotTopLarge
     $plotWidth = 480.0
     $plotHeight = 440.0
     $plotRight = $plotLeft + $plotWidth
@@ -4899,7 +4821,7 @@ function Write-FileQualityScatterChart
         Write-FileQualityScatterChart -OutDirectory '.\output' -Files $fileRows -TopNCount 50 -EncodingName 'UTF8'
     #>
     [CmdletBinding()]
-    param(
+    param( [hashtable]$Context = $script:NarutoContext,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$OutDirectory,
@@ -4952,7 +4874,7 @@ function Write-FileQualityScatterChart
             continue
         }
         $deadAdded = 0.0
-        $prop = $f.PSObject.Properties[$script:ColDeadAdded]
+        $prop = $f.PSObject.Properties[$Context.Metrics.ColDeadAdded]
         if ($null -ne $prop -and $null -ne $prop.Value)
         {
             $deadAdded = [double]$prop.Value
@@ -5020,10 +4942,10 @@ function Write-FileQualityScatterChart
     }
 
     # 描画定数
-    $plotLeft = $script:SvgPlotLeft
-    $plotTop = $script:SvgPlotTopLarge
-    $plotWidth = $script:SvgPlotWidth
-    $plotHeight = $script:SvgPlotHeight
+    $plotLeft = $Context.Constants.SvgPlotLeft
+    $plotTop = $Context.Constants.SvgPlotTopLarge
+    $plotWidth = $Context.Constants.SvgPlotWidth
+    $plotHeight = $Context.Constants.SvgPlotHeight
     $plotRight = $plotLeft + $plotWidth
     $plotBottom = $plotTop + $plotHeight
     $midX = $plotLeft + $plotWidth / 2.0
@@ -5039,8 +4961,8 @@ function Write-FileQualityScatterChart
     {
         $maxRank = 1
     }
-    $minBubble = $script:SvgBubbleMin
-    $maxBubble = $script:SvgBubbleMax
+    $minBubble = $Context.Constants.SvgBubbleMin
+    $maxBubble = $Context.Constants.SvgBubbleMax
 
     $quadrants = @(
         [pscustomobject]@{ X = $plotLeft + $plotWidth * 0.25; Y = $plotTop + $plotHeight * 0.2; Label = '⚠️ 過剰修正型' }
@@ -5073,7 +4995,7 @@ function Write-FileQualityScatterChart
     [void]$sb.AppendLine(('<text class="axis-label" x="{0}" y="{1}" text-anchor="middle">コード消滅率</text>' -f [int]($plotLeft + $plotWidth / 2.0), [int]($plotBottom + 36)))
     [void]$sb.AppendLine(('<text class="axis-label" x="16" y="{0}" text-anchor="middle" transform="rotate(-90,16,{0})">無駄チャーン率</text>' -f [int]($plotTop + $plotHeight / 2.0)))
     # 目盛り
-    for ($tick = 0.0; $tick -le 1.01; $tick += $script:SvgQuadrantTickStep)
+    for ($tick = 0.0; $tick -le 1.01; $tick += $Context.Constants.SvgQuadrantTickStep)
     {
         $tx = $plotLeft + $tick * $plotWidth
         $ty = $plotBottom - $tick * $plotHeight
@@ -5125,7 +5047,7 @@ function Write-CommitTimelineChart
         Write-CommitTimelineChart -OutDirectory '.\output' -Commits $commitRows -EncodingName 'UTF8'
     #>
     [CmdletBinding()]
-    param(
+    param( [hashtable]$Context = $script:NarutoContext,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$OutDirectory,
@@ -5209,7 +5131,7 @@ function Write-CommitTimelineChart
     $sorted = @($commitData | Sort-Object -Property DateTime)
 
     # 作者→色マッピング
-    $colorPalette = $script:DefaultColorPalette
+    $colorPalette = $Context.Constants.DefaultColorPalette
     $authorColors = @{}
     $authorIndex = 0
     foreach ($d in $sorted)
@@ -5223,7 +5145,7 @@ function Write-CommitTimelineChart
 
     # 描画定数
     $plotLeft = 100.0
-    $plotTop = $script:SvgPlotTop
+    $plotTop = $Context.Constants.SvgPlotTop
     $plotWidth = 560.0
     $plotHeight = 340.0
     $plotRight = $plotLeft + $plotWidth
@@ -5336,7 +5258,7 @@ function Write-CommitScatterChart
         Write-CommitScatterChart -OutDirectory '.\output' -Commits $commitRows -EncodingName 'UTF8'
     #>
     [CmdletBinding()]
-    param(
+    param( [hashtable]$Context = $script:NarutoContext,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$OutDirectory,
@@ -5418,7 +5340,7 @@ function Write-CommitScatterChart
     }
 
     # 作者→色マッピング
-    $colorPalette = $script:DefaultColorPalette
+    $colorPalette = $Context.Constants.DefaultColorPalette
     $authorColors = @{}
     $authorIndex = 0
     foreach ($d in $scatterData)
@@ -5431,10 +5353,10 @@ function Write-CommitScatterChart
     }
 
     # 描画定数
-    $plotLeft = $script:SvgPlotLeft
-    $plotTop = $script:SvgPlotTop
-    $plotWidth = $script:SvgPlotWidth
-    $plotHeight = $script:SvgPlotHeight
+    $plotLeft = $Context.Constants.SvgPlotLeft
+    $plotTop = $Context.Constants.SvgPlotTop
+    $plotWidth = $Context.Constants.SvgPlotWidth
+    $plotHeight = $Context.Constants.SvgPlotHeight
     $plotRight = $plotLeft + $plotWidth
     $plotBottom = $plotTop + $plotHeight
     $legendX = $plotRight + 20.0
@@ -5546,7 +5468,7 @@ function Get-SafeFileName
     #>
     [CmdletBinding()]
     [OutputType([string])]
-    param(
+    param( [hashtable]$Context = $script:NarutoContext,
         [Parameter(Mandatory = $true)]
         [AllowEmptyString()]
         [string]$BaseName,
@@ -5617,7 +5539,7 @@ function Get-SafeFileName
     {
         # 長すぎる場合は切り詰めてハッシュを付与
         # NOTE: MD5 はセキュリティ目的ではなく、ファイル名の一意性確保のみに使用
-        $hash = [BitConverter]::ToString([System.Security.Cryptography.MD5]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($safe))).Replace('-', '').Substring(0, $script:HashTruncateLength).ToLowerInvariant()
+        $hash = [BitConverter]::ToString([System.Security.Cryptography.MD5]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($safe))).Replace('-', '').Substring(0, $Context.Constants.HashTruncateLength).ToLowerInvariant()
         $truncLen = $maxBaseLen - 9
         if ($truncLen -lt 1)
         {
@@ -5752,7 +5674,7 @@ function Write-CommitterOutcomeChart
         Write-CommitterOutcomeChart -OutDirectory '.\output' -Committers $committers -TopNCount 10 -EncodingName 'UTF8'
     #>
     [CmdletBinding()]
-    param(
+    param( [hashtable]$Context = $script:NarutoContext,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$OutDirectory,
@@ -5793,10 +5715,10 @@ function Write-CommitterOutcomeChart
     }
 
     # --- 色定義 ---
-    $colorSurvived = $script:ColorSurvived
-    $colorSelfCancel = $script:ColorSelfCancel
-    $colorRemovedByOthers = $script:ColorRemovedByOthers
-    $colorOther = $script:ColorOtherDead
+    $colorSurvived = $Context.Constants.ColorSurvived
+    $colorSelfCancel = $Context.Constants.ColorSelfCancel
+    $colorRemovedByOthers = $Context.Constants.ColorRemovedByOthers
+    $colorOther = $Context.Constants.ColorOtherDead
 
     # --- 個人用 SVG（1人分のみ表示） ---
     $usedNames = New-Object 'System.Collections.Generic.HashSet[string]'
@@ -6073,7 +5995,7 @@ function Write-CommitterScatterChart
         Write-CommitterScatterChart -OutDirectory '.\output' -Committers $committers -TopNCount 10 -EncodingName 'UTF8'
     #>
     [CmdletBinding()]
-    param(
+    param( [hashtable]$Context = $script:NarutoContext,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$OutDirectory,
@@ -6114,10 +6036,10 @@ function Write-CommitterScatterChart
     }
 
     # 描画定数
-    $plotLeft = $script:SvgPlotLeft
-    $plotTop = $script:SvgPlotTop
-    $plotWidth = $script:SvgPlotWidth
-    $plotHeight = $script:SvgPlotHeight
+    $plotLeft = $Context.Constants.SvgPlotLeft
+    $plotTop = $Context.Constants.SvgPlotTop
+    $plotWidth = $Context.Constants.SvgPlotWidth
+    $plotHeight = $Context.Constants.SvgPlotHeight
     $plotRight = $plotLeft + $plotWidth
     $plotBottom = $plotTop + $plotHeight
     $midX = $plotLeft + $plotWidth / 2.0
@@ -6129,8 +6051,8 @@ function Write-CommitterScatterChart
     {
         $maxChurn = 1.0
     }
-    $minBubble = $script:SvgBubbleMin
-    $maxBubble = $script:SvgBubbleMax
+    $minBubble = $Context.Constants.SvgBubbleMin
+    $maxBubble = $Context.Constants.SvgBubbleMax
 
     # 象限ラベル
     $quadrants = @(
@@ -6183,7 +6105,7 @@ function Write-CommitterScatterChart
         [void]$sb.AppendLine(('<text class="axis-label" x="{0}" y="{1}" text-anchor="middle">リワーク率</text>' -f [int]($plotLeft + $plotWidth / 2.0), [int]($plotBottom + 36)))
         [void]$sb.AppendLine(('<text class="axis-label" x="16" y="{0}" text-anchor="middle" transform="rotate(-90,16,{0})">コード生存率</text>' -f [int]($plotTop + $plotHeight / 2.0)))
         # 目盛り
-        for ($tick = 0.0; $tick -le 1.01; $tick += $script:SvgQuadrantTickStep)
+        for ($tick = 0.0; $tick -le 1.01; $tick += $Context.Constants.SvgQuadrantTickStep)
         {
             $tx = $plotLeft + $tick * $plotWidth
             $ty = $plotBottom - $tick * $plotHeight
@@ -6225,7 +6147,7 @@ function Write-CommitterScatterChart
     [void]$sb.AppendLine(('<text class="axis-label" x="{0}" y="{1}" text-anchor="middle">リワーク率</text>' -f [int]($plotLeft + $plotWidth / 2.0), [int]($plotBottom + 36)))
     [void]$sb.AppendLine(('<text class="axis-label" x="16" y="{0}" text-anchor="middle" transform="rotate(-90,16,{0})">コード生存率</text>' -f [int]($plotTop + $plotHeight / 2.0)))
     # 目盛り
-    for ($tick = 0.0; $tick -le 1.01; $tick += $script:SvgQuadrantTickStep)
+    for ($tick = 0.0; $tick -le 1.01; $tick += $Context.Constants.SvgQuadrantTickStep)
     {
         $tx = $plotLeft + $tick * $plotWidth
         $ty = $plotBottom - $tick * $plotHeight
@@ -6239,7 +6161,7 @@ function Write-CommitterScatterChart
     }
     # 全員のバブル（大きい順に描画して小さい方が前面に来る）
     $sortedByChurn = @($scatterData | Sort-Object -Property TotalChurn -Descending)
-    $colorPalette = $script:DefaultColorPalette
+    $colorPalette = $Context.Constants.DefaultColorPalette
     for ($ci = 0; $ci -lt $sortedByChurn.Count; $ci++)
     {
         $d = $sortedByChurn[$ci]
@@ -6348,7 +6270,7 @@ function Write-SurvivedShareDonutChart
         出力時に使用する文字エンコーディングを指定する。
     #>
     [CmdletBinding()]
-    param(
+    param( [hashtable]$Context = $script:NarutoContext,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$OutDirectory,
@@ -6403,7 +6325,7 @@ function Write-SurvivedShareDonutChart
         return
     }
 
-    $colorPalette = $script:DefaultColorPalette
+    $colorPalette = $Context.Constants.DefaultColorPalette
     $svgW = 640
     $svgH = 420
     $cx = 240.0
@@ -6507,7 +6429,7 @@ function Write-TeamInteractionHeatMap
         出力時に使用する文字エンコーディングを指定する。
     #>
     [CmdletBinding()]
-    param(
+    param( [hashtable]$Context = $script:NarutoContext,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$OutDirectory,
@@ -6648,7 +6570,7 @@ function Write-TeamInteractionHeatMap
                 $cellColor = ('#{0}{1}{2}' -f $rVal.ToString('X2'), $gVal.ToString('X2'), $bVal.ToString('X2')).ToLowerInvariant()
             }
 
-            $textClass = if ($t -gt $script:HeatmapLightTextThreshold)
+            $textClass = if ($t -gt $Context.Constants.HeatmapLightTextThreshold)
             {
                 'cell-value-light'
             }
@@ -6761,7 +6683,7 @@ function Write-TeamActivityProfileChart
         出力時に使用する文字エンコーディングを指定する。
     #>
     [CmdletBinding()]
-    param(
+    param( [hashtable]$Context = $script:NarutoContext,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$OutDirectory,
@@ -6792,10 +6714,10 @@ function Write-TeamActivityProfileChart
     }
 
     # 描画定数
-    $plotLeft = $script:SvgPlotLeft
-    $plotTop = $script:SvgPlotTop
-    $plotWidth = $script:SvgPlotWidth
-    $plotHeight = $script:SvgPlotHeight
+    $plotLeft = $Context.Constants.SvgPlotLeft
+    $plotTop = $Context.Constants.SvgPlotTop
+    $plotWidth = $Context.Constants.SvgPlotWidth
+    $plotHeight = $Context.Constants.SvgPlotHeight
     $plotRight = $plotLeft + $plotWidth
     $plotBottom = $plotTop + $plotHeight
     $midX = $plotLeft + $plotWidth / 2.0
@@ -6806,8 +6728,8 @@ function Write-TeamActivityProfileChart
     {
         $maxChurn = 1.0
     }
-    $minBubble = $script:SvgBubbleMin
-    $maxBubble = $script:SvgBubbleMax
+    $minBubble = $Context.Constants.SvgBubbleMin
+    $maxBubble = $Context.Constants.SvgBubbleMax
 
     # 象限ラベル
     $quadrants = @(
@@ -6840,7 +6762,7 @@ function Write-TeamActivityProfileChart
     [void]$sb.AppendLine(('<text class="axis-label" x="{0}" y="{1}" text-anchor="middle">他者コード削除介入度</text>' -f [int]($plotLeft + $plotWidth / 2.0), [int]($plotBottom + 36)))
     [void]$sb.AppendLine(('<text class="axis-label" x="16" y="{0}" text-anchor="middle" transform="rotate(-90,16,{0})">他者コード変更生存率</text>' -f [int]($plotTop + $plotHeight / 2.0)))
     # 目盛り
-    for ($tick = 0.0; $tick -le 1.01; $tick += $script:SvgQuadrantTickStep)
+    for ($tick = 0.0; $tick -le 1.01; $tick += $Context.Constants.SvgQuadrantTickStep)
     {
         $tx = $plotLeft + $tick * $plotWidth
         $ty = $plotBottom - $tick * $plotHeight
@@ -6853,7 +6775,7 @@ function Write-TeamActivityProfileChart
         [void]$sb.AppendLine(('<text class="quadrant-label" x="{0:F0}" y="{1:F0}">{2}</text>' -f $q.X, $q.Y, (ConvertTo-SvgEscapedText -Text $q.Label)))
     }
     # 全員のバブル
-    $colorPalette = $script:DefaultColorPalette
+    $colorPalette = $Context.Constants.DefaultColorPalette
     $sortedByChurn = @($profileData | Sort-Object -Property TotalChurn -Descending)
     for ($ci = 0; $ci -lt $sortedByChurn.Count; $ci++)
     {
@@ -6890,7 +6812,7 @@ function Write-ProjectCodeFateChart
         出力時に使用する文字エンコーディングを指定する。
     #>
     [CmdletBinding()]
-    param(
+    param( [hashtable]$Context = $script:NarutoContext,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$OutDirectory,
@@ -6954,10 +6876,10 @@ function Write-ProjectCodeFateChart
     }
 
     $segments = @(
-        [pscustomobject]@{ Label = '生存'; Value = $totalSurvived; Color = $script:ColorSurvived }
-        [pscustomobject]@{ Label = '自己相殺'; Value = $totalSelfCancel; Color = $script:ColorSelfCancel }
-        [pscustomobject]@{ Label = '被他者削除'; Value = $totalRemovedByOthers; Color = $script:ColorRemovedByOthers }
-        [pscustomobject]@{ Label = 'その他消滅'; Value = $totalOther; Color = $script:ColorOtherDead }
+        [pscustomobject]@{ Label = '生存'; Value = $totalSurvived; Color = $Context.Constants.ColorSurvived }
+        [pscustomobject]@{ Label = '自己相殺'; Value = $totalSelfCancel; Color = $Context.Constants.ColorSelfCancel }
+        [pscustomobject]@{ Label = '被他者削除'; Value = $totalRemovedByOthers; Color = $Context.Constants.ColorRemovedByOthers }
+        [pscustomobject]@{ Label = 'その他消滅'; Value = $totalOther; Color = $Context.Constants.ColorOtherDead }
     )
     # 値が 0 のセグメントを除外
     $segments = @($segments | Where-Object { $_.Value -gt 0 })
@@ -7163,7 +7085,7 @@ function Write-ProjectEfficiencyQuadrantChart
         出力時に使用する文字エンコーディング名を指定する。
     #>
     [CmdletBinding()]
-    param(
+    param( [hashtable]$Context = $script:NarutoContext,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$OutDirectory,
@@ -7192,10 +7114,10 @@ function Write-ProjectEfficiencyQuadrantChart
         return
     }
 
-    $plotLeft = $script:SvgPlotLeft
-    $plotTop = $script:SvgPlotTopLarge
-    $plotWidth = $script:SvgPlotWidth
-    $plotHeight = $script:SvgPlotHeight
+    $plotLeft = $Context.Constants.SvgPlotLeft
+    $plotTop = $Context.Constants.SvgPlotTopLarge
+    $plotWidth = $Context.Constants.SvgPlotWidth
+    $plotHeight = $Context.Constants.SvgPlotHeight
     $plotRight = $plotLeft + $plotWidth
     $plotBottom = $plotTop + $plotHeight
     $svgW = 600
@@ -7206,8 +7128,8 @@ function Write-ProjectEfficiencyQuadrantChart
     {
         $maxChurn = 1.0
     }
-    $minBubble = $script:SvgBubbleMin
-    $maxBubble = $script:SvgBubbleMax
+    $minBubble = $Context.Constants.SvgBubbleMin
+    $maxBubble = $Context.Constants.SvgBubbleMax
 
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine('<?xml version="1.0" encoding="UTF-8"?>')
@@ -7231,7 +7153,7 @@ function Write-ProjectEfficiencyQuadrantChart
     [void]$sb.AppendLine(('<line class="mid-line" x1="{0}" y1="{1}" x2="{0}" y2="{2}"/>' -f [int]$midX, [int]$plotTop, [int]$plotBottom))
     [void]$sb.AppendLine(('<line class="mid-line" x1="{0}" y1="{1}" x2="{2}" y2="{1}"/>' -f [int]$plotLeft, [int]$midY, [int]$plotRight))
     # 目盛りラベル
-    for ($tick = 0.0; $tick -le 1.01; $tick += $script:SvgQuadrantTickStep)
+    for ($tick = 0.0; $tick -le 1.01; $tick += $Context.Constants.SvgQuadrantTickStep)
     {
         $tx = $plotLeft + $tick * $plotWidth
         $ty = $plotBottom - $tick * $plotHeight
@@ -7316,7 +7238,7 @@ function Write-ProjectSummaryDashboard
         出力時に使用する文字エンコーディングを指定する。
     #>
     [CmdletBinding()]
-    param(
+    param( [hashtable]$Context = $script:NarutoContext,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$OutDirectory,
@@ -7471,7 +7393,7 @@ function Write-ProjectSummaryDashboard
     )
 
     # 色割り当て
-    $cardColors = @($script:DefaultColorPalette[0], $script:DefaultColorPalette[0], $script:DefaultColorPalette[0], $script:DefaultColorPalette[1], $script:DefaultColorPalette[4], $script:DefaultColorPalette[2], $script:ColorSurvived, $script:ColorChurn, $script:DefaultColorPalette[3])
+    $cardColors = @($Context.Constants.DefaultColorPalette[0], $Context.Constants.DefaultColorPalette[0], $Context.Constants.DefaultColorPalette[0], $Context.Constants.DefaultColorPalette[1], $Context.Constants.DefaultColorPalette[4], $Context.Constants.DefaultColorPalette[2], $Context.Constants.ColorSurvived, $Context.Constants.ColorChurn, $Context.Constants.DefaultColorPalette[3])
 
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine('<?xml version="1.0" encoding="UTF-8"?>')
@@ -7533,7 +7455,7 @@ function Write-ContributorBalanceChart
         出力時に使用する文字エンコーディングを指定する。
     #>
     [CmdletBinding()]
-    param(
+    param( [hashtable]$Context = $script:NarutoContext,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$OutDirectory,
@@ -7642,8 +7564,8 @@ function Write-ContributorBalanceChart
     # 中央線
     [void]$sb.AppendLine(('<line x1="{0}" y1="{1}" x2="{0}" y2="{2}" stroke="#bdbdbd" stroke-width="1" stroke-dasharray="4,3"/>' -f [int]$centerX, [int]($marginTop - 6), [int]($marginTop + $n * ($barHeight + $barGap))))
 
-    $churnColor = $script:ColorChurn
-    $survivedColor = $script:ColorSurvived
+    $churnColor = $Context.Constants.ColorChurn
+    $survivedColor = $Context.Constants.ColorSurvived
 
     for ($i = 0; $i -lt $n; $i++)
     {
@@ -7754,7 +7676,7 @@ function Get-SvgCharacterWidth
     #>
     [CmdletBinding()]
     [OutputType([double])]
-    param(
+    param( [hashtable]$Context = $script:NarutoContext,
         [Parameter(Mandatory = $true)]
         [char]$Character,
         [Parameter(Mandatory = $false)]
@@ -7763,10 +7685,10 @@ function Get-SvgCharacterWidth
 
     $size = [Math]::Max(1.0, [double]$FontSize)
     $codePoint = [int]$Character
-    $ratio = $script:SvgCharWidthDefault
+    $ratio = $Context.Constants.SvgCharWidthDefault
     if ([char]::IsWhiteSpace($Character))
     {
-        $ratio = $script:SvgCharWidthSpace
+        $ratio = $Context.Constants.SvgCharWidthSpace
     }
     elseif (
         ($codePoint -ge 0x3000 -and $codePoint -le 0x303F) -or
@@ -7779,7 +7701,7 @@ function Get-SvgCharacterWidth
         ($codePoint -ge 0xFFE0 -and $codePoint -le 0xFFE6)
     )
     {
-        $ratio = $script:SvgCharWidthCjk
+        $ratio = $Context.Constants.SvgCharWidthCjk
     }
     elseif (
         $Character -eq '.' -or
@@ -7793,7 +7715,7 @@ function Get-SvgCharacterWidth
         $Character -eq 'I'
     )
     {
-        $ratio = $script:SvgCharWidthNarrow
+        $ratio = $Context.Constants.SvgCharWidthNarrow
     }
     elseif (
         $Character -eq 'W' -or
@@ -7802,7 +7724,7 @@ function Get-SvgCharacterWidth
         $Character -eq '#'
     )
     {
-        $ratio = $script:SvgCharWidthWide
+        $ratio = $Context.Constants.SvgCharWidthWide
     }
 
     return [Math]::Round($ratio * $size, 2)
@@ -8336,7 +8258,7 @@ function Set-CommitDerivedMetric
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
-    param([object]$Commit)
+    param( [hashtable]$Context = $script:NarutoContext, [object]$Commit)
     $added = 0
     $deleted = 0
     $churnPerFile = @()
@@ -8360,9 +8282,9 @@ function Set-CommitDerivedMetric
     }
     $Commit.MsgLen = $message.Length
     $oneLineMessage = ($message -replace '(\r?\n)+', ' ').Trim()
-    if ($oneLineMessage.Length -gt $script:CommitMessageMaxLength)
+    if ($oneLineMessage.Length -gt $Context.Constants.CommitMessageMaxLength)
     {
-        $oneLineMessage = $oneLineMessage.Substring(0, $script:CommitMessageMaxLength) + '...'
+        $oneLineMessage = $oneLineMessage.Substring(0, $Context.Constants.CommitMessageMaxLength) + '...'
     }
     $Commit.MessageShort = $oneLineMessage
 }
@@ -8396,7 +8318,7 @@ function Initialize-CommitDiffData
     #>
     [CmdletBinding()]
     [OutputType([hashtable])]
-    param(
+    param( [hashtable]$Context = $script:NarutoContext,
         [object[]]$Commits,
         [string]$CacheDir,
         [string]$TargetUrl,
@@ -8453,8 +8375,9 @@ function Initialize-CommitDiffData
                 'Invoke-SvnCommand',
                 'Get-CachedOrFetchDiffText'
             ) -SessionVariables @{
-                SvnExecutable = $script:SvnExecutable
-                SvnGlobalArguments = @($script:SvnGlobalArguments)
+                NarutoContext = (Get-RunspaceNarutoContext -Context $Context)
+                SvnExecutable = $Context.Runtime.SvnExecutable
+                SvnGlobalArguments = @($Context.Runtime.SvnGlobalArguments)
             } -ErrorContext 'commit diff prefetch')
     }
 
@@ -8634,7 +8557,7 @@ function Get-StrictOwnershipAggregate
     #>
     [CmdletBinding()]
     [OutputType([object])]
-    param(
+    param( [hashtable]$Context = $script:NarutoContext,
         [string]$TargetUrl,
         [int]$ToRevision,
         [string]$CacheDir,
@@ -8721,8 +8644,9 @@ function Get-StrictOwnershipAggregate
                 'Get-BlameMemoryCacheKey',
                 'Get-SvnBlameSummary'
             ) -SessionVariables @{
-                SvnExecutable = $script:SvnExecutable
-                SvnGlobalArguments = @($script:SvnGlobalArguments)
+                NarutoContext = (Get-RunspaceNarutoContext -Context $Context)
+                SvnExecutable = $Context.Runtime.SvnExecutable
+                SvnGlobalArguments = @($Context.Runtime.SvnGlobalArguments)
             } -ErrorContext 'strict ownership blame')
 
         foreach ($entry in @($ownershipResults))
@@ -8834,7 +8758,7 @@ function Update-FileRowWithStrictMetric
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
-    param(
+    param( [hashtable]$Context = $script:NarutoContext,
         [object[]]$FileRows,
         [hashtable]$RenameMap,
         [object]$StrictDetail,
@@ -8880,7 +8804,7 @@ function Update-FileRowWithStrictMetric
         }
 
         $row.'生存行数 (範囲指定)' = $survived
-        $row.($script:ColDeadAdded) = $dead
+        $row.($Context.Metrics.ColDeadAdded) = $dead
         $row.'自己相殺行数 (合計)' = $selfCancel
         $row.'他者差戻行数 (合計)' = $crossRevert
         $row.'同一箇所反復編集数 (合計)' = $repeatedHunk
@@ -8926,7 +8850,7 @@ function Update-CommitterRowWithStrictMetric
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
-    param(
+    param( [hashtable]$Context = $script:NarutoContext,
         [object[]]$CommitterRows,
         [hashtable]$AuthorSurvived,
         [hashtable]$AuthorOwned,
@@ -8949,7 +8873,7 @@ function Update-CommitterRowWithStrictMetric
         $modifiedOthersSurvived = Get-HashtableIntValue -Table $AuthorModifiedOthersSurvived -Key $author
 
         $row.'生存行数' = $survived
-        $row.($script:ColDeadAdded) = $dead
+        $row.($Context.Metrics.ColDeadAdded) = $dead
         $row.'所有行数' = $owned
         $ownShare = if ($OwnedTotal -gt 0)
         {
@@ -8967,8 +8891,8 @@ function Update-CommitterRowWithStrictMetric
         $row.'同一箇所反復編集数' = $repeatedHunk
         $row.'ピンポン回数' = $pingPong
         $row.'内部移動行数' = $internalMove
-        $row.($script:ColSelfDead) = $selfDead
-        $row.($script:ColOtherDead) = $otherDead
+        $row.($Context.Metrics.ColSelfDead) = $selfDead
+        $row.($Context.Metrics.ColOtherDead) = $otherDead
         $row.'他者コード変更行数' = $modifiedOthersCode
         $row.'他者コード変更生存行数' = $modifiedOthersSurvived
 
@@ -9094,10 +9018,10 @@ function Get-MetricHeader
     #>
     [CmdletBinding()]
     [OutputType([object])]
-    param()
+    param([hashtable]$Context = $script:NarutoContext)
     return [pscustomobject]@{
-        Committer = @('作者', 'コミット数', '活動日数', '変更ファイル数', '変更ディレクトリ数', '追加行数', '削除行数', '純増行数', '総チャーン', 'コミットあたりチャーン', '削除対追加比', 'チャーン対純増比', 'リワーク率', 'バイナリ変更回数', '追加アクション数', '変更アクション数', '削除アクション数', '置換アクション数', '生存行数', $script:ColDeadAdded, '所有行数', '所有割合', '自己相殺行数', '自己差戻行数', '他者差戻行数', '被他者削除行数', '同一箇所反復編集数', 'ピンポン回数', '内部移動行数', $script:ColSelfDead, $script:ColOtherDead, '他者コード変更行数', '他者コード変更生存行数', '他者コード変更生存率', 'ピンポン率', '変更エントロピー', '平均共同作者数', '最大共同作者数', 'メッセージ総文字数', 'メッセージ平均文字数', '課題ID言及数', '修正キーワード数', '差戻キーワード数', 'マージキーワード数')
-        File = @('ファイルパス', 'コミット数', '作者数', '追加行数', '削除行数', '純増行数', '総チャーン', 'バイナリ変更回数', '作成回数', '削除回数', '置換回数', '初回変更リビジョン', '最終変更リビジョン', '平均変更間隔日数', '活動期間日数', '生存行数 (範囲指定)', $script:ColDeadAdded, '最多作者チャーン占有率', '最多作者blame占有率', '自己相殺行数 (合計)', '他者差戻行数 (合計)', '同一箇所反復編集数 (合計)', 'ピンポン回数 (合計)', '内部移動行数 (合計)', 'ホットスポットスコア', 'ホットスポット順位')
+        Committer = @('作者', 'コミット数', '活動日数', '変更ファイル数', '変更ディレクトリ数', '追加行数', '削除行数', '純増行数', '総チャーン', 'コミットあたりチャーン', '削除対追加比', 'チャーン対純増比', 'リワーク率', 'バイナリ変更回数', '追加アクション数', '変更アクション数', '削除アクション数', '置換アクション数', '生存行数', $Context.Metrics.ColDeadAdded, '所有行数', '所有割合', '自己相殺行数', '自己差戻行数', '他者差戻行数', '被他者削除行数', '同一箇所反復編集数', 'ピンポン回数', '内部移動行数', $Context.Metrics.ColSelfDead, $Context.Metrics.ColOtherDead, '他者コード変更行数', '他者コード変更生存行数', '他者コード変更生存率', 'ピンポン率', '変更エントロピー', '平均共同作者数', '最大共同作者数', 'メッセージ総文字数', 'メッセージ平均文字数', '課題ID言及数', '修正キーワード数', '差戻キーワード数', 'マージキーワード数')
+        File = @('ファイルパス', 'コミット数', '作者数', '追加行数', '削除行数', '純増行数', '総チャーン', 'バイナリ変更回数', '作成回数', '削除回数', '置換回数', '初回変更リビジョン', '最終変更リビジョン', '平均変更間隔日数', '活動期間日数', '生存行数 (範囲指定)', $Context.Metrics.ColDeadAdded, '最多作者チャーン占有率', '最多作者blame占有率', '自己相殺行数 (合計)', '他者差戻行数 (合計)', '同一箇所反復編集数 (合計)', 'ピンポン回数 (合計)', '内部移動行数 (合計)', 'ホットスポットスコア', 'ホットスポット順位')
         Commit = @('リビジョン', '日時', '作者', 'メッセージ文字数', 'メッセージ', '変更ファイル数', '追加行数', '削除行数', 'チャーン', 'エントロピー')
         Coupling = @('ファイルA', 'ファイルB', '共変更回数', 'Jaccard', 'リフト値')
     }
@@ -9153,7 +9077,7 @@ function New-RunMetaData
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     [OutputType([System.Collections.Specialized.OrderedDictionary])]
-    param(
+    param( [hashtable]$Context = $script:NarutoContext,
         [datetime]$StartTime,
         [datetime]$EndTime,
         [string]$TargetUrl,
@@ -9181,7 +9105,7 @@ function New-RunMetaData
         RepoUrl = $TargetUrl
         FromRev = $FromRevision
         ToRev = $ToRevision
-        SvnExecutable = $script:SvnExecutable
+        SvnExecutable = $Context.Runtime.SvnExecutable
         SvnVersion = $SvnVersion
         StrictMode = $true
         Parallel = $Parallel
@@ -9190,9 +9114,9 @@ function New-RunMetaData
         CommitCount = @($Commits).Count
         FileCount = @($FileRows).Count
         OutputDirectory = (Resolve-Path $OutDirectory).Path
-        StrictBlameCallCount = [int]($script:StrictBlameCacheHits + $script:StrictBlameCacheMisses)
-        StrictBlameCacheHits = [int]$script:StrictBlameCacheHits
-        StrictBlameCacheMisses = [int]$script:StrictBlameCacheMisses
+        StrictBlameCallCount = [int]($Context.Caches.StrictBlameCacheHits + $Context.Caches.StrictBlameCacheMisses)
+        StrictBlameCacheHits = [int]$Context.Caches.StrictBlameCacheHits
+        StrictBlameCacheMisses = [int]$Context.Caches.StrictBlameCacheMisses
         NonStrictMetrics = @('課題ID言及数', '修正キーワード数', '差戻キーワード数', 'マージキーワード数')
         NonStrictReason = '正規表現ベースのヒューリスティックであり厳密化不可能'
         Parameters = [ordered]@{
@@ -9305,120 +9229,157 @@ function Get-RenameMap
 
 # endregion ヘッダーとメタデータ
 # endregion Utility
-try
+function Invoke-NarutoCodePipeline
 {
-    # --- ステップ 1: パラメータの初期化と検証 ---
-    $startedAt = Get-Date
-    Initialize-StrictModeContext
-    if ($FromRevision -gt $ToRevision)
+    <#
+    .SYNOPSIS
+        NarutoCode の解析パイプラインを実行する。
+    #>
+    [CmdletBinding()]
+    param(
+        [hashtable]$Context = $script:NarutoContext,
+        [string]$RepoUrl,
+        [int]$FromRevision,
+        [int]$ToRevision,
+        [string]$SvnExecutable,
+        [string]$OutDirectory,
+        [string]$Username,
+        [securestring]$Password,
+        [switch]$NonInteractive,
+        [switch]$TrustServerCert,
+        [int]$Parallel,
+        [string[]]$IncludePaths,
+        [string[]]$ExcludePaths,
+        [string[]]$IncludeExtensions,
+        [string[]]$ExcludeExtensions,
+        [int]$TopNCount,
+        [string]$Encoding,
+        [switch]$IgnoreWhitespace
+    )
+    try
     {
-        $tmp = $FromRevision
-        $FromRevision = $ToRevision
-        $ToRevision = $tmp
+        # --- ステップ 1: パラメータの初期化と検証 ---
+        $startedAt = Get-Date
+        Initialize-StrictModeContext -Context $Context
+        $Context = $script:NarutoContext
+        if ($FromRevision -gt $ToRevision)
+        {
+            $tmp = $FromRevision
+            $FromRevision = $ToRevision
+            $ToRevision = $tmp
+        }
+        if (-not $OutDirectory)
+        {
+            $OutDirectory = Join-Path (Get-Location) 'NarutoCode_out'
+        }
+
+        # Resolve relative OutDirectory to absolute path based on PowerShell $PWD
+        $OutDirectory = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutDirectory)
+        $cacheDir = Join-Path $OutDirectory 'cache'
+        New-Item -Path $cacheDir -ItemType Directory -Force | Out-Null
+
+        $IncludeExtensions = ConvertTo-NormalizedExtension -Extensions $IncludeExtensions
+        $ExcludeExtensions = ConvertTo-NormalizedExtension -Extensions $ExcludeExtensions
+        $IncludePaths = ConvertTo-NormalizedPatternList -Patterns $IncludePaths
+        $ExcludePaths = ConvertTo-NormalizedPatternList -Patterns $ExcludePaths
+
+        $svnCmd = Get-Command $SvnExecutable -ErrorAction SilentlyContinue
+        if (-not $svnCmd)
+        {
+            throw "svn executable not found: '$SvnExecutable'. Install Subversion client or specify -SvnExecutable."
+        }
+
+        $Context.Runtime.SvnExecutable = $svnCmd.Source
+        $Context.Runtime.SvnGlobalArguments = Get-SvnGlobalArgumentList -Username $Username -Password $Password -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert
+
+        $targetUrl = Resolve-SvnTargetUrl -Target $RepoUrl
+        $svnVersion = Get-SvnVersionSafe
+
+        # --- ステップ 2: SVN ログの取得とパース ---
+        Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 2/8: SVN ログの取得' -PercentComplete 5
+        $logText = Invoke-SvnCommand -Arguments @('log', '--xml', '--verbose', '-r', "$FromRevision`:$ToRevision", $targetUrl) -ErrorContext 'svn log'
+        $commits = @(ConvertFrom-SvnLogXml -XmlText $logText)
+
+        # --- ステップ 3: 差分の取得とコミット単位の差分統計構築 ---
+        Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 3/8: 差分の取得と統計構築' -PercentComplete 15
+        $diffArgs = Get-SvnDiffArgumentList -IgnoreWhitespace:$IgnoreWhitespace
+        $revToAuthor = Initialize-CommitDiffData -Commits $commits -CacheDir $cacheDir -TargetUrl $targetUrl -DiffArguments $diffArgs -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePaths -ExcludePathPatterns $ExcludePaths -Parallel $Parallel
+
+        # --- ステップ 3.5: リネームマップの構築（基本メトリクスと strict 帰属の両方で使用） ---
+        $renameMap = Get-RenameMap -Commits $commits
+
+        # --- ステップ 4: 基本メトリクス算出（コミッター / ファイル / カップリング / コミット） ---
+        Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 4/8: 基本メトリクス算出' -PercentComplete 35
+        $committerRows = @(Get-CommitterMetric -Commits $commits -RenameMap $renameMap)
+        $fileRows = @(Get-FileMetric -Commits $commits -RenameMap $renameMap)
+        # couplings.csv は常に全件を出力し、TopN は可視化側でのみ適用する。
+        $couplingRows = @(Get-CoChangeMetric -Commits $commits -TopNCount 0 -RenameMap $renameMap)
+        $commitRows = @(New-CommitRowFromCommit -Commits $commits)
+
+        # --- ステップ 5: Strict 死亡帰属（blame ベースの行追跡） ---
+        Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 5/8: Strict 帰属解析' -PercentComplete 45
+        $strictResult = Update-StrictAttributionMetric -Commits $commits -RevToAuthor $revToAuthor -TargetUrl $targetUrl -FromRevision $FromRevision -ToRevision $ToRevision -CacheDir $cacheDir -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -FileRows $fileRows -CommitterRows $committerRows -Parallel $Parallel -RenameMap $renameMap
+
+        # --- ステップ 6: CSV レポート出力 ---
+        Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 6/8: CSV レポート出力' -PercentComplete 80
+        $headers = Get-MetricHeader
+        Write-CsvFile -FilePath (Join-Path $OutDirectory 'committers.csv') -Rows $committerRows -Headers $headers.Committer -EncodingName $Encoding
+        Write-CsvFile -FilePath (Join-Path $OutDirectory 'files.csv') -Rows $fileRows -Headers $headers.File -EncodingName $Encoding
+        Write-CsvFile -FilePath (Join-Path $OutDirectory 'commits.csv') -Rows $commitRows -Headers $headers.Commit -EncodingName $Encoding
+        Write-CsvFile -FilePath (Join-Path $OutDirectory 'couplings.csv') -Rows $couplingRows -Headers $headers.Coupling -EncodingName $Encoding
+        if ($null -ne $strictResult)
+        {
+            Write-KillMatrixCsv -OutDirectory $OutDirectory -KillMatrix $strictResult.KillMatrix -AuthorSelfDead $strictResult.AuthorSelfDead -Committers $committerRows -EncodingName $Encoding
+        }
+        # --- ステップ 7: 可視化出力 ---
+        Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 7/8: 可視化出力' -PercentComplete 88
+        Write-PlantUmlFile -OutDirectory $OutDirectory -Committers $committerRows -Files $fileRows -Couplings $couplingRows -TopNCount $TopNCount -EncodingName $Encoding
+        Write-FileBubbleChart -OutDirectory $OutDirectory -Files $fileRows -TopNCount $TopNCount -EncodingName $Encoding
+        Write-CommitterOutcomeChart -OutDirectory $OutDirectory -Committers $committerRows -TopNCount $TopNCount -EncodingName $Encoding
+        Write-CommitterScatterChart -OutDirectory $OutDirectory -Committers $committerRows -TopNCount $TopNCount -EncodingName $Encoding
+        Write-SurvivedShareDonutChart -OutDirectory $OutDirectory -Committers $committerRows -EncodingName $Encoding
+        if ($null -ne $strictResult)
+        {
+            Write-TeamInteractionHeatMap -OutDirectory $OutDirectory -KillMatrix $strictResult.KillMatrix -AuthorSelfDead $strictResult.AuthorSelfDead -Committers $committerRows -EncodingName $Encoding
+        }
+        Write-TeamActivityProfileChart -OutDirectory $OutDirectory -Committers $committerRows -EncodingName $Encoding
+        Write-FileQualityScatterChart -OutDirectory $OutDirectory -Files $fileRows -TopNCount $TopNCount -EncodingName $Encoding
+        Write-CommitTimelineChart -OutDirectory $OutDirectory -Commits $commitRows -EncodingName $Encoding
+        Write-CommitScatterChart -OutDirectory $OutDirectory -Commits $commitRows -EncodingName $Encoding
+        Write-ProjectCodeFateChart -OutDirectory $OutDirectory -Committers $committerRows -EncodingName $Encoding
+        Write-ProjectEfficiencyQuadrantChart -OutDirectory $OutDirectory -Files $fileRows -TopNCount $TopNCount -EncodingName $Encoding
+        Write-ProjectSummaryDashboard -OutDirectory $OutDirectory -Committers $committerRows -FileRows $fileRows -CommitRows $commitRows -AuthorBorn $strictResult.AuthorBorn -EncodingName $Encoding
+        Write-ContributorBalanceChart -OutDirectory $OutDirectory -Committers $committerRows -TopNCount $TopNCount -EncodingName $Encoding
+
+        # --- ステップ 8: 実行メタデータとサマリーの書き出し ---
+        Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 8/8: メタデータ出力' -PercentComplete 95
+        $finishedAt = Get-Date
+        $meta = New-RunMetaData -StartTime $startedAt -EndTime $finishedAt -TargetUrl $targetUrl -FromRevision $FromRevision -ToRevision $ToRevision -SvnVersion $svnVersion -Parallel $Parallel -TopNCount $TopNCount -Encoding $Encoding -Commits $commits -FileRows $fileRows -OutDirectory $OutDirectory -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -IgnoreWhitespace:$IgnoreWhitespace
+        Write-JsonFile -Data $meta -FilePath (Join-Path $OutDirectory 'run_meta.json') -Depth 12 -EncodingName $Encoding
+
+        Write-Progress -Id 0 -Activity 'NarutoCode' -Completed
+        Write-RunSummary -TargetUrl $targetUrl -FromRevision $FromRevision -ToRevision $ToRevision -Commits $commits -FileRows $fileRows -OutDirectory $OutDirectory
+
+        return [pscustomobject]@{
+            OutDirectory = (Resolve-Path $OutDirectory).Path
+            Committers = $committerRows
+            Files = $fileRows
+            Commits = $commitRows
+            Couplings = $couplingRows
+            RunMeta = [pscustomobject]$meta
+        }
     }
-    if (-not $OutDirectory)
+    catch
     {
-        $OutDirectory = Join-Path (Get-Location) 'NarutoCode_out'
-    }
-
-    # Resolve relative OutDirectory to absolute path based on PowerShell $PWD
-    $OutDirectory = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutDirectory)
-    $cacheDir = Join-Path $OutDirectory 'cache'
-    New-Item -Path $cacheDir -ItemType Directory -Force | Out-Null
-
-    $IncludeExtensions = ConvertTo-NormalizedExtension -Extensions $IncludeExtensions
-    $ExcludeExtensions = ConvertTo-NormalizedExtension -Extensions $ExcludeExtensions
-    $IncludePaths = ConvertTo-NormalizedPatternList -Patterns $IncludePaths
-    $ExcludePaths = ConvertTo-NormalizedPatternList -Patterns $ExcludePaths
-
-    $svnCmd = Get-Command $SvnExecutable -ErrorAction SilentlyContinue
-    if (-not $svnCmd)
-    {
-        throw "svn executable not found: '$SvnExecutable'. Install Subversion client or specify -SvnExecutable."
-    }
-
-    $script:SvnExecutable = $svnCmd.Source
-    $script:SvnGlobalArguments = Get-SvnGlobalArgumentList -Username $Username -Password $Password -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert
-
-    $targetUrl = Resolve-SvnTargetUrl -Target $RepoUrl
-    $svnVersion = Get-SvnVersionSafe
-
-    # --- ステップ 2: SVN ログの取得とパース ---
-    Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 2/8: SVN ログの取得' -PercentComplete 5
-    $logText = Invoke-SvnCommand -Arguments @('log', '--xml', '--verbose', '-r', "$FromRevision`:$ToRevision", $targetUrl) -ErrorContext 'svn log'
-    $commits = @(ConvertFrom-SvnLogXml -XmlText $logText)
-
-    # --- ステップ 3: 差分の取得とコミット単位の差分統計構築 ---
-    Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 3/8: 差分の取得と統計構築' -PercentComplete 15
-    $diffArgs = Get-SvnDiffArgumentList -IgnoreWhitespace:$IgnoreWhitespace
-    $revToAuthor = Initialize-CommitDiffData -Commits $commits -CacheDir $cacheDir -TargetUrl $targetUrl -DiffArguments $diffArgs -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePaths -ExcludePathPatterns $ExcludePaths -Parallel $Parallel
-
-    # --- ステップ 3.5: リネームマップの構築（基本メトリクスと strict 帰属の両方で使用） ---
-    $renameMap = Get-RenameMap -Commits $commits
-
-    # --- ステップ 4: 基本メトリクス算出（コミッター / ファイル / カップリング / コミット） ---
-    Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 4/8: 基本メトリクス算出' -PercentComplete 35
-    $committerRows = @(Get-CommitterMetric -Commits $commits -RenameMap $renameMap)
-    $fileRows = @(Get-FileMetric -Commits $commits -RenameMap $renameMap)
-    # couplings.csv は常に全件を出力し、TopN は可視化側でのみ適用する。
-    $couplingRows = @(Get-CoChangeMetric -Commits $commits -TopNCount 0 -RenameMap $renameMap)
-    $commitRows = @(New-CommitRowFromCommit -Commits $commits)
-
-    # --- ステップ 5: Strict 死亡帰属（blame ベースの行追跡） ---
-    Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 5/8: Strict 帰属解析' -PercentComplete 45
-    $strictResult = Update-StrictAttributionMetric -Commits $commits -RevToAuthor $revToAuthor -TargetUrl $targetUrl -FromRevision $FromRevision -ToRevision $ToRevision -CacheDir $cacheDir -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -FileRows $fileRows -CommitterRows $committerRows -Parallel $Parallel -RenameMap $renameMap
-
-    # --- ステップ 6: CSV レポート出力 ---
-    Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 6/8: CSV レポート出力' -PercentComplete 80
-    $headers = Get-MetricHeader
-    Write-CsvFile -FilePath (Join-Path $OutDirectory 'committers.csv') -Rows $committerRows -Headers $headers.Committer -EncodingName $Encoding
-    Write-CsvFile -FilePath (Join-Path $OutDirectory 'files.csv') -Rows $fileRows -Headers $headers.File -EncodingName $Encoding
-    Write-CsvFile -FilePath (Join-Path $OutDirectory 'commits.csv') -Rows $commitRows -Headers $headers.Commit -EncodingName $Encoding
-    Write-CsvFile -FilePath (Join-Path $OutDirectory 'couplings.csv') -Rows $couplingRows -Headers $headers.Coupling -EncodingName $Encoding
-    if ($null -ne $strictResult)
-    {
-        Write-KillMatrixCsv -OutDirectory $OutDirectory -KillMatrix $strictResult.KillMatrix -AuthorSelfDead $strictResult.AuthorSelfDead -Committers $committerRows -EncodingName $Encoding
-    }
-    # --- ステップ 7: 可視化出力 ---
-    Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 7/8: 可視化出力' -PercentComplete 88
-    Write-PlantUmlFile -OutDirectory $OutDirectory -Committers $committerRows -Files $fileRows -Couplings $couplingRows -TopNCount $TopNCount -EncodingName $Encoding
-    Write-FileBubbleChart -OutDirectory $OutDirectory -Files $fileRows -TopNCount $TopNCount -EncodingName $Encoding
-    Write-CommitterOutcomeChart -OutDirectory $OutDirectory -Committers $committerRows -TopNCount $TopNCount -EncodingName $Encoding
-    Write-CommitterScatterChart -OutDirectory $OutDirectory -Committers $committerRows -TopNCount $TopNCount -EncodingName $Encoding
-    Write-SurvivedShareDonutChart -OutDirectory $OutDirectory -Committers $committerRows -EncodingName $Encoding
-    if ($null -ne $strictResult)
-    {
-        Write-TeamInteractionHeatMap -OutDirectory $OutDirectory -KillMatrix $strictResult.KillMatrix -AuthorSelfDead $strictResult.AuthorSelfDead -Committers $committerRows -EncodingName $Encoding
-    }
-    Write-TeamActivityProfileChart -OutDirectory $OutDirectory -Committers $committerRows -EncodingName $Encoding
-    Write-FileQualityScatterChart -OutDirectory $OutDirectory -Files $fileRows -TopNCount $TopNCount -EncodingName $Encoding
-    Write-CommitTimelineChart -OutDirectory $OutDirectory -Commits $commitRows -EncodingName $Encoding
-    Write-CommitScatterChart -OutDirectory $OutDirectory -Commits $commitRows -EncodingName $Encoding
-    Write-ProjectCodeFateChart -OutDirectory $OutDirectory -Committers $committerRows -EncodingName $Encoding
-    Write-ProjectEfficiencyQuadrantChart -OutDirectory $OutDirectory -Files $fileRows -TopNCount $TopNCount -EncodingName $Encoding
-    Write-ProjectSummaryDashboard -OutDirectory $OutDirectory -Committers $committerRows -FileRows $fileRows -CommitRows $commitRows -AuthorBorn $strictResult.AuthorBorn -EncodingName $Encoding
-    Write-ContributorBalanceChart -OutDirectory $OutDirectory -Committers $committerRows -TopNCount $TopNCount -EncodingName $Encoding
-
-    # --- ステップ 8: 実行メタデータとサマリーの書き出し ---
-    Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 8/8: メタデータ出力' -PercentComplete 95
-    $finishedAt = Get-Date
-    $meta = New-RunMetaData -StartTime $startedAt -EndTime $finishedAt -TargetUrl $targetUrl -FromRevision $FromRevision -ToRevision $ToRevision -SvnVersion $svnVersion -Parallel $Parallel -TopNCount $TopNCount -Encoding $Encoding -Commits $commits -FileRows $fileRows -OutDirectory $OutDirectory -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -IgnoreWhitespace:$IgnoreWhitespace
-    Write-JsonFile -Data $meta -FilePath (Join-Path $OutDirectory 'run_meta.json') -Depth 12 -EncodingName $Encoding
-
-    Write-Progress -Id 0 -Activity 'NarutoCode' -Completed
-    Write-RunSummary -TargetUrl $targetUrl -FromRevision $FromRevision -ToRevision $ToRevision -Commits $commits -FileRows $fileRows -OutDirectory $OutDirectory
-
-    [pscustomobject]@{
-        OutDirectory = (Resolve-Path $OutDirectory).Path
-        Committers = $committerRows
-        Files = $fileRows
-        Commits = $commitRows
-        Couplings = $couplingRows
-        RunMeta = [pscustomobject]$meta
+        Write-Error ("{0}`n{1}" -f $_.Exception.Message, $_.ScriptStackTrace)
+        throw
     }
 }
-catch
+
+if ($MyInvocation.InvocationName -ne '.')
 {
-    Write-Error ("{0}`n{1}" -f $_.Exception.Message, $_.ScriptStackTrace)
-    exit 1
+    Invoke-NarutoCodePipeline -Context $script:NarutoContext -RepoUrl $RepoUrl -FromRevision $FromRevision -ToRevision $ToRevision -SvnExecutable $SvnExecutable -OutDirectory $OutDirectory -Username $Username -Password $Password -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -Parallel $Parallel -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -TopNCount $TopNCount -Encoding $Encoding -IgnoreWhitespace:$IgnoreWhitespace
 }
+
+
+
