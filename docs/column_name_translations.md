@@ -6,7 +6,7 @@ CSV / PlantUML の見出しを日本語化した際の対訳一覧です。
 
 - **(概算)** / **(合計)** / **(範囲指定)** — 半角括弧で修飾語を付加
 - **据置** — 意図的に英語のまま残した列名
-- 内部オブジェクト（`Get-DeadLineDetail` 戻り値、`ConvertFrom-SvnLogXml` パイプライン、JSON キー等）は対象外
+- 内部オブジェクト（`ConvertFrom-SvnLogXml` パイプライン、JSON キー等）は対象外
 
 ---
 
@@ -149,4 +149,4 @@ CSV / PlantUML の見出しを日本語化した際の対訳一覧です。
 2. **「被」接頭辞** — 「他者が〜した」の受身方向を明示する場合のみ使用（`被他者削除行数`、`被他者消滅行数 (概算)` の 2 項目）。「自己消滅行数」には「被」を付けない（不自然なため）。
 3. **削除 vs 消滅** — 「削除」は diff の `-` 行による明示的アクション。「消滅」は ToRev 時点で結果的に残っていない状態（blame 差分による推定）。
 4. **据置** — `Jaccard`（統計学固有名詞）、`blame`（SCM 固有名詞）は英語のまま。
-5. **対象外** — JSON キー (`run_meta.json`)、内部パイプラインオブジェクト (`Commit`, `PathChange`, `DiffStat`, `BlameSummary`)、`Get-DeadLineDetail` 戻り値プロパティはすべて英語のまま。
+5. **対象外** — JSON キー (`run_meta.json`)、内部パイプラインオブジェクト (`Commit`, `PathChange`, `DiffStat`, `BlameSummary`) はすべて英語のまま。

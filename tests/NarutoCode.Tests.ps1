@@ -1535,274 +1535,6 @@ Describe 'Compare-BlameOutput' {
     }
 }
 
-Describe 'Get-DeadLineDetail — SelfCancel and CrossRevert' {
-    BeforeAll {
-        # Simulate: alice adds 2 lines in r100, alice deletes 1 in r101, bob deletes 1 in r102
-        $addHash1 = ConvertTo-LineHash -FilePath 'src/A.cs' -Content 'var x = 1;'
-        $addHash2 = ConvertTo-LineHash -FilePath 'src/A.cs' -Content 'var y = 2;'
-
-        $script:ddCommits = @(
-            [pscustomobject]@{
-                Revision = 100
-                Author = 'alice'
-                FilesChanged = @('src/A.cs')
-                FileDiffStats = @{
-                    'src/A.cs' = [pscustomobject]@{
-                        AddedLines = 2; DeletedLines = 0
-                        AddedLineHashes = @($addHash1, $addHash2)
-                        DeletedLineHashes = @()
-                        Hunks = @()
-                        IsBinary = $false
-                    }
-                }
-            },
-            [pscustomobject]@{
-                Revision = 101
-                Author = 'alice'
-                FilesChanged = @('src/A.cs')
-                FileDiffStats = @{
-                    'src/A.cs' = [pscustomobject]@{
-                        AddedLines = 0; DeletedLines = 1
-                        AddedLineHashes = @()
-                        DeletedLineHashes = @($addHash1)
-                        Hunks = @()
-                        IsBinary = $false
-                    }
-                }
-            },
-            [pscustomobject]@{
-                Revision = 102
-                Author = 'bob'
-                FilesChanged = @('src/A.cs')
-                FileDiffStats = @{
-                    'src/A.cs' = [pscustomobject]@{
-                        AddedLines = 0; DeletedLines = 1
-                        AddedLineHashes = @()
-                        DeletedLineHashes = @($addHash2)
-                        Hunks = @()
-                        IsBinary = $false
-                    }
-                }
-            }
-        )
-        $script:revMap = @{ 100 = 'alice'; 101 = 'alice'; 102 = 'bob' }
-    }
-
-    It 'counts SelfCancel correctly' {
-        $result = Get-DeadLineDetail -Commits $script:ddCommits -RevToAuthor $script:revMap -DetailLevel 1
-        $result.AuthorSelfCancel['alice'] | Should -Be 1
-    }
-
-    It 'counts CrossRevert correctly' {
-        $result = Get-DeadLineDetail -Commits $script:ddCommits -RevToAuthor $script:revMap -DetailLevel 1
-        $result.AuthorCrossRevert['alice'] | Should -Be 1
-    }
-
-    It 'counts RemovedByOthers correctly' {
-        $result = Get-DeadLineDetail -Commits $script:ddCommits -RevToAuthor $script:revMap -DetailLevel 1
-        $result.AuthorRemovedByOthers['alice'] | Should -Be 1
-    }
-
-    It 'counts file-level SelfCancel' {
-        $result = Get-DeadLineDetail -Commits $script:ddCommits -RevToAuthor $script:revMap -DetailLevel 1
-        $result.FileSelfCancel['src/A.cs'] | Should -Be 1
-    }
-
-    It 'counts file-level CrossRevert' {
-        $result = Get-DeadLineDetail -Commits $script:ddCommits -RevToAuthor $script:revMap -DetailLevel 1
-        $result.FileCrossRevert['src/A.cs'] | Should -Be 1
-    }
-}
-
-Describe 'Get-DeadLineDetail — Internal Move Detection' {
-    It 'detects file-internal moves at DetailLevel 2' {
-        $moveHash = ConvertTo-LineHash -FilePath 'src/A.cs' -Content 'public void DoWork()'
-
-        $commits = @(
-            [pscustomobject]@{
-                Revision = 200
-                Author = 'alice'
-                FilesChanged = @('src/A.cs')
-                FileDiffStats = @{
-                    'src/A.cs' = [pscustomobject]@{
-                        AddedLines = 1; DeletedLines = 1
-                        AddedLineHashes = @($moveHash)
-                        DeletedLineHashes = @($moveHash)
-                        Hunks = @()
-                        IsBinary = $false
-                    }
-                }
-            }
-        )
-        $result = Get-DeadLineDetail -Commits $commits -RevToAuthor @{ 200 = 'alice' } -DetailLevel 2
-        $result.FileInternalMoveCount['src/A.cs'] | Should -Be 1
-        $result.AuthorInternalMoveCount['alice'] | Should -Be 1
-    }
-}
-
-Describe 'Get-DeadLineDetail — Rename tracking' {
-    It 'tracks line hashes across renames' {
-        $lineHash = ConvertTo-LineHash -FilePath 'src/New.cs' -Content 'important code'
-
-        $commits = @(
-            [pscustomobject]@{
-                Revision = 300
-                Author = 'alice'
-                FilesChanged = @('src/Old.cs')
-                FileDiffStats = @{
-                    'src/Old.cs' = [pscustomobject]@{
-                        AddedLines = 1; DeletedLines = 0
-                        AddedLineHashes = @($lineHash)
-                        DeletedLineHashes = @()
-                        Hunks = @(); IsBinary = $false
-                    }
-                }
-            },
-            [pscustomobject]@{
-                Revision = 301
-                Author = 'bob'
-                FilesChanged = @('src/New.cs')
-                FileDiffStats = @{
-                    'src/New.cs' = [pscustomobject]@{
-                        AddedLines = 0; DeletedLines = 1
-                        AddedLineHashes = @()
-                        DeletedLineHashes = @($lineHash)
-                        Hunks = @(); IsBinary = $false
-                    }
-                }
-            }
-        )
-        $renameMap = @{ 'src/Old.cs' = 'src/New.cs' }
-        $result = Get-DeadLineDetail -Commits $commits -RevToAuthor @{ 300 = 'alice'; 301 = 'bob' } -DetailLevel 1 -RenameMap $renameMap
-        $result.AuthorCrossRevert['alice'] | Should -Be 1
-    }
-}
-
-Describe 'Get-DeadLineDetail — PingPong and RepeatedHunkEdits' {
-    It 'detects ping-pong pattern A-B-A' {
-        $ctxHash = ConvertTo-ContextHash -FilePath 'src/X.cs' -ContextLines @('ctx1', 'ctx2', 'ctx3')
-
-        $commits = @(
-            [pscustomobject]@{
-                Revision = 400
-                Author = 'alice'
-                FilesChanged = @('src/X.cs')
-                FileDiffStats = @{
-                    'src/X.cs' = [pscustomobject]@{
-                        AddedLines = 1; DeletedLines = 0
-                        AddedLineHashes = @(); DeletedLineHashes = @()
-                        Hunks = @([pscustomobject]@{
-                            OldStart = 10; OldCount = 3; NewStart = 10; NewCount = 4
-                            ContextHash = $ctxHash
-                            AddedLineHashes = @(); DeletedLineHashes = @()
-                        })
-                        IsBinary = $false
-                    }
-                }
-            },
-            [pscustomobject]@{
-                Revision = 401
-                Author = 'bob'
-                FilesChanged = @('src/X.cs')
-                FileDiffStats = @{
-                    'src/X.cs' = [pscustomobject]@{
-                        AddedLines = 1; DeletedLines = 1
-                        AddedLineHashes = @(); DeletedLineHashes = @()
-                        Hunks = @([pscustomobject]@{
-                            OldStart = 10; OldCount = 4; NewStart = 10; NewCount = 4
-                            ContextHash = $ctxHash
-                            AddedLineHashes = @(); DeletedLineHashes = @()
-                        })
-                        IsBinary = $false
-                    }
-                }
-            },
-            [pscustomobject]@{
-                Revision = 402
-                Author = 'alice'
-                FilesChanged = @('src/X.cs')
-                FileDiffStats = @{
-                    'src/X.cs' = [pscustomobject]@{
-                        AddedLines = 1; DeletedLines = 1
-                        AddedLineHashes = @(); DeletedLineHashes = @()
-                        Hunks = @([pscustomobject]@{
-                            OldStart = 10; OldCount = 4; NewStart = 10; NewCount = 4
-                            ContextHash = $ctxHash
-                            AddedLineHashes = @(); DeletedLineHashes = @()
-                        })
-                        IsBinary = $false
-                    }
-                }
-            }
-        )
-        $result = Get-DeadLineDetail -Commits $commits -RevToAuthor @{ 400='alice'; 401='bob'; 402='alice' } -DetailLevel 2
-        $result.AuthorPingPong['alice'] | Should -Be 1
-        $result.FilePingPong['src/X.cs'] | Should -Be 1
-    }
-
-    It 'counts repeated hunk edits by same author' {
-        $ctxHash = ConvertTo-ContextHash -FilePath 'src/Y.cs' -ContextLines @('c1', 'c2', 'c3')
-
-        $commits = @(
-            [pscustomobject]@{
-                Revision = 500
-                Author = 'alice'
-                FilesChanged = @('src/Y.cs')
-                FileDiffStats = @{
-                    'src/Y.cs' = [pscustomobject]@{
-                        AddedLines = 1; DeletedLines = 0
-                        AddedLineHashes = @(); DeletedLineHashes = @()
-                        Hunks = @([pscustomobject]@{
-                            OldStart = 1; OldCount = 3; NewStart = 1; NewCount = 4
-                            ContextHash = $ctxHash
-                            AddedLineHashes = @(); DeletedLineHashes = @()
-                        })
-                        IsBinary = $false
-                    }
-                }
-            },
-            [pscustomobject]@{
-                Revision = 501
-                Author = 'alice'
-                FilesChanged = @('src/Y.cs')
-                FileDiffStats = @{
-                    'src/Y.cs' = [pscustomobject]@{
-                        AddedLines = 1; DeletedLines = 1
-                        AddedLineHashes = @(); DeletedLineHashes = @()
-                        Hunks = @([pscustomobject]@{
-                            OldStart = 1; OldCount = 4; NewStart = 1; NewCount = 4
-                            ContextHash = $ctxHash
-                            AddedLineHashes = @(); DeletedLineHashes = @()
-                        })
-                        IsBinary = $false
-                    }
-                }
-            },
-            [pscustomobject]@{
-                Revision = 502
-                Author = 'alice'
-                FilesChanged = @('src/Y.cs')
-                FileDiffStats = @{
-                    'src/Y.cs' = [pscustomobject]@{
-                        AddedLines = 1; DeletedLines = 1
-                        AddedLineHashes = @(); DeletedLineHashes = @()
-                        Hunks = @([pscustomobject]@{
-                            OldStart = 1; OldCount = 4; NewStart = 1; NewCount = 4
-                            ContextHash = $ctxHash
-                            AddedLineHashes = @(); DeletedLineHashes = @()
-                        })
-                        IsBinary = $false
-                    }
-                }
-            }
-        )
-        $result = Get-DeadLineDetail -Commits $commits -RevToAuthor @{ 500='alice'; 501='alice'; 502='alice' } -DetailLevel 2
-        # alice edits the same hunk 3 times => repeated = 3-1 = 2
-        $result.AuthorRepeatedHunk['alice'] | Should -Be 2
-        $result.FileRepeatedHunk['src/Y.cs'] | Should -Be 2
-    }
-}
-
 Describe 'NarutoCode.ps1 parameter definition — Phase 2' {
     BeforeAll {
         $script:cmd = Get-Command $script:ScriptPath
@@ -2015,6 +1747,30 @@ Describe 'Invoke-ParallelWork' {
             $null = Invoke-ParallelWork -InputItems $items -WorkerScript $worker -MaxParallel 4 -ErrorContext 'test fail'
         } | Should -Throw '*failed for 1 item*'
     }
+
+    It 'includes failed item index in parallel error details' {
+        $items = 1..6
+        $worker = {
+            param($Item, $Index)
+            if ([int]$Item -eq 4)
+            {
+                throw 'intentional detail failure'
+            }
+            return ([int]$Item * 3)
+        }
+        $errorText = $null
+        try
+        {
+            $null = Invoke-ParallelWork -InputItems $items -WorkerScript $worker -MaxParallel 4 -ErrorContext 'detail fail'
+        }
+        catch
+        {
+            $errorText = $_.Exception.Message
+        }
+        $errorText | Should -Not -BeNullOrEmpty
+        $errorText | Should -Match '\[3\]'
+        $errorText | Should -Match 'intentional detail failure'
+    }
 }
 
 Describe 'Initialize-CommitDiffData parallel consistency' {
@@ -2219,6 +1975,50 @@ Describe 'Blame memory cache' {
         $first.LineCountTotal | Should -Be 1
         $second.LineCountTotal | Should -Be 1
         Assert-MockCalled Invoke-SvnCommandAllowMissingTarget -Times 2 -Exactly
+    }
+}
+
+Describe 'Get-StrictTransitionComparison fast path' {
+    BeforeAll {
+        $script:origGetSvnBlameLineFastCmp = (Get-Item function:Get-SvnBlameLine).ScriptBlock.ToString()
+        $script:origCompareBlameOutputFastCmp = (Get-Item function:Compare-BlameOutput).ScriptBlock.ToString()
+    }
+
+    AfterAll {
+        Set-Item -Path function:Get-SvnBlameLine -Value $script:origGetSvnBlameLineFastCmp
+        Set-Item -Path function:Compare-BlameOutput -Value $script:origCompareBlameOutputFastCmp
+    }
+
+    It 'uses add-only fast path without calling Compare-BlameOutput' {
+        Set-Item -Path function:Get-SvnBlameLine -Value {
+            param([string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir)
+            [pscustomobject]@{
+                LineCountTotal = 3
+                LineCountByRevision = @{}
+                LineCountByAuthor = @{}
+                Lines = @(
+                    [pscustomobject]@{ LineNumber = 1; Content = 'base'; Revision = 9; Author = 'alice' },
+                    [pscustomobject]@{ LineNumber = 2; Content = 'add-1'; Revision = 10; Author = 'alice' },
+                    [pscustomobject]@{ LineNumber = 3; Content = 'add-2'; Revision = 10; Author = 'alice' }
+                )
+            }
+        }
+        Set-Item -Path function:Compare-BlameOutput -Value {
+            param([object[]]$PreviousLines, [object[]]$CurrentLines)
+            throw 'Compare-BlameOutput should not be called for add-only fast path'
+        }
+        $context = [pscustomobject]@{
+            BeforePath = 'src/a.cs'
+            AfterPath = 'src/a.cs'
+            MetricFile = 'src/a.cs'
+            HasTransitionStat = $true
+            TransitionAdded = 2
+            TransitionDeleted = 0
+        }
+        $cmp = Get-StrictTransitionComparison -TransitionContext $context -TargetUrl 'https://example.invalid/svn/repo' -Revision 10 -CacheDir 'dummy'
+        @($cmp.KilledLines).Count | Should -Be 0
+        @($cmp.BornLines).Count | Should -Be 2
+        @($cmp.MovedPairs).Count | Should -Be 0
     }
 }
 
@@ -2459,6 +2259,116 @@ Describe 'Update-StrictAttributionMetric parallel consistency' {
 
         ($fileRowsSeq | ConvertTo-Json -Depth 10 -Compress) | Should -Be ($fileRowsPar | ConvertTo-Json -Depth 10 -Compress)
         ($committerRowsSeq | ConvertTo-Json -Depth 10 -Compress) | Should -Be ($committerRowsPar | ConvertTo-Json -Depth 10 -Compress)
+    }
+}
+
+Describe 'Get-StrictOwnershipAggregate' {
+    BeforeAll {
+        $script:origGetAllRepositoryFileOwnership = (Get-Item function:Get-AllRepositoryFile).ScriptBlock.ToString()
+        $script:origGetSvnBlameSummaryOwnership = (Get-Item function:Get-SvnBlameSummary).ScriptBlock.ToString()
+        $script:origInvokeParallelWorkOwnership = (Get-Item function:Invoke-ParallelWork).ScriptBlock.ToString()
+
+        Set-Item -Path function:Get-AllRepositoryFile -Value {
+            param([string]$TargetUrl, [int]$Revision, [string[]]$IncludeExtensions, [string[]]$ExcludeExtensions, [string[]]$IncludePathPatterns, [string[]]$ExcludePathPatterns)
+            @('src/a.cs', 'src/b.cs')
+        }
+        Set-Item -Path function:Get-SvnBlameSummary -Value {
+            param([string]$Repo, [string]$FilePath, [int]$ToRevision, [string]$CacheDir)
+            if ($FilePath -eq 'src/a.cs') {
+                return [pscustomobject]@{
+                    LineCountTotal = 3
+                    LineCountByRevision = @{}
+                    LineCountByAuthor = @{ 'alice' = 2; 'bob' = 1 }
+                    Lines = @()
+                }
+            }
+            return [pscustomobject]@{
+                LineCountTotal = 2
+                LineCountByRevision = @{}
+                LineCountByAuthor = @{ 'alice' = 1; 'charlie' = 1 }
+                Lines = @()
+            }
+        }
+        Set-Item -Path function:Invoke-ParallelWork -Value {
+            param(
+                [object[]]$InputItems,
+                [scriptblock]$WorkerScript,
+                [int]$MaxParallel = 1,
+                [string[]]$RequiredFunctions = @(),
+                [hashtable]$SessionVariables = @{},
+                [string]$ErrorContext = 'parallel work'
+            )
+            $rows = New-Object 'System.Collections.Generic.List[object]'
+            foreach ($item in @($InputItems))
+            {
+                $blame = Get-SvnBlameSummary -Repo $item.TargetUrl -FilePath ([string]$item.FilePath) -ToRevision ([int]$item.ToRevision) -CacheDir $item.CacheDir
+                [void]$rows.Add([pscustomobject]@{
+                        FilePath = [string]$item.FilePath
+                        Blame = $blame
+                    })
+            }
+            return @($rows.ToArray())
+        }
+    }
+
+    AfterAll {
+        Set-Item -Path function:Get-AllRepositoryFile -Value $script:origGetAllRepositoryFileOwnership
+        Set-Item -Path function:Get-SvnBlameSummary -Value $script:origGetSvnBlameSummaryOwnership
+        Set-Item -Path function:Invoke-ParallelWork -Value $script:origInvokeParallelWorkOwnership
+    }
+
+    It 'returns identical ownership aggregates between sequential and parallel branches' {
+        $seq = Get-StrictOwnershipAggregate -TargetUrl 'https://example.invalid/svn/repo' -ToRevision 20 -CacheDir 'dummy' -IncludeExtensions @() -ExcludeExtensions @() -IncludePaths @() -ExcludePaths @() -Parallel 1
+        $par = Get-StrictOwnershipAggregate -TargetUrl 'https://example.invalid/svn/repo' -ToRevision 20 -CacheDir 'dummy' -IncludeExtensions @() -ExcludeExtensions @() -IncludePaths @() -ExcludePaths @() -Parallel 4
+
+        [int]($seq.OwnedTotal) | Should -Be ([int]$par.OwnedTotal)
+        (Get-HashtableIntValue -Table $seq.AuthorOwned -Key 'alice') | Should -Be (Get-HashtableIntValue -Table $par.AuthorOwned -Key 'alice')
+        (Get-HashtableIntValue -Table $seq.AuthorOwned -Key 'bob') | Should -Be (Get-HashtableIntValue -Table $par.AuthorOwned -Key 'bob')
+        (Get-HashtableIntValue -Table $seq.AuthorOwned -Key 'charlie') | Should -Be (Get-HashtableIntValue -Table $par.AuthorOwned -Key 'charlie')
+        @($seq.ExistingFileSet | Sort-Object) | Should -Be @($par.ExistingFileSet | Sort-Object)
+        @($seq.BlameByFile.Keys | Sort-Object) | Should -Be @($par.BlameByFile.Keys | Sort-Object)
+    }
+}
+
+Describe 'Get-StrictFileBlameWithFallback' {
+    BeforeAll {
+        $script:origGetSvnBlameSummaryFallback = (Get-Item function:Get-SvnBlameSummary).ScriptBlock.ToString()
+    }
+
+    AfterAll {
+        Set-Item -Path function:Get-SvnBlameSummary -Value $script:origGetSvnBlameSummaryFallback
+    }
+
+    It 'tries metricKey then filePath in order and returns first successful blame' {
+        $script:blameLookupCalls = New-Object 'System.Collections.Generic.List[string]'
+        Set-Item -Path function:Get-SvnBlameSummary -Value {
+            param([string]$Repo, [string]$FilePath, [int]$ToRevision, [string]$CacheDir)
+            [void]$script:blameLookupCalls.Add([string]$FilePath)
+            if ($FilePath -eq 'src/canonical.cs')
+            {
+                throw 'missing canonical'
+            }
+            if ($FilePath -eq 'src/legacy.cs')
+            {
+                return [pscustomobject]@{
+                    LineCountTotal = 2
+                    LineCountByRevision = @{}
+                    LineCountByAuthor = @{ 'alice' = 2 }
+                    Lines = @()
+                }
+            }
+            throw 'unexpected lookup'
+        }
+
+        $existing = New-Object 'System.Collections.Generic.HashSet[string]'
+        [void]$existing.Add('src/canonical.cs')
+        $blameByFile = @{}
+        $result = Get-StrictFileBlameWithFallback -MetricKey 'src/canonical.cs' -FilePath 'src/legacy.cs' -ResolvedFilePath 'src/canonical.cs' -ExistingFileSet $existing -BlameByFile $blameByFile -TargetUrl 'https://example.invalid/svn/repo' -ToRevision 20 -CacheDir 'dummy'
+
+        [bool]$result.ExistsAtToRevision | Should -BeTrue
+        [int]$result.Blame.LineCountTotal | Should -Be 2
+        @($script:blameLookupCalls.ToArray()) | Should -Be @('src/canonical.cs', 'src/legacy.cs')
+        $blameByFile.ContainsKey('src/legacy.cs') | Should -BeTrue
     }
 }
 

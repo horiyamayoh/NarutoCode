@@ -499,6 +499,261 @@ function Add-Count
 }
 # endregion 数値と書式
 # region 並列実行
+function Invoke-ParallelWorkSequentialCore
+{
+    <#
+    .SYNOPSIS
+        Invoke-ParallelWork の逐次実行経路を実行する。
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [object[]]$Items,
+        [scriptblock]$WorkerScript,
+        [string]$ErrorContext,
+        [int]$ProgressId
+    )
+    $sequentialResults = [System.Collections.Generic.List[object]]::new()
+    for ($i = 0
+        $i -lt $Items.Count
+        $i++)
+    {
+        $pct = [Math]::Min(100, [int](($i / $Items.Count) * 100))
+        Write-Progress -Id $ProgressId -Activity $ErrorContext -Status ('{0}/{1}' -f ($i + 1), $Items.Count) -PercentComplete $pct
+        try
+        {
+            [void]$sequentialResults.Add((& $WorkerScript -Item $Items[$i] -Index $i))
+        }
+        catch
+        {
+            throw ("{0} failed at item index {1}: {2}" -f $ErrorContext, $i, $_.Exception.Message)
+        }
+    }
+    Write-Progress -Id $ProgressId -Activity $ErrorContext -Completed
+    return @($sequentialResults.ToArray())
+}
+function Invoke-ParallelWorkRunspaceCore
+{
+    <#
+    .SYNOPSIS
+        Invoke-ParallelWork の Runspace 実行経路を実行する。
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [object[]]$Items,
+        [string]$WorkerText,
+        [string]$InvokeScript,
+        [int]$EffectiveParallel,
+        [string]$ErrorContext,
+        [int]$ProgressId,
+        [System.Management.Automation.Runspaces.InitialSessionState]$InitialSessionState
+    )
+    $pool = [runspacefactory]::CreateRunspacePool($InitialSessionState)
+    [void]$pool.SetMinRunspaces(1)
+    [void]$pool.SetMaxRunspaces($EffectiveParallel)
+    $jobs = [System.Collections.Generic.List[object]]::new()
+    # 結果を元の入力順序で返すため、インデックスで管理する配列を事前確保する。
+    $wrappedByIndex = New-Object 'object[]' $Items.Count
+    try
+    {
+        $pool.Open()
+        $jobTotal = $Items.Count
+        $nextIndex = 0
+        $jobDone = 0
+        # 遅延投入 (lazy submission): 全ジョブを一括投入せず、同時実行数を
+        # $effectiveParallel 以下に制限する。これにより PowerShell インスタンスの
+        # メモリ消費を O(items.Count) → O(effectiveParallel) に抑える。
+        # 完了したジョブから順にスロットを解放し、次のジョブを投入する。
+        while ($nextIndex -lt $Items.Count -or $jobs.Count -gt 0)
+        {
+            while ($nextIndex -lt $Items.Count -and $jobs.Count -lt $EffectiveParallel)
+            {
+                $ps = [PowerShell]::Create()
+                $ps.RunspacePool = $pool
+                [void]$ps.AddScript($InvokeScript).AddArgument($WorkerText).AddArgument($Items[$nextIndex]).AddArgument($nextIndex)
+                $handle = $ps.BeginInvoke()
+                [void]$jobs.Add([pscustomobject]@{
+                        Index = $nextIndex
+                        PowerShell = $ps
+                        Handle = $handle
+                    })
+                $nextIndex++
+            }
+
+            $pct = [Math]::Min(100, [int](($jobDone / [Math]::Max(1, $jobTotal)) * 100))
+            Write-Progress -Id $ProgressId -Activity $ErrorContext -Status ('{0}/{1}' -f ($jobDone + 1), $jobTotal) -PercentComplete $pct
+            if ($jobs.Count -eq 0)
+            {
+                continue
+            }
+
+            $completedJobIndex = -1
+            for ($scan = 0
+                $scan -lt $jobs.Count
+                $scan++)
+            {
+                if ($null -ne $jobs[$scan] -and $null -ne $jobs[$scan].Handle -and $jobs[$scan].Handle.IsCompleted)
+                {
+                    $completedJobIndex = $scan
+                    break
+                }
+            }
+            if ($completedJobIndex -lt 0)
+            {
+                Start-Sleep -Milliseconds 1
+                continue
+            }
+
+            $job = $jobs[$completedJobIndex]
+            $jobs.RemoveAt($completedJobIndex)
+            if ($null -eq $job -or $null -eq $job.PowerShell)
+            {
+                $failedWrapped = [pscustomobject]@{
+                    Index = if ($null -ne $job)
+                    {
+                        [int]$job.Index
+                    }
+                    else
+                    {
+                        -1
+                    }
+                    Succeeded = $false
+                    Result = $null
+                    ErrorMessage = 'Worker handle was not initialized.'
+                    ErrorStack = $null
+                }
+                if ($failedWrapped.Index -ge 0 -and $failedWrapped.Index -lt $wrappedByIndex.Length)
+                {
+                    $wrappedByIndex[$failedWrapped.Index] = $failedWrapped
+                }
+                $jobDone++
+                continue
+            }
+
+            $wrapped = $null
+            try
+            {
+                $resultSet = $job.PowerShell.EndInvoke($job.Handle)
+                if ($resultSet -and $resultSet.Count -gt 0)
+                {
+                    $wrapped = $resultSet[0]
+                }
+                else
+                {
+                    $wrapped = [pscustomobject]@{
+                        Index = [int]$job.Index
+                        Succeeded = $false
+                        Result = $null
+                        ErrorMessage = 'Worker returned no result.'
+                        ErrorStack = $null
+                    }
+                }
+            }
+            catch
+            {
+                $wrapped = [pscustomobject]@{
+                    Index = [int]$job.Index
+                    Succeeded = $false
+                    Result = $null
+                    ErrorMessage = $_.Exception.Message
+                    ErrorStack = $_.ScriptStackTrace
+                }
+            }
+            finally
+            {
+                if ($job.PowerShell)
+                {
+                    $job.PowerShell.Dispose()
+                    $job.PowerShell = $null
+                }
+            }
+            if ($wrapped.Index -ge 0 -and $wrapped.Index -lt $wrappedByIndex.Length)
+            {
+                $wrappedByIndex[$wrapped.Index] = $wrapped
+            }
+            $jobDone++
+        }
+        Write-Progress -Id $ProgressId -Activity $ErrorContext -Completed
+    }
+    catch
+    {
+        throw ("{0} infrastructure failure: {1}" -f $ErrorContext, $_.Exception.Message)
+    }
+    finally
+    {
+        foreach ($job in @($jobs.ToArray()))
+        {
+            if ($null -ne $job -and $null -ne $job.PowerShell)
+            {
+                try
+                {
+                    $job.PowerShell.Dispose()
+                }
+                catch
+                {
+                    [void]$_
+                }
+            }
+        }
+        if ($pool)
+        {
+            $pool.Dispose()
+        }
+    }
+
+    $orderedWrapped = [System.Collections.Generic.List[object]]::new()
+    for ($orderedIndex = 0
+        $orderedIndex -lt $wrappedByIndex.Length
+        $orderedIndex++)
+    {
+        if ($null -ne $wrappedByIndex[$orderedIndex])
+        {
+            [void]$orderedWrapped.Add($wrappedByIndex[$orderedIndex])
+        }
+        else
+        {
+            [void]$orderedWrapped.Add([pscustomobject]@{
+                    Index = $orderedIndex
+                    Succeeded = $false
+                    Result = $null
+                    ErrorMessage = 'Worker result is missing.'
+                    ErrorStack = $null
+                })
+        }
+    }
+    return @($orderedWrapped.ToArray())
+}
+function Get-ParallelFailureSummaryText
+{
+    <#
+    .SYNOPSIS
+        並列実行失敗エントリ一覧を例外メッセージ文字列へ整形する。
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([object[]]$FailedEntries)
+    $lines = [System.Collections.Generic.List[string]]::new()
+    foreach ($f in @($FailedEntries))
+    {
+        $idx = -1
+        $msg = 'Unknown worker failure.'
+        $stack = $null
+        if ($null -ne $f)
+        {
+            $idx = [int]$f.Index
+            $msg = [string]$f.ErrorMessage
+            $stack = [string]$f.ErrorStack
+        }
+        $line = "[{0}] {1}" -f $idx, $msg
+        if (-not [string]::IsNullOrWhiteSpace($stack))
+        {
+            $line += "`n" + $stack
+        }
+        [void]$lines.Add($line)
+    }
+    return ($lines.ToArray() -join "`n")
+}
 function Invoke-ParallelWork
 {
     <#
@@ -546,24 +801,7 @@ function Invoke-ParallelWork
     $progressId = [Math]::Abs($ErrorContext.GetHashCode()) % 10000 + 10
     if ($effectiveParallel -le 1)
     {
-        $sequentialResults = [System.Collections.Generic.List[object]]::new()
-        for ($i = 0
-            $i -lt $items.Count
-            $i++)
-        {
-            $pct = [Math]::Min(100, [int](($i / $items.Count) * 100))
-            Write-Progress -Id $progressId -Activity $ErrorContext -Status ('{0}/{1}' -f ($i + 1), $items.Count) -PercentComplete $pct
-            try
-            {
-                [void]$sequentialResults.Add((& $WorkerScript -Item $items[$i] -Index $i))
-            }
-            catch
-            {
-                throw ("{0} failed at item index {1}: {2}" -f $ErrorContext, $i, $_.Exception.Message)
-            }
-        }
-        Write-Progress -Id $progressId -Activity $ErrorContext -Completed
-        return @($sequentialResults.ToArray())
+        return @(Invoke-ParallelWorkSequentialCore -Items $items -WorkerScript $WorkerScript -ErrorContext $ErrorContext -ProgressId $progressId)
     }
 
     $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault2()
@@ -623,185 +861,10 @@ catch
 }
 '@
 
-    $pool = [runspacefactory]::CreateRunspacePool($iss)
-    [void]$pool.SetMinRunspaces(1)
-    [void]$pool.SetMaxRunspaces($effectiveParallel)
-    $jobs = [System.Collections.Generic.List[object]]::new()
-    $wrappedResults = [System.Collections.Generic.List[object]]::new()
-    # 結果を元の入力順序で返すため、インデックスで管理する配列を事前確保する。
-    $wrappedByIndex = New-Object 'object[]' $items.Count
-    try
-    {
-        $pool.Open()
-        $jobTotal = $items.Count
-        $nextIndex = 0
-        $jobDone = 0
-        # 遅延投入 (lazy submission): 全ジョブを一括投入せず、同時実行数を
-        # $effectiveParallel 以下に制限する。これにより PowerShell インスタンスの
-        # メモリ消費を O(items.Count) → O(effectiveParallel) に抑える。
-        # 完了したジョブから順にスロットを解放し、次のジョブを投入する。
-        while ($nextIndex -lt $items.Count -or $jobs.Count -gt 0)
-        {
-            while ($nextIndex -lt $items.Count -and $jobs.Count -lt $effectiveParallel)
-            {
-                $ps = [PowerShell]::Create()
-                $ps.RunspacePool = $pool
-                [void]$ps.AddScript($invokeScript).AddArgument($workerText).AddArgument($items[$nextIndex]).AddArgument($nextIndex)
-                $handle = $ps.BeginInvoke()
-                [void]$jobs.Add([pscustomobject]@{
-                        Index = $nextIndex
-                        PowerShell = $ps
-                        Handle = $handle
-                    })
-                $nextIndex++
-            }
-
-            $pct = [Math]::Min(100, [int](($jobDone / [Math]::Max(1, $jobTotal)) * 100))
-            Write-Progress -Id $progressId -Activity $ErrorContext -Status ('{0}/{1}' -f ($jobDone + 1), $jobTotal) -PercentComplete $pct
-            if ($jobs.Count -eq 0)
-            {
-                continue
-            }
-
-            $completedJobIndex = -1
-            for ($scan = 0
-                $scan -lt $jobs.Count
-                $scan++)
-            {
-                if ($null -ne $jobs[$scan] -and $null -ne $jobs[$scan].Handle -and $jobs[$scan].Handle.IsCompleted)
-                {
-                    $completedJobIndex = $scan
-                    break
-                }
-            }
-            if ($completedJobIndex -lt 0)
-            {
-                Start-Sleep -Milliseconds 1
-                continue
-            }
-
-            $job = $jobs[$completedJobIndex]
-            $jobs.RemoveAt($completedJobIndex)
-            if ($null -eq $job -or $null -eq $job.PowerShell)
-            {
-                $failedWrapped = [pscustomobject]@{
-                    Index = if ($null -ne $job)
-                    {
-                        [int]$job.Index
-                    }
-                    else
-                    {
-                        -1
-                    }
-                    Succeeded = $false
-                    Result = $null
-                    ErrorMessage = 'Worker handle was not initialized.'
-                    ErrorStack = $null
-                }
-                [void]$wrappedResults.Add($failedWrapped)
-                if ($failedWrapped.Index -ge 0 -and $failedWrapped.Index -lt $wrappedByIndex.Length)
-                {
-                    $wrappedByIndex[$failedWrapped.Index] = $failedWrapped
-                }
-                $jobDone++
-                continue
-            }
-
-            $wrapped = $null
-            try
-            {
-                $resultSet = $job.PowerShell.EndInvoke($job.Handle)
-                if ($resultSet -and $resultSet.Count -gt 0)
-                {
-                    $wrapped = $resultSet[0]
-                }
-                else
-                {
-                    $wrapped = [pscustomobject]@{
-                        Index = [int]$job.Index
-                        Succeeded = $false
-                        Result = $null
-                        ErrorMessage = 'Worker returned no result.'
-                        ErrorStack = $null
-                    }
-                }
-            }
-            catch
-            {
-                $wrapped = [pscustomobject]@{
-                    Index = [int]$job.Index
-                    Succeeded = $false
-                    Result = $null
-                    ErrorMessage = $_.Exception.Message
-                    ErrorStack = $_.ScriptStackTrace
-                }
-            }
-            finally
-            {
-                if ($job.PowerShell)
-                {
-                    $job.PowerShell.Dispose()
-                    $job.PowerShell = $null
-                }
-            }
-            [void]$wrappedResults.Add($wrapped)
-            if ($wrapped.Index -ge 0 -and $wrapped.Index -lt $wrappedByIndex.Length)
-            {
-                $wrappedByIndex[$wrapped.Index] = $wrapped
-            }
-            $jobDone++
-        }
-        Write-Progress -Id $progressId -Activity $ErrorContext -Completed
-    }
-    catch
-    {
-        throw ("{0} infrastructure failure: {1}" -f $ErrorContext, $_.Exception.Message)
-    }
-    finally
-    {
-        foreach ($job in @($jobs.ToArray()))
-        {
-            if ($null -ne $job -and $null -ne $job.PowerShell)
-            {
-                try
-                {
-                    $job.PowerShell.Dispose()
-                }
-                catch
-                {
-                    [void]$_
-                }
-            }
-        }
-        if ($pool)
-        {
-            $pool.Dispose()
-        }
-    }
-
-    $orderedWrapped = [System.Collections.Generic.List[object]]::new()
-    for ($orderedIndex = 0
-        $orderedIndex -lt $wrappedByIndex.Length
-        $orderedIndex++)
-    {
-        if ($null -ne $wrappedByIndex[$orderedIndex])
-        {
-            [void]$orderedWrapped.Add($wrappedByIndex[$orderedIndex])
-        }
-        else
-        {
-            [void]$orderedWrapped.Add([pscustomobject]@{
-                    Index = $orderedIndex
-                    Succeeded = $false
-                    Result = $null
-                    ErrorMessage = 'Worker result is missing.'
-                    ErrorStack = $null
-                })
-        }
-    }
+    $orderedWrapped = @(Invoke-ParallelWorkRunspaceCore -Items $items -WorkerText $workerText -InvokeScript $invokeScript -EffectiveParallel $effectiveParallel -ErrorContext $ErrorContext -ProgressId $progressId -InitialSessionState $iss)
 
     $failed = [System.Collections.Generic.List[object]]::new()
-    foreach ($entry in @($orderedWrapped.ToArray()))
+    foreach ($entry in @($orderedWrapped))
     {
         if ($null -eq $entry -or -not [bool]$entry.Succeeded)
         {
@@ -810,30 +873,12 @@ catch
     }
     if ($failed.Count -gt 0)
     {
-        $lines = [System.Collections.Generic.List[string]]::new()
-        foreach ($f in @($failed.ToArray()))
-        {
-            $idx = -1
-            $msg = 'Unknown worker failure.'
-            $stack = $null
-            if ($null -ne $f)
-            {
-                $idx = [int]$f.Index
-                $msg = [string]$f.ErrorMessage
-                $stack = [string]$f.ErrorStack
-            }
-            $line = "[{0}] {1}" -f $idx, $msg
-            if (-not [string]::IsNullOrWhiteSpace($stack))
-            {
-                $line += "`n" + $stack
-            }
-            [void]$lines.Add($line)
-        }
-        throw ("{0} failed for {1} item(s).`n{2}" -f $ErrorContext, $failed.Count, ($lines.ToArray() -join "`n"))
+        $failureSummary = Get-ParallelFailureSummaryText -FailedEntries @($failed.ToArray())
+        throw ("{0} failed for {1} item(s).`n{2}" -f $ErrorContext, $failed.Count, $failureSummary)
     }
 
     $results = [System.Collections.Generic.List[object]]::new()
-    foreach ($entry in @($orderedWrapped.ToArray()))
+    foreach ($entry in @($orderedWrapped))
     {
         [void]$results.Add($entry.Result)
     }
@@ -2905,25 +2950,15 @@ function Get-CommitFileTransition
 
     return @($result.ToArray())
 }
-function Get-StrictHunkDetail
+function Get-StrictHunkEventsByFile
 {
     <#
     .SYNOPSIS
-        hunk の正準行範囲を追跡して反復編集とピンポンを集計する。
-    .DESCRIPTION
-        各 hunk の old 範囲を正準行番号空間へ写像し、行番号ずれの影響を吸収する。
-        重複範囲の重なり判定で同一作者の反復編集を集計し、局所的手戻りを可視化する。
-        A→B→A の三者重なりを抽出してピンポン編集を数え、協業摩擦の兆候を捉える。
-    .PARAMETER Commits
-        解析対象のコミット配列を指定する。
-    .PARAMETER RevToAuthor
-        リビジョン番号と作者の対応表を指定する。
-    .PARAMETER RenameMap
-        RenameMap の値を指定する。
+        Strict hunk 集計に使うファイル別イベント配列を構築する。
     #>
     [CmdletBinding()]
+    [OutputType([hashtable])]
     param([object[]]$Commits, [hashtable]$RevToAuthor, [hashtable]$RenameMap)
-
     $offsetByFile = @{}
     $eventsByFile = @{}
     foreach ($c in @($Commits | Sort-Object Revision))
@@ -3034,14 +3069,24 @@ function Get-StrictHunkDetail
             }
         }
     }
-
+    return $eventsByFile
+}
+function Get-StrictHunkOverlapSummary
+{
+    <#
+    .SYNOPSIS
+        ファイル別 hunk イベントから反復編集とピンポンを集計する。
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param([hashtable]$EventsByFile)
     $authorRepeated = @{}
     $fileRepeated = @{}
     $authorPingPong = @{}
     $filePingPong = @{}
-    foreach ($file in $eventsByFile.Keys)
+    foreach ($file in $EventsByFile.Keys)
     {
-        $events = @($eventsByFile[$file].ToArray() | Sort-Object Revision)
+        $events = @($EventsByFile[$file].ToArray() | Sort-Object Revision)
         $evtCount = $events.Count
         # 属性を配列にバラしてプロパティアクセスを減らす。
         $evtAuthor = New-Object 'string[]' $evtCount
@@ -3144,6 +3189,25 @@ function Get-StrictHunkDetail
         FileRepeatedHunk = $fileRepeated
         FilePingPong = $filePingPong
     }
+}
+function Get-StrictHunkDetail
+{
+    <#
+    .SYNOPSIS
+        hunk の正準行範囲を追跡して反復編集とピンポンを集計する。
+    .DESCRIPTION
+        イベント化と重なり集計を段階的に実行し、Strict hunk 指標を返す。
+    .PARAMETER Commits
+        解析対象のコミット配列を指定する。
+    .PARAMETER RevToAuthor
+        リビジョン番号と作者の対応表を指定する。
+    .PARAMETER RenameMap
+        RenameMap の値を指定する。
+    #>
+    [CmdletBinding()]
+    param([object[]]$Commits, [hashtable]$RevToAuthor, [hashtable]$RenameMap)
+    $eventsByFile = Get-StrictHunkEventsByFile -Commits $Commits -RevToAuthor $RevToAuthor -RenameMap $RenameMap
+    return (Get-StrictHunkOverlapSummary -EventsByFile $eventsByFile)
 }
 function Get-StrictBlamePrefetchTarget
 {
@@ -3348,6 +3412,365 @@ function Invoke-StrictBlameCachePrefetch
         $script:StrictBlameCacheMisses += [int]$entry.CacheMisses
     }
 }
+function New-StrictAttributionAccumulator
+{
+    <#
+    .SYNOPSIS
+        Strict 帰属集計で使う可変カウンター群を初期化する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    [OutputType([object])]
+    param()
+    return [pscustomobject]@{
+        AuthorBorn = @{}
+        AuthorDead = @{}
+        AuthorSelfDead = @{}
+        AuthorOtherDead = @{}
+        AuthorSurvived = @{}
+        AuthorCrossRevert = @{}
+        AuthorRemovedByOthers = @{}
+        FileBorn = @{}
+        FileDead = @{}
+        FileSurvived = @{}
+        FileSelfCancel = @{}
+        FileCrossRevert = @{}
+        AuthorInternalMove = @{}
+        FileInternalMove = @{}
+        AuthorModifiedOthersCode = @{}
+        RevsWhereKilledOthers = New-Object 'System.Collections.Generic.HashSet[string]'
+        KillMatrix = @{}
+    }
+}
+function Resolve-StrictTransitionContext
+{
+    <#
+    .SYNOPSIS
+        Strict 遷移1件分の比較コンテキストを正規化して返す。
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [object]$Commit,
+        [object]$Transition,
+        [hashtable]$RenameMap
+    )
+    $beforePath = if ($null -ne $Transition.BeforePath)
+    {
+        ConvertTo-PathKey -Path ([string]$Transition.BeforePath)
+    }
+    else
+    {
+        $null
+    }
+    $afterPath = if ($null -ne $Transition.AfterPath)
+    {
+        ConvertTo-PathKey -Path ([string]$Transition.AfterPath)
+    }
+    else
+    {
+        $null
+    }
+    if ([string]::IsNullOrWhiteSpace($beforePath) -and [string]::IsNullOrWhiteSpace($afterPath))
+    {
+        return $null
+    }
+
+    $isBinary = $false
+    foreach ($bp in @($beforePath, $afterPath))
+    {
+        if (-not $bp)
+        {
+            continue
+        }
+        if ($Commit.FileDiffStats.ContainsKey($bp))
+        {
+            $d = $Commit.FileDiffStats[$bp]
+            if ($null -ne $d -and $d.PSObject.Properties.Match('IsBinary') -and [bool]$d.IsBinary)
+            {
+                $isBinary = $true
+            }
+        }
+    }
+    if ($isBinary)
+    {
+        return $null
+    }
+
+    $transitionAdded = 0
+    $transitionDeleted = 0
+    $transitionStat = $null
+    if ($afterPath -and $Commit.FileDiffStats.ContainsKey($afterPath))
+    {
+        $transitionStat = $Commit.FileDiffStats[$afterPath]
+    }
+    elseif ($beforePath -and $Commit.FileDiffStats.ContainsKey($beforePath))
+    {
+        $transitionStat = $Commit.FileDiffStats[$beforePath]
+    }
+    if ($null -ne $transitionStat)
+    {
+        $transitionAdded = [int]$transitionStat.AddedLines
+        $transitionDeleted = [int]$transitionStat.DeletedLines
+    }
+
+    $metricFile = if ($afterPath)
+    {
+        Resolve-PathByRenameMap -FilePath $afterPath -RenameMap $RenameMap
+    }
+    else
+    {
+        Resolve-PathByRenameMap -FilePath $beforePath -RenameMap $RenameMap
+    }
+
+    return [pscustomobject]@{
+        BeforePath = $beforePath
+        AfterPath = $afterPath
+        MetricFile = $metricFile
+        HasTransitionStat = ($null -ne $transitionStat)
+        TransitionAdded = $transitionAdded
+        TransitionDeleted = $transitionDeleted
+    }
+}
+function Get-StrictTransitionComparison
+{
+    <#
+    .SYNOPSIS
+        Strict 遷移コンテキスト1件に対する blame 比較結果を返す。
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [object]$TransitionContext,
+        [string]$TargetUrl,
+        [int]$Revision,
+        [string]$CacheDir
+    )
+    $beforePath = [string]$TransitionContext.BeforePath
+    $afterPath = [string]$TransitionContext.AfterPath
+    $hasTransitionStat = [bool]$TransitionContext.HasTransitionStat
+    $transitionAdded = [int]$TransitionContext.TransitionAdded
+    $transitionDeleted = [int]$TransitionContext.TransitionDeleted
+
+    # Fast Path 1: zero-change — プロパティ変更のみ等。blame 取得自体を省略する。
+    if ($hasTransitionStat -and $transitionAdded -eq 0 -and $transitionDeleted -eq 0)
+    {
+        return $null
+    }
+
+    # Fast Path 2: add-only — 削除行なし。前リビジョンの blame 取得と LCS を省略し、
+    # 現リビジョンの blame から当該リビジョンで born された行だけを抽出する。
+    if ($hasTransitionStat -and $transitionAdded -gt 0 -and $transitionDeleted -eq 0 -and $afterPath)
+    {
+        $currBlame = Get-SvnBlameLine -Repo $TargetUrl -FilePath $afterPath -Revision $Revision -CacheDir $CacheDir
+        $currLines = @($currBlame.Lines)
+        $bornOnly = New-Object 'System.Collections.Generic.List[object]'
+        for ($currIdx = 0
+            $currIdx -lt $currLines.Count
+            $currIdx++)
+        {
+            $line = $currLines[$currIdx]
+            $lineRevision = $null
+            try
+            {
+                $lineRevision = [int]$line.Revision
+            }
+            catch
+            {
+                $lineRevision = $null
+            }
+            if ($lineRevision -eq $Revision)
+            {
+                [void]$bornOnly.Add([pscustomobject]@{
+                        Index = $currIdx
+                        Line = $line
+                    })
+            }
+        }
+        return [pscustomobject]@{
+            KilledLines = @()
+            BornLines = @($bornOnly.ToArray())
+            MatchedPairs = @()
+            MovedPairs = @()
+            ReattributedPairs = @()
+        }
+    }
+
+    # Fast Path 3: delete-file — ファイル削除。現リビジョンの blame 取得と LCS を省略し、
+    # 前リビジョンの全行を killed として扱う。afterPath が null であることが条件。
+    if ($hasTransitionStat -and $transitionDeleted -gt 0 -and $transitionAdded -eq 0 -and $beforePath -and (-not $afterPath))
+    {
+        $prevBlame = Get-SvnBlameLine -Repo $TargetUrl -FilePath $beforePath -Revision ($Revision - 1) -CacheDir $CacheDir
+        $prevLines = @($prevBlame.Lines)
+        $killedOnly = New-Object 'System.Collections.Generic.List[object]'
+        for ($prevIdx = 0
+            $prevIdx -lt $prevLines.Count
+            $prevIdx++)
+        {
+            [void]$killedOnly.Add([pscustomobject]@{
+                    Index = $prevIdx
+                    Line = $prevLines[$prevIdx]
+                })
+        }
+        return [pscustomobject]@{
+            KilledLines = @($killedOnly.ToArray())
+            BornLines = @()
+            MatchedPairs = @()
+            MovedPairs = @()
+            ReattributedPairs = @()
+        }
+    }
+
+    $prevLines = @()
+    if ($beforePath)
+    {
+        $prevBlame = Get-SvnBlameLine -Repo $TargetUrl -FilePath $beforePath -Revision ($Revision - 1) -CacheDir $CacheDir
+        $prevLines = @($prevBlame.Lines)
+    }
+    $currLines = @()
+    if ($afterPath)
+    {
+        $currBlame = Get-SvnBlameLine -Repo $TargetUrl -FilePath $afterPath -Revision $Revision -CacheDir $CacheDir
+        $currLines = @($currBlame.Lines)
+    }
+    return (Compare-BlameOutput -PreviousLines $prevLines -CurrentLines $currLines)
+}
+function Update-StrictAccumulatorFromComparison
+{
+    <#
+    .SYNOPSIS
+        Strict 比較結果を born/dead などの集計カウンターへ反映する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    param(
+        [object]$Accumulator,
+        [object]$Comparison,
+        [int]$Revision,
+        [string]$Killer,
+        [string]$MetricFile,
+        [int]$FromRevision,
+        [int]$ToRevision
+    )
+    if ($null -eq $Comparison)
+    {
+        return
+    }
+
+    $moveCount = @($Comparison.MovedPairs).Count
+    if ($moveCount -gt 0)
+    {
+        Add-Count -Table $Accumulator.AuthorInternalMove -Key $Killer -Delta $moveCount
+        Add-Count -Table $Accumulator.FileInternalMove -Key $MetricFile -Delta $moveCount
+    }
+
+    # bornは範囲内追加のみ加算し、初期生存行として保持する。
+    foreach ($born in @($Comparison.BornLines))
+    {
+        $line = $born.Line
+        $bornRev = $null
+        try
+        {
+            $bornRev = [int]$line.Revision
+        }
+        catch
+        {
+            $bornRev = $null
+        }
+        if ($null -eq $bornRev -or $bornRev -ne $Revision)
+        {
+            continue
+        }
+        if ($bornRev -lt $FromRevision -or $bornRev -gt $ToRevision)
+        {
+            continue
+        }
+        $bornAuthor = Get-NormalizedAuthorName -Author ([string]$line.Author)
+        Add-Count -Table $Accumulator.AuthorBorn -Key $bornAuthor
+        Add-Count -Table $Accumulator.AuthorSurvived -Key $bornAuthor
+        Add-Count -Table $Accumulator.FileBorn -Key $MetricFile
+        Add-Count -Table $Accumulator.FileSurvived -Key $MetricFile
+    }
+
+    # deadは生存減算と自己/他者分類を同時更新し整合を保つ。
+    foreach ($killed in @($Comparison.KilledLines))
+    {
+        $line = $killed.Line
+        $bornRev = $null
+        try
+        {
+            $bornRev = [int]$line.Revision
+        }
+        catch
+        {
+            $bornRev = $null
+        }
+        if ($null -eq $bornRev -or $bornRev -lt $FromRevision -or $bornRev -gt $ToRevision)
+        {
+            continue
+        }
+        $bornAuthor = Get-NormalizedAuthorName -Author ([string]$line.Author)
+        Add-Count -Table $Accumulator.AuthorDead -Key $bornAuthor
+        Add-Count -Table $Accumulator.FileDead -Key $MetricFile
+        Add-Count -Table $Accumulator.AuthorSurvived -Key $bornAuthor -Delta (-1)
+        Add-Count -Table $Accumulator.FileSurvived -Key $MetricFile -Delta (-1)
+        if ($bornAuthor -eq $Killer)
+        {
+            Add-Count -Table $Accumulator.AuthorSelfDead -Key $bornAuthor
+            Add-Count -Table $Accumulator.FileSelfCancel -Key $MetricFile
+        }
+        else
+        {
+            Add-Count -Table $Accumulator.AuthorOtherDead -Key $bornAuthor
+            Add-Count -Table $Accumulator.AuthorCrossRevert -Key $bornAuthor
+            Add-Count -Table $Accumulator.AuthorRemovedByOthers -Key $bornAuthor
+            Add-Count -Table $Accumulator.FileCrossRevert -Key $MetricFile
+            Add-Count -Table $Accumulator.AuthorModifiedOthersCode -Key $Killer
+            [void]$Accumulator.RevsWhereKilledOthers.Add(([string]$Revision + [char]31 + $Killer))
+            if (-not $Accumulator.KillMatrix.ContainsKey($Killer))
+            {
+                $Accumulator.KillMatrix[$Killer] = @{}
+            }
+            Add-Count -Table $Accumulator.KillMatrix[$Killer] -Key $bornAuthor
+        }
+    }
+}
+function Get-StrictAttributionResult
+{
+    <#
+    .SYNOPSIS
+        Strict 帰属集計値と hunk 詳細を最終返却形式へ整形する。
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [object]$Accumulator,
+        [object]$StrictHunk
+    )
+    return [pscustomobject]@{
+        AuthorBorn = $Accumulator.AuthorBorn
+        AuthorDead = $Accumulator.AuthorDead
+        AuthorSurvived = $Accumulator.AuthorSurvived
+        AuthorSelfDead = $Accumulator.AuthorSelfDead
+        AuthorOtherDead = $Accumulator.AuthorOtherDead
+        AuthorCrossRevert = $Accumulator.AuthorCrossRevert
+        AuthorRemovedByOthers = $Accumulator.AuthorRemovedByOthers
+        FileBorn = $Accumulator.FileBorn
+        FileDead = $Accumulator.FileDead
+        FileSurvived = $Accumulator.FileSurvived
+        FileSelfCancel = $Accumulator.FileSelfCancel
+        FileCrossRevert = $Accumulator.FileCrossRevert
+        AuthorInternalMoveCount = $Accumulator.AuthorInternalMove
+        FileInternalMoveCount = $Accumulator.FileInternalMove
+        AuthorRepeatedHunk = $StrictHunk.AuthorRepeatedHunk
+        AuthorPingPong = $StrictHunk.AuthorPingPong
+        FileRepeatedHunk = $StrictHunk.FileRepeatedHunk
+        FilePingPong = $StrictHunk.FilePingPong
+        AuthorModifiedOthersCode = $Accumulator.AuthorModifiedOthersCode
+        RevsWhereKilledOthers = $Accumulator.RevsWhereKilledOthers
+        KillMatrix = $Accumulator.KillMatrix
+    }
+}
 function Get-ExactDeathAttribution
 {
     <#
@@ -3386,26 +3809,7 @@ function Get-ExactDeathAttribution
         [int]$Parallel = 1
     )
 
-    $authorBorn = @{}
-    $authorDead = @{}
-    $authorSelfDead = @{}
-    $authorOtherDead = @{}
-    $authorSurvived = @{}
-    $authorCrossRevert = @{}
-    $authorRemovedByOthers = @{}
-
-    $fileBorn = @{}
-    $fileDead = @{}
-    $fileSurvived = @{}
-    $fileSelfCancel = @{}
-    $fileCrossRevert = @{}
-
-    $authorInternalMove = @{}
-    $fileInternalMove = @{}
-
-    $authorModifiedOthersCode = @{}
-    $revsWhereKilledOthers = New-Object 'System.Collections.Generic.HashSet[string]'
-    $killMatrix = @{}
+    $accumulator = New-StrictAttributionAccumulator
 
     $prefetchTargets = @(Get-StrictBlamePrefetchTarget -Commits $Commits -FromRevision $FromRevision -ToRevision $ToRevision -CacheDir $CacheDir)
     Invoke-StrictBlameCachePrefetch -Targets $prefetchTargets -TargetUrl $TargetUrl -CacheDir $CacheDir -Parallel $Parallel
@@ -3435,241 +3839,17 @@ function Get-ExactDeathAttribution
         {
             try
             {
-                $beforePath = if ($null -ne $t.BeforePath)
-                {
-                    ConvertTo-PathKey -Path ([string]$t.BeforePath)
-                }
-                else
-                {
-                    $null
-                }
-                $afterPath = if ($null -ne $t.AfterPath)
-                {
-                    ConvertTo-PathKey -Path ([string]$t.AfterPath)
-                }
-                else
-                {
-                    $null
-                }
-                if ([string]::IsNullOrWhiteSpace($beforePath) -and [string]::IsNullOrWhiteSpace($afterPath))
+                $transitionContext = Resolve-StrictTransitionContext -Commit $c -Transition $t -RenameMap $RenameMap
+                if ($null -eq $transitionContext)
                 {
                     continue
                 }
-
-                $isBinary = $false
-                foreach ($bp in @($beforePath, $afterPath))
-                {
-                    if (-not $bp)
-                    {
-                        continue
-                    }
-                    if ($c.FileDiffStats.ContainsKey($bp))
-                    {
-                        $d = $c.FileDiffStats[$bp]
-                        if ($null -ne $d -and $d.PSObject.Properties.Match('IsBinary') -and [bool]$d.IsBinary)
-                        {
-                            $isBinary = $true
-                        }
-                    }
-                }
-                if ($isBinary)
+                $cmp = Get-StrictTransitionComparison -TransitionContext $transitionContext -TargetUrl $TargetUrl -Revision $rev -CacheDir $CacheDir
+                if ($null -eq $cmp)
                 {
                     continue
                 }
-
-                $metricFile = if ($afterPath)
-                {
-                    Resolve-PathByRenameMap -FilePath $afterPath -RenameMap $RenameMap
-                }
-                else
-                {
-                    Resolve-PathByRenameMap -FilePath $beforePath -RenameMap $RenameMap
-                }
-
-                # --- Fast Path 分岐 ---
-                # diff 統計 (追加行数・削除行数) を事前に取得し、blame 比較の必要性を判定する。
-                # 典型的なコミットではファイルの大半が add-only や zero-change であり、
-                # 高コストな LCS (O(mn)) を回避できるケースが多い。
-                $transitionAdded = 0
-                $transitionDeleted = 0
-                $transitionStat = $null
-                if ($afterPath -and $c.FileDiffStats.ContainsKey($afterPath))
-                {
-                    $transitionStat = $c.FileDiffStats[$afterPath]
-                }
-                elseif ($beforePath -and $c.FileDiffStats.ContainsKey($beforePath))
-                {
-                    $transitionStat = $c.FileDiffStats[$beforePath]
-                }
-                if ($null -ne $transitionStat)
-                {
-                    $transitionAdded = [int]$transitionStat.AddedLines
-                    $transitionDeleted = [int]$transitionStat.DeletedLines
-                }
-                $hasTransitionStat = ($null -ne $transitionStat)
-
-                # Fast Path 1: zero-change — プロパティ変更のみ等。blame 取得自体を省略する。
-                if ($hasTransitionStat -and $transitionAdded -eq 0 -and $transitionDeleted -eq 0)
-                {
-                    continue
-                }
-
-                $cmp = $null
-                # Fast Path 2: add-only — 削除行なし。前リビジョンの blame 取得と LCS を省略し、
-                # 現リビジョンの blame から当該リビジョンで born された行だけを抽出する。
-                if ($hasTransitionStat -and $transitionAdded -gt 0 -and $transitionDeleted -eq 0 -and $afterPath)
-                {
-                    $currBlame = Get-SvnBlameLine -Repo $TargetUrl -FilePath $afterPath -Revision $rev -CacheDir $CacheDir
-                    $currLines = @($currBlame.Lines)
-                    $bornOnly = New-Object 'System.Collections.Generic.List[object]'
-                    for ($currIdx = 0
-                        $currIdx -lt $currLines.Count
-                        $currIdx++)
-                    {
-                        $line = $currLines[$currIdx]
-                        $lineRevision = $null
-                        try
-                        {
-                            $lineRevision = [int]$line.Revision
-                        }
-                        catch
-                        {
-                            $lineRevision = $null
-                        }
-                        if ($lineRevision -eq $rev)
-                        {
-                            [void]$bornOnly.Add([pscustomobject]@{
-                                    Index = $currIdx
-                                    Line = $line
-                                })
-                        }
-                    }
-                    $cmp = [pscustomobject]@{
-                        KilledLines = @()
-                        BornLines = @($bornOnly.ToArray())
-                        MatchedPairs = @()
-                        MovedPairs = @()
-                        ReattributedPairs = @()
-                    }
-                }
-                # Fast Path 3: delete-file — ファイル削除。現リビジョンの blame 取得と LCS を省略し、
-                # 前リビジョンの全行を killed として扱う。afterPath が null であることが条件。
-                elseif ($hasTransitionStat -and $transitionDeleted -gt 0 -and $transitionAdded -eq 0 -and $beforePath -and (-not $afterPath))
-                {
-                    $prevBlame = Get-SvnBlameLine -Repo $TargetUrl -FilePath $beforePath -Revision ($rev - 1) -CacheDir $CacheDir
-                    $prevLines = @($prevBlame.Lines)
-                    $killedOnly = New-Object 'System.Collections.Generic.List[object]'
-                    for ($prevIdx = 0
-                        $prevIdx -lt $prevLines.Count
-                        $prevIdx++)
-                    {
-                        [void]$killedOnly.Add([pscustomobject]@{
-                                Index = $prevIdx
-                                Line = $prevLines[$prevIdx]
-                            })
-                    }
-                    $cmp = [pscustomobject]@{
-                        KilledLines = @($killedOnly.ToArray())
-                        BornLines = @()
-                        MatchedPairs = @()
-                        MovedPairs = @()
-                        ReattributedPairs = @()
-                    }
-                }
-                else
-                {
-                    $prevLines = @()
-                    if ($beforePath)
-                    {
-                        $prevBlame = Get-SvnBlameLine -Repo $TargetUrl -FilePath $beforePath -Revision ($rev - 1) -CacheDir $CacheDir
-                        $prevLines = @($prevBlame.Lines)
-                    }
-                    $currLines = @()
-                    if ($afterPath)
-                    {
-                        $currBlame = Get-SvnBlameLine -Repo $TargetUrl -FilePath $afterPath -Revision $rev -CacheDir $CacheDir
-                        $currLines = @($currBlame.Lines)
-                    }
-                    $cmp = Compare-BlameOutput -PreviousLines $prevLines -CurrentLines $currLines
-                }
-
-                $moveCount = @($cmp.MovedPairs).Count
-                if ($moveCount -gt 0)
-                {
-                    Add-Count -Table $authorInternalMove -Key $killer -Delta $moveCount
-                    Add-Count -Table $fileInternalMove -Key $metricFile -Delta $moveCount
-                }
-
-                # bornは範囲内追加のみ加算し、初期生存行として保持する。
-                foreach ($born in @($cmp.BornLines))
-                {
-                    $line = $born.Line
-                    $bornRev = $null
-                    try
-                    {
-                        $bornRev = [int]$line.Revision
-                    }
-                    catch
-                    {
-                        $bornRev = $null
-                    }
-                    if ($null -eq $bornRev -or $bornRev -ne $rev)
-                    {
-                        continue
-                    }
-                    if ($bornRev -lt $FromRevision -or $bornRev -gt $ToRevision)
-                    {
-                        continue
-                    }
-                    $bornAuthor = Get-NormalizedAuthorName -Author ([string]$line.Author)
-                    Add-Count -Table $authorBorn -Key $bornAuthor
-                    Add-Count -Table $authorSurvived -Key $bornAuthor
-                    Add-Count -Table $fileBorn -Key $metricFile
-                    Add-Count -Table $fileSurvived -Key $metricFile
-                }
-
-                # deadは生存減算と自己/他者分類を同時更新し整合を保つ。
-                foreach ($killed in @($cmp.KilledLines))
-                {
-                    $line = $killed.Line
-                    $bornRev = $null
-                    try
-                    {
-                        $bornRev = [int]$line.Revision
-                    }
-                    catch
-                    {
-                        $bornRev = $null
-                    }
-                    if ($null -eq $bornRev -or $bornRev -lt $FromRevision -or $bornRev -gt $ToRevision)
-                    {
-                        continue
-                    }
-                    $bornAuthor = Get-NormalizedAuthorName -Author ([string]$line.Author)
-                    Add-Count -Table $authorDead -Key $bornAuthor
-                    Add-Count -Table $fileDead -Key $metricFile
-                    Add-Count -Table $authorSurvived -Key $bornAuthor -Delta (-1)
-                    Add-Count -Table $fileSurvived -Key $metricFile -Delta (-1)
-                    if ($bornAuthor -eq $killer)
-                    {
-                        Add-Count -Table $authorSelfDead -Key $bornAuthor
-                        Add-Count -Table $fileSelfCancel -Key $metricFile
-                    }
-                    else
-                    {
-                        Add-Count -Table $authorOtherDead -Key $bornAuthor
-                        Add-Count -Table $authorCrossRevert -Key $bornAuthor
-                        Add-Count -Table $authorRemovedByOthers -Key $bornAuthor
-                        Add-Count -Table $fileCrossRevert -Key $metricFile
-                        Add-Count -Table $authorModifiedOthersCode -Key $killer
-                        [void]$revsWhereKilledOthers.Add(([string]$rev + [char]31 + $killer))
-                        if (-not $killMatrix.ContainsKey($killer))
-                        {
-                            $killMatrix[$killer] = @{}
-                        }
-                        Add-Count -Table $killMatrix[$killer] -Key $bornAuthor
-                    }
-                }
+                Update-StrictAccumulatorFromComparison -Accumulator $accumulator -Comparison $cmp -Revision $rev -Killer $killer -MetricFile ([string]$transitionContext.MetricFile) -FromRevision $FromRevision -ToRevision $ToRevision
             }
             catch
             {
@@ -3691,29 +3871,7 @@ function Get-ExactDeathAttribution
     {
         throw ("Strict hunk analysis failed: {0}`n{1}" -f $_.Exception.Message, $_.ScriptStackTrace)
     }
-    return [pscustomobject]@{
-        AuthorBorn = $authorBorn
-        AuthorDead = $authorDead
-        AuthorSurvived = $authorSurvived
-        AuthorSelfDead = $authorSelfDead
-        AuthorOtherDead = $authorOtherDead
-        AuthorCrossRevert = $authorCrossRevert
-        AuthorRemovedByOthers = $authorRemovedByOthers
-        FileBorn = $fileBorn
-        FileDead = $fileDead
-        FileSurvived = $fileSurvived
-        FileSelfCancel = $fileSelfCancel
-        FileCrossRevert = $fileCrossRevert
-        AuthorInternalMoveCount = $authorInternalMove
-        FileInternalMoveCount = $fileInternalMove
-        AuthorRepeatedHunk = $strictHunk.AuthorRepeatedHunk
-        AuthorPingPong = $strictHunk.AuthorPingPong
-        FileRepeatedHunk = $strictHunk.FileRepeatedHunk
-        FilePingPong = $strictHunk.FilePingPong
-        AuthorModifiedOthersCode = $authorModifiedOthersCode
-        RevsWhereKilledOthers = $revsWhereKilledOthers
-        KillMatrix = $killMatrix
-    }
+    return (Get-StrictAttributionResult -Accumulator $accumulator -StrictHunk $strictHunk)
 }
 # endregion Strict 帰属
 # region メトリクス計算
@@ -7745,271 +7903,7 @@ function Get-SvgFittedText
     return ((-join $buffer.ToArray()) + $ellipsisText)
 }
 # endregion SVG 出力
-# region 消滅行詳細
-function Get-DeadLineDetail
-{
-    <#
-    .SYNOPSIS
-        差分ハッシュを使って行の自己相殺と他者差戻を詳細集計する。
-    .DESCRIPTION
-        diff 行ハッシュと hunk 文脈を用いて、自己相殺や他者差戻の詳細イベントを近似抽出する。
-        リネーム解決と同一 hunk 追跡を組み合わせ、作者別・ファイル別の詳細統計を構築する。
-        strict 計算が使えない場面でも比較可能な補助指標を提供する。
-    .PARAMETER Commits
-        解析対象のコミット配列を指定する。
-    .PARAMETER RevToAuthor
-        リビジョン番号と作者の対応表を指定する。
-    .PARAMETER DetailLevel
-        DetailLevel の値を指定する。
-    .PARAMETER RenameMap
-        RenameMap の値を指定する。
-    #>
-    [CmdletBinding()]
-    param(
-        [object[]]$Commits,
-        [hashtable]$RevToAuthor,
-        [int]$DetailLevel = 1,
-        [hashtable]$RenameMap = @{}
-    )
-    $authorSelfCancel = @{}
-    $authorCrossRevert = @{}
-    $authorRemovedByOthers = @{}
-    $fileSelfCancel = @{}
-    $fileCrossRevert = @{}
-    $authorRepeatedHunk = @{}
-    $authorPingPong = @{}
-    $fileRepeatedHunk = @{}
-    $filePingPong = @{}
-    $addedMultiset = @{}
-    $hunkAuthorCount = @{}
-    $hunkEvents = @{}
-    $fileInternalMoveCount = @{}
-    $authorInternalMoveCount = @{}
-    $sorted = @($Commits | Sort-Object Revision)
-    foreach ($c in $sorted)
-    {
-        $rev = [int]$c.Revision
-        $cAuthor = if ($RevToAuthor.ContainsKey($rev))
-        {
-            [string]$RevToAuthor[$rev]
-        }
-        else
-        {
-            [string]$c.Author
-        }
-        foreach ($f in @($c.FilesChanged))
-        {
-            $d = $c.FileDiffStats[$f]
-            if ($null -eq $d)
-            {
-                continue
-            }
-            $resolvedFile = Resolve-PathByRenameMap -FilePath ([string]$f) -RenameMap $RenameMap
-            $fileAddedHashes = @()
-            $fileDeletedHashes = @()
-            if ($d.PSObject.Properties.Match('AddedLineHashes').Count -gt 0 -and $null -ne $d.AddedLineHashes)
-            {
-                $fileAddedHashes = @($d.AddedLineHashes)
-            }
-            if ($d.PSObject.Properties.Match('DeletedLineHashes').Count -gt 0 -and $null -ne $d.DeletedLineHashes)
-            {
-                $fileDeletedHashes = @($d.DeletedLineHashes)
-            }
-            if ($DetailLevel -ge 2 -and $fileAddedHashes.Count -gt 0 -and $fileDeletedHashes.Count -gt 0)
-            {
-                $addSet = @{}
-                foreach ($ah in $fileAddedHashes)
-                {
-                    if (-not $addSet.ContainsKey($ah))
-                    {
-                        $addSet[$ah] = 0
-                    }
-                    $addSet[$ah]++
-                }
-                $delSet = @{}
-                foreach ($dh in $fileDeletedHashes)
-                {
-                    if (-not $delSet.ContainsKey($dh))
-                    {
-                        $delSet[$dh] = 0
-                    }
-                    $delSet[$dh]++
-                }
-                $moveCount = 0
-                foreach ($mk in $addSet.Keys)
-                {
-                    if ($delSet.ContainsKey($mk))
-                    {
-                        $moveCount += [Math]::Min([int]$addSet[$mk], [int]$delSet[$mk])
-                    }
-                }
-                if ($moveCount -gt 0)
-                {
-                    if (-not $fileInternalMoveCount.ContainsKey($resolvedFile))
-                    {
-                        $fileInternalMoveCount[$resolvedFile] = 0
-                    }
-                    $fileInternalMoveCount[$resolvedFile] += $moveCount
-                    if (-not $authorInternalMoveCount.ContainsKey($cAuthor))
-                    {
-                        $authorInternalMoveCount[$cAuthor] = 0
-                    }
-                    $authorInternalMoveCount[$cAuthor] += $moveCount
-                }
-            }
-            foreach ($delHash in $fileDeletedHashes)
-            {
-                $key = $resolvedFile + [char]31 + $delHash
-                if ($addedMultiset.ContainsKey($key))
-                {
-                    $queue = $addedMultiset[$key]
-                    if ($queue.Count -gt 0)
-                    {
-                        $origAuthor = [string]$queue[0]
-                        $queue.RemoveAt(0)
-                        if ($origAuthor -eq $cAuthor)
-                        {
-                            if (-not $authorSelfCancel.ContainsKey($cAuthor))
-                            {
-                                $authorSelfCancel[$cAuthor] = 0
-                            }
-                            $authorSelfCancel[$cAuthor]++
-                            if (-not $fileSelfCancel.ContainsKey($resolvedFile))
-                            {
-                                $fileSelfCancel[$resolvedFile] = 0
-                            }
-                            $fileSelfCancel[$resolvedFile]++
-                        }
-                        else
-                        {
-                            if (-not $authorCrossRevert.ContainsKey($origAuthor))
-                            {
-                                $authorCrossRevert[$origAuthor] = 0
-                            }
-                            $authorCrossRevert[$origAuthor]++
-                            if (-not $authorRemovedByOthers.ContainsKey($origAuthor))
-                            {
-                                $authorRemovedByOthers[$origAuthor] = 0
-                            }
-                            $authorRemovedByOthers[$origAuthor]++
-                            if (-not $fileCrossRevert.ContainsKey($resolvedFile))
-                            {
-                                $fileCrossRevert[$resolvedFile] = 0
-                            }
-                            $fileCrossRevert[$resolvedFile]++
-                        }
-                        if ($queue.Count -eq 0)
-                        {
-                            $addedMultiset.Remove($key)
-                        }
-                    }
-                }
-            }
-            foreach ($addHash in $fileAddedHashes)
-            {
-                $key = $resolvedFile + [char]31 + $addHash
-                if (-not $addedMultiset.ContainsKey($key))
-                {
-                    $addedMultiset[$key] = New-Object 'System.Collections.Generic.List[string]'
-                }
-                $addedMultiset[$key].Add($cAuthor)
-            }
-            if ($DetailLevel -ge 2)
-            {
-                foreach ($hunk in @($d.Hunks))
-                {
-                    $ctxHash = $null
-                    if ($hunk.PSObject.Properties.Match('ContextHash').Count -gt 0)
-                    {
-                        $ctxHash = $hunk.ContextHash
-                    }
-                    if (-not $ctxHash)
-                    {
-                        continue
-                    }
-                    $hunkKey = $resolvedFile + [char]31 + $ctxHash
-                    $authorHunkKey = $cAuthor + [char]31 + $hunkKey
-                    if (-not $hunkAuthorCount.ContainsKey($authorHunkKey))
-                    {
-                        $hunkAuthorCount[$authorHunkKey] = 0
-                    }
-                    $hunkAuthorCount[$authorHunkKey]++
-                    if (-not $hunkEvents.ContainsKey($hunkKey))
-                    {
-                        $hunkEvents[$hunkKey] = New-Object 'System.Collections.Generic.List[string]'
-                    }
-                    $hunkEvents[$hunkKey].Add($cAuthor)
-                }
-            }
-        }
-    }
-    if ($DetailLevel -ge 2)
-    {
-        foreach ($ahk in $hunkAuthorCount.Keys)
-        {
-            $cnt = [int]$hunkAuthorCount[$ahk]
-            if ($cnt -gt 1)
-            {
-                $repeat = $cnt - 1
-                $parts = $ahk -split [char]31, 3
-                $hAuthor = $parts[0]
-                $hFile = $parts[1]
-                if (-not $authorRepeatedHunk.ContainsKey($hAuthor))
-                {
-                    $authorRepeatedHunk[$hAuthor] = 0
-                }
-                $authorRepeatedHunk[$hAuthor] += $repeat
-                if (-not $fileRepeatedHunk.ContainsKey($hFile))
-                {
-                    $fileRepeatedHunk[$hFile] = 0
-                }
-                $fileRepeatedHunk[$hFile] += $repeat
-            }
-        }
-        foreach ($hk in $hunkEvents.Keys)
-        {
-            $evList = @($hunkEvents[$hk])
-            $hFile = ($hk -split [char]31, 2)[0]
-            if ($evList.Count -ge 3)
-            {
-                for ($i = 0
-                    $i -le ($evList.Count - 3)
-                    $i++)
-                {
-                    $aa = [string]$evList[$i]
-                    $bb = [string]$evList[$i + 1]
-                    $cc = [string]$evList[$i + 2]
-                    if ($aa -ne $bb -and $aa -eq $cc)
-                    {
-                        if (-not $authorPingPong.ContainsKey($aa))
-                        {
-                            $authorPingPong[$aa] = 0
-                        }
-                        $authorPingPong[$aa]++
-                        if (-not $filePingPong.ContainsKey($hFile))
-                        {
-                            $filePingPong[$hFile] = 0
-                        }
-                        $filePingPong[$hFile]++
-                    }
-                }
-            }
-        }
-    }
-    return [pscustomobject]@{
-        AuthorSelfCancel = $authorSelfCancel
-        AuthorCrossRevert = $authorCrossRevert
-        AuthorRemovedByOthers = $authorRemovedByOthers
-        FileSelfCancel = $fileSelfCancel
-        FileCrossRevert = $fileCrossRevert
-        AuthorRepeatedHunk = $authorRepeatedHunk
-        AuthorPingPong = $authorPingPong
-        FileRepeatedHunk = $fileRepeatedHunk
-        FilePingPong = $filePingPong
-        FileInternalMoveCount = $fileInternalMoveCount
-        AuthorInternalMoveCount = $authorInternalMoveCount
-    }
-}
+# region ハッシュテーブルヘルパー
 function Get-HashtableIntValue
 {
     <#
@@ -8033,7 +7927,7 @@ function Get-HashtableIntValue
     }
     return $Default
 }
-# endregion 消滅行詳細
+# endregion ハッシュテーブルヘルパー
 # region SVN 引数ヘルパー
 function Get-SvnGlobalArgumentList
 {
@@ -8711,6 +8605,207 @@ function Get-AuthorModifiedOthersSurvivedCount
     }
     return $authorModifiedOthersSurvived
 }
+function Add-StrictOwnershipBlameSummary
+{
+    <#
+    .SYNOPSIS
+        所有権 blame 1件を集計ハッシュへ反映する。
+    #>
+    [CmdletBinding()]
+    param(
+        [hashtable]$BlameByFile,
+        [hashtable]$AuthorOwned,
+        [ref]$OwnedTotal,
+        [string]$FilePath,
+        [object]$Blame
+    )
+    $BlameByFile[$FilePath] = $Blame
+    $OwnedTotal.Value += [int]$Blame.LineCountTotal
+    foreach ($author in $Blame.LineCountByAuthor.Keys)
+    {
+        Add-Count -Table $AuthorOwned -Key ([string]$author) -Delta ([int]$Blame.LineCountByAuthor[$author])
+    }
+}
+function Get-StrictOwnershipAggregate
+{
+    <#
+    .SYNOPSIS
+        Strict 所有権 blame の取得と集計を実行する。
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [string]$TargetUrl,
+        [int]$ToRevision,
+        [string]$CacheDir,
+        [string[]]$IncludeExtensions,
+        [string[]]$ExcludeExtensions,
+        [string[]]$IncludePaths,
+        [string[]]$ExcludePaths,
+        [int]$Parallel = 1
+    )
+    $ownershipTargets = @(Get-AllRepositoryFile -TargetUrl $TargetUrl -Revision $ToRevision -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePaths -ExcludePathPatterns $ExcludePaths)
+    $existingFileSet = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($file in $ownershipTargets)
+    {
+        [void]$existingFileSet.Add([string]$file)
+    }
+
+    $authorOwned = @{}
+    $ownedTotal = 0
+    $blameByFile = @{}
+    if ($Parallel -le 1)
+    {
+        $ownerTotal = $ownershipTargets.Count
+        $ownerIdx = 0
+        foreach ($file in $ownershipTargets)
+        {
+            $pct = [Math]::Min(100, [int](($ownerIdx / [Math]::Max(1, $ownerTotal)) * 100))
+            Write-Progress -Id 5 -Activity '所有権 blame 解析' -Status ('{0}/{1}' -f ($ownerIdx + 1), $ownerTotal) -PercentComplete $pct
+            try
+            {
+                $blame = Get-SvnBlameSummary -Repo $TargetUrl -FilePath $file -ToRevision $ToRevision -CacheDir $CacheDir
+            }
+            catch
+            {
+                throw ("Strict ownership blame failed for '{0}' at r{1}: {2}" -f $file, $ToRevision, $_.Exception.Message)
+            }
+            Add-StrictOwnershipBlameSummary -BlameByFile $blameByFile -AuthorOwned $authorOwned -OwnedTotal ([ref]$ownedTotal) -FilePath ([string]$file) -Blame $blame
+            $ownerIdx++
+        }
+        Write-Progress -Id 5 -Activity '所有権 blame 解析' -Completed
+    }
+    else
+    {
+        $ownershipItems = [System.Collections.Generic.List[object]]::new()
+        foreach ($file in $ownershipTargets)
+        {
+            [void]$ownershipItems.Add([pscustomobject]@{
+                    FilePath = [string]$file
+                    ToRevision = [int]$ToRevision
+                    TargetUrl = $TargetUrl
+                    CacheDir = $CacheDir
+                })
+        }
+
+        $ownershipWorker = {
+            param($Item, $Index)
+            [void]$Index # Required by Invoke-ParallelWork contract
+            try
+            {
+                $blame = Get-SvnBlameSummary -Repo $Item.TargetUrl -FilePath ([string]$Item.FilePath) -ToRevision ([int]$Item.ToRevision) -CacheDir $Item.CacheDir
+                [pscustomobject]@{
+                    FilePath = [string]$Item.FilePath
+                    Blame = $blame
+                }
+            }
+            catch
+            {
+                throw ("Strict ownership blame failed for '{0}' at r{1}: {2}" -f [string]$Item.FilePath, [int]$Item.ToRevision, $_.Exception.Message)
+            }
+        }
+        $ownershipResults = @(Invoke-ParallelWork -InputItems $ownershipItems.ToArray() -WorkerScript $ownershipWorker -MaxParallel $Parallel -RequiredFunctions @(
+                'ConvertTo-PathKey',
+                'Get-Sha1Hex',
+                'Get-PathCacheHash',
+                'Get-BlameCachePath',
+                'Read-BlameCacheFile',
+                'Write-BlameCacheFile',
+                'ConvertFrom-SvnXmlText',
+                'ConvertFrom-SvnBlameXml',
+                'Join-CommandArgument',
+                'Invoke-SvnCommand',
+                'Test-SvnMissingTargetError',
+                'Invoke-SvnCommandAllowMissingTarget',
+                'Get-EmptyBlameResult',
+                'Get-BlameMemoryCacheKey',
+                'Get-SvnBlameSummary'
+            ) -SessionVariables @{
+                SvnExecutable = $script:SvnExecutable
+                SvnGlobalArguments = @($script:SvnGlobalArguments)
+            } -ErrorContext 'strict ownership blame')
+
+        foreach ($entry in @($ownershipResults))
+        {
+            $file = [string]$entry.FilePath
+            $blame = $entry.Blame
+            Add-StrictOwnershipBlameSummary -BlameByFile $blameByFile -AuthorOwned $authorOwned -OwnedTotal ([ref]$ownedTotal) -FilePath $file -Blame $blame
+        }
+    }
+
+    return [pscustomobject]@{
+        OwnershipTargets = $ownershipTargets
+        ExistingFileSet = $existingFileSet
+        BlameByFile = $blameByFile
+        AuthorOwned = $authorOwned
+        OwnedTotal = [int]$ownedTotal
+    }
+}
+function Get-StrictFileBlameWithFallback
+{
+    <#
+    .SYNOPSIS
+        Strict files 行更新向けに候補順フォールバックで blame を取得する。
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [string]$MetricKey,
+        [string]$FilePath,
+        [string]$ResolvedFilePath,
+        [System.Collections.Generic.HashSet[string]]$ExistingFileSet,
+        [hashtable]$BlameByFile,
+        [string]$TargetUrl,
+        [int]$ToRevision,
+        [string]$CacheDir
+    )
+    $blame = $null
+    $existsAtToRevision = $false
+    if ($MetricKey)
+    {
+        $existsAtToRevision = $ExistingFileSet.Contains([string]$MetricKey)
+    }
+    $lookupCandidates = if ($existsAtToRevision)
+    {
+        @($MetricKey, $FilePath, $ResolvedFilePath)
+    }
+    else
+    {
+        @()
+    }
+    $lookupErrors = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($lookup in $lookupCandidates)
+    {
+        if (-not $lookup)
+        {
+            continue
+        }
+        if ($BlameByFile.ContainsKey($lookup))
+        {
+            $blame = $BlameByFile[$lookup]
+            break
+        }
+        try
+        {
+            $tmpBlame = Get-SvnBlameSummary -Repo $TargetUrl -FilePath $lookup -ToRevision $ToRevision -CacheDir $CacheDir
+            $BlameByFile[$lookup] = $tmpBlame
+            $blame = $tmpBlame
+            break
+        }
+        catch
+        {
+            [void]$lookupErrors.Add(([string]$lookup + ': ' + $_.Exception.Message))
+        }
+    }
+    if ($null -eq $blame -and $existsAtToRevision)
+    {
+        throw ("Strict file blame lookup failed for '{0}' at r{1}. Attempts: {2}" -f $MetricKey, $ToRevision, ($lookupErrors.ToArray() -join ' | '))
+    }
+    return [pscustomobject]@{
+        Blame = $blame
+        ExistsAtToRevision = [bool]$existsAtToRevision
+    }
+}
 function Update-FileRowWithStrictMetric
 {
     <#
@@ -8763,48 +8858,8 @@ function Update-FileRowWithStrictMetric
             $resolvedFilePath
         }
 
-        $blame = $null
-        $existsAtToRevision = $false
-        if ($metricKey)
-        {
-            $existsAtToRevision = $ExistingFileSet.Contains([string]$metricKey)
-        }
-        $lookupCandidates = if ($existsAtToRevision)
-        {
-            @($metricKey, $filePath, $resolvedFilePath)
-        }
-        else
-        {
-            @()
-        }
-        $lookupErrors = New-Object 'System.Collections.Generic.List[string]'
-        foreach ($lookup in $lookupCandidates)
-        {
-            if (-not $lookup)
-            {
-                continue
-            }
-            if ($BlameByFile.ContainsKey($lookup))
-            {
-                $blame = $BlameByFile[$lookup]
-                break
-            }
-            try
-            {
-                $tmpBlame = Get-SvnBlameSummary -Repo $TargetUrl -FilePath $lookup -ToRevision $ToRevision -CacheDir $CacheDir
-                $BlameByFile[$lookup] = $tmpBlame
-                $blame = $tmpBlame
-                break
-            }
-            catch
-            {
-                [void]$lookupErrors.Add(([string]$lookup + ': ' + $_.Exception.Message))
-            }
-        }
-        if ($null -eq $blame -and $existsAtToRevision)
-        {
-            throw ("Strict file blame lookup failed for '{0}' at r{1}. Attempts: {2}" -f $metricKey, $ToRevision, ($lookupErrors.ToArray() -join ' | '))
-        }
+        $lookupResult = Get-StrictFileBlameWithFallback -MetricKey $metricKey -FilePath $filePath -ResolvedFilePath $resolvedFilePath -ExistingFileSet $ExistingFileSet -BlameByFile $BlameByFile -TargetUrl $TargetUrl -ToRevision $ToRevision -CacheDir $CacheDir
+        $blame = $lookupResult.Blame
 
         $survived = 0
         $dead = 0
@@ -9013,103 +9068,11 @@ function Update-StrictAttributionMetric
     }
 
     $authorSurvived = $strictDetail.AuthorSurvived
-    $authorOwned = @{}
-    $ownedTotal = 0
-    $blameByFile = @{}
-    $ownershipTargets = @(Get-AllRepositoryFile -TargetUrl $TargetUrl -Revision $ToRevision -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePaths -ExcludePathPatterns $ExcludePaths)
-    $existingFileSet = New-Object 'System.Collections.Generic.HashSet[string]'
-    foreach ($file in $ownershipTargets)
-    {
-        [void]$existingFileSet.Add([string]$file)
-    }
-    if ($Parallel -le 1)
-    {
-        $ownerTotal = $ownershipTargets.Count
-        $ownerIdx = 0
-        foreach ($file in $ownershipTargets)
-        {
-            $pct = [Math]::Min(100, [int](($ownerIdx / [Math]::Max(1, $ownerTotal)) * 100))
-            Write-Progress -Id 5 -Activity '所有権 blame 解析' -Status ('{0}/{1}' -f ($ownerIdx + 1), $ownerTotal) -PercentComplete $pct
-            try
-            {
-                $blame = Get-SvnBlameSummary -Repo $TargetUrl -FilePath $file -ToRevision $ToRevision -CacheDir $CacheDir
-            }
-            catch
-            {
-                throw ("Strict ownership blame failed for '{0}' at r{1}: {2}" -f $file, $ToRevision, $_.Exception.Message)
-            }
-            $blameByFile[$file] = $blame
-            $ownedTotal += [int]$blame.LineCountTotal
-            foreach ($author in $blame.LineCountByAuthor.Keys)
-            {
-                Add-Count -Table $authorOwned -Key ([string]$author) -Delta ([int]$blame.LineCountByAuthor[$author])
-            }
-            $ownerIdx++
-        }
-        Write-Progress -Id 5 -Activity '所有権 blame 解析' -Completed
-    }
-    else
-    {
-        $ownershipItems = [System.Collections.Generic.List[object]]::new()
-        foreach ($file in $ownershipTargets)
-        {
-            [void]$ownershipItems.Add([pscustomobject]@{
-                    FilePath = [string]$file
-                    ToRevision = [int]$ToRevision
-                    TargetUrl = $TargetUrl
-                    CacheDir = $CacheDir
-                })
-        }
-
-        $ownershipWorker = {
-            param($Item, $Index)
-            [void]$Index # Required by Invoke-ParallelWork contract
-            try
-            {
-                $blame = Get-SvnBlameSummary -Repo $Item.TargetUrl -FilePath ([string]$Item.FilePath) -ToRevision ([int]$Item.ToRevision) -CacheDir $Item.CacheDir
-                [pscustomobject]@{
-                    FilePath = [string]$Item.FilePath
-                    Blame = $blame
-                }
-            }
-            catch
-            {
-                throw ("Strict ownership blame failed for '{0}' at r{1}: {2}" -f [string]$Item.FilePath, [int]$Item.ToRevision, $_.Exception.Message)
-            }
-        }
-        $ownershipResults = @(Invoke-ParallelWork -InputItems $ownershipItems.ToArray() -WorkerScript $ownershipWorker -MaxParallel $Parallel -RequiredFunctions @(
-                'ConvertTo-PathKey',
-                'Get-Sha1Hex',
-                'Get-PathCacheHash',
-                'Get-BlameCachePath',
-                'Read-BlameCacheFile',
-                'Write-BlameCacheFile',
-                'ConvertFrom-SvnXmlText',
-                'ConvertFrom-SvnBlameXml',
-                'Join-CommandArgument',
-                'Invoke-SvnCommand',
-                'Test-SvnMissingTargetError',
-                'Invoke-SvnCommandAllowMissingTarget',
-                'Get-EmptyBlameResult',
-                'Get-BlameMemoryCacheKey',
-                'Get-SvnBlameSummary'
-            ) -SessionVariables @{
-                SvnExecutable = $script:SvnExecutable
-                SvnGlobalArguments = @($script:SvnGlobalArguments)
-            } -ErrorContext 'strict ownership blame')
-
-        foreach ($entry in @($ownershipResults))
-        {
-            $file = [string]$entry.FilePath
-            $blame = $entry.Blame
-            $blameByFile[$file] = $blame
-            $ownedTotal += [int]$blame.LineCountTotal
-            foreach ($author in $blame.LineCountByAuthor.Keys)
-            {
-                Add-Count -Table $authorOwned -Key ([string]$author) -Delta ([int]$blame.LineCountByAuthor[$author])
-            }
-        }
-    }
+    $ownershipAggregate = Get-StrictOwnershipAggregate -TargetUrl $TargetUrl -ToRevision $ToRevision -CacheDir $CacheDir -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -Parallel $Parallel
+    $authorOwned = $ownershipAggregate.AuthorOwned
+    $ownedTotal = [int]$ownershipAggregate.OwnedTotal
+    $blameByFile = $ownershipAggregate.BlameByFile
+    $existingFileSet = $ownershipAggregate.ExistingFileSet
 
     $authorModifiedOthersSurvived = Get-AuthorModifiedOthersSurvivedCount -BlameByFile $blameByFile -RevsWhereKilledOthers $strictDetail.RevsWhereKilledOthers -FromRevision $FromRevision -ToRevision $ToRevision
     Update-FileRowWithStrictMetric -FileRows $FileRows -RenameMap $renameMap -StrictDetail $strictDetail -ExistingFileSet $existingFileSet -BlameByFile $blameByFile -TargetUrl $TargetUrl -ToRevision $ToRevision -CacheDir $CacheDir

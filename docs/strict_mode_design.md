@@ -116,18 +116,19 @@ per-revision blame 導入により負値が原理的に発生しなくなるた�
 #### 3.2.2 ハッシュベース照合の偽陽性
 
 `ConvertTo-LineHash`（L500-L518）は `SHA1(filePath + \0 + normalizedContent)` を計算する。
-`Get-DeadLineDetail`（L1349-L1585）で追加行ハッシュと削除行ハッシュを照合するが：
+旧 `Get-DeadLineDetail`（削除済み）で追加行ハッシュと削除行ハッシュを照合していたが、
+以下の問題があったため `Get-ExactDeathAttribution`（blame ベース）に完全置換された：
 
 - `Test-IsTrivialLine`（L526-L540）で定義されたトリビアル行（`{`, `}`, `return;` 等）
-  のフィルタリングが**実際には呼び出されていない**。
-  トリビアル行は同一ファイル内で頻出するため、大量の偽陽性 self-cancel が発生する。
-- `addedMultiset`（L1463）は FIFO キューで消費されるため、
-  同一ハッシュの複数行がある場合に「最初の追加者」が消費される。
-  これは実際の行の対応関係と一致しない場合がある。
+  のフィルタリングが**実際には呼び出されていなかった**。
+  トリビアル行は同一ファイル内で頻出するため、大量の偽陽性 self-cancel が発生していた。
+- `addedMultiset` は FIFO キューで消費されるため、
+  同一ハッシュの複数行がある場合に「最初の追加者」が消費された。
+  これは実際の行の対応関係と一致しない場合があった。
 - リネーム時、diff パース段階ではハッシュが旧パス名で計算されるが、
-  `Get-DeadLineDetail` 内では `$resolvedFile`（リネーム後パス）でキーを構築する。
+  旧関数内では `$resolvedFile`（リネーム後パス）でキーを構築していた。
   旧パスで計算されたハッシュと新パスでのキーの不一致により、
-  リネーム前後のマッチングが正しく動作しない。
+  リネーム前後のマッチングが正しく動作しなかった。
 
 ### 3.3 厳密アルゴリズム: per-revision blame 比較
 
@@ -446,7 +447,7 @@ per-revision blame でも最終状態の blame は取得されるため、
 |-------------------|---------|
 | `ConvertFrom-SvnBlameXml`（L730-L800） | 行単位データ（`Lines` プロパティ）を追加返却するモードを追加 |
 | `Get-SvnBlameSummary`（L831-L839） | リビジョン引数を一般化（現在は ToRev 固定で呼ばれている） |
-| `Get-DeadLineDetail`（L1349-L1585） | `$StrictMode` 時は呼び出さない（`Get-ExactDeathAttribution` に置換） |
+| ~~`Get-DeadLineDetail`~~（削除済み） | `Get-ExactDeathAttribution` に完全置換のため削除 |
 | blame セクション（L1870-L2050） | `$StrictMode` 分岐を追加し、per-revision blame パイプラインを統合 |
 | committer metric 代入（L2000-L2040） | 厳密値の代入。列名から `(概算)` を除去 |
 | file metric 代入（L1905-L1942, L2044-L2090） | 同上 |
@@ -625,7 +626,7 @@ For file f:
 |-------------------|---------|
 | `ConvertTo-ContextHash`（L536-L574） | `$StrictMode` 時は呼び出さない |
 | `ConvertFrom-SvnUnifiedDiff`（L576-L728） | ハンクの OldStart/OldCount を確実に返却（現行で既に実装済み） |
-| `Get-DeadLineDetail` の hunk 追跡部分（L1503-L1585） | `$StrictMode` 時は正準行範囲ベースに差し替え |
+| ~~`Get-DeadLineDetail`~~（削除済み） | `Get-StrictHunkEventsByFile` + `Get-StrictHunkOverlapSummary` に置換 |
 
 ---
 
