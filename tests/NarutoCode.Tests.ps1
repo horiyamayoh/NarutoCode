@@ -1948,7 +1948,7 @@ Describe 'Integration — test SVN repo output matches baseline' -Tag 'Integrati
         $meta.FromRev       | Should -Be 1
         $meta.ToRev         | Should -Be 20
         $meta.CommitCount   | Should -Be 20
-        $meta.FileCount     | Should -Be 19
+        $meta.FileCount     | Should -Be 17
         $meta.StrictMode    | Should -BeTrue
         $meta.Encoding      | Should -Be 'UTF8'
         $meta.Outputs.SurvivedShareDonutSvg | Should -Be 'team_survived_share.svg'
@@ -3387,5 +3387,213 @@ Describe 'SvnBlameLineMemoryCache eviction at commit boundary' {
 
         # blame 呼び出し自体は行われていることを確認(キャッシュではなく実際に呼ばれた)
         $blameCallLog.Count | Should -BeGreaterOrEqual 4
+    }
+}
+
+Describe 'Get-FileMetric - RenameMap統合' {
+    It 'リネームされたファイルは最新パスに統合される' {
+        $renameMap = @{ 'src/old.cpp' = 'src/new.cpp' }
+        $commits = @(
+            [pscustomobject]@{
+                Revision = 1
+                Author = 'alice'
+                Date = [datetime]'2026-01-01'
+                Message = 'add old.cpp'
+                AddedLines = 10
+                DeletedLines = 0
+                FilesChanged = @('src/old.cpp')
+                ChangedPathsFiltered = @([pscustomobject]@{ Path = 'src/old.cpp'; Action = 'A'; CopyFromPath = $null })
+                ChangedPaths = @([pscustomobject]@{ Path = 'src/old.cpp'; Action = 'A'; CopyFromPath = $null })
+                FileDiffStats = @{
+                    'src/old.cpp' = [pscustomobject]@{ AddedLines = 10; DeletedLines = 0; IsBinary = $false }
+                }
+            },
+            [pscustomobject]@{
+                Revision = 2
+                Author = 'bob'
+                Date = [datetime]'2026-01-02'
+                Message = 'rename old.cpp to new.cpp'
+                AddedLines = 5
+                DeletedLines = 2
+                FilesChanged = @('src/new.cpp')
+                ChangedPathsFiltered = @([pscustomobject]@{ Path = 'src/new.cpp'; Action = 'A'; CopyFromPath = 'src/old.cpp' })
+                ChangedPaths = @([pscustomobject]@{ Path = 'src/new.cpp'; Action = 'A'; CopyFromPath = 'src/old.cpp' })
+                FileDiffStats = @{
+                    'src/new.cpp' = [pscustomobject]@{ AddedLines = 5; DeletedLines = 2; IsBinary = $false }
+                }
+            }
+        )
+
+        $rows = @(Get-FileMetric -Commits $commits -RenameMap $renameMap)
+
+        # 旧パスと新パスが分離せず、1行に統合されること
+        $rows.Count | Should -Be 1
+        $rows[0].'ファイルパス' | Should -Be 'src/new.cpp'
+        $rows[0].'追加行数' | Should -Be 15
+        $rows[0].'削除行数' | Should -Be 2
+        $rows[0].'コミット数' | Should -Be 2
+        $rows[0].'作者数' | Should -Be 2
+    }
+
+    It 'RenameMap未指定時は従来通りの分離動作' {
+        $commits = @(
+            [pscustomobject]@{
+                Revision = 1
+                Author = 'alice'
+                Date = [datetime]'2026-01-01'
+                Message = 'add old.cpp'
+                AddedLines = 10
+                DeletedLines = 0
+                FilesChanged = @('src/old.cpp')
+                ChangedPathsFiltered = @([pscustomobject]@{ Path = 'src/old.cpp'; Action = 'A'; CopyFromPath = $null })
+                ChangedPaths = @([pscustomobject]@{ Path = 'src/old.cpp'; Action = 'A'; CopyFromPath = $null })
+                FileDiffStats = @{
+                    'src/old.cpp' = [pscustomobject]@{ AddedLines = 10; DeletedLines = 0; IsBinary = $false }
+                }
+            },
+            [pscustomobject]@{
+                Revision = 2
+                Author = 'bob'
+                Date = [datetime]'2026-01-02'
+                Message = 'add new.cpp'
+                AddedLines = 5
+                DeletedLines = 2
+                FilesChanged = @('src/new.cpp')
+                ChangedPathsFiltered = @([pscustomobject]@{ Path = 'src/new.cpp'; Action = 'A'; CopyFromPath = $null })
+                ChangedPaths = @([pscustomobject]@{ Path = 'src/new.cpp'; Action = 'A'; CopyFromPath = $null })
+                FileDiffStats = @{
+                    'src/new.cpp' = [pscustomobject]@{ AddedLines = 5; DeletedLines = 2; IsBinary = $false }
+                }
+            }
+        )
+
+        $rows = @(Get-FileMetric -Commits $commits)
+        $rows.Count | Should -Be 2
+    }
+}
+
+Describe 'Get-CommitterMetric - RenameMap統合' {
+    It 'リネームされたファイルが変更ファイル数に重複カウントされない' {
+        $renameMap = @{ 'src/old.cpp' = 'src/new.cpp' }
+        $commits = @(
+            [pscustomobject]@{
+                Revision = 1
+                Author = 'alice'
+                Date = [datetime]'2026-01-01'
+                Message = 'add old.cpp'
+                AddedLines = 10
+                DeletedLines = 0
+                FilesChanged = @('src/old.cpp')
+                ChangedPathsFiltered = @([pscustomobject]@{ Path = 'src/old.cpp'; Action = 'A'; CopyFromPath = $null })
+                ChangedPaths = @([pscustomobject]@{ Path = 'src/old.cpp'; Action = 'A'; CopyFromPath = $null })
+                FileDiffStats = @{
+                    'src/old.cpp' = [pscustomobject]@{ AddedLines = 10; DeletedLines = 0; IsBinary = $false }
+                }
+            },
+            [pscustomobject]@{
+                Revision = 2
+                Author = 'alice'
+                Date = [datetime]'2026-01-02'
+                Message = 'modify new.cpp'
+                AddedLines = 3
+                DeletedLines = 1
+                FilesChanged = @('src/new.cpp')
+                ChangedPathsFiltered = @([pscustomobject]@{ Path = 'src/new.cpp'; Action = 'M'; CopyFromPath = $null })
+                ChangedPaths = @([pscustomobject]@{ Path = 'src/new.cpp'; Action = 'M'; CopyFromPath = $null })
+                FileDiffStats = @{
+                    'src/new.cpp' = [pscustomobject]@{ AddedLines = 3; DeletedLines = 1; IsBinary = $false }
+                }
+            }
+        )
+
+        $rows = @(Get-CommitterMetric -Commits $commits -RenameMap $renameMap)
+        $rows.Count | Should -Be 1
+        # 旧パスと新パスは同一論理ファイルとしてカウントされる
+        $rows[0].'変更ファイル数' | Should -Be 1
+    }
+}
+
+Describe 'Get-CoChangeMetric - RenameMap統合' {
+    It 'リネーム前後のパスが同一ファイルとして扱われペアが不要に増えない' {
+        $renameMap = @{ 'src/old.cpp' = 'src/new.cpp' }
+        $commits = @(
+            [pscustomobject]@{
+                Revision = 1
+                Author = 'alice'
+                Date = [datetime]'2026-01-01'
+                Message = 'add both'
+                AddedLines = 10
+                DeletedLines = 0
+                FilesChanged = @('src/old.cpp', 'src/helper.cpp')
+                ChangedPathsFiltered = @()
+                ChangedPaths = @()
+                FileDiffStats = @{
+                    'src/old.cpp' = [pscustomobject]@{ AddedLines = 5; DeletedLines = 0; IsBinary = $false }
+                    'src/helper.cpp' = [pscustomobject]@{ AddedLines = 5; DeletedLines = 0; IsBinary = $false }
+                }
+            },
+            [pscustomobject]@{
+                Revision = 2
+                Author = 'bob'
+                Date = [datetime]'2026-01-02'
+                Message = 'modify both'
+                AddedLines = 4
+                DeletedLines = 2
+                FilesChanged = @('src/new.cpp', 'src/helper.cpp')
+                ChangedPathsFiltered = @()
+                ChangedPaths = @()
+                FileDiffStats = @{
+                    'src/new.cpp' = [pscustomobject]@{ AddedLines = 2; DeletedLines = 1; IsBinary = $false }
+                    'src/helper.cpp' = [pscustomobject]@{ AddedLines = 2; DeletedLines = 1; IsBinary = $false }
+                }
+            }
+        )
+
+        $rows = @(Get-CoChangeMetric -Commits $commits -TopNCount 0 -RenameMap $renameMap)
+        # リネーム解決により new.cpp + helper.cpp の1ペアのみ
+        $rows.Count | Should -Be 1
+        $rows[0].'ファイルA' | Should -Be 'src/helper.cpp'
+        $rows[0].'ファイルB' | Should -Be 'src/new.cpp'
+        $rows[0].'共変更回数' | Should -Be 2
+    }
+}
+
+Describe 'Get-RenameMap - 連鎖リネーム' {
+    It '連鎖リネーム A->B->C が正しく伝播される' {
+        $commits = @(
+            [pscustomobject]@{
+                Revision = 1
+                Author = 'alice'
+                ChangedPaths = @([pscustomobject]@{ Path = 'src/b.cpp'; Action = 'A'; CopyFromPath = 'src/a.cpp' })
+            },
+            [pscustomobject]@{
+                Revision = 2
+                Author = 'alice'
+                ChangedPaths = @([pscustomobject]@{ Path = 'src/c.cpp'; Action = 'A'; CopyFromPath = 'src/b.cpp' })
+            }
+        )
+
+        $map = Get-RenameMap -Commits $commits
+        $map['src/a.cpp'] | Should -Be 'src/c.cpp'
+        $map['src/b.cpp'] | Should -Be 'src/c.cpp'
+    }
+}
+
+Describe 'Resolve-PathByRenameMap - 連鎖解決' {
+    It '連鎖リネームを最終パスまで解決する' {
+        $map = @{ 'src/a.cpp' = 'src/b.cpp'; 'src/b.cpp' = 'src/c.cpp' }
+        $result = Resolve-PathByRenameMap -FilePath 'src/a.cpp' -RenameMap $map
+        $result | Should -Be 'src/c.cpp'
+    }
+
+    It 'マップに存在しないパスはそのまま返す' {
+        $map = @{ 'src/a.cpp' = 'src/b.cpp' }
+        $result = Resolve-PathByRenameMap -FilePath 'src/x.cpp' -RenameMap $map
+        $result | Should -Be 'src/x.cpp'
+    }
+
+    It '空のマップでもエラーにならない' {
+        $result = Resolve-PathByRenameMap -FilePath 'src/a.cpp' -RenameMap @{}
+        $result | Should -Be 'src/a.cpp'
     }
 }

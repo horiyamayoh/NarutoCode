@@ -9,21 +9,19 @@ salt
 | 2 | src/parser.cpp | 207.945392491468
 | 3 | src/logger.cpp | 151.43661971831
 | 4 | include/logger.h | 108.169014084507
-| 5 | src/utils.cpp | 88.7671232876712
+| 5 | src/string_utils.cpp | 91.1342465753425
 | 6 | src/formatter.cpp | 73
 | 7 | tests/test_calculator.cpp | 65.7848605577689
 | 8 | include/parser.h | 38.1456953642384
 | 9 | src/main.cpp | 31.0028328611898
-| 10 | tests/test_parser.cpp | 28
-| 11 | include/utils.h | 21.3041095890411
+| 10 | include/string_utils.h | 28.4054794520548
+| 11 | tests/test_parser.cpp | 28
 | 12 | include/formatter.h | 20
 | 13 | include/calculator.h | 8.30769230769231
 | 14 | README.md | 7.07082152974504
 | 15 | .gitignore | 7
-| 16 | include/string_utils.h | 6
-| 17 | CMakeLists.txt | 5.47368421052632
-| 18 | src/string_utils.cpp | 2
-| 19 | assets/logo.png | 0
+| 16 | CMakeLists.txt | 5.47368421052632
+| 17 | assets/logo.png | 0
 }
 }
 @enduml

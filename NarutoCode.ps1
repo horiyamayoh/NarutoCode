@@ -3652,7 +3652,7 @@ function Get-CommitterMetric
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
-    param([object[]]$Commits)
+    param([object[]]$Commits, [hashtable]$RenameMap = @{})
     $states = @{}
     $fileAuthors = @{}
     foreach ($c in $Commits)
@@ -3660,11 +3660,12 @@ function Get-CommitterMetric
         $a = [string]$c.Author
         foreach ($f in @($c.FilesChanged))
         {
-            if (-not $fileAuthors.ContainsKey($f))
+            $resolvedF = Resolve-PathByRenameMap -FilePath ([string]$f) -RenameMap $RenameMap
+            if (-not $fileAuthors.ContainsKey($resolvedF))
             {
-                $fileAuthors[$f] = New-Object 'System.Collections.Generic.HashSet[string]'
+                $fileAuthors[$resolvedF] = New-Object 'System.Collections.Generic.HashSet[string]'
             }
-            $null = $fileAuthors[$f].Add($a)
+            $null = $fileAuthors[$resolvedF].Add($a)
         }
     }
     foreach ($c in $Commits)
@@ -3714,15 +3715,16 @@ function Get-CommitterMetric
         $s.Merge += $m.MergeKeywordCount
         foreach ($f in @($c.FilesChanged))
         {
-            $null = $s.Files.Add($f)
-            $idx = $f.LastIndexOf('/')
+            $resolvedF = Resolve-PathByRenameMap -FilePath ([string]$f) -RenameMap $RenameMap
+            $null = $s.Files.Add($resolvedF)
+            $idx = $resolvedF.LastIndexOf('/')
             $dir = if ($idx -lt 0)
             {
                 '.'
             }
             else
             {
-                $f.Substring(0, $idx)
+                $resolvedF.Substring(0, $idx)
             }
             if ($dir)
             {
@@ -3730,11 +3732,11 @@ function Get-CommitterMetric
             }
             $d = $c.FileDiffStats[$f]
             $ch = [int]$d.AddedLines + [int]$d.DeletedLines
-            if (-not $s.FileChurn.ContainsKey($f))
+            if (-not $s.FileChurn.ContainsKey($resolvedF))
             {
-                $s.FileChurn[$f] = 0
+                $s.FileChurn[$resolvedF] = 0
             }
-            $s.FileChurn[$f] += $ch
+            $s.FileChurn[$resolvedF] += $ch
             if ([bool]$d.IsBinary)
             {
                 $s.Binary++
@@ -3885,7 +3887,7 @@ function Get-FileMetric
         変更間隔や最多作者占有率、ホットスポットスコアを算出して優先度付けに備える。
         strict で補完する blame 依存列は null 初期化し、後段更新との整合を保つ。
     #>
-    [CmdletBinding()]param([object[]]$Commits)
+    [CmdletBinding()]param([object[]]$Commits, [hashtable]$RenameMap = @{})
     $states = @{}
     foreach ($c in $Commits)
     {
@@ -3893,11 +3895,13 @@ function Get-FileMetric
         $files = New-Object 'System.Collections.Generic.HashSet[string]'
         foreach ($f in @($c.FilesChanged))
         {
-            $null = $files.Add([string]$f)
+            $resolved = Resolve-PathByRenameMap -FilePath ([string]$f) -RenameMap $RenameMap
+            $null = $files.Add($resolved)
         }
         foreach ($p in @($c.ChangedPathsFiltered))
         {
-            $null = $files.Add([string]$p.Path)
+            $resolved = Resolve-PathByRenameMap -FilePath ([string]$p.Path) -RenameMap $RenameMap
+            $null = $files.Add($resolved)
         }
         foreach ($f in $files)
         {
@@ -3926,7 +3930,8 @@ function Get-FileMetric
         }
         foreach ($f in @($c.FilesChanged))
         {
-            $s = $states[$f]
+            $resolvedF = Resolve-PathByRenameMap -FilePath ([string]$f) -RenameMap $RenameMap
+            $s = $states[$resolvedF]
             $d = $c.FileDiffStats[$f]
             $a = [int]$d.AddedLines
             $del = [int]$d.DeletedLines
@@ -3944,7 +3949,8 @@ function Get-FileMetric
         }
         foreach ($p in @($c.ChangedPathsFiltered))
         {
-            $s = $states[[string]$p.Path]
+            $resolvedP = Resolve-PathByRenameMap -FilePath ([string]$p.Path) -RenameMap $RenameMap
+            $s = $states[$resolvedP]
             switch (([string]$p.Action).ToUpperInvariant())
             {
                 'A'
@@ -4060,7 +4066,7 @@ function Get-CoChangeMetric
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
-    param([object[]]$Commits, [int]$TopNCount = 50)
+    param([object[]]$Commits, [int]$TopNCount = 50, [hashtable]$RenameMap = @{})
     $pair = @{}
     $fileCount = @{}
     $commitTotal = 0
@@ -4069,7 +4075,8 @@ function Get-CoChangeMetric
         $files = New-Object 'System.Collections.Generic.HashSet[string]'
         foreach ($f in @($c.FilesChanged))
         {
-            $null = $files.Add([string]$f)
+            $resolved = Resolve-PathByRenameMap -FilePath ([string]$f) -RenameMap $RenameMap
+            $null = $files.Add($resolved)
         }
         if ($files.Count -eq 0)
         {
@@ -4762,8 +4769,18 @@ function Write-FileQualityScatterChart
             $pingPong = [double]$prop.Value
         }
 
-        $deadRate = [Math]::Min(1.0, $deadAdded / $addedLines)
-        $wasteChurn = [Math]::Min(1.0, ($selfCancel + $otherRevert + $pingPong) / $totalChurn)
+        $rawDeadRate = $deadAdded / $addedLines
+        if ($rawDeadRate -gt 1.0)
+        {
+            Write-Warning ("消滅率が1.0を超過: {0} (dead={1}, added={2})" -f [string]$f.'ファイルパス', $deadAdded, $addedLines)
+        }
+        $deadRate = [Math]::Min(1.0, $rawDeadRate)
+        $rawWasteChurn = ($selfCancel + $otherRevert + $pingPong) / $totalChurn
+        if ($rawWasteChurn -gt 1.0)
+        {
+            Write-Warning ("無駄チャーン率が1.0を超過: {0}" -f [string]$f.'ファイルパス')
+        }
+        $wasteChurn = [Math]::Min(1.0, $rawWasteChurn)
 
         $rank = 1
         $prop = $f.PSObject.Properties['ホットスポット順位']
@@ -5496,6 +5513,7 @@ function Get-CommitterOutcomeData
         $other = $added - ($survived + $selfCancel + $removedByOthers)
         if ($other -lt 0)
         {
+            Write-Warning ("Outcome 'その他' が負の値: 作者={0} (added={1}, survived={2}, selfCancel={3}, removedByOthers={4})" -f [string]$c.'作者', $added, $survived, $selfCancel, $removedByOthers)
             $other = 0.0
         }
         $pingPongRate = 0.0
@@ -6805,6 +6823,7 @@ function Write-ProjectCodeFateChart
     $totalOther = $totalAdded - ($totalSurvived + $totalSelfCancel + $totalRemovedByOthers)
     if ($totalOther -lt 0)
     {
+        Write-Warning ("CodeFate 'その他消滅' が負の値: totalAdded={0}, survived={1}, selfCancel={2}, removedByOthers={3}" -f $totalAdded, $totalSurvived, $totalSelfCancel, $totalRemovedByOthers)
         $totalOther = 0.0
     }
     if (-not (Test-Path -LiteralPath $OutDirectory))
@@ -6976,6 +6995,7 @@ function Get-ProjectEfficiencyData
         $survivalRate = $survived / $added
         if ($survivalRate -gt 1.0)
         {
+            Write-Warning ("生存率が1.0を超過: {0} (survived={1}, added={2})" -f [string]$f.'ファイルパス', $survived, $added)
             $survivalRate = 1.0
         }
         $churnEfficiency = [Math]::Abs($net) / $churn
@@ -7819,11 +7839,7 @@ function Get-DeadLineDetail
             {
                 continue
             }
-            $resolvedFile = $f
-            if ($RenameMap.ContainsKey($f))
-            {
-                $resolvedFile = [string]$RenameMap[$f]
-            }
+            $resolvedFile = Resolve-PathByRenameMap -FilePath ([string]$f) -RenameMap $RenameMap
             $fileAddedHashes = @()
             $fileDeletedHashes = @()
             if ($d.PSObject.Properties.Match('AddedLineHashes').Count -gt 0 -and $null -ne $d.AddedLineHashes)
@@ -9009,14 +9025,22 @@ function Update-StrictAttributionMetric
         [string[]]$ExcludePaths,
         [object[]]$FileRows,
         [object[]]$CommitterRows,
-        [int]$Parallel = 1
+        [int]$Parallel = 1,
+        [hashtable]$RenameMap = @{}
     )
     if (@($FileRows).Count -le 0)
     {
         return
     }
 
-    $renameMap = Get-RenameMap -Commits $Commits
+    $renameMap = if ($RenameMap.Count -gt 0)
+    {
+        $RenameMap
+    }
+    else
+    {
+        Get-RenameMap -Commits $Commits
+    }
     $strictDetail = Get-ExactDeathAttribution -Commits $Commits -RevToAuthor $RevToAuthor -TargetUrl $TargetUrl -FromRevision $FromRevision -ToRevision $ToRevision -CacheDir $CacheDir -RenameMap $renameMap -Parallel $Parallel
     if ($null -eq $strictDetail)
     {
@@ -9401,17 +9425,20 @@ try
     $diffArgs = Get-SvnDiffArgumentList -IgnoreWhitespace:$IgnoreWhitespace
     $revToAuthor = Initialize-CommitDiffData -Commits $commits -CacheDir $cacheDir -TargetUrl $targetUrl -DiffArguments $diffArgs -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePaths -ExcludePathPatterns $ExcludePaths -Parallel $Parallel
 
+    # --- ステップ 3.5: リネームマップの構築（基本メトリクスと strict 帰属の両方で使用） ---
+    $renameMap = Get-RenameMap -Commits $commits
+
     # --- ステップ 4: 基本メトリクス算出（コミッター / ファイル / カップリング / コミット） ---
     Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 4/8: 基本メトリクス算出' -PercentComplete 35
-    $committerRows = @(Get-CommitterMetric -Commits $commits)
-    $fileRows = @(Get-FileMetric -Commits $commits)
+    $committerRows = @(Get-CommitterMetric -Commits $commits -RenameMap $renameMap)
+    $fileRows = @(Get-FileMetric -Commits $commits -RenameMap $renameMap)
     # couplings.csv は常に全件を出力し、TopN は可視化側でのみ適用する。
-    $couplingRows = @(Get-CoChangeMetric -Commits $commits -TopNCount 0)
+    $couplingRows = @(Get-CoChangeMetric -Commits $commits -TopNCount 0 -RenameMap $renameMap)
     $commitRows = @(New-CommitRowFromCommit -Commits $commits)
 
     # --- ステップ 5: Strict 死亡帰属（blame ベースの行追跡） ---
     Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 5/8: Strict 帰属解析' -PercentComplete 45
-    $strictResult = Update-StrictAttributionMetric -Commits $commits -RevToAuthor $revToAuthor -TargetUrl $targetUrl -FromRevision $FromRev -ToRevision $ToRev -CacheDir $cacheDir -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -FileRows $fileRows -CommitterRows $committerRows -Parallel $Parallel
+    $strictResult = Update-StrictAttributionMetric -Commits $commits -RevToAuthor $revToAuthor -TargetUrl $targetUrl -FromRevision $FromRev -ToRevision $ToRev -CacheDir $cacheDir -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -FileRows $fileRows -CommitterRows $committerRows -Parallel $Parallel -RenameMap $renameMap
 
     # --- ステップ 6: CSV レポート出力 ---
     Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 6/8: CSV レポート出力' -PercentComplete 80
