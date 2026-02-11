@@ -596,8 +596,6 @@ function New-NarutoContext
         }
         Metrics = @{
             ColDeadAdded = '消滅追加行数'  # 追加されたが ToRev 時点で生存していない行数
-            ColSelfDead = '自己消滅行数'  # 追加した本人が後のコミットで削除した行数
-            ColOtherDead = '被他者消滅行数'  # 別の作者によって削除された行数
         }
         Caches = @{
             StrictBlameCacheHits = 0
@@ -5236,14 +5234,10 @@ function ConvertTo-CommitterMetricRows
                 '所有行数' = $null
                 '所有割合' = $null
                 '自己相殺行数' = $null
-                '自己差戻行数' = $null
                 '他者差戻行数' = $null
-                '被他者削除行数' = $null
                 '同一箇所反復編集数' = $null
                 'ピンポン回数' = $null
                 '内部移動行数' = $null
-                $Context.Metrics.ColSelfDead = $null
-                $Context.Metrics.ColOtherDead = $null
                 '他者コード変更行数' = $null
                 '他者コード変更生存行数' = $null
                 '他者コード変更生存率' = $null
@@ -7026,9 +7020,9 @@ function Get-CommitterOutcomeData
             $selfCancel = [double]$c.'自己相殺行数'
         }
         $removedByOthers = 0.0
-        if ($null -ne $c.'被他者削除行数')
+        if ($null -ne $c.'他者差戻行数')
         {
-            $removedByOthers = [double]$c.'被他者削除行数'
+            $removedByOthers = [double]$c.'他者差戻行数'
         }
         $other = $added - ($survived + $selfCancel + $removedByOthers)
         if ($other -lt 0)
@@ -8270,7 +8264,7 @@ function Write-ProjectCodeFateChart
         $totalAdded += Get-ObjectNumericPropertyValue -InputObject $c -PropertyName '追加行数'
         $totalSurvived += Get-ObjectNumericPropertyValue -InputObject $c -PropertyName '生存行数'
         $totalSelfCancel += Get-ObjectNumericPropertyValue -InputObject $c -PropertyName '自己相殺行数'
-        $totalRemovedByOthers += Get-ObjectNumericPropertyValue -InputObject $c -PropertyName '被他者削除行数'
+        $totalRemovedByOthers += Get-ObjectNumericPropertyValue -InputObject $c -PropertyName '他者差戻行数'
     }
     if ($totalAdded -le 0)
     {
@@ -10635,7 +10629,7 @@ function Set-StrictFileRowMetricValues
         [object]$Values
     )
     $Row.'生存行数 (範囲指定)' = [int]$Values.Survived
-    $Row.($Context.Metrics.ColDeadAdded) = [int]$Values.Dead
+    $Row.($Context.Metrics.ColDeadAdded) = [Math]::Max(0, [int]$Row.'追加行数' - [int]$Values.Survived)
     $Row.'自己相殺行数 (合計)' = [int]$Values.SelfCancel
     $Row.'他者差戻行数 (合計)' = [int]$Values.CrossRevert
     $Row.'同一箇所反復編集数 (合計)' = [int]$Values.RepeatedHunk
@@ -10798,18 +10792,14 @@ function Set-StrictCommitterRowMetricValues
         [object]$Values
     )
     $Row.'生存行数' = [int]$Values.Survived
-    $Row.($Context.Metrics.ColDeadAdded) = [int]$Values.Dead
+    $Row.($Context.Metrics.ColDeadAdded) = [Math]::Max(0, [int]$Row.'追加行数' - [int]$Values.Survived)
     $Row.'所有行数' = [int]$Values.Owned
     $Row.'所有割合' = Format-MetricValue -Value ([double]$Values.OwnShare)
     $Row.'自己相殺行数' = [int]$Values.SelfDead
-    $Row.'自己差戻行数' = [int]$Values.SelfDead
     $Row.'他者差戻行数' = [int]$Values.OtherDead
-    $Row.'被他者削除行数' = [int]$Values.OtherDead
     $Row.'同一箇所反復編集数' = [int]$Values.RepeatedHunk
     $Row.'ピンポン回数' = [int]$Values.PingPong
     $Row.'内部移動行数' = [int]$Values.InternalMove
-    $Row.($Context.Metrics.ColSelfDead) = [int]$Values.SelfDead
-    $Row.($Context.Metrics.ColOtherDead) = [int]$Values.OtherDead
     $Row.'他者コード変更行数' = [int]$Values.ModifiedOthersCode
     $Row.'他者コード変更生存行数' = [int]$Values.ModifiedOthersSurvived
     $Row.'他者コード変更生存率' = Format-MetricValue -Value ([double]$Values.OtherChangeRate)
@@ -11111,7 +11101,7 @@ function Get-MetricColumnDefinitions
     [OutputType([hashtable])]
     param([hashtable]$Context = $script:NarutoContext)
     return [ordered]@{
-        Committer = @('作者', 'コミット数', '活動日数', '変更ファイル数', '変更ディレクトリ数', '追加行数', '削除行数', '純増行数', '総チャーン', 'コミットあたりチャーン', '削除対追加比', 'チャーン対純増比', 'リワーク率', 'バイナリ変更回数', '追加アクション数', '変更アクション数', '削除アクション数', '置換アクション数', '生存行数', $Context.Metrics.ColDeadAdded, '所有行数', '所有割合', '自己相殺行数', '自己差戻行数', '他者差戻行数', '被他者削除行数', '同一箇所反復編集数', 'ピンポン回数', '内部移動行数', $Context.Metrics.ColSelfDead, $Context.Metrics.ColOtherDead, '他者コード変更行数', '他者コード変更生存行数', '他者コード変更生存率', 'ピンポン率', '変更エントロピー', '平均共同作者数', '最大共同作者数', 'メッセージ総文字数', 'メッセージ平均文字数', '課題ID言及数', '修正キーワード数', '差戻キーワード数', 'マージキーワード数')
+        Committer = @('作者', 'コミット数', '活動日数', '変更ファイル数', '変更ディレクトリ数', '追加行数', '削除行数', '純増行数', '総チャーン', 'コミットあたりチャーン', '削除対追加比', 'チャーン対純増比', 'リワーク率', 'バイナリ変更回数', '追加アクション数', '変更アクション数', '削除アクション数', '置換アクション数', '生存行数', $Context.Metrics.ColDeadAdded, '所有行数', '所有割合', '自己相殺行数', '他者差戻行数', '同一箇所反復編集数', 'ピンポン回数', '内部移動行数', '他者コード変更行数', '他者コード変更生存行数', '他者コード変更生存率', 'ピンポン率', '変更エントロピー', '平均共同作者数', '最大共同作者数', 'メッセージ総文字数', 'メッセージ平均文字数', '課題ID言及数', '修正キーワード数', '差戻キーワード数', 'マージキーワード数')
         File = @('ファイルパス', 'コミット数', '作者数', '追加行数', '削除行数', '純増行数', '総チャーン', 'バイナリ変更回数', '作成回数', '削除回数', '置換回数', '初回変更リビジョン', '最終変更リビジョン', '平均変更間隔日数', '活動期間日数', '生存行数 (範囲指定)', $Context.Metrics.ColDeadAdded, '最多作者チャーン占有率', '最多作者blame占有率', '自己相殺行数 (合計)', '他者差戻行数 (合計)', '同一箇所反復編集数 (合計)', 'ピンポン回数 (合計)', '内部移動行数 (合計)', 'ホットスポットスコア', 'ホットスポット順位')
         Commit = @('リビジョン', '日時', '作者', 'メッセージ文字数', 'メッセージ', '変更ファイル数', '追加行数', '削除行数', 'チャーン', 'エントロピー')
         Coupling = @('ファイルA', 'ファイルB', '共変更回数', 'Jaccard', 'リフト値')

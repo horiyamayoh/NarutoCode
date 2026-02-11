@@ -10,6 +10,9 @@ Skip PSScriptAnalyzer static analysis.
 
 .PARAMETER LintOnly
 Run only PSScriptAnalyzer without Pester tests.
+
+.PARAMETER RunOracleIntegration
+Include Oracle integration tests (Tag: Oracle).
 #>
 [CmdletBinding()]
 param(
@@ -18,7 +21,9 @@ param(
 
     [switch]$SkipLint,
 
-    [switch]$LintOnly
+    [switch]$LintOnly,
+
+    [switch]$RunOracleIntegration
 )
 
 Set-StrictMode -Version Latest
@@ -89,7 +94,16 @@ if (-not $pesterModule) {
 Import-Module Pester -RequiredVersion $pesterModule.Version -Force
 
 $testPath = Join-Path $PSScriptRoot 'tests'
-$result = Invoke-Pester -Path $testPath -Output $Output -PassThru
+$pesterParams = @{
+    Path = $testPath
+    Output = $Output
+    PassThru = $true
+}
+if (-not $RunOracleIntegration) {
+    $pesterParams['ExcludeTag'] = @('Oracle')
+}
+
+$result = Invoke-Pester @pesterParams
 
 $failCount += $result.FailedCount
 

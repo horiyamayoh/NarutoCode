@@ -25,7 +25,7 @@ CSV / PlantUML の見出しを日本語化した際の対訳一覧です。
 | Churn | チャーン | |
 | Entropy | エントロピー | |
 
-## committers.csv（43 列）
+## committers.csv（40 列）
 
 ### Phase 1（基本指標 — 30 列）
 
@@ -63,19 +63,15 @@ CSV / PlantUML の見出しを日本語化した際の対訳一覧です。
 | RevertKeywordCount | 差戻キーワード数 | |
 | MergeKeywordCount | マージキーワード数 | |
 
-### Phase 2（dead-detail 指標 — 11 列）
+### Phase 2（dead-detail 指標 — 7 列）
 
 | 英語（旧） | 日本語（新） | 備考 |
 |---|---|---|
 | SelfCancelLineCount | 自己相殺行数 | 自分が追加→自分が削除 |
-| SelfRevertLines | 自己差戻行数 | 自分のコミットを自分で revert |
 | CrossRevertLines | 他者差戻行数 | 他者のコミットを自分が revert |
-| RemovedByOthersLines | 被他者削除行数 | 自分の追加行を他者が削除。「被」＝受身 |
 | RepeatedSameHunkEdits | 同一箇所反復編集数 | |
 | PingPongCount | ピンポン回数 | A→B→A パターン |
 | InternalMoveLineCount | 内部移動行数 | ファイル内の行移動 |
-| DeadBySelfApprox | 自己消滅行数 (概算) | SelfCancel ベースの内訳 |
-| DeadByOthersApprox | 被他者消滅行数 (概算) | 残差。「被」＝受身 |
 | ModifiedOthersCodeLines | 他者コード変更行数 | 他者が書いた行を自分が削除した行数。blame 由来 |
 | ModifiedOthersCodeSurvivedLines | 他者コード変更生存行数 | 他者コード変更コミットで追加した行のうち ToRev 時点で生存している行数。blame 由来 |
 
@@ -86,7 +82,7 @@ CSV / PlantUML の見出しを日本語化した際の対訳一覧です。
 | OtherCodeChangeSurvivalRate | 他者コード変更生存率 | 他者コード変更生存行数 ÷ 他者コード変更行数 |
 | PingPongPerCommit | ピンポン率 | ピンポン回数 ÷ コミット数 |
 
-## files.csv（25 列）
+## files.csv（26 列）
 
 ### Phase 1（基本指標 — 20 列）
 
@@ -106,8 +102,9 @@ CSV / PlantUML の見出しを日本語化した際の対訳一覧です。
 | FirstChangeRev | 初回変更リビジョン | |
 | LastChangeRev | 最終変更リビジョン | |
 | AvgDaysBetweenChanges | 平均変更間隔日数 | |
+| ActivitySpanDays | 活動期間日数 | |
 | SurvivedLinesFromRangeToToRev | 生存行数 (範囲指定) | blame 由来 |
-| DeadAddedLinesApprox | 消滅追加行数 (概算) | |
+| DeadAddedLines | 消滅追加行数 | `追加行数 − 生存行数 (範囲指定)` |
 | TopAuthorShareByChurn | 最多作者チャーン占有率 | |
 | TopAuthorShareByBlame | 最多作者blame占有率 | 据置：blame は固有名詞的 |
 | HotspotScore | ホットスポットスコア | |
@@ -145,8 +142,7 @@ CSV / PlantUML の見出しを日本語化した際の対訳一覧です。
 
 ## 翻訳方針メモ
 
-1. **半角括弧** — 修飾語は `XXX (概算)` のように半角スペース＋半角括弧で付加。アンダースコア不使用。
-2. **「被」接頭辞** — 「他者が〜した」の受身方向を明示する場合のみ使用（`被他者削除行数`、`被他者消滅行数 (概算)` の 2 項目）。「自己消滅行数」には「被」を付けない（不自然なため）。
-3. **削除 vs 消滅** — 「削除」は diff の `-` 行による明示的アクション。「消滅」は ToRev 時点で結果的に残っていない状態（blame 差分による推定）。
-4. **据置** — `Jaccard`（統計学固有名詞）、`blame`（SCM 固有名詞）は英語のまま。
-5. **対象外** — JSON キー (`run_meta.json`)、内部パイプラインオブジェクト (`Commit`, `PathChange`, `DiffStat`, `BlameSummary`) はすべて英語のまま。
+1. **半角括弧** — 修飾語は `XXX (合計)` のように半角スペース＋半角括弧で付加。アンダースコア不使用。
+2. **削除 vs 消滅** — 「削除」は diff の `-` 行による明示的アクション。「消滅」は `追加行数 − 生存行数` で算出される結果的な状態。
+3. **据置** — `Jaccard`（統計学固有名詞）、`blame`（SCM 固有名詞）は英語のまま。
+4. **対象外** — JSON キー (`run_meta.json`)、内部パイプラインオブジェクト (`Commit`, `PathChange`, `DiffStat`, `BlameSummary`) はすべて英語のまま。

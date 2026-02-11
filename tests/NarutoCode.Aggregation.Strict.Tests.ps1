@@ -100,7 +100,7 @@ Describe 'Strict aggregation refactor' {
 
         $row = $fileRows[0]
         $row.($script:Headers.File[15]) | Should -Be 8
-        $row.($script:Headers.File[16]) | Should -Be 2
+        $row.($script:Headers.File[16]) | Should -Be 0
         $row.($script:Headers.File[19]) | Should -Be 1
         $row.($script:Headers.File[20]) | Should -Be 2
         $row.($script:Headers.File[21]) | Should -Be 3
@@ -149,18 +149,18 @@ Describe 'Strict aggregation refactor' {
 
         $row = $committerRows[0]
         $row.($script:Headers.Committer[18]) | Should -Be 8
-        $row.($script:Headers.Committer[19]) | Should -Be 2
+        $row.($script:Headers.Committer[19]) | Should -Be 0
         $row.($script:Headers.Committer[20]) | Should -Be 10
         $row.($script:Headers.Committer[21]) | Should -Be 0.5
         $row.($script:Headers.Committer[22]) | Should -Be 1
         $row.($script:Headers.Committer[23]) | Should -Be 1
-        $row.($script:Headers.Committer[24]) | Should -Be 1
-        $row.($script:Headers.Committer[29]) | Should -Be 1
+        $row.($script:Headers.Committer[24]) | Should -Be 3
+        $row.($script:Headers.Committer[25]) | Should -Be 1
+        $row.($script:Headers.Committer[26]) | Should -Be 4
+        $row.($script:Headers.Committer[27]) | Should -Be 6
+        $row.($script:Headers.Committer[28]) | Should -Be 3
+        $row.($script:Headers.Committer[29]) | Should -Be 0.5
         $row.($script:Headers.Committer[30]) | Should -Be 1
-        $row.($script:Headers.Committer[31]) | Should -Be 6
-        $row.($script:Headers.Committer[32]) | Should -Be 3
-        $row.($script:Headers.Committer[33]) | Should -Be 0.5
-        $row.($script:Headers.Committer[34]) | Should -Be 1
     }
 
     Context 'Strict execution orchestration' {

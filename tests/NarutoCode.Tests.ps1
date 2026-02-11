@@ -1030,8 +1030,6 @@ Describe 'Strict-only behavior' {
             ))
         $row = $rows[0]
         $row.PSObject.Properties.Name -contains '消滅追加行数' | Should -BeTrue
-        $row.PSObject.Properties.Name -contains '自己消滅行数' | Should -BeTrue
-        $row.PSObject.Properties.Name -contains '被他者消滅行数' | Should -BeTrue
         $row.PSObject.Properties.Name -contains '他者コード変更行数' | Should -BeTrue
         $row.PSObject.Properties.Name -contains '他者コード変更生存行数' | Should -BeTrue
     }
@@ -1198,7 +1196,7 @@ Describe 'Write-CommitterOutcomeChart' {
                 '削除行数' = 20
                 '生存行数' = 80
                 '自己相殺行数' = 10
-                '被他者削除行数' = 5
+                '他者差戻行数' = 5
                 'ピンポン率' = 0.2
                 'コミット数' = 10
             },
@@ -1209,7 +1207,7 @@ Describe 'Write-CommitterOutcomeChart' {
                 '削除行数' = 30
                 '生存行数' = 40
                 '自己相殺行数' = 20
-                '被他者削除行数' = 10
+                '他者差戻行数' = 10
                 'ピンポン率' = 0.25
                 'コミット数' = 12
             },
@@ -1220,7 +1218,7 @@ Describe 'Write-CommitterOutcomeChart' {
                 '削除行数' = 0
                 '生存行数' = 0
                 '自己相殺行数' = 0
-                '被他者削除行数' = 0
+                '他者差戻行数' = 0
                 'ピンポン率' = 0
                 'コミット数' = 1
             }
@@ -1243,7 +1241,7 @@ Describe 'Write-CommitterOutcomeChart' {
                 '削除行数' = 5
                 '生存行数' = 15
                 '自己相殺行数' = 1
-                '被他者削除行数' = 2
+                '他者差戻行数' = 2
                 'ピンポン率' = 0.2
                 'コミット数' = 5
             }
@@ -1271,7 +1269,7 @@ Describe 'Write-CommitterOutcomeChart' {
                 '削除行数' = 10
                 '生存行数' = 40
                 '自己相殺行数' = 5
-                '被他者削除行数' = 3
+                '他者差戻行数' = 3
                 'ピンポン率' = 0.1
                 'コミット数' = 5
             }
@@ -3093,8 +3091,8 @@ Describe 'Write-ProjectCodeFateChart' {
 
     It 'creates donut SVG with fate segments and survival rate' {
         $committers = @(
-            [pscustomobject]@{ '作者' = 'alice'; '追加行数' = 400; '生存行数' = 300; '自己相殺行数' = 30; '被他者削除行数' = 20 }
-            [pscustomobject]@{ '作者' = 'bob'; '追加行数' = 100; '生存行数' = 50; '自己相殺行数' = 10; '被他者削除行数' = 5 }
+            [pscustomobject]@{ '作者' = 'alice'; '追加行数' = 400; '生存行数' = 300; '自己相殺行数' = 30; '他者差戻行数' = 20 }
+            [pscustomobject]@{ '作者' = 'bob'; '追加行数' = 100; '生存行数' = 50; '自己相殺行数' = 10; '他者差戻行数' = 5 }
         )
 
         Write-ProjectCodeFateChart -OutDirectory $script:fateDir -Committers $committers -EncodingName 'UTF8'
@@ -3120,7 +3118,7 @@ Describe 'Write-ProjectCodeFateChart' {
 
     It 'does not create SVG when total added is zero' {
         $committers = @(
-            [pscustomobject]@{ '作者' = 'x'; '追加行数' = 0; '生存行数' = 0; '自己相殺行数' = 0; '被他者削除行数' = 0 }
+            [pscustomobject]@{ '作者' = 'x'; '追加行数' = 0; '生存行数' = 0; '自己相殺行数' = 0; '他者差戻行数' = 0 }
         )
         Write-ProjectCodeFateChart -OutDirectory $script:fateDir -Committers $committers -EncodingName 'UTF8'
         Test-Path (Join-Path $script:fateDir 'project_code_fate.svg') | Should -BeFalse
@@ -3128,7 +3126,7 @@ Describe 'Write-ProjectCodeFateChart' {
 
     It 'clamps other to zero when breakdown exceeds total added' {
         $committers = @(
-            [pscustomobject]@{ '作者' = 'alice'; '追加行数' = 100; '生存行数' = 80; '自己相殺行数' = 15; '被他者削除行数' = 10 }
+            [pscustomobject]@{ '作者' = 'alice'; '追加行数' = 100; '生存行数' = 80; '自己相殺行数' = 15; '他者差戻行数' = 10 }
         )
 
         Write-ProjectCodeFateChart -OutDirectory $script:fateDir -Committers $committers -EncodingName 'UTF8'

@@ -142,3 +142,15 @@ NarutoCode/
 - `SkippedOutputs`
 
 詳細な方針は `docs/error_handling_policy.md` を参照してください。
+## テスト実行（RunTests.ps1）
+
+```powershell
+# 通常実行（Oracle 統合テストは除外）
+.\RunTests.ps1
+
+# Oracle 統合テストを含めて実行
+.\RunTests.ps1 -RunOracleIntegration
+```
+
+`RunTests.ps1` は既定で `Oracle` タグ付きテストを除外します。
+`-RunOracleIntegration` を指定したときだけ、`Oracle` タグ付き統合テストを実行します。
