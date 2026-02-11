@@ -171,6 +171,40 @@ function New-NarutoContext
             SvgCharWidthCjk = 1.00
             SvgCharWidthNarrow = 0.34
             SvgCharWidthWide = 0.82
+
+            # Runspace 並列実行で転送する関数名リスト
+            # 共通: SVN I/O とパスユーティリティ
+            RunspaceSvnCoreFunctions = @(
+                'ConvertTo-PathKey',
+                'Join-CommandArgument',
+                'Invoke-SvnCommand'
+            )
+            # Diff パーサ: ConvertFrom-SvnUnifiedDiff とその依存関数
+            RunspaceDiffParserFunctions = @(
+                'Get-Sha1Hex',
+                'ConvertTo-LineHash',
+                'ConvertTo-ContextHash',
+                'New-SvnUnifiedDiffParseState',
+                'New-SvnUnifiedDiffFileStat',
+                'Complete-SvnUnifiedDiffCurrentHunk',
+                'Reset-SvnUnifiedDiffCurrentHunkState',
+                'Start-SvnUnifiedDiffFileSection',
+                'Start-SvnUnifiedDiffHunkSection',
+                'Test-SvnUnifiedDiffBinaryMarker',
+                'Update-SvnUnifiedDiffLineStat',
+                'ConvertFrom-SvnUnifiedDiff'
+            )
+            # Blame キャッシュ I/O: ディスクキャッシュ読み書き
+            RunspaceBlameCacheFunctions = @(
+                'Get-Sha1Hex',
+                'Get-PathCacheHash',
+                'Get-BlameCachePath',
+                'Read-BlameCacheFile',
+                'Write-BlameCacheFile',
+                'Test-SvnMissingTargetError',
+                'Invoke-SvnCommandAllowMissingTarget',
+                'Get-EmptyBlameResult'
+            )
         }
     }
 }
@@ -180,8 +214,26 @@ function Get-RunspaceNarutoContext
     .SYNOPSIS
         並列 runspace 用に分離した NarutoContext を生成する。
     #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     [OutputType([hashtable])]
+    param([hashtable]$Context = $script:NarutoContext)
+    $runtimeState = Get-NarutoContextRuntimeState -Context $Context
+    $runspaceContext = New-NarutoContext -SvnExecutable $runtimeState.SvnExecutable -SvnGlobalArguments $runtimeState.SvnGlobalArguments
+    Copy-NarutoContextSection -SourceContext $Context -TargetContext $runspaceContext -SectionName 'Constants'
+    Copy-NarutoContextSection -SourceContext $Context -TargetContext $runspaceContext -SectionName 'Metrics'
+    # SHA1 インスタンスは runspace 間共有しない
+    $runspaceContext.Caches.SharedSha1 = $null
+    return $runspaceContext
+}
+function Get-NarutoContextRuntimeState
+{
+    <#
+    .SYNOPSIS
+        NarutoContext から実行時設定を抽出する。
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
     param([hashtable]$Context = $script:NarutoContext)
     $runtimeSvnExecutable = 'svn'
     $runtimeSvnGlobalArguments = @()
@@ -196,30 +248,48 @@ function Get-RunspaceNarutoContext
             $runtimeSvnGlobalArguments = @($Context.Runtime.SvnGlobalArguments)
         }
     }
-    $runspaceContext = New-NarutoContext -SvnExecutable $runtimeSvnExecutable -SvnGlobalArguments $runtimeSvnGlobalArguments
-    if ($null -ne $Context -and $null -ne $Context.Constants)
-    {
-        foreach ($key in @($Context.Constants.Keys))
-        {
-            $value = $Context.Constants[$key]
-            if ($value -is [System.Array])
-            {
-                $runspaceContext.Constants[$key] = @($value)
-                continue
-            }
-            $runspaceContext.Constants[$key] = $value
-        }
+    return [pscustomobject]@{
+        SvnExecutable = $runtimeSvnExecutable
+        SvnGlobalArguments = @($runtimeSvnGlobalArguments)
     }
-    if ($null -ne $Context -and $null -ne $Context.Metrics)
+}
+function Copy-NarutoContextSection
+{
+    <#
+    .SYNOPSIS
+        NarutoContext のセクション値を別コンテキストへコピーする。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    param(
+        [hashtable]$SourceContext,
+        [hashtable]$TargetContext,
+        [string]$SectionName
+    )
+    if ($null -eq $SourceContext -or $null -eq $TargetContext -or [string]::IsNullOrWhiteSpace($SectionName))
     {
-        foreach ($key in @($Context.Metrics.Keys))
-        {
-            $runspaceContext.Metrics[$key] = $Context.Metrics[$key]
-        }
+        return
     }
-    # SHA1 インスタンスは runspace 間共有しない
-    $runspaceContext.Caches.SharedSha1 = $null
-    return $runspaceContext
+    if (-not $SourceContext.ContainsKey($SectionName) -or -not $TargetContext.ContainsKey($SectionName))
+    {
+        return
+    }
+    $sourceSection = $SourceContext[$SectionName]
+    $targetSection = $TargetContext[$SectionName]
+    if ($null -eq $sourceSection -or $null -eq $targetSection)
+    {
+        return
+    }
+    foreach ($key in @($sourceSection.Keys))
+    {
+        $value = $sourceSection[$key]
+        if ($value -is [System.Array])
+        {
+            $targetSection[$key] = @($value)
+            continue
+        }
+        $targetSection[$key] = $value
+    }
 }
 $script:NarutoContext = New-NarutoContext -SvnExecutable $SvnExecutable
 
@@ -231,20 +301,8 @@ function Initialize-StrictModeContext
         Strict モード実行に必要なスクリプト状態を初期化する。
     #>
     param([hashtable]$Context = $script:NarutoContext)
-    $runtimeSvnExecutable = 'svn'
-    $runtimeSvnGlobalArguments = @()
-    if ($null -ne $Context -and $null -ne $Context.Runtime)
-    {
-        if (-not [string]::IsNullOrWhiteSpace([string]$Context.Runtime.SvnExecutable))
-        {
-            $runtimeSvnExecutable = [string]$Context.Runtime.SvnExecutable
-        }
-        if ($Context.Runtime.SvnGlobalArguments)
-        {
-            $runtimeSvnGlobalArguments = @($Context.Runtime.SvnGlobalArguments)
-        }
-    }
-    $script:NarutoContext = New-NarutoContext -SvnExecutable $runtimeSvnExecutable -SvnGlobalArguments $runtimeSvnGlobalArguments
+    $runtimeState = Get-NarutoContextRuntimeState -Context $Context
+    $script:NarutoContext = New-NarutoContext -SvnExecutable $runtimeState.SvnExecutable -SvnGlobalArguments $runtimeState.SvnGlobalArguments
 }
 function ConvertTo-NormalizedExtension
 {
@@ -588,15 +646,7 @@ function Invoke-ParallelWorkRunspaceCore
         {
             while ($nextIndex -lt $Items.Count -and $jobs.Count -lt $EffectiveParallel)
             {
-                $ps = [PowerShell]::Create()
-                $ps.RunspacePool = $pool
-                [void]$ps.AddScript($InvokeScript).AddArgument($WorkerText).AddArgument($Items[$nextIndex]).AddArgument($nextIndex)
-                $handle = $ps.BeginInvoke()
-                [void]$jobs.Add([pscustomobject]@{
-                        Index = $nextIndex
-                        PowerShell = $ps
-                        Handle = $handle
-                    })
+                Add-RunspaceParallelJob -Jobs $jobs -Pool $pool -InvokeScript $InvokeScript -WorkerText $WorkerText -Item $Items[$nextIndex] -Index $nextIndex
                 $nextIndex++
             }
 
@@ -607,17 +657,7 @@ function Invoke-ParallelWorkRunspaceCore
                 continue
             }
 
-            $completedJobIndex = -1
-            for ($scan = 0
-                $scan -lt $jobs.Count
-                $scan++)
-            {
-                if ($null -ne $jobs[$scan] -and $null -ne $jobs[$scan].Handle -and $jobs[$scan].Handle.IsCompleted)
-                {
-                    $completedJobIndex = $scan
-                    break
-                }
-            }
+            $completedJobIndex = Get-CompletedRunspaceParallelJobIndex -Jobs $jobs
             if ($completedJobIndex -lt 0)
             {
                 Start-Sleep -Milliseconds 1
@@ -626,67 +666,7 @@ function Invoke-ParallelWorkRunspaceCore
 
             $job = $jobs[$completedJobIndex]
             $jobs.RemoveAt($completedJobIndex)
-            if ($null -eq $job -or $null -eq $job.PowerShell)
-            {
-                $failedWrapped = [pscustomobject]@{
-                    Index = if ($null -ne $job)
-                    {
-                        [int]$job.Index
-                    }
-                    else
-                    {
-                        -1
-                    }
-                    Succeeded = $false
-                    Result = $null
-                    ErrorMessage = 'Worker handle was not initialized.'
-                    ErrorStack = $null
-                }
-                if ($failedWrapped.Index -ge 0 -and $failedWrapped.Index -lt $wrappedByIndex.Length)
-                {
-                    $wrappedByIndex[$failedWrapped.Index] = $failedWrapped
-                }
-                $jobDone++
-                continue
-            }
-
-            $wrapped = $null
-            try
-            {
-                $resultSet = $job.PowerShell.EndInvoke($job.Handle)
-                if ($resultSet -and $resultSet.Count -gt 0)
-                {
-                    $wrapped = $resultSet[0]
-                }
-                else
-                {
-                    $wrapped = [pscustomobject]@{
-                        Index = [int]$job.Index
-                        Succeeded = $false
-                        Result = $null
-                        ErrorMessage = 'Worker returned no result.'
-                        ErrorStack = $null
-                    }
-                }
-            }
-            catch
-            {
-                $wrapped = [pscustomobject]@{
-                    Index = [int]$job.Index
-                    Succeeded = $false
-                    Result = $null
-                    ErrorMessage = $_.Exception.Message
-                    ErrorStack = $_.ScriptStackTrace
-                }
-            }
-            finally
-            {
-                if ($job.PowerShell)
-                {
-                    $job.PowerShell.Dispose()
-                    $job.PowerShell = $null
-                }
-            }
+            $wrapped = Receive-RunspaceParallelJobResult -Job $job
             if ($wrapped.Index -ge 0 -and $wrapped.Index -lt $wrappedByIndex.Length)
             {
                 $wrappedByIndex[$wrapped.Index] = $wrapped
@@ -703,17 +683,7 @@ function Invoke-ParallelWorkRunspaceCore
     {
         foreach ($job in @($jobs.ToArray()))
         {
-            if ($null -ne $job -and $null -ne $job.PowerShell)
-            {
-                try
-                {
-                    $job.PowerShell.Dispose()
-                }
-                catch
-                {
-                    [void]$_
-                }
-            }
+            Clear-RunspaceParallelJob -Job $job
         }
         if ($pool)
         {
@@ -721,25 +691,165 @@ function Invoke-ParallelWorkRunspaceCore
         }
     }
 
-    $orderedWrapped = [System.Collections.Generic.List[object]]::new()
-    for ($orderedIndex = 0
-        $orderedIndex -lt $wrappedByIndex.Length
-        $orderedIndex++)
+    return @(ConvertTo-OrderedRunspaceWrappedResult -WrappedByIndex $wrappedByIndex)
+}
+function New-ParallelWorkerFailureResult
+{
+    <#
+    .SYNOPSIS
+        並列ワーカー失敗時の共通ラッパー結果を生成する。
+    .PARAMETER Index
+        失敗したワーカーのインデックス。
+    .PARAMETER ErrorMessage
+        エラーメッセージ文字列。
+    .PARAMETER ErrorStack
+        エラー発生時のスタックトレース文字列。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [int]$Index = -1,
+        [string]$ErrorMessage = 'Unknown worker failure.',
+        [string]$ErrorStack = $null
+    )
+    return [pscustomobject]@{
+        Index = [int]$Index
+        Succeeded = $false
+        Result = $null
+        ErrorMessage = $ErrorMessage
+        ErrorStack = $ErrorStack
+    }
+}
+function Add-RunspaceParallelJob
+{
+    <#
+    .SYNOPSIS
+        Runspace ジョブを作成してジョブ一覧へ登録する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    param(
+        [System.Collections.Generic.List[object]]$Jobs,
+        [System.Management.Automation.Runspaces.RunspacePool]$Pool,
+        [string]$InvokeScript,
+        [string]$WorkerText,
+        [object]$Item,
+        [int]$Index
+    )
+    $ps = [PowerShell]::Create()
+    $ps.RunspacePool = $Pool
+    [void]$ps.AddScript($InvokeScript).AddArgument($WorkerText).AddArgument($Item).AddArgument($Index)
+    $handle = $ps.BeginInvoke()
+    [void]$Jobs.Add([pscustomobject]@{
+            Index = [int]$Index
+            PowerShell = $ps
+            Handle = $handle
+        })
+}
+function Get-CompletedRunspaceParallelJobIndex
+{
+    <#
+    .SYNOPSIS
+        完了済み Runspace ジョブの配列インデックスを返す。
+    #>
+    [CmdletBinding()]
+    [OutputType([int])]
+    param([System.Collections.Generic.List[object]]$Jobs)
+    for ($scan = 0
+        $scan -lt $Jobs.Count
+        $scan++)
     {
-        if ($null -ne $wrappedByIndex[$orderedIndex])
+        if ($null -ne $Jobs[$scan] -and $null -ne $Jobs[$scan].Handle -and $Jobs[$scan].Handle.IsCompleted)
         {
-            [void]$orderedWrapped.Add($wrappedByIndex[$orderedIndex])
+            return $scan
+        }
+    }
+    return -1
+}
+function Clear-RunspaceParallelJob
+{
+    <#
+    .SYNOPSIS
+        Runspace ジョブの PowerShell インスタンスを安全に破棄する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    param([object]$Job)
+    if ($null -eq $Job -or $null -eq $Job.PowerShell)
+    {
+        return
+    }
+    try
+    {
+        $Job.PowerShell.Dispose()
+    }
+    catch
+    {
+        [void]$_
+    }
+    $Job.PowerShell = $null
+}
+function Receive-RunspaceParallelJobResult
+{
+    <#
+    .SYNOPSIS
+        完了した Runspace ジョブからラップ済み結果を回収する。
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param([object]$Job)
+    if ($null -eq $Job -or $null -eq $Job.PowerShell)
+    {
+        $failedIndex = if ($null -ne $Job)
+        {
+            [int]$Job.Index
         }
         else
         {
-            [void]$orderedWrapped.Add([pscustomobject]@{
-                    Index = $orderedIndex
-                    Succeeded = $false
-                    Result = $null
-                    ErrorMessage = 'Worker result is missing.'
-                    ErrorStack = $null
-                })
+            -1
         }
+        return (New-ParallelWorkerFailureResult -Index $failedIndex -ErrorMessage 'Worker handle was not initialized.')
+    }
+
+    try
+    {
+        $resultSet = $Job.PowerShell.EndInvoke($Job.Handle)
+        if ($resultSet -and $resultSet.Count -gt 0)
+        {
+            return $resultSet[0]
+        }
+        return (New-ParallelWorkerFailureResult -Index ([int]$Job.Index) -ErrorMessage 'Worker returned no result.')
+    }
+    catch
+    {
+        return (New-ParallelWorkerFailureResult -Index ([int]$Job.Index) -ErrorMessage $_.Exception.Message -ErrorStack $_.ScriptStackTrace)
+    }
+    finally
+    {
+        Clear-RunspaceParallelJob -Job $Job
+    }
+}
+function ConvertTo-OrderedRunspaceWrappedResult
+{
+    <#
+    .SYNOPSIS
+        収集済みワーカー結果を入力順序へ整列して返す。
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param([object[]]$WrappedByIndex)
+    $orderedWrapped = [System.Collections.Generic.List[object]]::new()
+    for ($orderedIndex = 0
+        $orderedIndex -lt $WrappedByIndex.Length
+        $orderedIndex++)
+    {
+        if ($null -ne $WrappedByIndex[$orderedIndex])
+        {
+            [void]$orderedWrapped.Add($WrappedByIndex[$orderedIndex])
+            continue
+        }
+        [void]$orderedWrapped.Add((New-ParallelWorkerFailureResult -Index $orderedIndex -ErrorMessage 'Worker result is missing.'))
     }
     return @($orderedWrapped.ToArray())
 }
@@ -1814,6 +1924,239 @@ function ConvertTo-ContextHash
     $raw = $FilePath + '|' + ($first -join '|') + '|' + ($last -join '|')
     return Get-Sha1Hex -Text $raw
 }
+function New-SvnUnifiedDiffParseState
+{
+    <#
+    .SYNOPSIS
+        Unified diff パース処理の内部状態を初期化する。
+    .PARAMETER DetailLevel
+        差分の詳細レベル。0 = サマリのみ、1 以上で hunk 詳細を含む。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param([int]$DetailLevel = 0)
+    return @{
+        Result = @{}
+        DetailLevel = $DetailLevel
+        Current = $null
+        CurrentFile = $null
+        CurrentHunk = $null
+        HunkContextLines = $null
+        HunkAddedHashes = $null
+        HunkDeletedHashes = $null
+    }
+}
+function New-SvnUnifiedDiffFileStat
+{
+    <#
+    .SYNOPSIS
+        1ファイル分の差分統計オブジェクトを生成する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    [OutputType([object])]
+    param()
+    return [pscustomobject]@{
+        AddedLines = 0
+        DeletedLines = 0
+        Hunks = (New-Object 'System.Collections.Generic.List[object]')
+        IsBinary = $false
+        AddedLineHashes = (New-Object 'System.Collections.Generic.List[string]')
+        DeletedLineHashes = (New-Object 'System.Collections.Generic.List[string]')
+    }
+}
+function Complete-SvnUnifiedDiffCurrentHunk
+{
+    <#
+    .SYNOPSIS
+        進行中 hunk のコンテキストハッシュと行ハッシュを確定する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    param([hashtable]$ParseState)
+    if ($ParseState.DetailLevel -lt 1 -or $null -eq $ParseState.CurrentHunk -or $null -eq $ParseState.CurrentFile)
+    {
+        return
+    }
+    $contextLines = @()
+    if ($null -ne $ParseState.HunkContextLines)
+    {
+        $contextLines = @($ParseState.HunkContextLines.ToArray())
+    }
+    $addedHashes = @()
+    if ($null -ne $ParseState.HunkAddedHashes)
+    {
+        $addedHashes = @($ParseState.HunkAddedHashes.ToArray())
+    }
+    $deletedHashes = @()
+    if ($null -ne $ParseState.HunkDeletedHashes)
+    {
+        $deletedHashes = @($ParseState.HunkDeletedHashes.ToArray())
+    }
+    $ParseState.CurrentHunk.ContextHash = ConvertTo-ContextHash -FilePath $ParseState.CurrentFile -ContextLines $contextLines
+    $ParseState.CurrentHunk.AddedLineHashes = $addedHashes
+    $ParseState.CurrentHunk.DeletedLineHashes = $deletedHashes
+}
+function Reset-SvnUnifiedDiffCurrentHunkState
+{
+    <#
+    .SYNOPSIS
+        パース中の hunk 追跡状態を初期化する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    param([hashtable]$ParseState)
+    $ParseState.CurrentHunk = $null
+    $ParseState.HunkContextLines = $null
+    $ParseState.HunkAddedHashes = $null
+    $ParseState.HunkDeletedHashes = $null
+}
+function Start-SvnUnifiedDiffFileSection
+{
+    <#
+    .SYNOPSIS
+        Index 行を処理してファイル境界を切り替える。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    param([hashtable]$ParseState, [string]$Line)
+    Complete-SvnUnifiedDiffCurrentHunk -ParseState $ParseState
+    $file = ConvertTo-PathKey -Path $Line.Substring(7).Trim()
+    if ($file)
+    {
+        if (-not $ParseState.Result.ContainsKey($file))
+        {
+            $ParseState.Result[$file] = New-SvnUnifiedDiffFileStat
+        }
+        $ParseState.Current = $ParseState.Result[$file]
+        $ParseState.CurrentFile = $file
+    }
+    else
+    {
+        $ParseState.Current = $null
+        $ParseState.CurrentFile = $null
+    }
+    Reset-SvnUnifiedDiffCurrentHunkState -ParseState $ParseState
+}
+function Start-SvnUnifiedDiffHunkSection
+{
+    <#
+    .SYNOPSIS
+        hunk ヘッダー行を処理して hunk 状態を開始する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    param(
+        [hashtable]$ParseState,
+        [int]$OldStart,
+        [int]$OldCount,
+        [int]$NewStart,
+        [int]$NewCount
+    )
+    Complete-SvnUnifiedDiffCurrentHunk -ParseState $ParseState
+    $hunkObj = [pscustomobject]@{
+        OldStart = $OldStart
+        OldCount = $OldCount
+        NewStart = $NewStart
+        NewCount = $NewCount
+        ContextHash = $null
+        AddedLineHashes = @()
+        DeletedLineHashes = @()
+    }
+    [void]$ParseState.Current.Hunks.Add($hunkObj)
+    $ParseState.CurrentHunk = $hunkObj
+    if ($ParseState.DetailLevel -ge 1)
+    {
+        $ParseState.HunkContextLines = New-Object 'System.Collections.Generic.List[string]'
+        $ParseState.HunkAddedHashes = New-Object 'System.Collections.Generic.List[string]'
+        $ParseState.HunkDeletedHashes = New-Object 'System.Collections.Generic.List[string]'
+    }
+    else
+    {
+        $ParseState.HunkContextLines = $null
+        $ParseState.HunkAddedHashes = $null
+        $ParseState.HunkDeletedHashes = $null
+    }
+}
+function Test-SvnUnifiedDiffBinaryMarker
+{
+    <#
+    .SYNOPSIS
+        差分行がバイナリ変更マーカーかを判定する。
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([string]$Line)
+    if ($Line -match '^Cannot display: file marked as a binary type\.' -or $Line -match '^Binary files .* differ' -or $Line -match '(?i)mime-type\s*=\s*application/octet-stream')
+    {
+        return $true
+    }
+    return $false
+}
+function Update-SvnUnifiedDiffLineStat
+{
+    <#
+    .SYNOPSIS
+        差分1行から行統計とハッシュ情報を更新する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    param([hashtable]$ParseState, [string]$Line)
+    if (-not $Line)
+    {
+        return
+    }
+    # 最頻出文字を先にチェックして分岐を減らす。
+    $ch = $Line[0]
+    if ($ch -eq '+')
+    {
+        if ($Line.Length -ge 3 -and $Line[1] -eq '+' -and $Line[2] -eq '+')
+        {
+            return
+        }
+        $ParseState.Current.AddedLines++
+        if ($ParseState.DetailLevel -ge 1 -and $null -ne $ParseState.CurrentFile)
+        {
+            $content = $Line.Substring(1)
+            $hashValue = ConvertTo-LineHash -FilePath $ParseState.CurrentFile -Content $content
+            $ParseState.Current.AddedLineHashes.Add($hashValue)
+            if ($null -ne $ParseState.HunkAddedHashes)
+            {
+                $ParseState.HunkAddedHashes.Add($hashValue)
+            }
+        }
+        return
+    }
+    if ($ch -eq '-')
+    {
+        if ($Line.Length -ge 3 -and $Line[1] -eq '-' -and $Line[2] -eq '-')
+        {
+            return
+        }
+        $ParseState.Current.DeletedLines++
+        if ($ParseState.DetailLevel -ge 1 -and $null -ne $ParseState.CurrentFile)
+        {
+            $content = $Line.Substring(1)
+            $hashValue = ConvertTo-LineHash -FilePath $ParseState.CurrentFile -Content $content
+            $ParseState.Current.DeletedLineHashes.Add($hashValue)
+            if ($null -ne $ParseState.HunkDeletedHashes)
+            {
+                $ParseState.HunkDeletedHashes.Add($hashValue)
+            }
+        }
+        return
+    }
+    if ($ch -eq ' ' -and $ParseState.DetailLevel -ge 1 -and $null -ne $ParseState.HunkContextLines)
+    {
+        $ParseState.HunkContextLines.Add($Line.Substring(1))
+        return
+    }
+    if ($ch -eq '\' -and $Line -eq '\ No newline at end of file')
+    {
+        return
+    }
+}
 function ConvertFrom-SvnUnifiedDiff
 {
     <#
@@ -1824,166 +2167,59 @@ function ConvertFrom-SvnUnifiedDiff
         hunk ヘッダーを基点に追加・削除・文脈行を収集し、必要時は行ハッシュも同時に構築する。
         バイナリ兆候を検出したファイルはテキスト行追跡対象から外し、誤集計を避ける。
     #>
-    [CmdletBinding()]param([string]$DiffText, [int]$DetailLevel = 0)
-    $result = @{}
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param([string]$DiffText, [int]$DetailLevel = 0)
     if ([string]::IsNullOrWhiteSpace($DiffText))
     {
-        return $result
+        return @{}
     }
+    $parseState = New-SvnUnifiedDiffParseState -DetailLevel $DetailLevel
     $lines = $DiffText -split "`r?`n"
-    $current = $null
-    $currentFile = $null
-    $currentHunk = $null
-    $hunkContextLines = $null
-    $hunkAddedHashes = $null
-    $hunkDeletedHashes = $null
     foreach ($line in $lines)
     {
         # ファイル境界を先に確定し、前hunkの確定漏れを防ぐ。
         if ($line -like 'Index: *')
         {
-            if ($DetailLevel -ge 1 -and $null -ne $currentHunk -and $null -ne $currentFile)
-            {
-                $currentHunk.ContextHash = ConvertTo-ContextHash -FilePath $currentFile -ContextLines $hunkContextLines
-                $currentHunk.AddedLineHashes = $hunkAddedHashes.ToArray()
-                $currentHunk.DeletedLineHashes = $hunkDeletedHashes.ToArray()
-            }
-            $file = ConvertTo-PathKey -Path $line.Substring(7).Trim()
-            if ($file)
-            {
-                if (-not $result.ContainsKey($file))
-                {
-                    $result[$file] = [pscustomobject]@{
-                        AddedLines = 0
-                        DeletedLines = 0
-                        Hunks = (New-Object 'System.Collections.Generic.List[object]')
-                        IsBinary = $false
-                        AddedLineHashes = (New-Object 'System.Collections.Generic.List[string]')
-                        DeletedLineHashes = (New-Object 'System.Collections.Generic.List[string]')
-                    }
-                }
-                $current = $result[$file]
-                $currentFile = $file
-            }
-            $currentHunk = $null
-            $hunkContextLines = $null
-            $hunkAddedHashes = $null
-            $hunkDeletedHashes = $null
+            Start-SvnUnifiedDiffFileSection -ParseState $parseState -Line $line
             continue
         }
-        if ($null -eq $current)
+        if ($null -eq $parseState.Current)
         {
             continue
         }
         # hunk単位で位置情報を持ち、後段の行追跡精度を担保する。
         if ($line -match '^@@\s*-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s*@@')
         {
-            if ($DetailLevel -ge 1 -and $null -ne $currentHunk -and $null -ne $currentFile)
+            $oldCount = if ($Matches[2])
             {
-                $currentHunk.ContextHash = ConvertTo-ContextHash -FilePath $currentFile -ContextLines $hunkContextLines
-                $currentHunk.AddedLineHashes = $hunkAddedHashes.ToArray()
-                $currentHunk.DeletedLineHashes = $hunkDeletedHashes.ToArray()
+                [int]$Matches[2]
             }
-            $hunkObj = [pscustomobject]@{
-                OldStart = [int]$Matches[1]
-                OldCount = if ($Matches[2])
-                {
-                    [int]$Matches[2]
-                }
-                else
-                {
-                    1
-                }
-                NewStart = [int]$Matches[3]
-                NewCount = if ($Matches[4])
-                {
-                    [int]$Matches[4]
-                }
-                else
-                {
-                    1
-                }
-                ContextHash = $null
-                AddedLineHashes = @()
-                DeletedLineHashes = @()
-            }
-            [void]$current.Hunks.Add($hunkObj)
-            $currentHunk = $hunkObj
-            if ($DetailLevel -ge 1)
+            else
             {
-                $hunkContextLines = New-Object 'System.Collections.Generic.List[string]'
-                $hunkAddedHashes = New-Object 'System.Collections.Generic.List[string]'
-                $hunkDeletedHashes = New-Object 'System.Collections.Generic.List[string]'
+                1
             }
+            $newCount = if ($Matches[4])
+            {
+                [int]$Matches[4]
+            }
+            else
+            {
+                1
+            }
+            Start-SvnUnifiedDiffHunkSection -ParseState $parseState -OldStart ([int]$Matches[1]) -OldCount $oldCount -NewStart ([int]$Matches[3]) -NewCount $newCount
             continue
         }
         # バイナリは行追跡不能なため早期にテキスト解析対象から外す。
-        if ($line -match '^Cannot display: file marked as a binary type\.' -or $line -match '^Binary files .* differ' -or $line -match '(?i)mime-type\s*=\s*application/octet-stream')
+        if (Test-SvnUnifiedDiffBinaryMarker -Line $line)
         {
-            $current.IsBinary = $true
+            $parseState.Current.IsBinary = $true
             continue
         }
-        if (-not $line)
-        {
-            continue
-        }
-        # 最頻出文字を先にチェックして分岐を減らす。
-        $ch = $line[0]
-        if ($ch -eq '+')
-        {
-            if ($line.Length -ge 3 -and $line[1] -eq '+' -and $line[2] -eq '+')
-            {
-                continue
-            }
-            $current.AddedLines++
-            if ($DetailLevel -ge 1 -and $null -ne $currentFile)
-            {
-                $content = $line.Substring(1)
-                $h = ConvertTo-LineHash -FilePath $currentFile -Content $content
-                $current.AddedLineHashes.Add($h)
-                if ($null -ne $hunkAddedHashes)
-                {
-                    $hunkAddedHashes.Add($h)
-                }
-            }
-            continue
-        }
-        if ($ch -eq '-')
-        {
-            if ($line.Length -ge 3 -and $line[1] -eq '-' -and $line[2] -eq '-')
-            {
-                continue
-            }
-            $current.DeletedLines++
-            if ($DetailLevel -ge 1 -and $null -ne $currentFile)
-            {
-                $content = $line.Substring(1)
-                $h = ConvertTo-LineHash -FilePath $currentFile -Content $content
-                $current.DeletedLineHashes.Add($h)
-                if ($null -ne $hunkDeletedHashes)
-                {
-                    $hunkDeletedHashes.Add($h)
-                }
-            }
-            continue
-        }
-        if ($ch -eq ' ' -and $DetailLevel -ge 1 -and $null -ne $hunkContextLines)
-        {
-            $hunkContextLines.Add($line.Substring(1))
-            continue
-        }
-        if ($ch -eq '\' -and $line -eq '\ No newline at end of file')
-        {
-            continue
-        }
+        Update-SvnUnifiedDiffLineStat -ParseState $parseState -Line $line
     }
-    if ($DetailLevel -ge 1 -and $null -ne $currentHunk -and $null -ne $currentFile)
-    {
-        $currentHunk.ContextHash = ConvertTo-ContextHash -FilePath $currentFile -ContextLines $hunkContextLines
-        $currentHunk.AddedLineHashes = $hunkAddedHashes.ToArray()
-        $currentHunk.DeletedLineHashes = $hunkDeletedHashes.ToArray()
-    }
-    return $result
+    Complete-SvnUnifiedDiffCurrentHunk -ParseState $parseState
+    return $parseState.Result
 }
 # endregion ログ・差分パース
 # region Blame パース
@@ -2564,39 +2800,123 @@ function Compare-BlameOutput
         $currContent[$j] = [string]$curr[$j].Content
     }
 
-    $matchedPairs = New-Object 'System.Collections.Generic.List[object]'
-    $prevMatched = New-Object 'bool[]' $m
-    $currMatched = New-Object 'bool[]' $n
+    $state = New-BlameCompareState -PreviousLines $prev -CurrentLines $curr
 
-    # 前後一致の prefix/suffix は LCS せずに固定し、中央差分区間だけを探索する。
+    Lock-BlamePrefixSuffixMatch -State $state -PreviousIdentity $prevIdentity -CurrentIdentity $currIdentity
+    # まず identity LCS で帰属が同じ行を優先一致させる。
+    Add-BlameLcsMatch -State $state -PreviousKeys $prevIdentity -CurrentKeys $currIdentity -MatchType 'LcsIdentity'
+    $movedPairs = @(Get-BlameMovedPairList -State $state -PreviousIdentity $prevIdentity -CurrentIdentity $currIdentity)
+    # 次に content LCS で帰属変更行を救済し誤検出を減らす。
+    Add-BlameLcsMatch -State $state -PreviousKeys $prevContent -CurrentKeys $currContent -MatchType 'LcsContent'
+
+    # 最後に未一致残余を born/dead として確定する。
+    $killed = @(Get-BlameUnmatchedLineList -Lines $prev -MatchedFlags $state.PreviousMatched)
+    $born = @(Get-BlameUnmatchedLineList -Lines $curr -MatchedFlags $state.CurrentMatched)
+    $reattributed = @(Get-BlameReattributedPairList -MatchedPairs @($state.MatchedPairs.ToArray()))
+
+    return [pscustomobject]@{
+        KilledLines = $killed
+        BornLines = $born
+        MatchedPairs = @($state.MatchedPairs.ToArray() | Sort-Object PrevIndex, CurrIndex)
+        MovedPairs = $movedPairs
+        ReattributedPairs = $reattributed
+    }
+}
+function New-BlameCompareState
+{
+    <#
+    .SYNOPSIS
+        Blame 比較処理の共有状態 DTO を生成する。
+    .PARAMETER PreviousLines
+        比較元の blame 行配列。
+    .PARAMETER CurrentLines
+        比較先の blame 行配列。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [object[]]$PreviousLines,
+        [object[]]$CurrentLines
+    )
+    $m = $PreviousLines.Count
+    $n = $CurrentLines.Count
+    return @{
+        PreviousLines = $PreviousLines
+        CurrentLines = $CurrentLines
+        PreviousMatched = (New-Object 'bool[]' $m)
+        CurrentMatched = (New-Object 'bool[]' $n)
+        MatchedPairs = (New-Object 'System.Collections.Generic.List[object]')
+    }
+}
+function Add-BlameMatchedPair
+{
+    <#
+    .SYNOPSIS
+        blame 比較の一致ペアを追加し一致フラグを更新する。
+    .PARAMETER State
+        New-BlameCompareState で生成した共有状態 DTO。
+    .PARAMETER PrevIndex
+        一致した Previous 側の行インデックス。
+    .PARAMETER CurrIndex
+        一致した Current 側の行インデックス。
+    .PARAMETER MatchType
+        一致分類ラベル（LcsIdentity / Move / LcsContent）。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    param(
+        [hashtable]$State,
+        [int]$PrevIndex,
+        [int]$CurrIndex,
+        [string]$MatchType
+    )
+    $State.PreviousMatched[$PrevIndex] = $true
+    $State.CurrentMatched[$CurrIndex] = $true
+    [void]$State.MatchedPairs.Add([pscustomobject]@{
+            PrevIndex = [int]$PrevIndex
+            CurrIndex = [int]$CurrIndex
+            PrevLine = $State.PreviousLines[$PrevIndex]
+            CurrLine = $State.CurrentLines[$CurrIndex]
+            MatchType = $MatchType
+        })
+}
+function Lock-BlamePrefixSuffixMatch
+{
+    <#
+    .SYNOPSIS
+        blame 前後配列の prefix/suffix 一致を固定する。
+    .PARAMETER State
+        New-BlameCompareState で生成した共有状態 DTO。
+    .PARAMETER PreviousIdentity
+        Previous 側の identity キー配列。
+    .PARAMETER CurrentIdentity
+        Current 側の identity キー配列。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    param(
+        [hashtable]$State,
+        [string[]]$PreviousIdentity,
+        [string[]]$CurrentIdentity
+    )
+    $m = $PreviousIdentity.Count
+    $n = $CurrentIdentity.Count
     $prefix = 0
-    while ($prefix -lt $m -and $prefix -lt $n -and $prevIdentity[$prefix] -ceq $currIdentity[$prefix])
+    while ($prefix -lt $m -and $prefix -lt $n -and $PreviousIdentity[$prefix] -ceq $CurrentIdentity[$prefix])
     {
-        $prevMatched[$prefix] = $true
-        $currMatched[$prefix] = $true
-        [void]$matchedPairs.Add([pscustomobject]@{
-                PrevIndex = $prefix
-                CurrIndex = $prefix
-                PrevLine = $prev[$prefix]
-                CurrLine = $curr[$prefix]
-                MatchType = 'LcsIdentity'
-            })
+        Add-BlameMatchedPair -State $State -PrevIndex $prefix -CurrIndex $prefix -MatchType 'LcsIdentity'
         $prefix++
     }
 
     $suffixPrev = $m - 1
     $suffixCurr = $n - 1
     $suffixPairs = New-Object 'System.Collections.Generic.List[object]'
-    while ($suffixPrev -ge $prefix -and $suffixCurr -ge $prefix -and $prevIdentity[$suffixPrev] -ceq $currIdentity[$suffixCurr])
+    while ($suffixPrev -ge $prefix -and $suffixCurr -ge $prefix -and $PreviousIdentity[$suffixPrev] -ceq $CurrentIdentity[$suffixCurr])
     {
-        $prevMatched[$suffixPrev] = $true
-        $currMatched[$suffixCurr] = $true
         [void]$suffixPairs.Add([pscustomobject]@{
-                PrevIndex = $suffixPrev
-                CurrIndex = $suffixCurr
-                PrevLine = $prev[$suffixPrev]
-                CurrLine = $curr[$suffixCurr]
-                MatchType = 'LcsIdentity'
+                PrevIndex = [int]$suffixPrev
+                CurrIndex = [int]$suffixCurr
             })
         $suffixPrev--
         $suffixCurr--
@@ -2605,52 +2925,90 @@ function Compare-BlameOutput
         $suffixIdx -ge 0
         $suffixIdx--)
     {
-        [void]$matchedPairs.Add($suffixPairs[$suffixIdx])
+        $suffixPair = $suffixPairs[$suffixIdx]
+        Add-BlameMatchedPair -State $State -PrevIndex ([int]$suffixPair.PrevIndex) -CurrIndex ([int]$suffixPair.CurrIndex) -MatchType 'LcsIdentity'
     }
-
-    # まず identity LCS で帰属が同じ行を優先一致させる。
-    foreach ($pair in @(Get-LcsMatchedPair -PreviousKeys $prevIdentity -CurrentKeys $currIdentity -PreviousLocked $prevMatched -CurrentLocked $currMatched))
+}
+function Add-BlameLcsMatch
+{
+    <#
+    .SYNOPSIS
+        指定キーで LCS 一致を適用する。
+    .PARAMETER State
+        New-BlameCompareState で生成した共有状態 DTO。
+    .PARAMETER PreviousKeys
+        Previous 側の比較キー配列。
+    .PARAMETER CurrentKeys
+        Current 側の比較キー配列。
+    .PARAMETER MatchType
+        一致分類ラベル。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    param(
+        [hashtable]$State,
+        [string[]]$PreviousKeys,
+        [string[]]$CurrentKeys,
+        [string]$MatchType
+    )
+    foreach ($pair in @(Get-LcsMatchedPair -PreviousKeys $PreviousKeys -CurrentKeys $CurrentKeys -PreviousLocked $State.PreviousMatched -CurrentLocked $State.CurrentMatched))
     {
         $prevIdx = [int]$pair.PrevIndex
         $currIdx = [int]$pair.CurrIndex
-        $prevMatched[$prevIdx] = $true
-        $currMatched[$currIdx] = $true
-        [void]$matchedPairs.Add([pscustomobject]@{
-                PrevIndex = $prevIdx
-                CurrIndex = $currIdx
-                PrevLine = $prev[$prevIdx]
-                CurrLine = $curr[$currIdx]
-                MatchType = 'LcsIdentity'
-            })
-    }
-
-    $unmatchedPrevByKey = @{}
-    for ($pi = 0
-        $pi -lt $m
-        $pi++)
-    {
-        if ($prevMatched[$pi])
+        if ($State.PreviousMatched[$prevIdx] -or $State.CurrentMatched[$currIdx])
         {
             continue
         }
-        $key = $prevIdentity[$pi]
+        Add-BlameMatchedPair -State $State -PrevIndex $prevIdx -CurrIndex $currIdx -MatchType $MatchType
+    }
+}
+function Get-BlameMovedPairList
+{
+    <#
+    .SYNOPSIS
+        identity キー一致で移動行ペアを抽出する。
+    .PARAMETER State
+        New-BlameCompareState で生成した共有状態 DTO。
+    .PARAMETER PreviousIdentity
+        Previous 側の identity キー配列。
+    .PARAMETER CurrentIdentity
+        Current 側の identity キー配列。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [hashtable]$State,
+        [string[]]$PreviousIdentity,
+        [string[]]$CurrentIdentity
+    )
+    $unmatchedPrevByKey = @{}
+    for ($pi = 0
+        $pi -lt $PreviousIdentity.Count
+        $pi++)
+    {
+        if ($State.PreviousMatched[$pi])
+        {
+            continue
+        }
+        $key = $PreviousIdentity[$pi]
         if (-not $unmatchedPrevByKey.ContainsKey($key))
         {
-            $unmatchedPrevByKey[$key] = New-Object 'System.Collections.Generic.List[int]'
+            $unmatchedPrevByKey[$key] = New-Object 'System.Collections.Generic.Queue[int]'
         }
-        [void]$unmatchedPrevByKey[$key].Add($pi)
+        [void]$unmatchedPrevByKey[$key].Enqueue($pi)
     }
 
     $movedPairs = New-Object 'System.Collections.Generic.List[object]'
     for ($ci = 0
-        $ci -lt $n
+        $ci -lt $CurrentIdentity.Count
         $ci++)
     {
-        if ($currMatched[$ci])
+        if ($State.CurrentMatched[$ci])
         {
             continue
         }
-        $key = $currIdentity[$ci]
+        $key = $CurrentIdentity[$ci]
         if (-not $unmatchedPrevByKey.ContainsKey($key))
         {
             continue
@@ -2660,87 +3018,60 @@ function Compare-BlameOutput
         {
             continue
         }
-        $prevIdx = [int]$queue[0]
-        $queue.RemoveAt(0)
-        $prevMatched[$prevIdx] = $true
-        $currMatched[$ci] = $true
-        $pair = [pscustomobject]@{
-            PrevIndex = $prevIdx
-            CurrIndex = $ci
-            PrevLine = $prev[$prevIdx]
-            CurrLine = $curr[$ci]
-            MatchType = 'Move'
-        }
-        [void]$matchedPairs.Add($pair)
-        [void]$movedPairs.Add($pair)
+        $prevIdx = [int]$queue.Dequeue()
+        Add-BlameMatchedPair -State $State -PrevIndex $prevIdx -CurrIndex $ci -MatchType 'Move'
+        [void]$movedPairs.Add($State.MatchedPairs[$State.MatchedPairs.Count - 1])
     }
-
-    # 次に content LCS で帰属変更行を救済し誤検出を減らす。
-    foreach ($pair in @(Get-LcsMatchedPair -PreviousKeys $prevContent -CurrentKeys $currContent -PreviousLocked $prevMatched -CurrentLocked $currMatched))
+    return @($movedPairs.ToArray())
+}
+function Get-BlameUnmatchedLineList
+{
+    <#
+    .SYNOPSIS
+        一致していない blame 行を Index/Line 形式で返す。
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param([object[]]$Lines, [bool[]]$MatchedFlags)
+    $unmatched = New-Object 'System.Collections.Generic.List[object]'
+    for ($idx = 0
+        $idx -lt $Lines.Count
+        $idx++)
     {
-        $prevIdx = [int]$pair.PrevIndex
-        $currIdx = [int]$pair.CurrIndex
-        if ($prevMatched[$prevIdx] -or $currMatched[$currIdx])
+        if ($MatchedFlags[$idx])
         {
             continue
         }
-        $prevMatched[$prevIdx] = $true
-        $currMatched[$currIdx] = $true
-        [void]$matchedPairs.Add([pscustomobject]@{
-                PrevIndex = $prevIdx
-                CurrIndex = $currIdx
-                PrevLine = $prev[$prevIdx]
-                CurrLine = $curr[$currIdx]
-                MatchType = 'LcsContent'
+        [void]$unmatched.Add([pscustomobject]@{
+                Index = [int]$idx
+                Line = $Lines[$idx]
             })
     }
-
-    # 最後に未一致残余を born/dead として確定する。
-    $killed = New-Object 'System.Collections.Generic.List[object]'
-    for ($pi = 0
-        $pi -lt $m
-        $pi++)
-    {
-        if (-not $prevMatched[$pi])
-        {
-            [void]$killed.Add([pscustomobject]@{
-                    Index = $pi
-                    Line = $prev[$pi]
-                })
-        }
-    }
-    $born = New-Object 'System.Collections.Generic.List[object]'
-    for ($ci = 0
-        $ci -lt $n
-        $ci++)
-    {
-        if (-not $currMatched[$ci])
-        {
-            [void]$born.Add([pscustomobject]@{
-                    Index = $ci
-                    Line = $curr[$ci]
-                })
-        }
-    }
-
+    return @($unmatched.ToArray())
+}
+function Get-BlameReattributedPairList
+{
+    <#
+    .SYNOPSIS
+        同一 content で帰属が変化した一致ペアを抽出する。
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param([object[]]$MatchedPairs)
     $reattributed = New-Object 'System.Collections.Generic.List[object]'
-    foreach ($pair in @($matchedPairs.ToArray()))
+    foreach ($pair in @($MatchedPairs))
     {
         $prevLine = $pair.PrevLine
         $currLine = $pair.CurrLine
-        if ([string]$prevLine.Content -ceq [string]$currLine.Content -and (([string]$prevLine.Revision -ne [string]$currLine.Revision) -or ((Get-NormalizedAuthorName -Author ([string]$prevLine.Author)) -ne (Get-NormalizedAuthorName -Author ([string]$currLine.Author)))))
+        $isSameContent = [string]$prevLine.Content -ceq [string]$currLine.Content
+        $isRevisionChanged = [string]$prevLine.Revision -ne [string]$currLine.Revision
+        $isAuthorChanged = (Get-NormalizedAuthorName -Author ([string]$prevLine.Author)) -ne (Get-NormalizedAuthorName -Author ([string]$currLine.Author))
+        if ($isSameContent -and ($isRevisionChanged -or $isAuthorChanged))
         {
             [void]$reattributed.Add($pair)
         }
     }
-
-    return [pscustomobject]@{
-        KilledLines = @($killed.ToArray())
-        BornLines = @($born.ToArray())
-        MatchedPairs = @($matchedPairs.ToArray() | Sort-Object PrevIndex, CurrIndex)
-        MovedPairs = @($movedPairs.ToArray())
-        ReattributedPairs = @($reattributed.ToArray())
-    }
+    return @($reattributed.ToArray())
 }
 # endregion LCS・Blame 比較
 # region Strict 帰属
@@ -3416,21 +3747,14 @@ function Invoke-StrictBlameCachePrefetch
         }
     }
     $results = @(Invoke-ParallelWork -InputItems $prefetchItems.ToArray() -WorkerScript $worker -MaxParallel $Parallel -RequiredFunctions @(
-            'ConvertTo-PathKey',
-            'Get-Sha1Hex',
-            'Get-PathCacheHash',
-            'Get-BlameCachePath',
-            'Get-CatCachePath',
-            'Read-BlameCacheFile',
-            'Write-BlameCacheFile',
-            'Read-CatCacheFile',
-            'Write-CatCacheFile',
-            'Join-CommandArgument',
-            'Invoke-SvnCommand',
-            'Test-SvnMissingTargetError',
-            'Invoke-SvnCommandAllowMissingTarget',
-            'Get-EmptyBlameResult',
-            'Initialize-SvnBlameLineCache'
+            $Context.Constants.RunspaceSvnCoreFunctions +
+            $Context.Constants.RunspaceBlameCacheFunctions +
+            @(
+                'Get-CatCachePath',
+                'Read-CatCacheFile',
+                'Write-CatCacheFile',
+                'Initialize-SvnBlameLineCache'
+            )
         ) -SessionVariables @{
             NarutoContext = (Get-RunspaceNarutoContext -Context $Context)
             SvnExecutable = $Context.Runtime.SvnExecutable
@@ -7127,33 +7451,16 @@ function Write-ProjectCodeFateChart
         {
             continue
         }
-        if ($null -ne $c.'追加行数')
-        {
-            $totalAdded += [double]$c.'追加行数'
-        }
-        if ($null -ne $c.'生存行数')
-        {
-            $totalSurvived += [double]$c.'生存行数'
-        }
-        if ($null -ne $c.'自己相殺行数')
-        {
-            $totalSelfCancel += [double]$c.'自己相殺行数'
-        }
-        if ($null -ne $c.'被他者削除行数')
-        {
-            $totalRemovedByOthers += [double]$c.'被他者削除行数'
-        }
+        $totalAdded += Get-ObjectNumericPropertyValue -InputObject $c -PropertyName '追加行数'
+        $totalSurvived += Get-ObjectNumericPropertyValue -InputObject $c -PropertyName '生存行数'
+        $totalSelfCancel += Get-ObjectNumericPropertyValue -InputObject $c -PropertyName '自己相殺行数'
+        $totalRemovedByOthers += Get-ObjectNumericPropertyValue -InputObject $c -PropertyName '被他者削除行数'
     }
     if ($totalAdded -le 0)
     {
         return
     }
-    $totalOther = $totalAdded - ($totalSurvived + $totalSelfCancel + $totalRemovedByOthers)
-    if ($totalOther -lt 0)
-    {
-        Write-Warning ("CodeFate 'その他消滅' が負の値: totalAdded={0}, survived={1}, selfCancel={2}, removedByOthers={3}" -f $totalAdded, $totalSurvived, $totalSelfCancel, $totalRemovedByOthers)
-        $totalOther = 0.0
-    }
+    $totalOther = Get-MetricBreakdownResidualValue -MetricName 'CodeFate.OtherDead' -TotalValue $totalAdded -BreakdownValues @($totalSurvived, $totalSelfCancel, $totalRemovedByOthers) -BreakdownLabels @('survived', 'selfCancel', 'removedByOthers')
     if (-not (Initialize-OutputDirectory -Path $OutDirectory))
     {
         return
@@ -8133,6 +8440,122 @@ function Get-HashtableIntValue
     }
     return $Default
 }
+function Get-ObjectPropertyValue
+{
+    <#
+    .SYNOPSIS
+        オブジェクトからプロパティ値を取得し、未定義時は既定値を返す。
+    .PARAMETER InputObject
+        プロパティを取得する対象オブジェクト。
+    .PARAMETER PropertyName
+        取得するプロパティ名。
+    .PARAMETER DefaultValue
+        プロパティが存在しないか null の場合に返す既定値。
+    #>
+    [CmdletBinding()]
+    param(
+        [object]$InputObject,
+        [string]$PropertyName,
+        $DefaultValue = $null
+    )
+    if ($null -eq $InputObject -or [string]::IsNullOrWhiteSpace($PropertyName))
+    {
+        return $DefaultValue
+    }
+    if ($InputObject.PSObject.Properties.Match($PropertyName).Count -eq 0)
+    {
+        return $DefaultValue
+    }
+    $value = $InputObject.$PropertyName
+    if ($null -eq $value)
+    {
+        return $DefaultValue
+    }
+    return $value
+}
+function Get-ObjectNumericPropertyValue
+{
+    <#
+    .SYNOPSIS
+        オブジェクトの数値プロパティを安全に double として取得する。
+    .PARAMETER InputObject
+        プロパティを取得する対象オブジェクト。
+    .PARAMETER PropertyName
+        取得する数値プロパティ名。
+    .PARAMETER DefaultValue
+        プロパティが存在しないか変換不可の場合に返す既定値。
+    #>
+    [CmdletBinding()]
+    [OutputType([double])]
+    param(
+        [object]$InputObject,
+        [string]$PropertyName,
+        [double]$DefaultValue = 0.0
+    )
+    $rawValue = Get-ObjectPropertyValue -InputObject $InputObject -PropertyName $PropertyName -DefaultValue $null
+    if ($null -eq $rawValue)
+    {
+        return $DefaultValue
+    }
+    try
+    {
+        return [double]$rawValue
+    }
+    catch
+    {
+        return $DefaultValue
+    }
+}
+function Get-MetricBreakdownResidualValue
+{
+    <#
+    .SYNOPSIS
+        合計値と内訳値から残余値を計算し不整合を診断する。
+    .PARAMETER MetricName
+        診断メッセージに使用するメトリクス名。
+    .PARAMETER TotalValue
+        全体の合計値。
+    .PARAMETER BreakdownValues
+        内訳の数値配列。
+    .PARAMETER BreakdownLabels
+        内訳ラベルの文字列配列（診断メッセージ用）。
+    #>
+    [CmdletBinding()]
+    [OutputType([double])]
+    param(
+        [string]$MetricName,
+        [double]$TotalValue,
+        [double[]]$BreakdownValues,
+        [string[]]$BreakdownLabels
+    )
+    $sumBreakdown = 0.0
+    foreach ($value in @($BreakdownValues))
+    {
+        $sumBreakdown += [double]$value
+    }
+    $residual = $TotalValue - $sumBreakdown
+    if ($residual -lt 0)
+    {
+        $detailParts = New-Object 'System.Collections.Generic.List[string]'
+        for ($i = 0
+            $i -lt $BreakdownValues.Count
+            $i++)
+        {
+            $label = if ($i -lt $BreakdownLabels.Count)
+            {
+                [string]$BreakdownLabels[$i]
+            }
+            else
+            {
+                "breakdown[{0}]" -f $i
+            }
+            [void]$detailParts.Add(("{0}={1}" -f $label, [double]$BreakdownValues[$i]))
+        }
+        Write-Warning ("Metric breakdown exceeded total: metric={0}, total={1}, {2}" -f $MetricName, $TotalValue, ($detailParts.ToArray() -join ', '))
+        return 0.0
+    }
+    return $residual
+}
 # endregion ハッシュテーブルヘルパー
 # region SVN 引数ヘルパー
 function Get-SvnGlobalArgumentList
@@ -8784,14 +9207,11 @@ function Invoke-CommitDiffPrefetch
             }
         }
         $phaseAResults = @(Invoke-ParallelWork -InputItems @($PrefetchItems) -WorkerScript $phaseAWorker -MaxParallel $Parallel -RequiredFunctions @(
-                'ConvertTo-PathKey',
-                'Get-Sha1Hex',
-                'ConvertTo-LineHash',
-                'ConvertTo-ContextHash',
-                'ConvertFrom-SvnUnifiedDiff',
-                'Join-CommandArgument',
-                'Invoke-SvnCommand',
-                'Get-CachedOrFetchDiffText'
+                $Context.Constants.RunspaceSvnCoreFunctions +
+                $Context.Constants.RunspaceDiffParserFunctions +
+                @(
+                    'Get-CachedOrFetchDiffText'
+                )
             ) -SessionVariables @{
                 NarutoContext = (Get-RunspaceNarutoContext -Context $Context)
                 SvnExecutable = $Context.Runtime.SvnExecutable
@@ -9125,21 +9545,14 @@ function Get-StrictOwnershipAggregate
             }
         }
         $ownershipResults = @(Invoke-ParallelWork -InputItems $ownershipItems.ToArray() -WorkerScript $ownershipWorker -MaxParallel $Parallel -RequiredFunctions @(
-                'ConvertTo-PathKey',
-                'Get-Sha1Hex',
-                'Get-PathCacheHash',
-                'Get-BlameCachePath',
-                'Read-BlameCacheFile',
-                'Write-BlameCacheFile',
-                'ConvertFrom-SvnXmlText',
-                'ConvertFrom-SvnBlameXml',
-                'Join-CommandArgument',
-                'Invoke-SvnCommand',
-                'Test-SvnMissingTargetError',
-                'Invoke-SvnCommandAllowMissingTarget',
-                'Get-EmptyBlameResult',
-                'Get-BlameMemoryCacheKey',
-                'Get-SvnBlameSummary'
+                $Context.Constants.RunspaceSvnCoreFunctions +
+                $Context.Constants.RunspaceBlameCacheFunctions +
+                @(
+                    'ConvertFrom-SvnXmlText',
+                    'ConvertFrom-SvnBlameXml',
+                    'Get-BlameMemoryCacheKey',
+                    'Get-SvnBlameSummary'
+                )
             ) -SessionVariables @{
                 NarutoContext = (Get-RunspaceNarutoContext -Context $Context)
                 SvnExecutable = $Context.Runtime.SvnExecutable
@@ -9500,6 +9913,133 @@ function Update-CommitterRowWithStrictMetric
         Set-StrictCommitterRowMetricValues -Context $Context -Row $row -Values $values
     }
 }
+function Get-EffectiveStrictRenameMap
+{
+    <#
+    .SYNOPSIS
+        Strict 実行で利用する最終 rename map を確定する。
+    .PARAMETER Commits
+        コミット情報オブジェクトの配列。
+    .PARAMETER RenameMap
+        外部指定のリネームマップ。空の場合はコミットから自動生成する。
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [object[]]$Commits,
+        [hashtable]$RenameMap = @{}
+    )
+    if ($RenameMap.Count -gt 0)
+    {
+        return $RenameMap
+    }
+    return (Get-RenameMap -Commits $Commits)
+}
+function Get-StrictDeathDetailOrThrow
+{
+    <#
+    .SYNOPSIS
+        Strict の厳密死亡帰属結果を取得し、null を拒否する。
+    .PARAMETER Context
+        NarutoContext ハッシュテーブル。
+    .PARAMETER Commits
+        対象コミット情報の配列。
+    .PARAMETER RevToAuthor
+        リビジョン番号から著者名へのマッピング。
+    .PARAMETER TargetUrl
+        解析対象の SVN リポジトリ URL。
+    .PARAMETER FromRevision
+        解析範囲の開始リビジョン。
+    .PARAMETER ToRevision
+        解析範囲の終了リビジョン。
+    .PARAMETER CacheDir
+        キャッシュディレクトリのパス。
+    .PARAMETER RenameMap
+        ファイルリネーム追跡用のマッピング。
+    .PARAMETER Parallel
+        並列実行ワーカー数。
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [hashtable]$Context = $script:NarutoContext,
+        [object[]]$Commits,
+        [hashtable]$RevToAuthor,
+        [string]$TargetUrl,
+        [int]$FromRevision,
+        [int]$ToRevision,
+        [string]$CacheDir,
+        [hashtable]$RenameMap,
+        [int]$Parallel = 1
+    )
+    $strictDetail = Get-ExactDeathAttribution -Context $Context -Commits $Commits -RevToAuthor $RevToAuthor -TargetUrl $TargetUrl -FromRevision $FromRevision -ToRevision $ToRevision -CacheDir $CacheDir -RenameMap $RenameMap -Parallel $Parallel
+    if ($null -eq $strictDetail)
+    {
+        throw "Strict death attribution returned null."
+    }
+    return $strictDetail
+}
+function New-StrictExecutionContext
+{
+    <#
+    .SYNOPSIS
+        Strict 実行依存データを格納する DTO を生成する。
+    .PARAMETER RenameMap
+        ファイルリネーム追跡用のマッピング。
+    .PARAMETER StrictDetail
+        厳密死亡帰属の詳細結果オブジェクト。
+    .PARAMETER AuthorOwned
+        著者ごとの所有行数マッピング。
+    .PARAMETER OwnedTotal
+        所有行数の合計。
+    .PARAMETER BlameByFile
+        ファイルパスごとの blame 結果マッピング。
+    .PARAMETER ExistingFileSet
+        現存するファイルパスのセット。
+    .PARAMETER AuthorModifiedOthersSurvived
+        著者が変更し他者の行として生存したマッピング。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [hashtable]$RenameMap,
+        [object]$StrictDetail,
+        [hashtable]$AuthorOwned,
+        [int]$OwnedTotal,
+        [hashtable]$BlameByFile,
+        [System.Collections.Generic.HashSet[string]]$ExistingFileSet,
+        [hashtable]$AuthorModifiedOthersSurvived
+    )
+    return [pscustomobject]@{
+        RenameMap = $RenameMap
+        StrictDetail = $StrictDetail
+        AuthorSurvived = $StrictDetail.AuthorSurvived
+        AuthorOwned = $AuthorOwned
+        OwnedTotal = [int]$OwnedTotal
+        BlameByFile = $BlameByFile
+        ExistingFileSet = $ExistingFileSet
+        AuthorModifiedOthersSurvived = $AuthorModifiedOthersSurvived
+    }
+}
+function New-StrictAttributionResult
+{
+    <#
+    .SYNOPSIS
+        Strict 反映結果の返却 DTO を生成する。
+    .PARAMETER StrictExecutionContext
+        New-StrictExecutionContext で生成した実行コンテキスト DTO。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    [OutputType([object])]
+    param([object]$StrictExecutionContext)
+    return [pscustomobject]@{
+        KillMatrix = $StrictExecutionContext.StrictDetail.KillMatrix
+        AuthorSelfDead = $StrictExecutionContext.StrictDetail.AuthorSelfDead
+        AuthorBorn = $StrictExecutionContext.StrictDetail.AuthorBorn
+    }
+}
 function Get-StrictExecutionContext
 {
     <#
@@ -9523,32 +10063,12 @@ function Get-StrictExecutionContext
         [int]$Parallel = 1,
         [hashtable]$RenameMap = @{}
     )
-    $renameMap = if ($RenameMap.Count -gt 0)
-    {
-        $RenameMap
-    }
-    else
-    {
-        Get-RenameMap -Commits $Commits
-    }
-    $strictDetail = Get-ExactDeathAttribution -Context $Context -Commits $Commits -RevToAuthor $RevToAuthor -TargetUrl $TargetUrl -FromRevision $FromRevision -ToRevision $ToRevision -CacheDir $CacheDir -RenameMap $renameMap -Parallel $Parallel
-    if ($null -eq $strictDetail)
-    {
-        throw "Strict death attribution returned null."
-    }
+    $renameMap = Get-EffectiveStrictRenameMap -Commits $Commits -RenameMap $RenameMap
+    $strictDetail = Get-StrictDeathDetailOrThrow -Context $Context -Commits $Commits -RevToAuthor $RevToAuthor -TargetUrl $TargetUrl -FromRevision $FromRevision -ToRevision $ToRevision -CacheDir $CacheDir -RenameMap $renameMap -Parallel $Parallel
     $ownershipAggregate = Get-StrictOwnershipAggregate -Context $Context -TargetUrl $TargetUrl -ToRevision $ToRevision -CacheDir $CacheDir -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -Parallel $Parallel
     $authorModifiedOthersSurvived = Get-AuthorModifiedOthersSurvivedCount -BlameByFile $ownershipAggregate.BlameByFile -RevsWhereKilledOthers $strictDetail.RevsWhereKilledOthers -FromRevision $FromRevision -ToRevision $ToRevision
 
-    return [pscustomobject]@{
-        RenameMap = $renameMap
-        StrictDetail = $strictDetail
-        AuthorSurvived = $strictDetail.AuthorSurvived
-        AuthorOwned = $ownershipAggregate.AuthorOwned
-        OwnedTotal = [int]$ownershipAggregate.OwnedTotal
-        BlameByFile = $ownershipAggregate.BlameByFile
-        ExistingFileSet = $ownershipAggregate.ExistingFileSet
-        AuthorModifiedOthersSurvived = $authorModifiedOthersSurvived
-    }
+    return (New-StrictExecutionContext -RenameMap $renameMap -StrictDetail $strictDetail -AuthorOwned $ownershipAggregate.AuthorOwned -OwnedTotal ([int]$ownershipAggregate.OwnedTotal) -BlameByFile $ownershipAggregate.BlameByFile -ExistingFileSet $ownershipAggregate.ExistingFileSet -AuthorModifiedOthersSurvived $authorModifiedOthersSurvived)
 }
 function Update-StrictMetricsOnRows
 {
@@ -9635,11 +10155,7 @@ function Update-StrictAttributionMetric
     $strictExecutionContext = Get-StrictExecutionContext -Context $Context -Commits $Commits -RevToAuthor $RevToAuthor -TargetUrl $TargetUrl -FromRevision $FromRevision -ToRevision $ToRevision -CacheDir $CacheDir -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -Parallel $Parallel -RenameMap $RenameMap
     Update-StrictMetricsOnRows -Context $Context -FileRows $FileRows -CommitterRows $CommitterRows -StrictExecutionContext $strictExecutionContext -TargetUrl $TargetUrl -ToRevision $ToRevision -CacheDir $CacheDir
 
-    return [pscustomobject]@{
-        KillMatrix = $strictExecutionContext.StrictDetail.KillMatrix
-        AuthorSelfDead = $strictExecutionContext.StrictDetail.AuthorSelfDead
-        AuthorBorn = $strictExecutionContext.StrictDetail.AuthorBorn
-    }
+    return (New-StrictAttributionResult -StrictExecutionContext $strictExecutionContext)
 }
 # endregion Strict メトリクス更新
 # region ヘッダーとメタデータ
@@ -9880,6 +10396,158 @@ function Get-RenameMap
 
 # endregion ヘッダーとメタデータ
 # endregion Utility
+function Get-NormalizedRevisionRange
+{
+    <#
+    .SYNOPSIS
+        開始/終了リビジョンを昇順に正規化する。
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [int]$FromRevision,
+        [int]$ToRevision
+    )
+    $normalizedFrom = $FromRevision
+    $normalizedTo = $ToRevision
+    if ($normalizedFrom -gt $normalizedTo)
+    {
+        $tmp = $normalizedFrom
+        $normalizedFrom = $normalizedTo
+        $normalizedTo = $tmp
+    }
+    return [pscustomobject]@{
+        FromRevision = [int]$normalizedFrom
+        ToRevision = [int]$normalizedTo
+    }
+}
+function Resolve-PipelineOutputState
+{
+    <#
+    .SYNOPSIS
+        パイプライン出力先とキャッシュディレクトリを確定する。
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param([string]$OutDirectory)
+    $resolvedOutDirectory = $OutDirectory
+    if (-not $resolvedOutDirectory)
+    {
+        $resolvedOutDirectory = Join-Path (Get-Location) 'NarutoCode_out'
+    }
+    $resolvedOutDirectory = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($resolvedOutDirectory)
+    $cacheDir = Join-Path $resolvedOutDirectory 'cache'
+    New-Item -Path $cacheDir -ItemType Directory -Force | Out-Null
+    return [pscustomobject]@{
+        OutDirectory = $resolvedOutDirectory
+        CacheDir = $cacheDir
+    }
+}
+function Get-NormalizedPipelineFilterSet
+{
+    <#
+    .SYNOPSIS
+        パイプラインの拡張子/パスフィルタ入力を正規化する。
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [string[]]$IncludePaths,
+        [string[]]$ExcludePaths,
+        [string[]]$IncludeExtensions,
+        [string[]]$ExcludeExtensions
+    )
+    return [pscustomobject]@{
+        IncludePaths = @(ConvertTo-NormalizedPatternList -Patterns $IncludePaths)
+        ExcludePaths = @(ConvertTo-NormalizedPatternList -Patterns $ExcludePaths)
+        IncludeExtensions = @(ConvertTo-NormalizedExtension -Extensions $IncludeExtensions)
+        ExcludeExtensions = @(ConvertTo-NormalizedExtension -Extensions $ExcludeExtensions)
+    }
+}
+function Initialize-PipelineSvnRuntimeContext
+{
+    <#
+    .SYNOPSIS
+        実行時 SVN コマンドと共通引数を Context へ反映する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [hashtable]$Context = $script:NarutoContext,
+        [string]$SvnExecutable,
+        [string]$Username,
+        [securestring]$Password,
+        [switch]$NonInteractive,
+        [switch]$TrustServerCert
+    )
+    $svnCmd = Get-Command $SvnExecutable -ErrorAction SilentlyContinue
+    if (-not $svnCmd)
+    {
+        throw "svn executable not found: '$SvnExecutable'. Install Subversion client or specify -SvnExecutable."
+    }
+    $Context.Runtime.SvnExecutable = $svnCmd.Source
+    $Context.Runtime.SvnGlobalArguments = Get-SvnGlobalArgumentList -Username $Username -Password $Password -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert
+    return $Context.Runtime.SvnExecutable
+}
+function New-PipelineExecutionState
+{
+    <#
+    .SYNOPSIS
+        パイプライン実行状態 DTO を構築する。
+    .PARAMETER RepoUrl
+        SVN リポジトリのルート URL。
+    .PARAMETER FromRevision
+        解析範囲の開始リビジョン。
+    .PARAMETER ToRevision
+        解析範囲の終了リビジョン。
+    .PARAMETER OutDirectory
+        出力ファイルの配置ディレクトリ。
+    .PARAMETER CacheDir
+        キャッシュファイルの配置ディレクトリ。
+    .PARAMETER IncludePaths
+        解析対象に含めるパスフィルタ。
+    .PARAMETER ExcludePaths
+        解析対象から除外するパスフィルタ。
+    .PARAMETER IncludeExtensions
+        解析対象に含める拡張子フィルタ。
+    .PARAMETER ExcludeExtensions
+        解析対象から除外する拡張子フィルタ。
+    .PARAMETER TargetUrl
+        解析対象の SVN パス URL。
+    .PARAMETER SvnVersion
+        使用する SVN クライアントのバージョン文字列。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [string]$RepoUrl,
+        [int]$FromRevision,
+        [int]$ToRevision,
+        [string]$OutDirectory,
+        [string]$CacheDir,
+        [string[]]$IncludePaths,
+        [string[]]$ExcludePaths,
+        [string[]]$IncludeExtensions,
+        [string[]]$ExcludeExtensions,
+        [string]$TargetUrl,
+        [string]$SvnVersion
+    )
+    return [pscustomobject]@{
+        RepoUrl = $RepoUrl
+        FromRevision = [int]$FromRevision
+        ToRevision = [int]$ToRevision
+        OutDirectory = $OutDirectory
+        CacheDir = $CacheDir
+        IncludePaths = @($IncludePaths)
+        ExcludePaths = @($ExcludePaths)
+        IncludeExtensions = @($IncludeExtensions)
+        ExcludeExtensions = @($ExcludeExtensions)
+        TargetUrl = $TargetUrl
+        SvnVersion = $SvnVersion
+    }
+}
 function Resolve-PipelineExecutionState
 {
     <#
@@ -9917,54 +10585,15 @@ function Resolve-PipelineExecutionState
         [switch]$NonInteractive,
         [switch]$TrustServerCert
     )
-    $normalizedFrom = $FromRevision
-    $normalizedTo = $ToRevision
-    if ($normalizedFrom -gt $normalizedTo)
-    {
-        $tmp = $normalizedFrom
-        $normalizedFrom = $normalizedTo
-        $normalizedTo = $tmp
-    }
+    $normalizedRange = Get-NormalizedRevisionRange -FromRevision $FromRevision -ToRevision $ToRevision
+    $outputState = Resolve-PipelineOutputState -OutDirectory $OutDirectory
+    $normalizedFilters = Get-NormalizedPipelineFilterSet -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions
 
-    $resolvedOutDirectory = $OutDirectory
-    if (-not $resolvedOutDirectory)
-    {
-        $resolvedOutDirectory = Join-Path (Get-Location) 'NarutoCode_out'
-    }
-    $resolvedOutDirectory = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($resolvedOutDirectory)
-
-    $cacheDir = Join-Path $resolvedOutDirectory 'cache'
-    New-Item -Path $cacheDir -ItemType Directory -Force | Out-Null
-
-    $normalizedIncludeExtensions = ConvertTo-NormalizedExtension -Extensions $IncludeExtensions
-    $normalizedExcludeExtensions = ConvertTo-NormalizedExtension -Extensions $ExcludeExtensions
-    $normalizedIncludePaths = ConvertTo-NormalizedPatternList -Patterns $IncludePaths
-    $normalizedExcludePaths = ConvertTo-NormalizedPatternList -Patterns $ExcludePaths
-
-    $svnCmd = Get-Command $SvnExecutable -ErrorAction SilentlyContinue
-    if (-not $svnCmd)
-    {
-        throw "svn executable not found: '$SvnExecutable'. Install Subversion client or specify -SvnExecutable."
-    }
-    $Context.Runtime.SvnExecutable = $svnCmd.Source
-    $Context.Runtime.SvnGlobalArguments = Get-SvnGlobalArgumentList -Username $Username -Password $Password -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert
-
+    [void](Initialize-PipelineSvnRuntimeContext -Context $Context -SvnExecutable $SvnExecutable -Username $Username -Password $Password -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert)
     $targetUrl = Resolve-SvnTargetUrl -Context $Context -Target $RepoUrl
     $svnVersion = Get-SvnVersionSafe -Context $Context
 
-    return [pscustomobject]@{
-        RepoUrl = $RepoUrl
-        FromRevision = [int]$normalizedFrom
-        ToRevision = [int]$normalizedTo
-        OutDirectory = $resolvedOutDirectory
-        CacheDir = $cacheDir
-        IncludePaths = @($normalizedIncludePaths)
-        ExcludePaths = @($normalizedExcludePaths)
-        IncludeExtensions = @($normalizedIncludeExtensions)
-        ExcludeExtensions = @($normalizedExcludeExtensions)
-        TargetUrl = $targetUrl
-        SvnVersion = $svnVersion
-    }
+    return (New-PipelineExecutionState -RepoUrl $RepoUrl -FromRevision $normalizedRange.FromRevision -ToRevision $normalizedRange.ToRevision -OutDirectory $outputState.OutDirectory -CacheDir $outputState.CacheDir -IncludePaths $normalizedFilters.IncludePaths -ExcludePaths $normalizedFilters.ExcludePaths -IncludeExtensions $normalizedFilters.IncludeExtensions -ExcludeExtensions $normalizedFilters.ExcludeExtensions -TargetUrl $targetUrl -SvnVersion $svnVersion)
 }
 function Invoke-PipelineLogAndDiffStage
 {
@@ -10263,4 +10892,3 @@ if ($MyInvocation.InvocationName -ne '.')
 {
     Invoke-NarutoCodePipeline -Context $script:NarutoContext -RepoUrl $RepoUrl -FromRevision $FromRevision -ToRevision $ToRevision -SvnExecutable $SvnExecutable -OutDirectory $OutDirectory -Username $Username -Password $Password -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -Parallel $Parallel -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -TopNCount $TopNCount -Encoding $Encoding -IgnoreWhitespace:$IgnoreWhitespace
 }
-

@@ -1186,3 +1186,80 @@ The following SVN I/O helpers now accept explicit `Context` and are called throu
 - `Get-RenamePairRealDiffStat`
 
 This keeps runtime dependency flow explicit and reduces hidden reliance on script-scope defaults.
+
+## Core Maintainability Refactor (2026-02)
+
+This update keeps outputs compatible while reducing complexity in core analysis paths.
+
+### Context/runtime unification
+
+- Added `Get-NarutoContextRuntimeState` to centralize runtime extraction (`SvnExecutable`, `SvnGlobalArguments`).
+- Added `Copy-NarutoContextSection` to copy `Constants` and `Metrics` into runspace-local contexts.
+- `Get-RunspaceNarutoContext` and `Initialize-StrictModeContext` now share the same runtime extraction logic.
+
+### Unified diff parser decomposition
+
+`ConvertFrom-SvnUnifiedDiff` now orchestrates dedicated helper steps:
+
+- Parse state lifecycle:
+  - `New-SvnUnifiedDiffParseState`
+  - `Reset-SvnUnifiedDiffCurrentHunkState`
+  - `Complete-SvnUnifiedDiffCurrentHunk`
+- State transitions:
+  - `Start-SvnUnifiedDiffFileSection`
+  - `Start-SvnUnifiedDiffHunkSection`
+- Line classification:
+  - `Test-SvnUnifiedDiffBinaryMarker`
+  - `Update-SvnUnifiedDiffLineStat`
+
+Algorithm and output schema remain unchanged.
+
+### Blame comparison decomposition
+
+`Compare-BlameOutput` now delegates stage logic to helpers:
+
+- Pair management: `Add-BlameMatchedPair`
+- Prefix/suffix lock: `Lock-BlamePrefixSuffixMatch`
+- LCS application: `Add-BlameLcsMatch`
+- Move detection: `Get-BlameMovedPairList`
+- Residual extraction: `Get-BlameUnmatchedLineList`
+- Reattribution extraction: `Get-BlameReattributedPairList`
+
+This preserves the same classification categories (`KilledLines`, `BornLines`, `MovedPairs`, `ReattributedPairs`).
+
+### Runspace job lifecycle decomposition
+
+`Invoke-ParallelWorkRunspaceCore` now separates job lifecycle concerns:
+
+- Failure DTO: `New-ParallelWorkerFailureResult`
+- Submission: `Add-RunspaceParallelJob`
+- Completion scan: `Get-CompletedRunspaceParallelJobIndex`
+- Result receive: `Receive-RunspaceParallelJobResult`
+- Disposal: `Clear-RunspaceParallelJob`
+- Order reconstruction: `ConvertTo-OrderedRunspaceWrappedResult`
+
+Behavioral guarantees are unchanged:
+- input order preserved
+- sequential/parallel equivalence preserved
+- failure summary contract preserved
+
+### Pipeline/strict DTO helpers
+
+- Added `New-PipelineExecutionState` and split `Resolve-PipelineExecutionState` into:
+  - `Get-NormalizedRevisionRange`
+  - `Resolve-PipelineOutputState`
+  - `Get-NormalizedPipelineFilterSet`
+  - `Initialize-PipelineSvnRuntimeContext`
+- Added strict DTO helpers:
+  - `Get-EffectiveStrictRenameMap`
+  - `Get-StrictDeathDetailOrThrow`
+  - `New-StrictExecutionContext`
+  - `New-StrictAttributionResult`
+
+### Metric consistency guard
+
+- Added object access helpers:
+  - `Get-ObjectPropertyValue`
+  - `Get-ObjectNumericPropertyValue`
+- Added `Get-MetricBreakdownResidualValue` for standardized breakdown-vs-total diagnostics.
+- `Write-ProjectCodeFateChart` now uses these helpers and emits unified warning format on residual underflow.

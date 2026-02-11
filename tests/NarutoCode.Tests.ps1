@@ -653,6 +653,54 @@ Index: trunk/X.txt
         $parsed['trunk/X.txt'].Hunks[0].OldCount | Should -Be 1
         $parsed['trunk/X.txt'].Hunks[0].NewCount | Should -Be 1
     }
+
+    It 'finalizes previous hunk when file section changes in detail mode' {
+        $diff = @"
+Index: trunk/A.cs
+===================================================================
+--- trunk/A.cs	(revision 1)
++++ trunk/A.cs	(revision 2)
+@@ -1,2 +1,2 @@
+ context
+-old
++new
+Index: trunk/B.cs
+===================================================================
+--- trunk/B.cs	(revision 1)
++++ trunk/B.cs	(revision 2)
+@@ -1,1 +1,1 @@
+-before
++after
+"@
+        $parsed = ConvertFrom-SvnUnifiedDiff -DiffText $diff -DetailLevel 1
+        $parsed.Keys.Count | Should -Be 2
+        $parsed['trunk/A.cs'].Hunks.Count | Should -Be 1
+        $parsed['trunk/A.cs'].Hunks[0].ContextHash | Should -Not -BeNullOrEmpty
+        @($parsed['trunk/A.cs'].Hunks[0].AddedLineHashes).Count | Should -Be 1
+        @($parsed['trunk/A.cs'].Hunks[0].DeletedLineHashes).Count | Should -Be 1
+        @($parsed['trunk/B.cs'].Hunks[0].AddedLineHashes).Count | Should -Be 1
+    }
+
+    It 'handles binary and text files in the same diff independently' {
+        $diff = @"
+Index: trunk/bin/data.bin
+===================================================================
+Cannot display: file marked as a binary type.
+svn:mime-type = application/octet-stream
+Index: trunk/src/App.cs
+===================================================================
+--- trunk/src/App.cs	(revision 1)
++++ trunk/src/App.cs	(revision 2)
+@@ -1 +1,2 @@
+ keep
++added
+"@
+        $parsed = ConvertFrom-SvnUnifiedDiff -DiffText $diff -DetailLevel 1
+        $parsed['trunk/bin/data.bin'].IsBinary | Should -BeTrue
+        $parsed['trunk/src/App.cs'].IsBinary | Should -BeFalse
+        $parsed['trunk/src/App.cs'].AddedLines | Should -Be 1
+        $parsed['trunk/src/App.cs'].DeletedLines | Should -Be 0
+    }
 }
 
 Describe 'Metrics functions — detailed verification' {
@@ -1492,6 +1540,128 @@ Describe 'Compare-BlameOutput' {
         $cmp.KilledLines.Count | Should -Be 0
         $cmp.BornLines.Count | Should -Be 0
         $cmp.ReattributedPairs.Count | Should -Be 1
+    }
+
+    It 'classifies reordered identical lines as move without born or killed' {
+        $prev = @(
+            [pscustomobject]@{ LineNumber = 1; Content = 'first'; Revision = 10; Author = 'alice' },
+            [pscustomobject]@{ LineNumber = 2; Content = 'second'; Revision = 10; Author = 'alice' }
+        )
+        $curr = @(
+            [pscustomobject]@{ LineNumber = 1; Content = 'second'; Revision = 10; Author = 'alice' },
+            [pscustomobject]@{ LineNumber = 2; Content = 'first'; Revision = 10; Author = 'alice' }
+        )
+
+        $cmp = Compare-BlameOutput -PreviousLines $prev -CurrentLines $curr
+        $cmp.KilledLines.Count | Should -Be 0
+        $cmp.BornLines.Count | Should -Be 0
+        $cmp.MovedPairs.Count | Should -Be 1
+        $cmp.MovedPairs[0].MatchType | Should -Be 'Move'
+    }
+
+    It 'completes within acceptable time for 1000-line blame comparison (Queue benchmark)' {
+        # 1000 行のうち中央ブロックを移動させるシナリオで処理時間を計測する。
+        # identity key = Revision + Author + Content のため、Revision と Author を
+        # 同一に保つことで identity LCS / Move 検出が正しく機能することを確認する。
+        # Queue[int] の Dequeue O(1) の効果は、同一 identity を持つ移動行が
+        # 多数存在する場合に発揮される。
+        $lineCount = 1000
+        $prev = @(
+            for ($i = 1; $i -le $lineCount; $i++)
+            {
+                [pscustomobject]@{
+                    LineNumber = $i
+                    Content = "line_$i"
+                    Revision = 10
+                    Author = ('author_' + ($i % 5))
+                }
+            }
+        )
+        # 中央 200 行 (401-600) を先頭へ移動し、残りは元の順序を維持する。
+        # identity key は全行で保持されるため、prefix/suffix 不一致 → LCS + Move で解決される。
+        $movedBlock = @($prev[400..599])
+        $beforeBlock = @($prev[0..399])
+        $afterBlock = @($prev[600..999])
+        $reordered = $movedBlock + $beforeBlock + $afterBlock
+        $curr = @(
+            for ($idx = 0; $idx -lt $reordered.Count; $idx++)
+            {
+                $src = $reordered[$idx]
+                [pscustomobject]@{
+                    LineNumber = $idx + 1
+                    Content = $src.Content
+                    Revision = $src.Revision
+                    Author = $src.Author
+                }
+            }
+        )
+
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $cmp = Compare-BlameOutput -PreviousLines $prev -CurrentLines $curr
+        $sw.Stop()
+
+        # 全行がマッチし、born/killed が出ないことを確認
+        $cmp.KilledLines.Count | Should -Be 0
+        $cmp.BornLines.Count | Should -Be 0
+        # 移動行が検出されること
+        $cmp.MatchedPairs.Count | Should -Be $lineCount
+
+        # 1000 行比較が 10 秒以内に完了することを確認
+        $sw.Elapsed.TotalSeconds | Should -BeLessThan 10
+    }
+}
+
+Describe 'Resolve-PipelineExecutionState' {
+    BeforeAll {
+        $script:origResolveSvnTargetUrlForExecutionState = (Get-Item function:Resolve-SvnTargetUrl).ScriptBlock.ToString()
+        $script:origGetSvnVersionSafeForExecutionState = (Get-Item function:Get-SvnVersionSafe).ScriptBlock.ToString()
+    }
+
+    AfterAll {
+        Set-Item -Path function:Resolve-SvnTargetUrl -Value $script:origResolveSvnTargetUrlForExecutionState
+        Set-Item -Path function:Get-SvnVersionSafe -Value $script:origGetSvnVersionSafeForExecutionState
+    }
+
+    It 'normalizes revisions and filter inputs while resolving runtime state' {
+        Set-Item -Path function:Resolve-SvnTargetUrl -Value {
+            param([hashtable]$Context, [string]$Target)
+            [void]$Context
+            [void]$Target
+            return 'https://example.invalid/normalized/repo'
+        }
+        Set-Item -Path function:Get-SvnVersionSafe -Value {
+            param([hashtable]$Context)
+            [void]$Context
+            return '1.14.2'
+        }
+
+        $outDir = Join-Path $env:TEMP ('narutocode_exec_state_' + [guid]::NewGuid().ToString('N'))
+        $password = ConvertTo-SecureString -String 'p@ss' -AsPlainText -Force
+        try {
+            $state = Resolve-PipelineExecutionState -Context $script:NarutoContext -RepoUrl 'https://example.invalid/repos/proj/trunk' -FromRevision 20 -ToRevision 10 -OutDirectory $outDir -IncludePaths @(' src/* ', 'src/*') -ExcludePaths @(' tmp/* ', 'tmp/*') -IncludeExtensions @('.cs', 'CS') -ExcludeExtensions @(' .bin ', 'BIN') -SvnExecutable 'powershell' -Username 'tester' -Password $password -NonInteractive -TrustServerCert
+
+            $state.FromRevision | Should -Be 10
+            $state.ToRevision | Should -Be 20
+            $state.TargetUrl | Should -Be 'https://example.invalid/normalized/repo'
+            $state.SvnVersion | Should -Be '1.14.2'
+            $state.OutDirectory | Should -Be $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($outDir)
+            (Test-Path $state.CacheDir) | Should -BeTrue
+            $state.IncludePaths.Count | Should -Be 1
+            $state.IncludePaths[0] | Should -Be 'src/*'
+            $state.ExcludePaths.Count | Should -Be 1
+            $state.ExcludePaths[0] | Should -Be 'tmp/*'
+            $state.IncludeExtensions.Count | Should -Be 1
+            $state.IncludeExtensions[0] | Should -Be 'cs'
+            $state.ExcludeExtensions.Count | Should -Be 1
+            $state.ExcludeExtensions[0] | Should -Be 'bin'
+            $script:NarutoContext.Runtime.SvnGlobalArguments -contains '--username' | Should -BeTrue
+            $script:NarutoContext.Runtime.SvnGlobalArguments -contains 'tester' | Should -BeTrue
+            $script:NarutoContext.Runtime.SvnGlobalArguments -contains '--non-interactive' | Should -BeTrue
+            $script:NarutoContext.Runtime.SvnGlobalArguments -contains '--trust-server-cert' | Should -BeTrue
+        }
+        finally {
+            Remove-Item -Path $outDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
