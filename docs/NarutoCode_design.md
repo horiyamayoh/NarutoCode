@@ -1106,3 +1106,41 @@ Phase 2（Phase 1 完了後）
 - XML は `[xml]` でパースし、ノード欠落に強くする。
 - CSV は `Export-Csv -NoTypeInformation -Encoding UTF8` を基本。
 
+
+## Aggregation-First Refactor Structure (2026-02)
+
+This phase keeps the single-file constraint (`NarutoCode.ps1`) and reorganizes aggregation logic into explicit stages.
+
+### Diff processing pipeline
+
+- `New-CommitDiffPrefetchPlan`: build filtered path targets and prefetch candidates.
+- `Invoke-CommitDiffPrefetch`: fetch/collect raw diff inputs (sequential or parallel).
+- `Merge-CommitDiffForCommit`: merge raw diff result with log path metadata.
+- `Complete-CommitDiffForCommit`: apply rename correction and finalize derived commit-level metrics.
+
+Rename correction internals are decomposed into:
+- `Get-RenameCorrectionCandidates`
+- `Get-RenamePairRealDiffStat`
+- `Set-RenamePairDiffStatCorrection`
+
+### Base aggregation
+
+The following metrics now follow `initialize -> update -> convert rows` flow:
+- Committer: `Initialize-CommitterMetricState`, `Update-CommitterMetricState`, `ConvertTo-CommitterMetricRows`
+- File: `Initialize-FileMetricState`, `Update-FileMetricState`, `ConvertTo-FileMetricRows`
+- Co-change: `Get-CoChangeCounters`, `ConvertTo-CoChangeRows`
+
+### Strict aggregation
+
+Strict processing is split into:
+- Commit-level attribution execution: `Resolve-StrictKillerAuthor`, `Invoke-StrictCommitAttribution`
+- Execution context assembly: `Get-StrictExecutionContext`
+- Row reflection: `Update-StrictMetricsOnRows`
+- Row-value decomposition:
+  - Files: `Get-StrictFileRowMetricValues` + `Set-StrictFileRowMetricValues`
+  - Committers: `Get-StrictCommitterRowMetricValues` + `Set-StrictCommitterRowMetricValues`
+
+### Header/column consistency
+
+- `Get-MetricColumnDefinitions` is the shared source for metric column arrays.
+- `Get-MetricHeader` now reads from this shared definition to reduce duplication risk.

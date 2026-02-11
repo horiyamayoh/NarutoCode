@@ -2736,6 +2736,171 @@ function Compare-BlameOutput
 }
 # endregion LCS・Blame 比較
 # region Strict 帰属
+function Get-CommitTransitionRenameContext
+{
+    <#
+    .SYNOPSIS
+        コミット内パスから rename 判定に必要な中間状態を構築する。
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param([object[]]$Paths)
+    $pathMap = @{}
+    $deleted = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($pathEntry in @($Paths))
+    {
+        $pathKey = ConvertTo-PathKey -Path ([string]$pathEntry.Path)
+        if (-not $pathKey)
+        {
+            continue
+        }
+        if (-not $pathMap.ContainsKey($pathKey))
+        {
+            $pathMap[$pathKey] = New-Object 'System.Collections.Generic.List[object]'
+        }
+        [void]$pathMap[$pathKey].Add($pathEntry)
+        if (([string]$pathEntry.Action).ToUpperInvariant() -eq 'D')
+        {
+            [void]$deleted.Add($pathKey)
+        }
+    }
+
+    $renameNewToOld = @{}
+    $consumedOld = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($pathEntry in @($Paths))
+    {
+        $action = ([string]$pathEntry.Action).ToUpperInvariant()
+        if (($action -ne 'A' -and $action -ne 'R') -or [string]::IsNullOrWhiteSpace([string]$pathEntry.CopyFromPath))
+        {
+            continue
+        }
+        $newPath = ConvertTo-PathKey -Path ([string]$pathEntry.Path)
+        $oldPath = ConvertTo-PathKey -Path ([string]$pathEntry.CopyFromPath)
+        if (-not $newPath -or -not $oldPath)
+        {
+            continue
+        }
+        if ($deleted.Contains($oldPath))
+        {
+            $renameNewToOld[$newPath] = $oldPath
+            [void]$consumedOld.Add($oldPath)
+        }
+    }
+    return [pscustomobject]@{
+        PathMap = $pathMap
+        Deleted = $deleted
+        RenameNewToOld = $renameNewToOld
+        ConsumedOld = $consumedOld
+    }
+}
+function ConvertTo-CommitRenameTransitions
+{
+    <#
+    .SYNOPSIS
+        rename 判定結果から before/after 遷移行を生成する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '')]
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [hashtable]$RenameNewToOld,
+        [System.Collections.Generic.HashSet[string]]$Dedup
+    )
+    $rows = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($newPath in @($RenameNewToOld.Keys | Sort-Object))
+    {
+        $oldPath = [string]$RenameNewToOld[$newPath]
+        $key = $oldPath + [char]31 + $newPath
+        if ($Dedup.Add($key))
+        {
+            [void]$rows.Add([pscustomobject]@{
+                    BeforePath = $oldPath
+                    AfterPath = $newPath
+                })
+        }
+    }
+    return @($rows.ToArray())
+}
+function ConvertTo-CommitNonRenameTransitions
+{
+    <#
+    .SYNOPSIS
+        rename 以外の before/after 遷移行を生成する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '')]
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [object]$Commit,
+        [hashtable]$PathMap,
+        [hashtable]$RenameNewToOld,
+        [System.Collections.Generic.HashSet[string]]$Deleted,
+        [System.Collections.Generic.HashSet[string]]$ConsumedOld,
+        [System.Collections.Generic.HashSet[string]]$Dedup
+    )
+    $rows = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($oldPath in $Deleted)
+    {
+        if ($ConsumedOld.Contains($oldPath))
+        {
+            continue
+        }
+        $key = $oldPath + [char]31
+        if ($Dedup.Add($key))
+        {
+            [void]$rows.Add([pscustomobject]@{
+                    BeforePath = $oldPath
+                    AfterPath = $null
+                })
+        }
+    }
+
+    $candidates = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($filePath in @($Commit.FilesChanged))
+    {
+        [void]$candidates.Add((ConvertTo-PathKey -Path ([string]$filePath)))
+    }
+    foreach ($path in $PathMap.Keys)
+    {
+        [void]$candidates.Add($path)
+    }
+
+    foreach ($path in $candidates)
+    {
+        if (-not $path)
+        {
+            continue
+        }
+        if ($RenameNewToOld.ContainsKey($path) -or $ConsumedOld.Contains($path) -or $Deleted.Contains($path))
+        {
+            continue
+        }
+        $beforePath = $path
+        $afterPath = $path
+        if ($PathMap.ContainsKey($path))
+        {
+            $entries = $PathMap[$path]
+            if ($null -ne $entries -and $entries.Count -gt 0)
+            {
+                $entry = $entries[0]
+                $action = ([string]$entry.Action).ToUpperInvariant()
+                if ($action -eq 'A')
+                {
+                    $beforePath = $null
+                }
+            }
+        }
+        $key = ([string]$beforePath) + [char]31 + ([string]$afterPath)
+        if ($Dedup.Add($key))
+        {
+            [void]$rows.Add([pscustomobject]@{
+                    BeforePath = $beforePath
+                    AfterPath = $afterPath
+                })
+        }
+    }
+    return @($rows.ToArray())
+}
 function Get-CommitFileTransition
 {
     <#
@@ -2749,127 +2914,111 @@ function Get-CommitFileTransition
     [CmdletBinding()]
     [OutputType([object[]])]
     param([object]$Commit)
-
     $paths = @($Commit.ChangedPathsFiltered)
-    $pathMap = @{}
-    $deleted = New-Object 'System.Collections.Generic.HashSet[string]'
-    foreach ($p in $paths)
-    {
-        $path = ConvertTo-PathKey -Path ([string]$p.Path)
-        if (-not $path)
-        {
-            continue
-        }
-        if (-not $pathMap.ContainsKey($path))
-        {
-            $pathMap[$path] = New-Object 'System.Collections.Generic.List[object]'
-        }
-        [void]$pathMap[$path].Add($p)
-        if (([string]$p.Action).ToUpperInvariant() -eq 'D')
-        {
-            [void]$deleted.Add($path)
-        }
-    }
-
-    $renameNewToOld = @{}
-    $consumedOld = New-Object 'System.Collections.Generic.HashSet[string]'
-    foreach ($p in $paths)
-    {
-        $action = ([string]$p.Action).ToUpperInvariant()
-        if (($action -ne 'A' -and $action -ne 'R') -or [string]::IsNullOrWhiteSpace([string]$p.CopyFromPath))
-        {
-            continue
-        }
-        $newPath = ConvertTo-PathKey -Path ([string]$p.Path)
-        $oldPath = ConvertTo-PathKey -Path ([string]$p.CopyFromPath)
-        if (-not $newPath -or -not $oldPath)
-        {
-            continue
-        }
-        if ($deleted.Contains($oldPath))
-        {
-            $renameNewToOld[$newPath] = $oldPath
-            [void]$consumedOld.Add($oldPath)
-        }
-    }
-
-    $result = New-Object 'System.Collections.Generic.List[object]'
+    $renameContext = Get-CommitTransitionRenameContext -Paths $paths
     $dedup = New-Object 'System.Collections.Generic.HashSet[string]'
-    foreach ($newPath in @($renameNewToOld.Keys | Sort-Object))
+    $result = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($transition in @(ConvertTo-CommitRenameTransitions -RenameNewToOld $renameContext.RenameNewToOld -Dedup $dedup))
     {
-        $oldPath = [string]$renameNewToOld[$newPath]
-        $key = $oldPath + [char]31 + $newPath
-        if ($dedup.Add($key))
-        {
-            [void]$result.Add([pscustomobject]@{
-                    BeforePath = $oldPath
-                    AfterPath = $newPath
-                })
-        }
+        [void]$result.Add($transition)
     }
-
-    foreach ($oldPath in $deleted)
+    foreach ($transition in @(ConvertTo-CommitNonRenameTransitions -Commit $Commit -PathMap $renameContext.PathMap -RenameNewToOld $renameContext.RenameNewToOld -Deleted $renameContext.Deleted -ConsumedOld $renameContext.ConsumedOld -Dedup $dedup))
     {
-        if ($consumedOld.Contains($oldPath))
-        {
-            continue
-        }
-        $key = $oldPath + [char]31
-        if ($dedup.Add($key))
-        {
-            [void]$result.Add([pscustomobject]@{
-                    BeforePath = $oldPath
-                    AfterPath = $null
-                })
-        }
+        [void]$result.Add($transition)
     }
-
-    $candidates = New-Object 'System.Collections.Generic.HashSet[string]'
-    foreach ($f in @($Commit.FilesChanged))
-    {
-        [void]$candidates.Add((ConvertTo-PathKey -Path ([string]$f)))
-    }
-    foreach ($path in $pathMap.Keys)
-    {
-        [void]$candidates.Add($path)
-    }
-
-    foreach ($path in $candidates)
-    {
-        if (-not $path)
-        {
-            continue
-        }
-        if ($renameNewToOld.ContainsKey($path) -or $consumedOld.Contains($path) -or $deleted.Contains($path))
-        {
-            continue
-        }
-        $beforePath = $path
-        $afterPath = $path
-        if ($pathMap.ContainsKey($path))
-        {
-            $entries = $pathMap[$path]
-            if ($null -ne $entries -and $entries.Count -gt 0)
-            {
-                $entry = $entries[0]
-                $action = ([string]$entry.Action).ToUpperInvariant()
-                if ($action -eq 'A')
-                {
-                    $beforePath = $null
-                }
-            }
-        }
-        $key = ([string]$beforePath) + [char]31 + ([string]$afterPath)
-        if ($dedup.Add($key))
-        {
-            [void]$result.Add([pscustomobject]@{
-                    BeforePath = $beforePath
-                    AfterPath = $afterPath
-                })
-        }
-    }
-
     return @($result.ToArray())
+}
+function ConvertTo-StrictHunkList
+{
+    <#
+    .SYNOPSIS
+        hunk 入力を列挙可能な配列へ正規化する。
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param([object]$HunksRaw)
+    if ($null -eq $HunksRaw)
+    {
+        return @()
+    }
+    $hunks = New-Object 'System.Collections.Generic.List[object]'
+    if ($HunksRaw -is [System.Collections.IEnumerable] -and -not ($HunksRaw -is [string]))
+    {
+        foreach ($hunk in $HunksRaw)
+        {
+            [void]$hunks.Add($hunk)
+        }
+    }
+    else
+    {
+        [void]$hunks.Add($HunksRaw)
+    }
+    return @($hunks.ToArray())
+}
+function Get-StrictCanonicalHunkEvents
+{
+    <#
+    .SYNOPSIS
+        hunk 配列から正準行番号ベースのイベント群を生成する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '')]
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [object[]]$Hunks,
+        [int]$Revision,
+        [string]$Author,
+        [object]$OffsetEvents
+    )
+    $events = New-Object 'System.Collections.Generic.List[object]'
+    $pending = New-Object 'System.Collections.Generic.List[object]'
+    # 行番号ずれを吸収するため、先に正準範囲へ写像して記録する。
+    foreach ($hunk in @($Hunks | Sort-Object OldStart, NewStart))
+    {
+        $oldStart = [int]$hunk.OldStart
+        $oldCount = [int]$hunk.OldCount
+        $newCount = [int]$hunk.NewCount
+        if ($oldStart -lt 1)
+        {
+            continue
+        }
+        $start = Get-CanonicalLineNumber -OffsetEvents $OffsetEvents -LineNumber $oldStart
+        $end = $start
+        if ($oldCount -gt 0)
+        {
+            $end = Get-CanonicalLineNumber -OffsetEvents $OffsetEvents -LineNumber ($oldStart + $oldCount - 1)
+        }
+        if ($end -lt $start)
+        {
+            $tmp = $start
+            $start = $end
+            $end = $tmp
+        }
+        [void]$events.Add([pscustomobject]@{
+                Revision = $Revision
+                Author = $Author
+                Start = $start
+                End = $end
+            })
+        $shift = $newCount - $oldCount
+        if ($shift -ne 0)
+        {
+            $threshold = $oldStart + $oldCount
+            if ($oldCount -eq 0)
+            {
+                $threshold = $oldStart
+            }
+            [void]$pending.Add([pscustomobject]@{
+                    Threshold = $threshold
+                    Delta = $shift
+                })
+        }
+    }
+    foreach ($shiftEvent in @($pending.ToArray() | Sort-Object Threshold))
+    {
+        Add-CanonicalOffsetEvent -OffsetEvents $OffsetEvents -ThresholdLine ([int]$shiftEvent.Threshold) -ShiftDelta ([int]$shiftEvent.Delta)
+    }
+    return @($events.ToArray())
 }
 function Get-StrictHunkEventsByFile
 {
@@ -2882,115 +3031,70 @@ function Get-StrictHunkEventsByFile
     param([object[]]$Commits, [hashtable]$RevToAuthor, [hashtable]$RenameMap)
     $offsetByFile = @{}
     $eventsByFile = @{}
-    foreach ($c in @($Commits | Sort-Object Revision))
+    foreach ($commit in @($Commits | Sort-Object Revision))
     {
-        $rev = [int]$c.Revision
-        $author = if ($RevToAuthor.ContainsKey($rev))
+        $revision = [int]$commit.Revision
+        $author = if ($RevToAuthor.ContainsKey($revision))
         {
-            Get-NormalizedAuthorName -Author ([string]$RevToAuthor[$rev])
+            Get-NormalizedAuthorName -Author ([string]$RevToAuthor[$revision])
         }
         else
         {
-            Get-NormalizedAuthorName -Author ([string]$c.Author)
+            Get-NormalizedAuthorName -Author ([string]$commit.Author)
         }
-        foreach ($f in @($c.FilesChanged))
+        foreach ($filePath in @($commit.FilesChanged))
         {
-            if (-not $c.FileDiffStats.ContainsKey($f))
+            if (-not $commit.FileDiffStats.ContainsKey($filePath))
             {
                 continue
             }
-            $d = $c.FileDiffStats[$f]
-            if ($null -eq $d -or -not ($d.PSObject.Properties.Name -contains 'Hunks'))
+            $diffStat = $commit.FileDiffStats[$filePath]
+            if ($null -eq $diffStat -or -not ($diffStat.PSObject.Properties.Name -contains 'Hunks'))
             {
                 continue
             }
-            $hunksRaw = $d.Hunks
-            if ($null -eq $hunksRaw)
-            {
-                continue
-            }
-            $hunks = New-Object 'System.Collections.Generic.List[object]'
-            if ($hunksRaw -is [System.Collections.IEnumerable] -and -not ($hunksRaw -is [string]))
-            {
-                foreach ($hx in $hunksRaw)
-                {
-                    [void]$hunks.Add($hx)
-                }
-            }
-            else
-            {
-                [void]$hunks.Add($hunksRaw)
-            }
+            $hunks = @(ConvertTo-StrictHunkList -HunksRaw $diffStat.Hunks)
             if ($hunks.Count -eq 0)
             {
                 continue
             }
-            $resolved = Resolve-PathByRenameMap -FilePath $f -RenameMap $RenameMap
-            if ([string]::IsNullOrWhiteSpace($resolved))
+            $resolvedPath = Resolve-PathByRenameMap -FilePath $filePath -RenameMap $RenameMap
+            if ([string]::IsNullOrWhiteSpace($resolvedPath))
             {
                 continue
             }
-            if (-not $offsetByFile.ContainsKey($resolved))
+            if (-not $offsetByFile.ContainsKey($resolvedPath))
             {
-                $offsetByFile[$resolved] = Initialize-CanonicalOffsetMap
+                $offsetByFile[$resolvedPath] = Initialize-CanonicalOffsetMap
             }
-            if (-not $eventsByFile.ContainsKey($resolved))
+            if (-not $eventsByFile.ContainsKey($resolvedPath))
             {
-                $eventsByFile[$resolved] = New-Object 'System.Collections.Generic.List[object]'
+                $eventsByFile[$resolvedPath] = New-Object 'System.Collections.Generic.List[object]'
             }
-
-            $offset = $offsetByFile[$resolved]
-            $pending = New-Object 'System.Collections.Generic.List[object]'
-            # 行番号ずれを吸収するため、先に正準範囲へ写像して記録する。
-            foreach ($h in @($hunks.ToArray() | Sort-Object OldStart, NewStart))
+            $canonicalEvents = @(Get-StrictCanonicalHunkEvents -Hunks $hunks -Revision $revision -Author $author -OffsetEvents $offsetByFile[$resolvedPath])
+            foreach ($canonicalEvent in $canonicalEvents)
             {
-                $oldStart = [int]$h.OldStart
-                $oldCount = [int]$h.OldCount
-                $newCount = [int]$h.NewCount
-                if ($oldStart -lt 1)
-                {
-                    continue
-                }
-                $start = Get-CanonicalLineNumber -OffsetEvents $offset -LineNumber $oldStart
-                $end = $start
-                if ($oldCount -gt 0)
-                {
-                    $end = Get-CanonicalLineNumber -OffsetEvents $offset -LineNumber ($oldStart + $oldCount - 1)
-                }
-                if ($end -lt $start)
-                {
-                    $tmp = $start
-                    $start = $end
-                    $end = $tmp
-                }
-                [void]$eventsByFile[$resolved].Add([pscustomobject]@{
-                        Revision = $rev
-                        Author = $author
-                        Start = $start
-                        End = $end
-                    })
-
-                $shift = $newCount - $oldCount
-                if ($shift -ne 0)
-                {
-                    $threshold = $oldStart + $oldCount
-                    if ($oldCount -eq 0)
-                    {
-                        $threshold = $oldStart
-                    }
-                    [void]$pending.Add([pscustomobject]@{
-                            Threshold = $threshold
-                            Delta = $shift
-                        })
-                }
-            }
-            foreach ($p in @($pending.ToArray() | Sort-Object Threshold))
-            {
-                Add-CanonicalOffsetEvent -OffsetEvents $offset -ThresholdLine ([int]$p.Threshold) -ShiftDelta ([int]$p.Delta)
+                [void]$eventsByFile[$resolvedPath].Add($canonicalEvent)
             }
         }
     }
     return $eventsByFile
+}
+function Test-StrictHunkRangeOverlap
+{
+    <#
+    .SYNOPSIS
+        2つの行範囲が重なっているかを判定する。
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [int]$StartA,
+        [int]$EndA,
+        [int]$StartB,
+        [int]$EndB
+    )
+    return ($StartA -le $EndB -and $StartB -le $EndA)
 }
 function Get-StrictHunkOverlapSummary
 {
@@ -3037,7 +3141,6 @@ function Get-StrictHunkOverlapSummary
                 {
                     continue
                 }
-                # 範囲重複判定: [s1,e1] ∩ [sj,ej] ≠ ∅ ⇔ s1≤ej ∧ sj≤e1
                 if ($s1 -le $evtEnd[$j] -and $evtStart[$j] -le $e1)
                 {
                     Add-Count -Table $authorRepeated -Key $a1
@@ -3063,8 +3166,7 @@ function Get-StrictHunkOverlapSummary
                 }
                 $sj = $evtStart[$j]
                 $ej = $evtEnd[$j]
-                # 2者重複判定: [s1,e1] ∩ [sj,ej] = ∅ ⇔ s1>ej ∨ sj>e1
-                if ($s1 -gt $ej -or $sj -gt $e1)
+                if (-not ($s1 -le $ej -and $sj -le $e1))
                 {
                     continue
                 }
@@ -3093,7 +3195,6 @@ function Get-StrictHunkOverlapSummary
                     {
                         continue
                     }
-                    # 3者重複判定: [abMax,abMin] ∩ [sk,ek] ≠ ∅
                     if ($abMax -le $evtEnd[$k] -and $evtStart[$k] -le $abMin)
                     {
                         Add-Count -Table $authorPingPong -Key $a1
@@ -3693,6 +3794,78 @@ function Get-StrictAttributionResult
         KillMatrix = $Accumulator.KillMatrix
     }
 }
+function Resolve-StrictKillerAuthor
+{
+    <#
+    .SYNOPSIS
+        Strict 帰属計算で現在コミットの削除側作者を解決する。
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [object]$Commit,
+        [hashtable]$RevToAuthor
+    )
+    $revision = [int]$Commit.Revision
+    if ($RevToAuthor.ContainsKey($revision))
+    {
+        return (Get-NormalizedAuthorName -Author ([string]$RevToAuthor[$revision]))
+    }
+    return (Get-NormalizedAuthorName -Author ([string]$Commit.Author))
+}
+function Invoke-StrictCommitAttribution
+{
+    <#
+    .SYNOPSIS
+        Strict 帰属計算をコミット単位で実行して集計へ反映する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [hashtable]$Context = $script:NarutoContext,
+        [object]$Accumulator,
+        [object]$Commit,
+        [hashtable]$RevToAuthor,
+        [string]$TargetUrl,
+        [int]$FromRevision,
+        [int]$ToRevision,
+        [string]$CacheDir,
+        [hashtable]$RenameMap = @{}
+    )
+    $revision = [int]$Commit.Revision
+    if ($revision -lt $FromRevision -or $revision -gt $ToRevision)
+    {
+        return $false
+    }
+    $killer = Resolve-StrictKillerAuthor -Commit $Commit -RevToAuthor $RevToAuthor
+    $transitions = @(Get-CommitFileTransition -Commit $Commit)
+    foreach ($transition in $transitions)
+    {
+        try
+        {
+            $transitionContext = Resolve-StrictTransitionContext -Commit $Commit -Transition $transition -RenameMap $RenameMap
+            if ($null -eq $transitionContext)
+            {
+                continue
+            }
+            $comparison = Get-StrictTransitionComparison -TransitionContext $transitionContext -TargetUrl $TargetUrl -Revision $revision -CacheDir $CacheDir
+            if ($null -eq $comparison)
+            {
+                continue
+            }
+            Update-StrictAccumulatorFromComparison -Accumulator $Accumulator -Comparison $comparison -Revision $revision -Killer $killer -MetricFile ([string]$transitionContext.MetricFile) -FromRevision $FromRevision -ToRevision $ToRevision
+        }
+        catch
+        {
+            throw ("Strict blame attribution failed at r{0} (before='{1}', after='{2}'): {3}" -f $revision, [string]$transition.BeforePath, [string]$transition.AfterPath, $_.Exception.Message)
+        }
+    }
+    # コミット間でキャッシュキーの再利用はないため、コミット境界で安全にクリア可能。
+    # これによりメモリ使用量を O(N×K×L) から O(K×L) に削減する。
+    $Context.Caches.SvnBlameLineMemoryCache.Clear()
+    return $true
+}
 function Get-ExactDeathAttribution
 {
     <#
@@ -3730,61 +3903,23 @@ function Get-ExactDeathAttribution
         [hashtable]$RenameMap = @{},
         [int]$Parallel = 1
     )
-
     $accumulator = New-StrictAttributionAccumulator
-
     $prefetchTargets = @(Get-StrictBlamePrefetchTarget -Commits $Commits -FromRevision $FromRevision -ToRevision $ToRevision -CacheDir $CacheDir)
     Invoke-StrictBlameCachePrefetch -Targets $prefetchTargets -TargetUrl $TargetUrl -CacheDir $CacheDir -Parallel $Parallel
-
     $sortedCommits = @($Commits | Sort-Object Revision)
     $deathTotal = $sortedCommits.Count
     $deathIdx = 0
-    foreach ($c in $sortedCommits)
+    foreach ($commit in $sortedCommits)
     {
         $pct = [Math]::Min(100, [int](($deathIdx / [Math]::Max(1, $deathTotal)) * 100))
-        Write-Progress -Id 3 -Activity '行単位の帰属解析' -Status ('r{0} ({1}/{2})' -f [int]$c.Revision, ($deathIdx + 1), $deathTotal) -PercentComplete $pct
-        $rev = [int]$c.Revision
-        if ($rev -lt $FromRevision -or $rev -gt $ToRevision)
+        Write-Progress -Id 3 -Activity '行単位の帰属解析' -Status ('r{0} ({1}/{2})' -f [int]$commit.Revision, ($deathIdx + 1), $deathTotal) -PercentComplete $pct
+        $processed = Invoke-StrictCommitAttribution -Context $Context -Accumulator $accumulator -Commit $commit -RevToAuthor $RevToAuthor -TargetUrl $TargetUrl -FromRevision $FromRevision -ToRevision $ToRevision -CacheDir $CacheDir -RenameMap $RenameMap
+        if ($processed)
         {
-            continue
+            $deathIdx++
         }
-        $killer = if ($RevToAuthor.ContainsKey($rev))
-        {
-            Get-NormalizedAuthorName -Author ([string]$RevToAuthor[$rev])
-        }
-        else
-        {
-            Get-NormalizedAuthorName -Author ([string]$c.Author)
-        }
-        $transitions = @(Get-CommitFileTransition -Commit $c)
-        foreach ($t in $transitions)
-        {
-            try
-            {
-                $transitionContext = Resolve-StrictTransitionContext -Commit $c -Transition $t -RenameMap $RenameMap
-                if ($null -eq $transitionContext)
-                {
-                    continue
-                }
-                $cmp = Get-StrictTransitionComparison -TransitionContext $transitionContext -TargetUrl $TargetUrl -Revision $rev -CacheDir $CacheDir
-                if ($null -eq $cmp)
-                {
-                    continue
-                }
-                Update-StrictAccumulatorFromComparison -Accumulator $accumulator -Comparison $cmp -Revision $rev -Killer $killer -MetricFile ([string]$transitionContext.MetricFile) -FromRevision $FromRevision -ToRevision $ToRevision
-            }
-            catch
-            {
-                throw ("Strict blame attribution failed at r{0} (before='{1}', after='{2}'): {3}" -f $rev, [string]$t.BeforePath, [string]$t.AfterPath, $_.Exception.Message)
-            }
-        }
-        $deathIdx++
-        # コミット間でキャッシュキーの再利用はないため、コミット境界で安全にクリア可能。
-        # これによりメモリ使用量を O(N×K×L) から O(K×L) に削減する。
-        $Context.Caches.SvnBlameLineMemoryCache.Clear()
     }
     Write-Progress -Id 3 -Activity '行単位の帰属解析' -Completed
-
     try
     {
         $strictHunk = Get-StrictHunkDetail -Commits $Commits -RevToAuthor $RevToAuthor -RenameMap $RenameMap
@@ -3797,146 +3932,158 @@ function Get-ExactDeathAttribution
 }
 # endregion Strict 帰属
 # region メトリクス計算
-function Get-CommitterMetric
+function Initialize-CommitterMetricState
 {
     <#
     .SYNOPSIS
-        コミッター単位の基本メトリクスを集計して行オブジェクト化する。
-    .DESCRIPTION
-        コミット単位データから作者別に活動量・チャーン・行動属性を集約する。
-        比率、エントロピー、共同編集者数など派生指標を算出し、比較可能な行形式へ整える。
-        strict で後から上書きする列は null で初期化し、更新フローを分離する。
+        コミッター集計用の初期状態オブジェクトを作成する。
     #>
     [CmdletBinding()]
+    [OutputType([hashtable])]
+    param([string]$Author)
+    return [ordered]@{
+        Author = $Author
+        CommitCount = 0
+        ActiveDays = (New-Object 'System.Collections.Generic.HashSet[string]')
+        Files = (New-Object 'System.Collections.Generic.HashSet[string]')
+        Dirs = (New-Object 'System.Collections.Generic.HashSet[string]')
+        Added = 0
+        Deleted = 0
+        Binary = 0
+        ActA = 0
+        ActM = 0
+        ActD = 0
+        ActR = 0
+        MsgLen = 0
+        Issue = 0
+        Fix = 0
+        Revert = 0
+        Merge = 0
+        FileChurn = @{}
+    }
+}
+function Update-CommitterMetricState
+{
+    <#
+    .SYNOPSIS
+        コミット1件分の情報をコミッター集計状態へ反映する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    param(
+        [hashtable]$States,
+        [object]$Commit,
+        [hashtable]$RenameMap = @{}
+    )
+    $author = [string]$Commit.Author
+    if (-not $States.ContainsKey($author))
+    {
+        $States[$author] = Initialize-CommitterMetricState -Author $author
+    }
+
+    $state = $States[$author]
+    $state.CommitCount++
+    if ($Commit.Date)
+    {
+        [void]$state.ActiveDays.Add(([datetime]$Commit.Date).ToString('yyyy-MM-dd'))
+    }
+    $state.Added += [int]$Commit.AddedLines
+    $state.Deleted += [int]$Commit.DeletedLines
+
+    $message = [string]$Commit.Message
+    if ($null -eq $message)
+    {
+        $message = ''
+    }
+    $state.MsgLen += $message.Length
+    $messageMetric = Get-MessageMetricCount -Message $message
+    $state.Issue += $messageMetric.IssueIdMentionCount
+    $state.Fix += $messageMetric.FixKeywordCount
+    $state.Revert += $messageMetric.RevertKeywordCount
+    $state.Merge += $messageMetric.MergeKeywordCount
+
+    foreach ($filePath in @($Commit.FilesChanged))
+    {
+        $resolvedFilePath = Resolve-PathByRenameMap -FilePath ([string]$filePath) -RenameMap $RenameMap
+        [void]$state.Files.Add($resolvedFilePath)
+        $idx = $resolvedFilePath.LastIndexOf('/')
+        $dir = if ($idx -lt 0)
+        {
+            '.'
+        }
+        else
+        {
+            $resolvedFilePath.Substring(0, $idx)
+        }
+        if ($dir)
+        {
+            [void]$state.Dirs.Add($dir)
+        }
+        $diffStat = $Commit.FileDiffStats[$filePath]
+        $fileChurn = [int]$diffStat.AddedLines + [int]$diffStat.DeletedLines
+        if (-not $state.FileChurn.ContainsKey($resolvedFilePath))
+        {
+            $state.FileChurn[$resolvedFilePath] = 0
+        }
+        $state.FileChurn[$resolvedFilePath] += $fileChurn
+        if ([bool]$diffStat.IsBinary)
+        {
+            $state.Binary++
+        }
+    }
+
+    foreach ($pathEntry in @($Commit.ChangedPathsFiltered))
+    {
+        switch (([string]$pathEntry.Action).ToUpperInvariant())
+        {
+            'A'
+            {
+                $state.ActA++
+            }
+            'M'
+            {
+                $state.ActM++
+            }
+            'D'
+            {
+                $state.ActD++
+            }
+            'R'
+            {
+                $state.ActR++
+            }
+        }
+    }
+}
+function ConvertTo-CommitterMetricRows
+{
+    <#
+    .SYNOPSIS
+        コミッター集計状態を出力行へ変換する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '')]
+    [CmdletBinding()]
     [OutputType([object[]])]
-    param( [hashtable]$Context = $script:NarutoContext, [object[]]$Commits, [hashtable]$RenameMap = @{})
-    $states = @{}
-    $fileAuthors = @{}
-    foreach ($c in $Commits)
-    {
-        $a = [string]$c.Author
-        foreach ($f in @($c.FilesChanged))
-        {
-            $resolvedF = Resolve-PathByRenameMap -FilePath ([string]$f) -RenameMap $RenameMap
-            if (-not $fileAuthors.ContainsKey($resolvedF))
-            {
-                $fileAuthors[$resolvedF] = New-Object 'System.Collections.Generic.HashSet[string]'
-            }
-            [void]$fileAuthors[$resolvedF].Add($a)
-        }
-    }
-    foreach ($c in $Commits)
-    {
-        $a = [string]$c.Author
-        if (-not $states.ContainsKey($a))
-        {
-            $states[$a] = [ordered]@{
-                Author = $a
-                CommitCount = 0
-                ActiveDays = (New-Object 'System.Collections.Generic.HashSet[string]')
-                Files = (New-Object 'System.Collections.Generic.HashSet[string]')
-                Dirs = (New-Object 'System.Collections.Generic.HashSet[string]')
-                Added = 0
-                Deleted = 0
-                Binary = 0
-                ActA = 0
-                ActM = 0
-                ActD = 0
-                ActR = 0
-                MsgLen = 0
-                Issue = 0
-                Fix = 0
-                Revert = 0
-                Merge = 0
-                FileChurn = @{}
-            }
-        }
-        $s = $states[$a]
-        $s.CommitCount++
-        if ($c.Date)
-        {
-            [void]$s.ActiveDays.Add(([datetime]$c.Date).ToString('yyyy-MM-dd'))
-        }
-        $s.Added += [int]$c.AddedLines
-        $s.Deleted += [int]$c.DeletedLines
-        $msg = [string]$c.Message
-        if ($null -eq $msg)
-        {
-            $msg = ''
-        }
-        $s.MsgLen += $msg.Length
-        $m = Get-MessageMetricCount -Message $msg
-        $s.Issue += $m.IssueIdMentionCount
-        $s.Fix += $m.FixKeywordCount
-        $s.Revert += $m.RevertKeywordCount
-        $s.Merge += $m.MergeKeywordCount
-        foreach ($f in @($c.FilesChanged))
-        {
-            $resolvedF = Resolve-PathByRenameMap -FilePath ([string]$f) -RenameMap $RenameMap
-            [void]$s.Files.Add($resolvedF)
-            $idx = $resolvedF.LastIndexOf('/')
-            $dir = if ($idx -lt 0)
-            {
-                '.'
-            }
-            else
-            {
-                $resolvedF.Substring(0, $idx)
-            }
-            if ($dir)
-            {
-                [void]$s.Dirs.Add($dir)
-            }
-            $d = $c.FileDiffStats[$f]
-            $ch = [int]$d.AddedLines + [int]$d.DeletedLines
-            if (-not $s.FileChurn.ContainsKey($resolvedF))
-            {
-                $s.FileChurn[$resolvedF] = 0
-            }
-            $s.FileChurn[$resolvedF] += $ch
-            if ([bool]$d.IsBinary)
-            {
-                $s.Binary++
-            }
-        }
-        foreach ($p in @($c.ChangedPathsFiltered))
-        {
-            switch (([string]$p.Action).ToUpperInvariant())
-            {
-                'A'
-                {
-                    $s.ActA++
-                }
-                'M'
-                {
-                    $s.ActM++
-                }
-                'D'
-                {
-                    $s.ActD++
-                }
-                'R'
-                {
-                    $s.ActR++
-                }
-            }
-        }
-    }
+    param(
+        [hashtable]$Context = $script:NarutoContext,
+        [hashtable]$States,
+        [hashtable]$FileAuthors
+    )
     $rows = New-Object 'System.Collections.Generic.List[object]'
-    foreach ($s in $states.Values)
+    foreach ($state in $States.Values)
     {
-        $net = [int]$s.Added - [int]$s.Deleted
-        $ch = [int]$s.Added + [int]$s.Deleted
+        $net = [int]$state.Added - [int]$state.Deleted
+        $churn = [int]$state.Added + [int]$state.Deleted
         $coAvg = 0.0
         $coMax = 0.0
-        if ($s.Files.Count -gt 0)
+        if ($state.Files.Count -gt 0)
         {
             $vals = @()
-            foreach ($f in $s.Files)
+            foreach ($file in $state.Files)
             {
-                if ($fileAuthors.ContainsKey($f))
+                if ($FileAuthors.ContainsKey($file))
                 {
-                    $vals += [Math]::Max(0, $fileAuthors[$f].Count - 1)
+                    $vals += [Math]::Max(0, $FileAuthors[$file].Count - 1)
                 }
             }
             if ($vals.Count -gt 0)
@@ -3945,37 +4092,37 @@ function Get-CommitterMetric
                 $coMax = ($vals | Measure-Object -Maximum).Maximum
             }
         }
-        $entropy = Get-Entropy -Values @($s.FileChurn.Values | ForEach-Object { [double]$_ })
-        $churnPerCommit = if ($s.CommitCount -gt 0)
+        $entropy = Get-Entropy -Values @($state.FileChurn.Values | ForEach-Object { [double]$_ })
+        $churnPerCommit = if ($state.CommitCount -gt 0)
         {
-            $ch / [double]$s.CommitCount
+            $churn / [double]$state.CommitCount
         }
         else
         {
             0
         }
-        $msgLenAvg = if ($s.CommitCount -gt 0)
+        $messageLengthAverage = if ($state.CommitCount -gt 0)
         {
-            $s.MsgLen / [double]$s.CommitCount
+            $state.MsgLen / [double]$state.CommitCount
         }
         else
         {
             0
         }
         [void]$rows.Add([pscustomobject][ordered]@{
-                '作者' = [string]$s.Author
-                'コミット数' = [int]$s.CommitCount
-                '活動日数' = [int]$s.ActiveDays.Count
-                '変更ファイル数' = [int]$s.Files.Count
-                '変更ディレクトリ数' = [int]$s.Dirs.Count
-                '追加行数' = [int]$s.Added
-                '削除行数' = [int]$s.Deleted
+                '作者' = [string]$state.Author
+                'コミット数' = [int]$state.CommitCount
+                '活動日数' = [int]$state.ActiveDays.Count
+                '変更ファイル数' = [int]$state.Files.Count
+                '変更ディレクトリ数' = [int]$state.Dirs.Count
+                '追加行数' = [int]$state.Added
+                '削除行数' = [int]$state.Deleted
                 '純増行数' = $net
-                '総チャーン' = $ch
+                '総チャーン' = $churn
                 'コミットあたりチャーン' = Format-MetricValue -Value $churnPerCommit
-                '削除対追加比' = if ([int]$s.Added -gt 0)
+                '削除対追加比' = if ([int]$state.Added -gt 0)
                 {
-                    Format-MetricValue -Value ([int]$s.Deleted / [double]$s.Added)
+                    Format-MetricValue -Value ([int]$state.Deleted / [double]$state.Added)
                 }
                 else
                 {
@@ -3983,25 +4130,25 @@ function Get-CommitterMetric
                 }
                 'チャーン対純増比' = if ([Math]::Abs($net) -gt 0)
                 {
-                    Format-MetricValue -Value ($ch / [double][Math]::Abs($net))
+                    Format-MetricValue -Value ($churn / [double][Math]::Abs($net))
                 }
                 else
                 {
                     $null
                 }
-                'リワーク率' = if ($ch -gt 0)
+                'リワーク率' = if ($churn -gt 0)
                 {
-                    Format-MetricValue -Value (1 - [Math]::Abs($net) / [double]$ch)
+                    Format-MetricValue -Value (1 - [Math]::Abs($net) / [double]$churn)
                 }
                 else
                 {
                     $null
                 }
-                'バイナリ変更回数' = [int]$s.Binary
-                '追加アクション数' = [int]$s.ActA
-                '変更アクション数' = [int]$s.ActM
-                '削除アクション数' = [int]$s.ActD
-                '置換アクション数' = [int]$s.ActR
+                'バイナリ変更回数' = [int]$state.Binary
+                '追加アクション数' = [int]$state.ActA
+                '変更アクション数' = [int]$state.ActM
+                '削除アクション数' = [int]$state.ActD
+                '置換アクション数' = [int]$state.ActR
                 '生存行数' = $null
                 $Context.Metrics.ColDeadAdded = $null
                 '所有行数' = $null
@@ -4022,128 +4169,189 @@ function Get-CommitterMetric
                 '変更エントロピー' = Format-MetricValue -Value $entropy
                 '平均共同作者数' = Format-MetricValue -Value $coAvg
                 '最大共同作者数' = [int]$coMax
-                'メッセージ総文字数' = [int]$s.MsgLen
-                'メッセージ平均文字数' = Format-MetricValue -Value $msgLenAvg
-                '課題ID言及数' = [int]$s.Issue
-                '修正キーワード数' = [int]$s.Fix
-                '差戻キーワード数' = [int]$s.Revert
-                'マージキーワード数' = [int]$s.Merge
+                'メッセージ総文字数' = [int]$state.MsgLen
+                'メッセージ平均文字数' = Format-MetricValue -Value $messageLengthAverage
+                '課題ID言及数' = [int]$state.Issue
+                '修正キーワード数' = [int]$state.Fix
+                '差戻キーワード数' = [int]$state.Revert
+                'マージキーワード数' = [int]$state.Merge
             })
     }
-    return @($rows.ToArray() | Sort-Object -Property @{Expression = '総チャーン'
-            Descending = $true
-        }, '作者')
+    return @($rows.ToArray())
 }
-function Get-FileMetric
+function Get-CommitterMetric
 {
     <#
     .SYNOPSIS
-        ファイル単位の基本メトリクスを集計して行オブジェクト化する。
+        コミッター単位の基本メトリクスを集計して行オブジェクト化する。
     .DESCRIPTION
-        コミット履歴をファイル軸で集約し、量・頻度・作者分散の基本指標を算出する。
-        変更間隔や最多作者占有率、ホットスポットスコアを算出して優先度付けに備える。
-        strict で補完する blame 依存列は null 初期化し、後段更新との整合を保つ。
+        コミット単位データから作者別に活動量・チャーン・行動属性を集約する。
+        比率、エントロピー、共同編集者数など派生指標を算出し、比較可能な行形式へ整える。
+        strict で後から上書きする列は null で初期化し、更新フローを分離する。
     #>
-    [CmdletBinding()]param( [hashtable]$Context = $script:NarutoContext, [object[]]$Commits, [hashtable]$RenameMap = @{})
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param( [hashtable]$Context = $script:NarutoContext, [object[]]$Commits, [hashtable]$RenameMap = @{})
     $states = @{}
-    foreach ($c in $Commits)
+    $fileAuthors = @{}
+    foreach ($commit in @($Commits))
     {
-        $author = [string]$c.Author
-        $files = New-Object 'System.Collections.Generic.HashSet[string]'
-        foreach ($f in @($c.FilesChanged))
+        $author = [string]$commit.Author
+        foreach ($filePath in @($commit.FilesChanged))
         {
-            $resolved = Resolve-PathByRenameMap -FilePath ([string]$f) -RenameMap $RenameMap
-            [void]$files.Add($resolved)
-        }
-        foreach ($p in @($c.ChangedPathsFiltered))
-        {
-            $resolved = Resolve-PathByRenameMap -FilePath ([string]$p.Path) -RenameMap $RenameMap
-            [void]$files.Add($resolved)
-        }
-        foreach ($f in $files)
-        {
-            if (-not $states.ContainsKey($f))
+            $resolvedFilePath = Resolve-PathByRenameMap -FilePath ([string]$filePath) -RenameMap $RenameMap
+            if (-not $fileAuthors.ContainsKey($resolvedFilePath))
             {
-                $states[$f] = [ordered]@{ FilePath = $f
-                    Commits = (New-Object 'System.Collections.Generic.HashSet[int]')
-                    Authors = (New-Object 'System.Collections.Generic.HashSet[string]')
-                    Dates = (New-Object 'System.Collections.Generic.List[datetime]')
-                    Added = 0
-                    Deleted = 0
-                    Binary = 0
-                    Create = 0
-                    Delete = 0
-                    Replace = 0
-                    AuthorChurn = @{}
-                }
+                $fileAuthors[$resolvedFilePath] = New-Object 'System.Collections.Generic.HashSet[string]'
             }
-            $s = $states[$f]
-            $added = $s.Commits.Add([int]$c.Revision)
-            if ($added -and $c.Date)
-            {
-                [void]$s.Dates.Add([datetime]$c.Date)
-            }
-            [void]$s.Authors.Add($author)
+            [void]$fileAuthors[$resolvedFilePath].Add($author)
         }
-        foreach ($f in @($c.FilesChanged))
+    }
+
+    foreach ($commit in @($Commits))
+    {
+        Update-CommitterMetricState -States $states -Commit $commit -RenameMap $RenameMap
+    }
+    $rows = ConvertTo-CommitterMetricRows -Context $Context -States $states -FileAuthors $fileAuthors
+    return @($rows | Sort-Object -Property @{Expression = '総チャーン'
+            Descending = $true
+        }, '作者')
+}
+function Initialize-FileMetricState
+{
+    <#
+    .SYNOPSIS
+        ファイル集計用の初期状態オブジェクトを作成する。
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param([string]$FilePath)
+    return [ordered]@{
+        FilePath = $FilePath
+        Commits = (New-Object 'System.Collections.Generic.HashSet[int]')
+        Authors = (New-Object 'System.Collections.Generic.HashSet[string]')
+        Dates = (New-Object 'System.Collections.Generic.List[datetime]')
+        Added = 0
+        Deleted = 0
+        Binary = 0
+        Create = 0
+        Delete = 0
+        Replace = 0
+        AuthorChurn = @{}
+    }
+}
+function Update-FileMetricState
+{
+    <#
+    .SYNOPSIS
+        コミット1件分の情報をファイル集計状態へ反映する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    param(
+        [hashtable]$States,
+        [object]$Commit,
+        [hashtable]$RenameMap = @{}
+    )
+    $author = [string]$Commit.Author
+    $files = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($filePath in @($Commit.FilesChanged))
+    {
+        $resolved = Resolve-PathByRenameMap -FilePath ([string]$filePath) -RenameMap $RenameMap
+        [void]$files.Add($resolved)
+    }
+    foreach ($pathEntry in @($Commit.ChangedPathsFiltered))
+    {
+        $resolved = Resolve-PathByRenameMap -FilePath ([string]$pathEntry.Path) -RenameMap $RenameMap
+        [void]$files.Add($resolved)
+    }
+    foreach ($file in $files)
+    {
+        if (-not $States.ContainsKey($file))
         {
-            $resolvedF = Resolve-PathByRenameMap -FilePath ([string]$f) -RenameMap $RenameMap
-            $s = $states[$resolvedF]
-            $d = $c.FileDiffStats[$f]
-            $a = [int]$d.AddedLines
-            $del = [int]$d.DeletedLines
-            $s.Added += $a
-            $s.Deleted += $del
-            if ([bool]$d.IsBinary)
-            {
-                $s.Binary++
-            }
-            if (-not $s.AuthorChurn.ContainsKey($author))
-            {
-                $s.AuthorChurn[$author] = 0
-            }
-            $s.AuthorChurn[$author] += ($a + $del)
+            $States[$file] = Initialize-FileMetricState -FilePath $file
         }
-        foreach ($p in @($c.ChangedPathsFiltered))
+        $state = $States[$file]
+        $added = $state.Commits.Add([int]$Commit.Revision)
+        if ($added -and $Commit.Date)
         {
-            $resolvedP = Resolve-PathByRenameMap -FilePath ([string]$p.Path) -RenameMap $RenameMap
-            $s = $states[$resolvedP]
-            switch (([string]$p.Action).ToUpperInvariant())
+            [void]$state.Dates.Add([datetime]$Commit.Date)
+        }
+        [void]$state.Authors.Add($author)
+    }
+
+    foreach ($filePath in @($Commit.FilesChanged))
+    {
+        $resolvedFilePath = Resolve-PathByRenameMap -FilePath ([string]$filePath) -RenameMap $RenameMap
+        $state = $States[$resolvedFilePath]
+        $diffStat = $Commit.FileDiffStats[$filePath]
+        $addedLines = [int]$diffStat.AddedLines
+        $deletedLines = [int]$diffStat.DeletedLines
+        $state.Added += $addedLines
+        $state.Deleted += $deletedLines
+        if ([bool]$diffStat.IsBinary)
+        {
+            $state.Binary++
+        }
+        if (-not $state.AuthorChurn.ContainsKey($author))
+        {
+            $state.AuthorChurn[$author] = 0
+        }
+        $state.AuthorChurn[$author] += ($addedLines + $deletedLines)
+    }
+    foreach ($pathEntry in @($Commit.ChangedPathsFiltered))
+    {
+        $resolvedPath = Resolve-PathByRenameMap -FilePath ([string]$pathEntry.Path) -RenameMap $RenameMap
+        $state = $States[$resolvedPath]
+        switch (([string]$pathEntry.Action).ToUpperInvariant())
+        {
+            'A'
             {
-                'A'
-                {
-                    $s.Create++
-                }
-                'D'
-                {
-                    $s.Delete++
-                }
-                'R'
-                {
-                    $s.Replace++
-                }
+                $state.Create++
+            }
+            'D'
+            {
+                $state.Delete++
+            }
+            'R'
+            {
+                $state.Replace++
             }
         }
     }
+}
+function ConvertTo-FileMetricRows
+{
+    <#
+    .SYNOPSIS
+        ファイル集計状態を出力行へ変換する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '')]
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [hashtable]$Context = $script:NarutoContext,
+        [hashtable]$States
+    )
     $rows = New-Object 'System.Collections.Generic.List[object]'
-    foreach ($s in $states.Values)
+    foreach ($state in $States.Values)
     {
-        $cc = [int]$s.Commits.Count
-        $add = [int]$s.Added
-        $del = [int]$s.Deleted
-        $ch = $add + $del
+        $commitCount = [int]$state.Commits.Count
+        $added = [int]$state.Added
+        $deleted = [int]$state.Deleted
+        $churn = $added + $deleted
         $first = $null
         $last = $null
-        if ($cc -gt 0)
+        if ($commitCount -gt 0)
         {
-            $first = ($s.Commits | Measure-Object -Minimum).Minimum
-            $last = ($s.Commits | Measure-Object -Maximum).Maximum
+            $first = ($state.Commits | Measure-Object -Minimum).Minimum
+            $last = ($state.Commits | Measure-Object -Maximum).Maximum
         }
-        $avg = 0.0
+        $averageIntervalDays = 0.0
         $spanDays = 0.0
-        if ($s.Dates.Count -gt 1)
+        if ($state.Dates.Count -gt 1)
         {
-            $dates = @($s.Dates | Sort-Object -Unique)
+            $dates = @($state.Dates | Sort-Object -Unique)
             $vals = @()
             for ($i = 1
                 $i -lt $dates.Count
@@ -4153,34 +4361,34 @@ function Get-FileMetric
             }
             if ($vals.Count -gt 0)
             {
-                $avg = ($vals | Measure-Object -Average).Average
+                $averageIntervalDays = ($vals | Measure-Object -Average).Average
             }
             $spanDays = (New-TimeSpan -Start $dates[0] -End $dates[-1]).TotalDays
         }
         $topShare = 0.0
-        if ($ch -gt 0 -and $s.AuthorChurn.Count -gt 0)
+        if ($churn -gt 0 -and $state.AuthorChurn.Count -gt 0)
         {
-            $mx = ($s.AuthorChurn.Values | Measure-Object -Maximum).Maximum
-            $topShare = $mx / [double]$ch
+            $mx = ($state.AuthorChurn.Values | Measure-Object -Maximum).Maximum
+            $topShare = $mx / [double]$churn
         }
-        $authorCount = [int]$s.Authors.Count
-        $frequency = [double]$cc / [Math]::Max($spanDays, 1.0)
-        $hotspotScore = [double]$cc * [double]$authorCount * [double]$ch * $frequency
+        $authorCount = [int]$state.Authors.Count
+        $frequency = [double]$commitCount / [Math]::Max($spanDays, 1.0)
+        $hotspotScore = [double]$commitCount * [double]$authorCount * [double]$churn * $frequency
         [void]$rows.Add([pscustomobject][ordered]@{
-                'ファイルパス' = [string]$s.FilePath
-                'コミット数' = $cc
+                'ファイルパス' = [string]$state.FilePath
+                'コミット数' = $commitCount
                 '作者数' = $authorCount
-                '追加行数' = $add
-                '削除行数' = $del
-                '純増行数' = ($add - $del)
-                '総チャーン' = $ch
-                'バイナリ変更回数' = [int]$s.Binary
-                '作成回数' = [int]$s.Create
-                '削除回数' = [int]$s.Delete
-                '置換回数' = [int]$s.Replace
+                '追加行数' = $added
+                '削除行数' = $deleted
+                '純増行数' = ($added - $deleted)
+                '総チャーン' = $churn
+                'バイナリ変更回数' = [int]$state.Binary
+                '作成回数' = [int]$state.Create
+                '削除回数' = [int]$state.Delete
+                '置換回数' = [int]$state.Replace
                 '初回変更リビジョン' = $first
                 '最終変更リビジョン' = $last
-                '平均変更間隔日数' = Format-MetricValue -Value $avg
+                '平均変更間隔日数' = Format-MetricValue -Value $averageIntervalDays
                 '活動期間日数' = Format-MetricValue -Value $spanDays
                 '生存行数 (範囲指定)' = $null
                 $Context.Metrics.ColDeadAdded = $null
@@ -4201,12 +4409,152 @@ function Get-FileMetric
             Descending = $true
         }, 'ファイルパス')
     $rank = 0
-    foreach ($r in $sorted)
+    foreach ($row in $sorted)
     {
         $rank++
-        $r.'ホットスポット順位' = $rank
+        $row.'ホットスポット順位' = $rank
     }
     return $sorted
+}
+function Get-CoChangeCounters
+{
+    <#
+    .SYNOPSIS
+        共変更集計に必要なペア/ファイル頻度カウンタを算出する。
+    .DESCRIPTION
+        Committer/File メトリクスは Initialize → Update → ConvertTo の3段階で
+        コミットごとに状態を蓄積するパターンを使うが、共変更分析はコミット単位の
+        状態蓄積が不要（ペア列挙を1パスで完結できる）ため、初期化と更新を
+        本関数に集約し Get → ConvertTo の2段階パターンを採用している。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '')]
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [object[]]$Commits,
+        [hashtable]$RenameMap = @{}
+    )
+    $pair = @{}
+    $fileCount = @{}
+    $commitTotal = 0
+    foreach ($commit in @($Commits))
+    {
+        $files = New-Object 'System.Collections.Generic.HashSet[string]'
+        foreach ($filePath in @($commit.FilesChanged))
+        {
+            $resolved = Resolve-PathByRenameMap -FilePath ([string]$filePath) -RenameMap $RenameMap
+            [void]$files.Add($resolved)
+        }
+        if ($files.Count -eq 0)
+        {
+            continue
+        }
+        $commitTotal++
+        foreach ($file in $files)
+        {
+            if (-not $fileCount.ContainsKey($file))
+            {
+                $fileCount[$file] = 0
+            }
+            $fileCount[$file]++
+        }
+        $list = @($files | Sort-Object)
+        for ($i = 0
+            $i -lt ($list.Count - 1)
+            $i++)
+        {
+            for ($j = $i + 1
+                $j -lt $list.Count
+                $j++)
+            {
+                $pairKey = $list[$i] + [char]31 + $list[$j]
+                if (-not $pair.ContainsKey($pairKey))
+                {
+                    $pair[$pairKey] = 0
+                }
+                $pair[$pairKey]++
+            }
+        }
+    }
+    return [pscustomobject]@{
+        Pair = $pair
+        FileCount = $fileCount
+        CommitTotal = [int]$commitTotal
+    }
+}
+function ConvertTo-CoChangeRows
+{
+    <#
+    .SYNOPSIS
+        共変更カウンタを出力行へ変換する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '')]
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [hashtable]$Pair,
+        [hashtable]$FileCount,
+        [int]$CommitTotal
+    )
+    $rows = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($pairKey in $Pair.Keys)
+    {
+        $parts = $pairKey -split [char]31, 2
+        $fileA = $parts[0]
+        $fileB = $parts[1]
+        $co = [int]$Pair[$pairKey]
+        $countA = [int]$FileCount[$fileA]
+        $countB = [int]$FileCount[$fileB]
+        $jaccard = 0.0
+        $denominator = ($countA + $countB - $co)
+        if ($denominator -gt 0)
+        {
+            $jaccard = $co / [double]$denominator
+        }
+        $lift = 0.0
+        if ($CommitTotal -gt 0 -and $countA -gt 0 -and $countB -gt 0)
+        {
+            $pab = $co / [double]$CommitTotal
+            $pa = $countA / [double]$CommitTotal
+            $pb = $countB / [double]$CommitTotal
+            if (($pa * $pb) -gt 0)
+            {
+                $lift = $pab / ($pa * $pb)
+            }
+        }
+        [void]$rows.Add([pscustomobject][ordered]@{
+                'ファイルA' = $fileA
+                'ファイルB' = $fileB
+                '共変更回数' = $co
+                'Jaccard' = Format-MetricValue -Value $jaccard
+                'リフト値' = Format-MetricValue -Value $lift
+            })
+    }
+    return @($rows.ToArray())
+}
+function Get-FileMetric
+{
+    <#
+    .SYNOPSIS
+        ファイル単位の基本メトリクスを集計して行オブジェクト化する。
+    .DESCRIPTION
+        コミット履歴をファイル軸で集約し、量・頻度・作者分散の基本指標を算出する。
+        変更間隔や最多作者占有率、ホットスポットスコアを算出して優先度付けに備える。
+        strict で補完する blame 依存列は null 初期化し、後段更新との整合を保つ。
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [hashtable]$Context = $script:NarutoContext,
+        [object[]]$Commits,
+        [hashtable]$RenameMap = @{}
+    )
+    $states = @{}
+    foreach ($commit in @($Commits))
+    {
+        Update-FileMetricState -States $states -Commit $commit -RenameMap $RenameMap
+    }
+    return @(ConvertTo-FileMetricRows -Context $Context -States $states)
 }
 function Get-CoChangeMetric
 {
@@ -4224,82 +4572,10 @@ function Get-CoChangeMetric
     [CmdletBinding()]
     [OutputType([object[]])]
     param([object[]]$Commits, [int]$TopNCount = 50, [hashtable]$RenameMap = @{})
-    $pair = @{}
-    $fileCount = @{}
-    $commitTotal = 0
-    foreach ($c in $Commits)
-    {
-        $files = New-Object 'System.Collections.Generic.HashSet[string]'
-        foreach ($f in @($c.FilesChanged))
-        {
-            $resolved = Resolve-PathByRenameMap -FilePath ([string]$f) -RenameMap $RenameMap
-            [void]$files.Add($resolved)
-        }
-        if ($files.Count -eq 0)
-        {
-            continue
-        }
-        $commitTotal++
-        foreach ($f in $files)
-        {
-            if (-not $fileCount.ContainsKey($f))
-            {
-                $fileCount[$f] = 0
-            }
-            $fileCount[$f]++
-        }
-        $list = @($files | Sort-Object)
-        for ($i = 0
-            $i -lt ($list.Count - 1)
-            $i++)
-        {
-            for ($j = $i + 1
-                $j -lt $list.Count
-                $j++)
-            {
-                $k = $list[$i] + [char]31 + $list[$j]
-                if (-not $pair.ContainsKey($k))
-                {
-                    $pair[$k] = 0
-                }
-                $pair[$k]++
-            }
-        }
-    }
-    $rows = New-Object 'System.Collections.Generic.List[object]'
-    foreach ($k in $pair.Keys)
-    {
-        $p = $k -split [char]31, 2
-        $a = $p[0]
-        $b = $p[1]
-        $co = [int]$pair[$k]
-        $ca = [int]$fileCount[$a]
-        $cb = [int]$fileCount[$b]
-        $j = 0.0
-        $den = ($ca + $cb - $co)
-        if ($den -gt 0)
-        {
-            $j = $co / [double]$den
-        }
-        $lift = 0.0
-        if ($commitTotal -gt 0 -and $ca -gt 0 -and $cb -gt 0)
-        {
-            $pab = $co / [double]$commitTotal
-            $pa = $ca / [double]$commitTotal
-            $pb = $cb / [double]$commitTotal
-            if (($pa * $pb) -gt 0)
-            {
-                $lift = $pab / ($pa * $pb)
-            }
-        }
-        [void]$rows.Add([pscustomobject][ordered]@{ 'ファイルA' = $a
-                'ファイルB' = $b
-                '共変更回数' = $co
-                'Jaccard' = Format-MetricValue -Value $j
-                'リフト値' = Format-MetricValue -Value $lift
-            })
-    }
-    $sorted = @($rows.ToArray() | Sort-Object -Property @{Expression = '共変更回数'
+    $counters = Get-CoChangeCounters -Commits $Commits -RenameMap $RenameMap
+    $rows = ConvertTo-CoChangeRows -Pair $counters.Pair -FileCount $counters.FileCount -CommitTotal ([int]$counters.CommitTotal
+    )
+    $sorted = @($rows | Sort-Object -Property @{Expression = '共変更回数'
             Descending = $true
         }, @{Expression = 'Jaccard'
             Descending = $true
@@ -8075,15 +8351,30 @@ function Set-DiffStatCollectionProperty
     }
 
     $targetValue = $TargetStat.$PropertyName
+    $appliedInPlace = $false
     if ($targetValue -is [System.Collections.IList])
     {
-        $targetValue.Clear()
-        foreach ($item in $sourceItems.ToArray())
+        $isFixedSize = $false
+        if ($targetValue -is [System.Array])
         {
-            [void]$targetValue.Add($item)
+            $isFixedSize = $true
+        }
+        elseif ($targetValue.PSObject.Properties.Match('IsFixedSize').Count -gt 0)
+        {
+            $isFixedSize = [bool]$targetValue.IsFixedSize
+        }
+
+        if (-not $isFixedSize)
+        {
+            $targetValue.Clear()
+            foreach ($item in $sourceItems.ToArray())
+            {
+                [void]$targetValue.Add($item)
+            }
+            $appliedInPlace = $true
         }
     }
-    else
+    if (-not $appliedInPlace)
     {
         if ($AsString)
         {
@@ -8109,11 +8400,26 @@ function Clear-DiffStatCollectionProperty
         return
     }
     $targetValue = $TargetStat.$PropertyName
+    $clearedInPlace = $false
     if ($targetValue -is [System.Collections.IList])
     {
-        $targetValue.Clear()
+        $isFixedSize = $false
+        if ($targetValue -is [System.Array])
+        {
+            $isFixedSize = $true
+        }
+        elseif ($targetValue.PSObject.Properties.Match('IsFixedSize').Count -gt 0)
+        {
+            $isFixedSize = [bool]$targetValue.IsFixedSize
+        }
+
+        if (-not $isFixedSize)
+        {
+            $targetValue.Clear()
+            $clearedInPlace = $true
+        }
     }
-    else
+    if (-not $clearedInPlace)
     {
         $TargetStat.$PropertyName = @()
     }
@@ -8152,6 +8458,130 @@ function Reset-DiffStatForRemovedPath
     Clear-DiffStatCollectionProperty -TargetStat $DiffStat -PropertyName 'AddedLineHashes'
     Clear-DiffStatCollectionProperty -TargetStat $DiffStat -PropertyName 'DeletedLineHashes'
 }
+function Get-RenameCorrectionCandidates
+{
+    <#
+    .SYNOPSIS
+        リネーム差分補正の対象ペアを抽出する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '')]
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [object]$Commit,
+        [int]$Revision
+    )
+    $deletedSet = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($pathEntry in @($Commit.ChangedPathsFiltered))
+    {
+        if (([string]$pathEntry.Action).ToUpperInvariant() -eq 'D')
+        {
+            [void]$deletedSet.Add((ConvertTo-PathKey -Path ([string]$pathEntry.Path)))
+        }
+    }
+    $candidates = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($pathEntry in @($Commit.ChangedPathsFiltered))
+    {
+        $action = ([string]$pathEntry.Action).ToUpperInvariant()
+        if (($action -ne 'A' -and $action -ne 'R') -or [string]::IsNullOrWhiteSpace([string]$pathEntry.CopyFromPath))
+        {
+            continue
+        }
+        $newPath = ConvertTo-PathKey -Path ([string]$pathEntry.Path)
+        $oldPath = ConvertTo-PathKey -Path ([string]$pathEntry.CopyFromPath)
+        if (-not $newPath -or -not $oldPath -or -not $deletedSet.Contains($oldPath))
+        {
+            continue
+        }
+        if (-not $Commit.FileDiffStats.ContainsKey($oldPath) -or -not $Commit.FileDiffStats.ContainsKey($newPath))
+        {
+            continue
+        }
+        $copyRev = $pathEntry.CopyFromRev
+        if ($null -eq $copyRev)
+        {
+            $copyRev = $Revision - 1
+        }
+        [void]$candidates.Add([pscustomobject]@{
+                OldPath = $oldPath
+                NewPath = $newPath
+                CopyRevision = [int]$copyRev
+            })
+    }
+    return @($candidates.ToArray())
+}
+function Get-RenamePairRealDiffStat
+{
+    <#
+    .SYNOPSIS
+        リネーム前後ペアの実差分を取得して DiffStat として返す。
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [string]$TargetUrl,
+        [string[]]$DiffArguments,
+        [string]$OldPath,
+        [string]$NewPath,
+        [int]$CopyRevision,
+        [int]$Revision
+    )
+    $compareArguments = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($item in @($DiffArguments))
+    {
+        [void]$compareArguments.Add([string]$item)
+    }
+    [void]$compareArguments.Add(($TargetUrl.TrimEnd('/') + '/' + $OldPath + '@' + [string]$CopyRevision))
+    [void]$compareArguments.Add(($TargetUrl.TrimEnd('/') + '/' + $NewPath + '@' + [string]$Revision))
+    $realDiff = Invoke-SvnCommand -Arguments $compareArguments.ToArray() -ErrorContext ("svn diff rename pair r{0} {1}->{2}" -f $Revision, $OldPath, $NewPath)
+    $realParsed = ConvertFrom-SvnUnifiedDiff -DiffText $realDiff -DetailLevel 2
+
+    $realStat = $null
+    if ($realParsed.ContainsKey($NewPath))
+    {
+        $realStat = $realParsed[$NewPath]
+    }
+    elseif ($realParsed.ContainsKey($OldPath))
+    {
+        $realStat = $realParsed[$OldPath]
+    }
+    elseif ($realParsed.Keys.Count -gt 0)
+    {
+        $firstKey = @($realParsed.Keys | Sort-Object | Select-Object -First 1)[0]
+        $realStat = $realParsed[$firstKey]
+    }
+    if ($null -eq $realStat)
+    {
+        return [pscustomobject]@{
+            AddedLines = 0
+            DeletedLines = 0
+            Hunks = @()
+            IsBinary = $false
+            AddedLineHashes = @()
+            DeletedLineHashes = @()
+        }
+    }
+    return $realStat
+}
+function Set-RenamePairDiffStatCorrection
+{
+    <#
+    .SYNOPSIS
+        リネーム補正で得た実差分をコミット差分統計へ反映する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    param(
+        [object]$Commit,
+        [string]$OldPath,
+        [string]$NewPath,
+        [object]$RealStat
+    )
+    $newStat = $Commit.FileDiffStats[$NewPath]
+    $oldStat = $Commit.FileDiffStats[$OldPath]
+    Set-DiffStatFromSource -TargetStat $newStat -SourceStat $RealStat
+    Reset-DiffStatForRemovedPath -DiffStat $oldStat
+}
 function Update-RenamePairDiffStat
 {
     <#
@@ -8173,92 +8603,23 @@ function Update-RenamePairDiffStat
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     param([object]$Commit, [int]$Revision, [string]$TargetUrl, [string[]]$DiffArguments)
-    $deletedSet = New-Object 'System.Collections.Generic.HashSet[string]'
-    foreach ($pathEntry in @($Commit.ChangedPathsFiltered))
+    $candidates = @(Get-RenameCorrectionCandidates -Commit $Commit -Revision $Revision)
+    foreach ($candidate in $candidates)
     {
-        if (([string]$pathEntry.Action).ToUpperInvariant() -eq 'D')
-        {
-            [void]$deletedSet.Add((ConvertTo-PathKey -Path ([string]$pathEntry.Path)))
-        }
-    }
-
-    foreach ($pathEntry in @($Commit.ChangedPathsFiltered))
-    {
-        $action = ([string]$pathEntry.Action).ToUpperInvariant()
-        if (($action -ne 'A' -and $action -ne 'R') -or [string]::IsNullOrWhiteSpace([string]$pathEntry.CopyFromPath))
-        {
-            continue
-        }
-
-        $newPath = ConvertTo-PathKey -Path ([string]$pathEntry.Path)
-        $oldPath = ConvertTo-PathKey -Path ([string]$pathEntry.CopyFromPath)
-        if (-not $newPath -or -not $oldPath -or -not $deletedSet.Contains($oldPath))
-        {
-            continue
-        }
-        if (-not $Commit.FileDiffStats.ContainsKey($oldPath) -or -not $Commit.FileDiffStats.ContainsKey($newPath))
-        {
-            continue
-        }
-
-        $copyRev = $pathEntry.CopyFromRev
-        if ($null -eq $copyRev)
-        {
-            $copyRev = $Revision - 1
-        }
-
-        $compareArguments = New-Object 'System.Collections.Generic.List[string]'
-        foreach ($item in $DiffArguments)
-        {
-            [void]$compareArguments.Add([string]$item)
-        }
-        [void]$compareArguments.Add(($TargetUrl.TrimEnd('/') + '/' + $oldPath + '@' + [string]$copyRev))
-        [void]$compareArguments.Add(($TargetUrl.TrimEnd('/') + '/' + $newPath + '@' + [string]$Revision))
-
-        $realDiff = Invoke-SvnCommand -Arguments $compareArguments.ToArray() -ErrorContext ("svn diff rename pair r{0} {1}->{2}" -f $Revision, $oldPath, $newPath)
-        $realParsed = ConvertFrom-SvnUnifiedDiff -DiffText $realDiff -DetailLevel 2
-
-        $realStat = $null
-        if ($realParsed.ContainsKey($newPath))
-        {
-            $realStat = $realParsed[$newPath]
-        }
-        elseif ($realParsed.ContainsKey($oldPath))
-        {
-            $realStat = $realParsed[$oldPath]
-        }
-        elseif ($realParsed.Keys.Count -gt 0)
-        {
-            $firstKey = @($realParsed.Keys | Sort-Object | Select-Object -First 1)[0]
-            $realStat = $realParsed[$firstKey]
-        }
-        if ($null -eq $realStat)
-        {
-            $realStat = [pscustomobject]@{
-                AddedLines = 0
-                DeletedLines = 0
-                Hunks = @()
-                IsBinary = $false
-                AddedLineHashes = @()
-                DeletedLineHashes = @()
-            }
-        }
-
-        $newStat = $Commit.FileDiffStats[$newPath]
-        $oldStat = $Commit.FileDiffStats[$oldPath]
-        Set-DiffStatFromSource -TargetStat $newStat -SourceStat $realStat
-        Reset-DiffStatForRemovedPath -DiffStat $oldStat
+        $realStat = Get-RenamePairRealDiffStat -TargetUrl $TargetUrl -DiffArguments $DiffArguments -OldPath ([string]$candidate.OldPath) -NewPath ([string]$candidate.NewPath) -CopyRevision ([int]$candidate.CopyRevision) -Revision $Revision
+        Set-RenamePairDiffStatCorrection -Commit $Commit -OldPath ([string]$candidate.OldPath) -NewPath ([string]$candidate.NewPath) -RealStat $realStat
     }
 }
-function Set-CommitDerivedMetric
+function Get-CommitDerivedChurnValues
 {
     <#
     .SYNOPSIS
-        コミット単位の派生指標と短縮メッセージを設定する。
+        コミットの追加・削除・チャーン・エントロピー計算に必要な値を返す。
     #>
-    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '')]
     [CmdletBinding()]
-    param( [hashtable]$Context = $script:NarutoContext, [object]$Commit)
+    [OutputType([object])]
+    param([object]$Commit)
     $added = 0
     $deleted = 0
     $churnPerFile = @()
@@ -8269,24 +8630,245 @@ function Set-CommitDerivedMetric
         $deleted += [int]$diffStat.DeletedLines
         $churnPerFile += ([int]$diffStat.AddedLines + [int]$diffStat.DeletedLines)
     }
-
-    $Commit.AddedLines = $added
-    $Commit.DeletedLines = $deleted
-    $Commit.Churn = $added + $deleted
-    $Commit.Entropy = Get-Entropy -Values @($churnPerFile | ForEach-Object { [double]$_ })
-
-    $message = [string]$Commit.Message
-    if ($null -eq $message)
-    {
-        $message = ''
+    return [pscustomobject]@{
+        Added = [int]$added
+        Deleted = [int]$deleted
+        Churn = [int]($added + $deleted)
+        Entropy = [double](Get-Entropy -Values @($churnPerFile | ForEach-Object { [double]$_ }))
     }
-    $Commit.MsgLen = $message.Length
-    $oneLineMessage = ($message -replace '(\r?\n)+', ' ').Trim()
+}
+function Get-CommitMessageSummary
+{
+    <#
+    .SYNOPSIS
+        コミットメッセージを1行短縮形式へ正規化する。
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [hashtable]$Context = $script:NarutoContext,
+        [string]$Message
+    )
+    $normalized = [string]$Message
+    if ($null -eq $normalized)
+    {
+        $normalized = ''
+    }
+    $oneLineMessage = ($normalized -replace '(\r?\n)+', ' ').Trim()
     if ($oneLineMessage.Length -gt $Context.Constants.CommitMessageMaxLength)
     {
         $oneLineMessage = $oneLineMessage.Substring(0, $Context.Constants.CommitMessageMaxLength) + '...'
     }
-    $Commit.MessageShort = $oneLineMessage
+    return [pscustomobject]@{
+        Length = [int]$normalized.Length
+        Short = $oneLineMessage
+    }
+}
+function Set-ObjectPropertyValue
+{
+    <#
+    .SYNOPSIS
+        オブジェクトのプロパティを存在有無に応じて設定または追加する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    param(
+        [object]$InputObject,
+        [string]$PropertyName,
+        $Value
+    )
+    if ($InputObject.PSObject.Properties.Match($PropertyName).Count -gt 0)
+    {
+        $InputObject.$PropertyName = $Value
+        return
+    }
+    Add-Member -InputObject $InputObject -MemberType NoteProperty -Name $PropertyName -Value $Value -Force
+}
+function Set-CommitDerivedMetric
+{
+    <#
+    .SYNOPSIS
+        コミット単位の派生指標と短縮メッセージを設定する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    param( [hashtable]$Context = $script:NarutoContext, [object]$Commit)
+    $churnValues = Get-CommitDerivedChurnValues -Commit $Commit
+    Set-ObjectPropertyValue -InputObject $Commit -PropertyName 'AddedLines' -Value ([int]$churnValues.Added)
+    Set-ObjectPropertyValue -InputObject $Commit -PropertyName 'DeletedLines' -Value ([int]$churnValues.Deleted)
+    Set-ObjectPropertyValue -InputObject $Commit -PropertyName 'Churn' -Value ([int]$churnValues.Churn)
+    Set-ObjectPropertyValue -InputObject $Commit -PropertyName 'Entropy' -Value ([double]$churnValues.Entropy)
+
+    $messageSummary = Get-CommitMessageSummary -Context $Context -Message ([string]$Commit.Message
+    )
+    Set-ObjectPropertyValue -InputObject $Commit -PropertyName 'MsgLen' -Value ([int]$messageSummary.Length)
+    Set-ObjectPropertyValue -InputObject $Commit -PropertyName 'MessageShort' -Value ([string]$messageSummary.Short)
+}
+function New-CommitDiffPrefetchPlan
+{
+    <#
+    .SYNOPSIS
+        コミット差分取得の事前計画を構築する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [object[]]$Commits,
+        [string]$CacheDir,
+        [string]$TargetUrl,
+        [string[]]$DiffArguments,
+        [string[]]$IncludeExtensions,
+        [string[]]$ExcludeExtensions,
+        [string[]]$IncludePathPatterns,
+        [string[]]$ExcludePathPatterns
+    )
+    $revToAuthor = @{}
+    $phaseAItems = [System.Collections.Generic.List[object]]::new()
+    foreach ($commit in @($Commits))
+    {
+        $revision = [int]$commit.Revision
+        $revToAuthor[$revision] = [string]$commit.Author
+        $filteredChangedPaths = @(Get-FilteredChangedPathEntry -ChangedPaths @($commit.ChangedPaths) -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns)
+        $commit.ChangedPathsFiltered = $filteredChangedPaths
+        if ($filteredChangedPaths.Count -le 0)
+        {
+            continue
+        }
+        [void]$phaseAItems.Add([pscustomobject]@{
+                Revision = $revision
+                CacheDir = $CacheDir
+                TargetUrl = $TargetUrl
+                DiffArguments = @($DiffArguments)
+            })
+    }
+    return [pscustomobject]@{
+        RevToAuthor = $revToAuthor
+        PrefetchItems = @($phaseAItems.ToArray())
+    }
+}
+function Invoke-CommitDiffPrefetch
+{
+    <#
+    .SYNOPSIS
+        差分取得計画に基づいて raw diff を取得する。
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [hashtable]$Context = $script:NarutoContext,
+        [object[]]$PrefetchItems,
+        [int]$Parallel = 1
+    )
+    $phaseAResults = @()
+    if (@($PrefetchItems).Count -gt 0)
+    {
+        $phaseAWorker = {
+            param($Item, $Index)
+            [void]$Index # Required by Invoke-ParallelWork contract
+            $diffText = Get-CachedOrFetchDiffText -CacheDir $Item.CacheDir -Revision ([int]$Item.Revision) -TargetUrl $Item.TargetUrl -DiffArguments @($Item.DiffArguments)
+            $rawDiffByPath = ConvertFrom-SvnUnifiedDiff -DiffText $diffText -DetailLevel 2
+            [pscustomobject]@{
+                Revision = [int]$Item.Revision
+                RawDiffByPath = $rawDiffByPath
+            }
+        }
+        $phaseAResults = @(Invoke-ParallelWork -InputItems @($PrefetchItems) -WorkerScript $phaseAWorker -MaxParallel $Parallel -RequiredFunctions @(
+                'ConvertTo-PathKey',
+                'Get-Sha1Hex',
+                'ConvertTo-LineHash',
+                'ConvertTo-ContextHash',
+                'ConvertFrom-SvnUnifiedDiff',
+                'Join-CommandArgument',
+                'Invoke-SvnCommand',
+                'Get-CachedOrFetchDiffText'
+            ) -SessionVariables @{
+                NarutoContext = (Get-RunspaceNarutoContext -Context $Context)
+                SvnExecutable = $Context.Runtime.SvnExecutable
+                SvnGlobalArguments = @($Context.Runtime.SvnGlobalArguments)
+            } -ErrorContext 'commit diff prefetch')
+    }
+    $rawDiffByRevision = @{}
+    foreach ($result in @($phaseAResults))
+    {
+        $rawDiffByRevision[[int]$result.Revision] = $result.RawDiffByPath
+    }
+    return $rawDiffByRevision
+}
+function Merge-CommitDiffForCommit
+{
+    <#
+    .SYNOPSIS
+        1コミット分の raw diff とログ変更パスを突き合わせる。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    param(
+        [object]$Commit,
+        [hashtable]$RawDiffByRevision,
+        [string[]]$IncludeExtensions,
+        [string[]]$ExcludeExtensions,
+        [string[]]$IncludePathPatterns,
+        [string[]]$ExcludePathPatterns
+    )
+    $revision = [int]$Commit.Revision
+    $rawDiffByPath = @{}
+    if ($RawDiffByRevision.ContainsKey($revision))
+    {
+        $rawDiffByPath = $RawDiffByRevision[$revision]
+    }
+    $filteredDiffByPath = @{}
+    foreach ($path in $rawDiffByPath.Keys)
+    {
+        if (Test-ShouldCountFile -FilePath $path -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns)
+        {
+            $filteredDiffByPath[$path] = $rawDiffByPath[$path]
+        }
+    }
+    $Commit.FileDiffStats = $filteredDiffByPath
+
+    if ($null -eq $Commit.ChangedPathsFiltered)
+    {
+        $Commit.ChangedPathsFiltered = Get-FilteredChangedPathEntry -ChangedPaths @($Commit.ChangedPaths) -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns
+    }
+
+    $allowedFilePathSet = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($pathEntry in @($Commit.ChangedPathsFiltered))
+    {
+        $path = ConvertTo-PathKey -Path ([string]$pathEntry.Path)
+        if ($path)
+        {
+            [void]$allowedFilePathSet.Add($path)
+        }
+    }
+
+    $filteredByLog = @{}
+    foreach ($path in $Commit.FileDiffStats.Keys)
+    {
+        if ($allowedFilePathSet.Contains([string]$path))
+        {
+            $filteredByLog[$path] = $Commit.FileDiffStats[$path]
+        }
+    }
+    $Commit.FileDiffStats = $filteredByLog
+    $Commit.FilesChanged = @($Commit.FileDiffStats.Keys | Sort-Object)
+}
+function Complete-CommitDiffForCommit
+{
+    <#
+    .SYNOPSIS
+        1コミット分の差分統計を最終化する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    param(
+        [object]$Commit,
+        [int]$Revision,
+        [string]$TargetUrl,
+        [string[]]$DiffArguments
+    )
+    Update-RenamePairDiffStat -Commit $Commit -Revision $Revision -TargetUrl $TargetUrl -DiffArguments $DiffArguments
+    Set-CommitDerivedMetric -Commit $Commit
 }
 function Initialize-CommitDiffData
 {
@@ -8329,63 +8911,8 @@ function Initialize-CommitDiffData
         [string[]]$ExcludePathPatterns,
         [int]$Parallel = 1
     )
-    $revToAuthor = @{}
-    $phaseAItems = [System.Collections.Generic.List[object]]::new()
-    foreach ($commit in @($Commits))
-    {
-        $revision = [int]$commit.Revision
-        $revToAuthor[$revision] = [string]$commit.Author
-        # 早期フィルタスキップ: 拡張子・パスフィルタを diff 取得前に適用し、
-        # 対象ファイルが0件のコミットは svn diff の並列取得キューに入れない。
-        # ドキュメントのみ変更等、対象外コミットが多いリポジトリでネットワーク往復を大幅に削減する。
-        $filteredChangedPaths = @(Get-FilteredChangedPathEntry -ChangedPaths @($commit.ChangedPaths) -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns)
-        $commit.ChangedPathsFiltered = $filteredChangedPaths
-        if ($filteredChangedPaths.Count -le 0)
-        {
-            continue
-        }
-        [void]$phaseAItems.Add([pscustomobject]@{
-                Revision = $revision
-                CacheDir = $CacheDir
-                TargetUrl = $TargetUrl
-                DiffArguments = @($DiffArguments)
-            })
-    }
-
-    $phaseAResults = @()
-    if ($phaseAItems.Count -gt 0)
-    {
-        $phaseAWorker = {
-            param($Item, $Index)
-            [void]$Index # Required by Invoke-ParallelWork contract
-            $diffText = Get-CachedOrFetchDiffText -CacheDir $Item.CacheDir -Revision ([int]$Item.Revision) -TargetUrl $Item.TargetUrl -DiffArguments @($Item.DiffArguments)
-            $rawDiffByPath = ConvertFrom-SvnUnifiedDiff -DiffText $diffText -DetailLevel 2
-            [pscustomobject]@{
-                Revision = [int]$Item.Revision
-                RawDiffByPath = $rawDiffByPath
-            }
-        }
-        $phaseAResults = @(Invoke-ParallelWork -InputItems $phaseAItems.ToArray() -WorkerScript $phaseAWorker -MaxParallel $Parallel -RequiredFunctions @(
-                'ConvertTo-PathKey',
-                'Get-Sha1Hex',
-                'ConvertTo-LineHash',
-                'ConvertTo-ContextHash',
-                'ConvertFrom-SvnUnifiedDiff',
-                'Join-CommandArgument',
-                'Invoke-SvnCommand',
-                'Get-CachedOrFetchDiffText'
-            ) -SessionVariables @{
-                NarutoContext = (Get-RunspaceNarutoContext -Context $Context)
-                SvnExecutable = $Context.Runtime.SvnExecutable
-                SvnGlobalArguments = @($Context.Runtime.SvnGlobalArguments)
-            } -ErrorContext 'commit diff prefetch')
-    }
-
-    $rawDiffByRevision = @{}
-    foreach ($result in @($phaseAResults))
-    {
-        $rawDiffByRevision[[int]$result.Revision] = $result.RawDiffByPath
-    }
+    $prefetchPlan = New-CommitDiffPrefetchPlan -Commits $Commits -CacheDir $CacheDir -TargetUrl $TargetUrl -DiffArguments $DiffArguments -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns
+    $rawDiffByRevision = Invoke-CommitDiffPrefetch -Context $Context -PrefetchItems $prefetchPlan.PrefetchItems -Parallel $Parallel
 
     $commitTotal = @($Commits).Count
     $commitIdx = 0
@@ -8394,53 +8921,12 @@ function Initialize-CommitDiffData
         $pct = [Math]::Min(100, [int](($commitIdx / [Math]::Max(1, $commitTotal)) * 100))
         Write-Progress -Id 2 -Activity 'コミット差分の統合' -Status ('{0}/{1}' -f ($commitIdx + 1), $commitTotal) -PercentComplete $pct
         $revision = [int]$commit.Revision
-        $rawDiffByPath = @{}
-        if ($rawDiffByRevision.ContainsKey($revision))
-        {
-            $rawDiffByPath = $rawDiffByRevision[$revision]
-        }
-        $filteredDiffByPath = @{}
-        foreach ($path in $rawDiffByPath.Keys)
-        {
-            if (Test-ShouldCountFile -FilePath $path -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns)
-            {
-                $filteredDiffByPath[$path] = $rawDiffByPath[$path]
-            }
-        }
-        $commit.FileDiffStats = $filteredDiffByPath
-
-        if ($null -eq $commit.ChangedPathsFiltered)
-        {
-            $commit.ChangedPathsFiltered = Get-FilteredChangedPathEntry -ChangedPaths @($commit.ChangedPaths) -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns
-        }
-
-        $allowedFilePathSet = New-Object 'System.Collections.Generic.HashSet[string]'
-        foreach ($pathEntry in @($commit.ChangedPathsFiltered))
-        {
-            $path = ConvertTo-PathKey -Path ([string]$pathEntry.Path)
-            if ($path)
-            {
-                [void]$allowedFilePathSet.Add($path)
-            }
-        }
-
-        $filteredByLog = @{}
-        foreach ($path in $commit.FileDiffStats.Keys)
-        {
-            if ($allowedFilePathSet.Contains([string]$path))
-            {
-                $filteredByLog[$path] = $commit.FileDiffStats[$path]
-            }
-        }
-        $commit.FileDiffStats = $filteredByLog
-        $commit.FilesChanged = @($commit.FileDiffStats.Keys | Sort-Object)
-
-        Update-RenamePairDiffStat -Commit $commit -Revision $revision -TargetUrl $TargetUrl -DiffArguments $DiffArguments
-        Set-CommitDerivedMetric -Commit $commit
+        Merge-CommitDiffForCommit -Commit $commit -RawDiffByRevision $rawDiffByRevision -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns
+        Complete-CommitDiffForCommit -Commit $commit -Revision $revision -TargetUrl $TargetUrl -DiffArguments $DiffArguments
         $commitIdx++
     }
     Write-Progress -Id 2 -Activity 'コミット差分の統合' -Completed
-    return $revToAuthor
+    return $prefetchPlan.RevToAuthor
 }
 # endregion 差分処理パイプライン
 # region Strict メトリクス更新
@@ -8730,6 +9216,84 @@ function Get-StrictFileBlameWithFallback
         ExistsAtToRevision = [bool]$existsAtToRevision
     }
 }
+function Get-StrictFileRowMetricValues
+{
+    <#
+    .SYNOPSIS
+        files 行へ反映する strict 指標値を算出する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '')]
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [object]$StrictDetail,
+        [string]$MetricKey,
+        [object]$Blame
+    )
+    $survived = 0
+    $dead = 0
+    $selfCancel = 0
+    $crossRevert = 0
+    $repeatedHunk = 0
+    $pingPong = 0
+    $internalMoveCount = 0
+    if ($MetricKey)
+    {
+        $survived = Get-HashtableIntValue -Table $StrictDetail.FileSurvived -Key $MetricKey
+        $dead = Get-HashtableIntValue -Table $StrictDetail.FileDead -Key $MetricKey
+        $selfCancel = Get-HashtableIntValue -Table $StrictDetail.FileSelfCancel -Key $MetricKey
+        $crossRevert = Get-HashtableIntValue -Table $StrictDetail.FileCrossRevert -Key $MetricKey
+        $repeatedHunk = Get-HashtableIntValue -Table $StrictDetail.FileRepeatedHunk -Key $MetricKey
+        $pingPong = Get-HashtableIntValue -Table $StrictDetail.FilePingPong -Key $MetricKey
+        $internalMoveCount = Get-HashtableIntValue -Table $StrictDetail.FileInternalMoveCount -Key $MetricKey
+    }
+    $maxOwned = 0
+    if ($null -ne $Blame -and $Blame.LineCountByAuthor.Count -gt 0)
+    {
+        $maxOwned = ($Blame.LineCountByAuthor.Values | Measure-Object -Maximum).Maximum
+    }
+    $topBlameShare = if ($null -ne $Blame -and $Blame.LineCountTotal -gt 0)
+    {
+        $maxOwned / [double]$Blame.LineCountTotal
+    }
+    else
+    {
+        0
+    }
+    return [pscustomobject]@{
+        Survived = [int]$survived
+        Dead = [int]$dead
+        SelfCancel = [int]$selfCancel
+        CrossRevert = [int]$crossRevert
+        RepeatedHunk = [int]$repeatedHunk
+        PingPong = [int]$pingPong
+        InternalMoveCount = [int]$internalMoveCount
+        TopBlameShare = [double]$topBlameShare
+    }
+}
+function Set-StrictFileRowMetricValues
+{
+    <#
+    .SYNOPSIS
+        算出済み strict 指標値を files 行へ反映する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '')]
+    [CmdletBinding()]
+    param(
+        [hashtable]$Context = $script:NarutoContext,
+        [object]$Row,
+        [object]$Values
+    )
+    $Row.'生存行数 (範囲指定)' = [int]$Values.Survived
+    $Row.($Context.Metrics.ColDeadAdded) = [int]$Values.Dead
+    $Row.'自己相殺行数 (合計)' = [int]$Values.SelfCancel
+    $Row.'他者差戻行数 (合計)' = [int]$Values.CrossRevert
+    $Row.'同一箇所反復編集数 (合計)' = [int]$Values.RepeatedHunk
+    $Row.'ピンポン回数 (合計)' = [int]$Values.PingPong
+    $Row.'内部移動行数 (合計)' = [int]$Values.InternalMoveCount
+    $Row.'最多作者blame占有率' = Format-MetricValue -Value ([double]$Values.TopBlameShare)
+}
 function Update-FileRowWithStrictMetric
 {
     <#
@@ -8781,51 +9345,110 @@ function Update-FileRowWithStrictMetric
         {
             $resolvedFilePath
         }
-
         $lookupResult = Get-StrictFileBlameWithFallback -MetricKey $metricKey -FilePath $filePath -ResolvedFilePath $resolvedFilePath -ExistingFileSet $ExistingFileSet -BlameByFile $BlameByFile -TargetUrl $TargetUrl -ToRevision $ToRevision -CacheDir $CacheDir
-        $blame = $lookupResult.Blame
-
-        $survived = 0
-        $dead = 0
-        $selfCancel = 0
-        $crossRevert = 0
-        $repeatedHunk = 0
-        $pingPong = 0
-        $internalMoveCount = 0
-        if ($metricKey)
-        {
-            $survived = Get-HashtableIntValue -Table $StrictDetail.FileSurvived -Key $metricKey
-            $dead = Get-HashtableIntValue -Table $StrictDetail.FileDead -Key $metricKey
-            $selfCancel = Get-HashtableIntValue -Table $StrictDetail.FileSelfCancel -Key $metricKey
-            $crossRevert = Get-HashtableIntValue -Table $StrictDetail.FileCrossRevert -Key $metricKey
-            $repeatedHunk = Get-HashtableIntValue -Table $StrictDetail.FileRepeatedHunk -Key $metricKey
-            $pingPong = Get-HashtableIntValue -Table $StrictDetail.FilePingPong -Key $metricKey
-            $internalMoveCount = Get-HashtableIntValue -Table $StrictDetail.FileInternalMoveCount -Key $metricKey
-        }
-
-        $row.'生存行数 (範囲指定)' = $survived
-        $row.($Context.Metrics.ColDeadAdded) = $dead
-        $row.'自己相殺行数 (合計)' = $selfCancel
-        $row.'他者差戻行数 (合計)' = $crossRevert
-        $row.'同一箇所反復編集数 (合計)' = $repeatedHunk
-        $row.'ピンポン回数 (合計)' = $pingPong
-        $row.'内部移動行数 (合計)' = $internalMoveCount
-
-        $maxOwned = 0
-        if ($null -ne $blame -and $blame.LineCountByAuthor.Count -gt 0)
-        {
-            $maxOwned = ($blame.LineCountByAuthor.Values | Measure-Object -Maximum).Maximum
-        }
-        $topBlameShare = if ($null -ne $blame -and $blame.LineCountTotal -gt 0)
-        {
-            $maxOwned / [double]$blame.LineCountTotal
-        }
-        else
-        {
-            0
-        }
-        $row.'最多作者blame占有率' = Format-MetricValue -Value $topBlameShare
+        $values = Get-StrictFileRowMetricValues -StrictDetail $StrictDetail -MetricKey $metricKey -Blame $lookupResult.Blame
+        Set-StrictFileRowMetricValues -Context $Context -Row $row -Values $values
     }
+}
+function Get-StrictCommitterRowMetricValues
+{
+    <#
+    .SYNOPSIS
+        committers 行へ反映する strict 指標値を算出する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '')]
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [string]$Author,
+        [hashtable]$AuthorSurvived,
+        [hashtable]$AuthorOwned,
+        [int]$OwnedTotal,
+        [object]$StrictDetail,
+        [hashtable]$AuthorModifiedOthersSurvived,
+        [int]$CommitCount
+    )
+    $survived = Get-HashtableIntValue -Table $AuthorSurvived -Key $Author
+    $owned = Get-HashtableIntValue -Table $AuthorOwned -Key $Author
+    $dead = Get-HashtableIntValue -Table $StrictDetail.AuthorDead -Key $Author
+    $selfDead = Get-HashtableIntValue -Table $StrictDetail.AuthorSelfDead -Key $Author
+    $otherDead = Get-HashtableIntValue -Table $StrictDetail.AuthorOtherDead -Key $Author
+    $repeatedHunk = Get-HashtableIntValue -Table $StrictDetail.AuthorRepeatedHunk -Key $Author
+    $pingPong = Get-HashtableIntValue -Table $StrictDetail.AuthorPingPong -Key $Author
+    $internalMove = Get-HashtableIntValue -Table $StrictDetail.AuthorInternalMoveCount -Key $Author
+    $modifiedOthersCode = Get-HashtableIntValue -Table $StrictDetail.AuthorModifiedOthersCode -Key $Author
+    $modifiedOthersSurvived = Get-HashtableIntValue -Table $AuthorModifiedOthersSurvived -Key $Author
+    $ownShare = if ($OwnedTotal -gt 0)
+    {
+        $owned / [double]$OwnedTotal
+    }
+    else
+    {
+        0
+    }
+    $otherChangeRate = if ($modifiedOthersCode -gt 0)
+    {
+        $modifiedOthersSurvived / [double]$modifiedOthersCode
+    }
+    else
+    {
+        0
+    }
+    $pingPongPerCommit = if ($CommitCount -gt 0)
+    {
+        $pingPong / [double]$CommitCount
+    }
+    else
+    {
+        0
+    }
+    return [pscustomobject]@{
+        Survived = [int]$survived
+        Dead = [int]$dead
+        Owned = [int]$owned
+        OwnShare = [double]$ownShare
+        SelfDead = [int]$selfDead
+        OtherDead = [int]$otherDead
+        RepeatedHunk = [int]$repeatedHunk
+        PingPong = [int]$pingPong
+        InternalMove = [int]$internalMove
+        ModifiedOthersCode = [int]$modifiedOthersCode
+        ModifiedOthersSurvived = [int]$modifiedOthersSurvived
+        OtherChangeRate = [double]$otherChangeRate
+        PingPongPerCommit = [double]$pingPongPerCommit
+    }
+}
+function Set-StrictCommitterRowMetricValues
+{
+    <#
+    .SYNOPSIS
+        算出済み strict 指標値を committers 行へ反映する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '')]
+    [CmdletBinding()]
+    param(
+        [hashtable]$Context = $script:NarutoContext,
+        [object]$Row,
+        [object]$Values
+    )
+    $Row.'生存行数' = [int]$Values.Survived
+    $Row.($Context.Metrics.ColDeadAdded) = [int]$Values.Dead
+    $Row.'所有行数' = [int]$Values.Owned
+    $Row.'所有割合' = Format-MetricValue -Value ([double]$Values.OwnShare)
+    $Row.'自己相殺行数' = [int]$Values.SelfDead
+    $Row.'自己差戻行数' = [int]$Values.SelfDead
+    $Row.'他者差戻行数' = [int]$Values.OtherDead
+    $Row.'被他者削除行数' = [int]$Values.OtherDead
+    $Row.'同一箇所反復編集数' = [int]$Values.RepeatedHunk
+    $Row.'ピンポン回数' = [int]$Values.PingPong
+    $Row.'内部移動行数' = [int]$Values.InternalMove
+    $Row.($Context.Metrics.ColSelfDead) = [int]$Values.SelfDead
+    $Row.($Context.Metrics.ColOtherDead) = [int]$Values.OtherDead
+    $Row.'他者コード変更行数' = [int]$Values.ModifiedOthersCode
+    $Row.'他者コード変更生存行数' = [int]$Values.ModifiedOthersSurvived
+    $Row.'他者コード変更生存率' = Format-MetricValue -Value ([double]$Values.OtherChangeRate)
+    $Row.'ピンポン率' = Format-MetricValue -Value ([double]$Values.PingPongPerCommit)
 }
 function Update-CommitterRowWithStrictMetric
 {
@@ -8861,62 +9484,82 @@ function Update-CommitterRowWithStrictMetric
     foreach ($row in @($CommitterRows))
     {
         $author = [string]$row.'作者'
-        $survived = Get-HashtableIntValue -Table $AuthorSurvived -Key $author
-        $owned = Get-HashtableIntValue -Table $AuthorOwned -Key $author
-        $dead = Get-HashtableIntValue -Table $StrictDetail.AuthorDead -Key $author
-        $selfDead = Get-HashtableIntValue -Table $StrictDetail.AuthorSelfDead -Key $author
-        $otherDead = Get-HashtableIntValue -Table $StrictDetail.AuthorOtherDead -Key $author
-        $repeatedHunk = Get-HashtableIntValue -Table $StrictDetail.AuthorRepeatedHunk -Key $author
-        $pingPong = Get-HashtableIntValue -Table $StrictDetail.AuthorPingPong -Key $author
-        $internalMove = Get-HashtableIntValue -Table $StrictDetail.AuthorInternalMoveCount -Key $author
-        $modifiedOthersCode = Get-HashtableIntValue -Table $StrictDetail.AuthorModifiedOthersCode -Key $author
-        $modifiedOthersSurvived = Get-HashtableIntValue -Table $AuthorModifiedOthersSurvived -Key $author
-
-        $row.'生存行数' = $survived
-        $row.($Context.Metrics.ColDeadAdded) = $dead
-        $row.'所有行数' = $owned
-        $ownShare = if ($OwnedTotal -gt 0)
-        {
-            $owned / [double]$OwnedTotal
-        }
-        else
-        {
-            0
-        }
-        $row.'所有割合' = Format-MetricValue -Value $ownShare
-        $row.'自己相殺行数' = $selfDead
-        $row.'自己差戻行数' = $selfDead
-        $row.'他者差戻行数' = $otherDead
-        $row.'被他者削除行数' = $otherDead
-        $row.'同一箇所反復編集数' = $repeatedHunk
-        $row.'ピンポン回数' = $pingPong
-        $row.'内部移動行数' = $internalMove
-        $row.($Context.Metrics.ColSelfDead) = $selfDead
-        $row.($Context.Metrics.ColOtherDead) = $otherDead
-        $row.'他者コード変更行数' = $modifiedOthersCode
-        $row.'他者コード変更生存行数' = $modifiedOthersSurvived
-
-        $otherChangeRate = if ($modifiedOthersCode -gt 0)
-        {
-            $modifiedOthersSurvived / [double]$modifiedOthersCode
-        }
-        else
-        {
-            0
-        }
-        $row.'他者コード変更生存率' = Format-MetricValue -Value $otherChangeRate
-
         $commitCount = [int]$row.'コミット数'
-        $pingPongPerCommit = if ($commitCount -gt 0)
-        {
-            $pingPong / [double]$commitCount
-        }
-        else
-        {
-            0
-        }
-        $row.'ピンポン率' = Format-MetricValue -Value $pingPongPerCommit
+        $values = Get-StrictCommitterRowMetricValues -Author $author -AuthorSurvived $AuthorSurvived -AuthorOwned $AuthorOwned -OwnedTotal $OwnedTotal -StrictDetail $StrictDetail -AuthorModifiedOthersSurvived $AuthorModifiedOthersSurvived -CommitCount $commitCount
+        Set-StrictCommitterRowMetricValues -Context $Context -Row $row -Values $values
     }
+}
+function Get-StrictExecutionContext
+{
+    <#
+    .SYNOPSIS
+        Strict 帰属反映に必要な依存データを一括で構築する。
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [hashtable]$Context = $script:NarutoContext,
+        [object[]]$Commits,
+        [hashtable]$RevToAuthor,
+        [string]$TargetUrl,
+        [int]$FromRevision,
+        [int]$ToRevision,
+        [string]$CacheDir,
+        [string[]]$IncludeExtensions,
+        [string[]]$ExcludeExtensions,
+        [string[]]$IncludePaths,
+        [string[]]$ExcludePaths,
+        [int]$Parallel = 1,
+        [hashtable]$RenameMap = @{}
+    )
+    $renameMap = if ($RenameMap.Count -gt 0)
+    {
+        $RenameMap
+    }
+    else
+    {
+        Get-RenameMap -Commits $Commits
+    }
+    $strictDetail = Get-ExactDeathAttribution -Context $Context -Commits $Commits -RevToAuthor $RevToAuthor -TargetUrl $TargetUrl -FromRevision $FromRevision -ToRevision $ToRevision -CacheDir $CacheDir -RenameMap $renameMap -Parallel $Parallel
+    if ($null -eq $strictDetail)
+    {
+        throw "Strict death attribution returned null."
+    }
+    $ownershipAggregate = Get-StrictOwnershipAggregate -Context $Context -TargetUrl $TargetUrl -ToRevision $ToRevision -CacheDir $CacheDir -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -Parallel $Parallel
+    $authorModifiedOthersSurvived = Get-AuthorModifiedOthersSurvivedCount -BlameByFile $ownershipAggregate.BlameByFile -RevsWhereKilledOthers $strictDetail.RevsWhereKilledOthers -FromRevision $FromRevision -ToRevision $ToRevision
+
+    return [pscustomobject]@{
+        RenameMap = $renameMap
+        StrictDetail = $strictDetail
+        AuthorSurvived = $strictDetail.AuthorSurvived
+        AuthorOwned = $ownershipAggregate.AuthorOwned
+        OwnedTotal = [int]$ownershipAggregate.OwnedTotal
+        BlameByFile = $ownershipAggregate.BlameByFile
+        ExistingFileSet = $ownershipAggregate.ExistingFileSet
+        AuthorModifiedOthersSurvived = $authorModifiedOthersSurvived
+    }
+}
+function Update-StrictMetricsOnRows
+{
+    <#
+    .SYNOPSIS
+        Strict 実行コンテキストを files/committers 行へ反映する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '')]
+    [CmdletBinding()]
+    param(
+        [hashtable]$Context = $script:NarutoContext,
+        [object[]]$FileRows,
+        [object[]]$CommitterRows,
+        [object]$StrictExecutionContext,
+        [string]$TargetUrl,
+        [int]$ToRevision,
+        [string]$CacheDir
+    )
+    $strictDetail = $StrictExecutionContext.StrictDetail
+    Update-FileRowWithStrictMetric -Context $Context -FileRows $FileRows -RenameMap $StrictExecutionContext.RenameMap -StrictDetail $strictDetail -ExistingFileSet $StrictExecutionContext.ExistingFileSet -BlameByFile $StrictExecutionContext.BlameByFile -TargetUrl $TargetUrl -ToRevision $ToRevision -CacheDir $CacheDir
+    Update-CommitterRowWithStrictMetric -Context $Context -CommitterRows $CommitterRows -AuthorSurvived $StrictExecutionContext.AuthorSurvived -AuthorOwned $StrictExecutionContext.AuthorOwned -OwnedTotal ([int]$StrictExecutionContext.OwnedTotal) -StrictDetail $strictDetail -AuthorModifiedOthersSurvived $StrictExecutionContext.AuthorModifiedOthersSurvived
 }
 function Update-StrictAttributionMetric
 {
@@ -8957,6 +9600,7 @@ function Update-StrictAttributionMetric
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     param(
+        [hashtable]$Context = $script:NarutoContext,
         [object[]]$Commits,
         [hashtable]$RevToAuthor,
         [string]$TargetUrl,
@@ -8977,39 +9621,34 @@ function Update-StrictAttributionMetric
         return
     }
 
-    $renameMap = if ($RenameMap.Count -gt 0)
-    {
-        $RenameMap
-    }
-    else
-    {
-        Get-RenameMap -Commits $Commits
-    }
-    $strictDetail = Get-ExactDeathAttribution -Commits $Commits -RevToAuthor $RevToAuthor -TargetUrl $TargetUrl -FromRevision $FromRevision -ToRevision $ToRevision -CacheDir $CacheDir -RenameMap $renameMap -Parallel $Parallel
-    if ($null -eq $strictDetail)
-    {
-        throw "Strict death attribution returned null."
-    }
-
-    $authorSurvived = $strictDetail.AuthorSurvived
-    $ownershipAggregate = Get-StrictOwnershipAggregate -TargetUrl $TargetUrl -ToRevision $ToRevision -CacheDir $CacheDir -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -Parallel $Parallel
-    $authorOwned = $ownershipAggregate.AuthorOwned
-    $ownedTotal = [int]$ownershipAggregate.OwnedTotal
-    $blameByFile = $ownershipAggregate.BlameByFile
-    $existingFileSet = $ownershipAggregate.ExistingFileSet
-
-    $authorModifiedOthersSurvived = Get-AuthorModifiedOthersSurvivedCount -BlameByFile $blameByFile -RevsWhereKilledOthers $strictDetail.RevsWhereKilledOthers -FromRevision $FromRevision -ToRevision $ToRevision
-    Update-FileRowWithStrictMetric -FileRows $FileRows -RenameMap $renameMap -StrictDetail $strictDetail -ExistingFileSet $existingFileSet -BlameByFile $blameByFile -TargetUrl $TargetUrl -ToRevision $ToRevision -CacheDir $CacheDir
-    Update-CommitterRowWithStrictMetric -CommitterRows $CommitterRows -AuthorSurvived $authorSurvived -AuthorOwned $authorOwned -OwnedTotal $ownedTotal -StrictDetail $strictDetail -AuthorModifiedOthersSurvived $authorModifiedOthersSurvived
+    $strictExecutionContext = Get-StrictExecutionContext -Context $Context -Commits $Commits -RevToAuthor $RevToAuthor -TargetUrl $TargetUrl -FromRevision $FromRevision -ToRevision $ToRevision -CacheDir $CacheDir -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -Parallel $Parallel -RenameMap $RenameMap
+    Update-StrictMetricsOnRows -Context $Context -FileRows $FileRows -CommitterRows $CommitterRows -StrictExecutionContext $strictExecutionContext -TargetUrl $TargetUrl -ToRevision $ToRevision -CacheDir $CacheDir
 
     return [pscustomobject]@{
-        KillMatrix = $strictDetail.KillMatrix
-        AuthorSelfDead = $strictDetail.AuthorSelfDead
-        AuthorBorn = $strictDetail.AuthorBorn
+        KillMatrix = $strictExecutionContext.StrictDetail.KillMatrix
+        AuthorSelfDead = $strictExecutionContext.StrictDetail.AuthorSelfDead
+        AuthorBorn = $strictExecutionContext.StrictDetail.AuthorBorn
     }
 }
 # endregion Strict メトリクス更新
 # region ヘッダーとメタデータ
+function Get-MetricColumnDefinitions
+{
+    <#
+    .SYNOPSIS
+        メトリクス出力列の定義配列を返す。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '')]
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param([hashtable]$Context = $script:NarutoContext)
+    return [ordered]@{
+        Committer = @('作者', 'コミット数', '活動日数', '変更ファイル数', '変更ディレクトリ数', '追加行数', '削除行数', '純増行数', '総チャーン', 'コミットあたりチャーン', '削除対追加比', 'チャーン対純増比', 'リワーク率', 'バイナリ変更回数', '追加アクション数', '変更アクション数', '削除アクション数', '置換アクション数', '生存行数', $Context.Metrics.ColDeadAdded, '所有行数', '所有割合', '自己相殺行数', '自己差戻行数', '他者差戻行数', '被他者削除行数', '同一箇所反復編集数', 'ピンポン回数', '内部移動行数', $Context.Metrics.ColSelfDead, $Context.Metrics.ColOtherDead, '他者コード変更行数', '他者コード変更生存行数', '他者コード変更生存率', 'ピンポン率', '変更エントロピー', '平均共同作者数', '最大共同作者数', 'メッセージ総文字数', 'メッセージ平均文字数', '課題ID言及数', '修正キーワード数', '差戻キーワード数', 'マージキーワード数')
+        File = @('ファイルパス', 'コミット数', '作者数', '追加行数', '削除行数', '純増行数', '総チャーン', 'バイナリ変更回数', '作成回数', '削除回数', '置換回数', '初回変更リビジョン', '最終変更リビジョン', '平均変更間隔日数', '活動期間日数', '生存行数 (範囲指定)', $Context.Metrics.ColDeadAdded, '最多作者チャーン占有率', '最多作者blame占有率', '自己相殺行数 (合計)', '他者差戻行数 (合計)', '同一箇所反復編集数 (合計)', 'ピンポン回数 (合計)', '内部移動行数 (合計)', 'ホットスポットスコア', 'ホットスポット順位')
+        Commit = @('リビジョン', '日時', '作者', 'メッセージ文字数', 'メッセージ', '変更ファイル数', '追加行数', '削除行数', 'チャーン', 'エントロピー')
+        Coupling = @('ファイルA', 'ファイルB', '共変更回数', 'Jaccard', 'リフト値')
+    }
+}
 function Get-MetricHeader
 {
     <#
@@ -9019,11 +9658,12 @@ function Get-MetricHeader
     [CmdletBinding()]
     [OutputType([object])]
     param([hashtable]$Context = $script:NarutoContext)
+    $definitions = Get-MetricColumnDefinitions -Context $Context
     return [pscustomobject]@{
-        Committer = @('作者', 'コミット数', '活動日数', '変更ファイル数', '変更ディレクトリ数', '追加行数', '削除行数', '純増行数', '総チャーン', 'コミットあたりチャーン', '削除対追加比', 'チャーン対純増比', 'リワーク率', 'バイナリ変更回数', '追加アクション数', '変更アクション数', '削除アクション数', '置換アクション数', '生存行数', $Context.Metrics.ColDeadAdded, '所有行数', '所有割合', '自己相殺行数', '自己差戻行数', '他者差戻行数', '被他者削除行数', '同一箇所反復編集数', 'ピンポン回数', '内部移動行数', $Context.Metrics.ColSelfDead, $Context.Metrics.ColOtherDead, '他者コード変更行数', '他者コード変更生存行数', '他者コード変更生存率', 'ピンポン率', '変更エントロピー', '平均共同作者数', '最大共同作者数', 'メッセージ総文字数', 'メッセージ平均文字数', '課題ID言及数', '修正キーワード数', '差戻キーワード数', 'マージキーワード数')
-        File = @('ファイルパス', 'コミット数', '作者数', '追加行数', '削除行数', '純増行数', '総チャーン', 'バイナリ変更回数', '作成回数', '削除回数', '置換回数', '初回変更リビジョン', '最終変更リビジョン', '平均変更間隔日数', '活動期間日数', '生存行数 (範囲指定)', $Context.Metrics.ColDeadAdded, '最多作者チャーン占有率', '最多作者blame占有率', '自己相殺行数 (合計)', '他者差戻行数 (合計)', '同一箇所反復編集数 (合計)', 'ピンポン回数 (合計)', '内部移動行数 (合計)', 'ホットスポットスコア', 'ホットスポット順位')
-        Commit = @('リビジョン', '日時', '作者', 'メッセージ文字数', 'メッセージ', '変更ファイル数', '追加行数', '削除行数', 'チャーン', 'エントロピー')
-        Coupling = @('ファイルA', 'ファイルB', '共変更回数', 'Jaccard', 'リフト値')
+        Committer = @($definitions.Committer)
+        File = @($definitions.File)
+        Commit = @($definitions.Commit)
+        Coupling = @($definitions.Coupling)
     }
 }
 function New-RunMetaData

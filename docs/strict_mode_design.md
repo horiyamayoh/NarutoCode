@@ -1041,3 +1041,50 @@ Phase F: テスト・ドキュメント
 |------|------|
 | PlantUML TopN | 可視化の制限であり指標の近似ではない |
 | 作者エイリアス | SVN 情報のみでは判定不可能。別パラメータとして設計 |
+
+## Strict Refactor Responsibility Update (2026-02)
+
+The Strict pipeline keeps output compatibility while splitting responsibilities into smaller units.
+
+### Main orchestration flow
+
+1. `Get-StrictExecutionContext`
+- Resolves rename map.
+- Executes exact death attribution.
+- Builds ownership aggregate.
+- Computes modified-others-survived helper data.
+
+2. `Update-StrictMetricsOnRows`
+- Applies strict metrics to file rows.
+- Applies strict metrics to committer rows.
+
+3. `Update-StrictAttributionMetric`
+- Acts as a thin orchestrator.
+- Returns only strict summary outputs (`KillMatrix`, `AuthorSelfDead`, `AuthorBorn`).
+
+### Commit attribution internals
+
+- `Resolve-StrictKillerAuthor`: resolves killer author per revision.
+- `Invoke-StrictCommitAttribution`: executes transition-level strict attribution for one commit.
+- Transition decomposition:
+  - `Get-CommitTransitionRenameContext`
+  - `ConvertTo-CommitRenameTransitions`
+  - `ConvertTo-CommitNonRenameTransitions`
+
+### Hunk analysis decomposition
+
+- Event generation:
+  - `ConvertTo-StrictHunkList`
+  - `Get-StrictCanonicalHunkEvents`
+- Overlap judgment:
+  - `Test-StrictHunkRangeOverlap`
+  - `Get-StrictHunkOverlapSummary`
+
+### Row reflection decomposition
+
+- Files:
+  - value calculation: `Get-StrictFileRowMetricValues`
+  - row assignment: `Set-StrictFileRowMetricValues`
+- Committers:
+  - value calculation: `Get-StrictCommitterRowMetricValues`
+  - row assignment: `Set-StrictCommitterRowMetricValues`
