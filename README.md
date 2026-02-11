@@ -56,9 +56,11 @@ SVN リポジトリの履歴を解析し、コミット品質・変更傾向の�
 | `-TopN` | | `50` | 可視化に表示する上位件数（CSV は全件出力） |
 | `-Encoding` | | `UTF8` | 出力ファイルのエンコーディング |
 | `-IgnoreWhitespace` | | | diff 時に空白・改行コードの差異を無視 |
+| `-ExcludeCommentOnlyLines` | | | コメント専用行（コードを含まない行）を全メトリクスで除外 |
 | `-NoProgress` | | | 進捗バー表示を抑止 |
 
 > 旧パラメータ名（`-Path`, `-FromRevision`, `-ToRevision` 等）はエイリアスとして引き続き使用可能です。
+> `-ExcludeCommentOnlyLines` は拡張子ごとの組み込みコメント記法（`CStyle` / `PowerShellStyle` / `IniStyle`）を使って判定します。
 
 ## 出力ファイル
 

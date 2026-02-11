@@ -116,6 +116,130 @@ svn:mime-type = application/octet-stream
     }
 }
 
+Describe 'Comment syntax profile and line mask' {
+    It 'resolves profile by extension' {
+        (Get-CommentSyntaxProfileByPath -FilePath 'src/main.c').Name | Should -Be 'CStyle'
+        (Get-CommentSyntaxProfileByPath -FilePath 'scripts/build.ps1').Name | Should -Be 'PowerShellStyle'
+        (Get-CommentSyntaxProfileByPath -FilePath 'config/app.ini').Name | Should -Be 'IniStyle'
+    }
+
+    It 'returns null for undefined extension' {
+        Get-CommentSyntaxProfileByPath -FilePath 'docs/readme.txt' | Should -BeNullOrEmpty
+    }
+
+    It 'marks comment-only lines for CStyle and ignores comment tokens in strings' {
+        $profile = Get-CommentSyntaxProfileByPath -FilePath 'src/main.cs'
+        $lines = @(
+            '// line comment'
+            'var x = 1; // trailing comment'
+            '/* block start'
+            'block middle'
+            'block end */'
+            'var s = "//not-comment";'
+            'return x;'
+        )
+        $mask = ConvertTo-CommentOnlyLineMask -Lines $lines -CommentSyntaxProfile $profile
+        @($mask) | Should -Be @($true, $false, $true, $true, $true, $false, $false)
+    }
+
+    It 'marks comment-only lines for PowerShellStyle and IniStyle' {
+        $psProfile = Get-CommentSyntaxProfileByPath -FilePath 'scripts/task.ps1'
+        $psLines = @(
+            '# line comment'
+            'Write-Host "hello" # trailing'
+            '<#'
+            'inside block'
+            '#>'
+        )
+        $psMask = ConvertTo-CommentOnlyLineMask -Lines $psLines -CommentSyntaxProfile $psProfile
+        @($psMask) | Should -Be @($true, $false, $true, $true, $true)
+
+        $iniProfile = Get-CommentSyntaxProfileByPath -FilePath 'config/app.ini'
+        $iniLines = @(
+            '# hash comment'
+            '; semicolon comment'
+            'key=value ; trailing'
+            '   '
+        )
+        $iniMask = ConvertTo-CommentOnlyLineMask -Lines $iniLines -CommentSyntaxProfile $iniProfile
+        @($iniMask) | Should -Be @($true, $true, $false, $false)
+    }
+}
+
+Describe 'ConvertFrom-SvnUnifiedDiff comment exclusion' {
+    It 'excludes comment-only changes from added/deleted counts and effective segments' {
+        $diff = @"
+Index: trunk/src/Main.cs
+===================================================================
+--- trunk/src/Main.cs	(revision 9)
++++ trunk/src/Main.cs	(revision 10)
+@@ -1,3 +1,3 @@
+ keep1
+-// old comment
++// new comment
+ keep2
+"@
+        $lineMaskByPath = @{
+            'trunk/src/Main.cs' = [pscustomobject]@{
+                OldMask = @($false, $true, $false)
+                NewMask = @($false, $true, $false)
+            }
+        }
+        $parsed = ConvertFrom-SvnUnifiedDiff -DiffText $diff -DetailLevel 2 -ExcludeCommentOnlyLines -LineMaskByPath $lineMaskByPath
+        $stat = $parsed['trunk/src/Main.cs']
+        $stat.AddedLines | Should -Be 0
+        $stat.DeletedLines | Should -Be 0
+        $stat.Hunks.Count | Should -Be 1
+        @($stat.Hunks[0].EffectiveSegments).Count | Should -Be 0
+    }
+
+    It 'keeps non-comment changes in mixed hunk and builds effective segment' {
+        $diff = @"
+Index: trunk/src/Main.cs
+===================================================================
+--- trunk/src/Main.cs	(revision 9)
++++ trunk/src/Main.cs	(revision 10)
+@@ -1,4 +1,4 @@
+ keep1
+-// old comment
++// new comment
+-old code
++new code
+ keep2
+"@
+        $lineMaskByPath = @{
+            'trunk/src/Main.cs' = [pscustomobject]@{
+                OldMask = @($false, $true, $false, $false)
+                NewMask = @($false, $true, $false, $false)
+            }
+        }
+        $parsed = ConvertFrom-SvnUnifiedDiff -DiffText $diff -DetailLevel 2 -ExcludeCommentOnlyLines -LineMaskByPath $lineMaskByPath
+        $stat = $parsed['trunk/src/Main.cs']
+        $stat.AddedLines | Should -Be 1
+        $stat.DeletedLines | Should -Be 1
+        @($stat.Hunks[0].EffectiveSegments).Count | Should -Be 1
+        $stat.Hunks[0].EffectiveSegments[0].OldStart | Should -Be 3
+        $stat.Hunks[0].EffectiveSegments[0].OldCount | Should -Be 1
+        $stat.Hunks[0].EffectiveSegments[0].NewStart | Should -Be 3
+        $stat.Hunks[0].EffectiveSegments[0].NewCount | Should -Be 1
+    }
+
+    It 'keeps behavior unchanged when extension is undefined' {
+        $diff = @"
+Index: trunk/src/unknown.extx
+===================================================================
+--- trunk/src/unknown.extx	(revision 1)
++++ trunk/src/unknown.extx	(revision 2)
+@@ -1 +1 @@
+-old
++new
+"@
+        $parsed = ConvertFrom-SvnUnifiedDiff -DiffText $diff -ExcludeCommentOnlyLines
+        $parsed['trunk/src/unknown.extx'].AddedLines | Should -Be 1
+        $parsed['trunk/src/unknown.extx'].DeletedLines | Should -Be 1
+    }
+}
+
 Describe 'ConvertFrom-SvnBlameXml' {
     It 'parses totals and per-revision/author counts' {
         $xml = @"
@@ -220,7 +344,7 @@ Describe 'NarutoCode.ps1 parameter definition' {
     }
 
     It 'contains new Phase 1 parameters' {
-        $names = @('OutDirectory','Username','Password','NonInteractive','TrustServerCert','Parallel','IncludePaths','IgnoreWhitespace','TopNCount','Encoding')
+        $names = @('OutDirectory','Username','Password','NonInteractive','TrustServerCert','Parallel','IncludePaths','IgnoreWhitespace','ExcludeCommentOnlyLines','TopNCount','Encoding')
         foreach ($name in $names) {
             $script:cmd.Parameters[$name] | Should -Not -BeNullOrEmpty
         }
@@ -1664,7 +1788,7 @@ Describe 'Resolve-PipelineExecutionState' {
         $outDir = Join-Path $env:TEMP ('narutocode_exec_state_' + [guid]::NewGuid().ToString('N'))
         $password = ConvertTo-SecureString -String 'p@ss' -AsPlainText -Force
         try {
-            $state = Resolve-PipelineExecutionState -Context $script:NarutoContext -RepoUrl 'https://example.invalid/repos/proj/trunk' -FromRevision 20 -ToRevision 10 -OutDirectory $outDir -IncludePaths @(' src/* ', 'src/*') -ExcludePaths @(' tmp/* ', 'tmp/*') -IncludeExtensions @('.cs', 'CS') -ExcludeExtensions @(' .bin ', 'BIN') -SvnExecutable 'powershell' -Username 'tester' -Password $password -NonInteractive -TrustServerCert
+            $state = Resolve-PipelineExecutionState -Context $script:NarutoContext -RepoUrl 'https://example.invalid/repos/proj/trunk' -FromRevision 20 -ToRevision 10 -OutDirectory $outDir -IncludePaths @(' src/* ', 'src/*') -ExcludePaths @(' tmp/* ', 'tmp/*') -IncludeExtensions @('.cs', 'CS') -ExcludeExtensions @(' .bin ', 'BIN') -SvnExecutable 'powershell' -Username 'tester' -Password $password -NonInteractive -TrustServerCert -ExcludeCommentOnlyLines
 
             $state.FromRevision | Should -Be 10
             $state.ToRevision | Should -Be 20
@@ -1684,6 +1808,7 @@ Describe 'Resolve-PipelineExecutionState' {
             $script:NarutoContext.Runtime.SvnGlobalArguments -contains 'tester' | Should -BeTrue
             $script:NarutoContext.Runtime.SvnGlobalArguments -contains '--non-interactive' | Should -BeTrue
             $script:NarutoContext.Runtime.SvnGlobalArguments -contains '--trust-server-cert' | Should -BeTrue
+            [bool]$state.ExcludeCommentOnlyLines | Should -BeTrue
             $state.LogPathPrefix | Should -Be 'proj/trunk/'
         }
         finally {
@@ -1700,6 +1825,11 @@ Describe 'NarutoCode.ps1 parameter definition — Phase 2' {
     It 'has IgnoreWhitespace switch parameter' {
         $script:cmd.Parameters['IgnoreWhitespace'] | Should -Not -BeNullOrEmpty
         $script:cmd.Parameters['IgnoreWhitespace'].ParameterType.Name | Should -Be 'SwitchParameter'
+    }
+
+    It 'has ExcludeCommentOnlyLines switch parameter' {
+        $script:cmd.Parameters['ExcludeCommentOnlyLines'] | Should -Not -BeNullOrEmpty
+        $script:cmd.Parameters['ExcludeCommentOnlyLines'].ParameterType.Name | Should -Be 'SwitchParameter'
     }
 }
 
@@ -1840,6 +1970,7 @@ Describe 'Integration — test SVN repo output matches baseline' -Tag 'Integrati
         $meta.FileCount     | Should -Be 17
         $meta.StrictMode    | Should -BeTrue
         $meta.Encoding      | Should -Be 'UTF8'
+        [bool]$meta.Parameters.ExcludeCommentOnlyLines | Should -BeFalse
         $meta.Outputs.SurvivedShareDonutSvg | Should -Be 'team_survived_share.svg'
     }
 
@@ -2097,6 +2228,39 @@ Describe 'Blame memory cache' {
         Assert-MockCalled Invoke-SvnCommandAllowMissingTarget -Times 1 -Exactly
     }
 
+    It 'separates summary memory cache between comment exclusion OFF and ON' {
+        $xml = @"
+<blame>
+  <target path="trunk/src/A.cs">
+    <entry line-number="1"><commit revision="10"><author>alice</author></commit></entry>
+    <entry line-number="2"><commit revision="10"><author>alice</author></commit></entry>
+  </target>
+</blame>
+"@
+        Mock Read-BlameCacheFile {
+            return $xml
+        }
+        Mock Read-CatCacheFile {
+            return "// comment only`ncode line`n"
+        }
+        Mock Invoke-SvnCommandAllowMissingTarget {
+            return $null
+        }
+
+        $script:NarutoContext.Runtime.ExcludeCommentOnlyLines = $false
+        $off = Get-SvnBlameSummary -Repo 'https://example.invalid/svn/repo' -FilePath 'trunk/src/A.cs' -ToRevision 10 -CacheDir 'dummy'
+        $off.Data.LineCountTotal | Should -Be 2
+
+        $script:NarutoContext.Runtime.ExcludeCommentOnlyLines = $true
+        $on = Get-SvnBlameSummary -Repo 'https://example.invalid/svn/repo' -FilePath 'trunk/src/A.cs' -ToRevision 10 -CacheDir 'dummy'
+        $on.Data.LineCountTotal | Should -Be 1
+
+        $script:NarutoContext.Runtime.ExcludeCommentOnlyLines = $false
+        $offAgain = Get-SvnBlameSummary -Repo 'https://example.invalid/svn/repo' -FilePath 'trunk/src/A.cs' -ToRevision 10 -CacheDir 'dummy'
+        $offAgain.Data.LineCountTotal | Should -Be 2
+        Assert-MockCalled Invoke-SvnCommandAllowMissingTarget -Times 0 -Exactly
+    }
+
     It 'reuses Get-SvnBlameLine result without extra svn blame/cat command call' {
         $xml = @"
 <blame>
@@ -2145,11 +2309,14 @@ Describe 'Get-StrictTransitionComparison fast path' {
     BeforeAll {
         $script:origGetSvnBlameLineFastCmp = (Get-Item function:Get-SvnBlameLine).ScriptBlock.ToString()
         $script:origCompareBlameOutputFastCmp = (Get-Item function:Compare-BlameOutput).ScriptBlock.ToString()
+        $script:origGetCachedOrFetchCatTextFastCmp = (Get-Item function:Get-CachedOrFetchCatText).ScriptBlock.ToString()
     }
 
     AfterAll {
         Set-Item -Path function:Get-SvnBlameLine -Value $script:origGetSvnBlameLineFastCmp
         Set-Item -Path function:Compare-BlameOutput -Value $script:origCompareBlameOutputFastCmp
+        Set-Item -Path function:Get-CachedOrFetchCatText -Value $script:origGetCachedOrFetchCatTextFastCmp
+        $script:NarutoContext.Runtime.ExcludeCommentOnlyLines = $false
     }
 
     It 'uses add-only fast path without calling Compare-BlameOutput' {
@@ -2182,6 +2349,49 @@ Describe 'Get-StrictTransitionComparison fast path' {
         @($cmp.KilledLines).Count | Should -Be 0
         @($cmp.BornLines).Count | Should -Be 2
         @($cmp.MovedPairs).Count | Should -Be 0
+    }
+
+    It 'applies comment-only filtering in add-only fast path when option is enabled' {
+        Initialize-StrictModeContext
+        $script:NarutoContext.Runtime.ExcludeCommentOnlyLines = $true
+
+        Set-Item -Path function:Get-SvnBlameLine -Value {
+            param([string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir)
+            [pscustomobject]@{
+                LineCountTotal = 2
+                LineCountByRevision = @{ 10 = 2 }
+                LineCountByAuthor = @{ alice = 2 }
+                Lines = @(
+                    [pscustomobject]@{ LineNumber = 1; Content = '// comment only'; Revision = 10; Author = 'alice' },
+                    [pscustomobject]@{ LineNumber = 2; Content = 'code line'; Revision = 10; Author = 'alice' }
+                )
+            }
+        }
+        Set-Item -Path function:Get-CachedOrFetchCatText -Value {
+            param([hashtable]$Context, [string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir)
+            [void]$Context
+            [void]$Repo
+            [void]$FilePath
+            [void]$Revision
+            [void]$CacheDir
+            return "// comment only`ncode line`n"
+        }
+        Set-Item -Path function:Compare-BlameOutput -Value {
+            param([object[]]$PreviousLines, [object[]]$CurrentLines)
+            throw 'Compare-BlameOutput should not be called for add-only fast path'
+        }
+
+        $context = [pscustomobject]@{
+            BeforePath = 'src/a.cs'
+            AfterPath = 'src/a.cs'
+            MetricFile = 'src/a.cs'
+            HasTransitionStat = $true
+            TransitionAdded = 2
+            TransitionDeleted = 0
+        }
+        $cmp = Get-StrictTransitionComparison -Context $script:NarutoContext -TransitionContext $context -TargetUrl 'https://example.invalid/svn/repo' -Revision 10 -CacheDir 'dummy'
+        @($cmp.BornLines).Count | Should -Be 1
+        $cmp.BornLines[0].Line.Content | Should -Be 'code line'
     }
 }
 

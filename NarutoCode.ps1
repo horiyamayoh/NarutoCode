@@ -67,6 +67,9 @@
     svn diff 実行時に空白・改行コードの差異を無視する。
     指定すると --ignore-space-change および --ignore-eol-style が付与される。
     インデント変更のみのコミットをチャーンから除外したい場合に有用。
+.PARAMETER ExcludeCommentOnlyLines
+    指定時はコメント専用行（コメント以外のコードを含まない行）を集計対象から除外する。
+    拡張子ごとに組み込みのコメント記法プロファイルを適用し、全メトリクス（strict/hunk 含む）へ反映する。
 .PARAMETER NoProgress
     進捗バー（Write-Progress）の出力を抑止する。
     CI/CD のログやリダイレクト出力で余計な表示を避けたい場合に指定する。
@@ -90,6 +93,7 @@ param(
     [ValidateRange(1, 5000)][int]$TopNCount = 50,
     [ValidateSet('UTF8', 'UTF8BOM', 'Unicode', 'ASCII')][string]$Encoding = 'UTF8',
     [switch]$IgnoreWhitespace,
+    [switch]$ExcludeCommentOnlyLines,
     [switch]$NoProgress
 )
 
@@ -559,6 +563,7 @@ function New-NarutoContext
             StrictModeEnabled = $true
             SvnExecutable = $SvnExecutable
             SvnGlobalArguments = @($SvnGlobalArguments)
+            ExcludeCommentOnlyLines = $false
         }
         Diagnostics = @{
             WarningCount = 0
@@ -637,6 +642,39 @@ function New-NarutoContext
             HashTruncateLength = 8
             HeatmapLightTextThreshold = 0.6
 
+            # コメント記法プロファイル（組み込み固定）
+            # Extensions は小文字比較。LineCommentTokens/BlockCommentPairs は字句走査で使用する。
+            CommentSyntaxProfiles = @(
+                [pscustomobject]@{
+                    Name = 'CStyle'
+                    Extensions = @('c', 'cc', 'cpp', 'cxx', 'h', 'hh', 'hpp', 'hxx', 'cs', 'java', 'js', 'jsx', 'ts', 'tsx', 'go', 'php', 'swift', 'kt', 'kts', 'scala')
+                    LineCommentTokens = @('//')
+                    BlockCommentPairs = @(
+                        [pscustomobject]@{
+                            Start = '/*'
+                            End = '*/'
+                        }
+                    )
+                },
+                [pscustomobject]@{
+                    Name = 'PowerShellStyle'
+                    Extensions = @('ps1', 'psm1', 'psd1')
+                    LineCommentTokens = @('#')
+                    BlockCommentPairs = @(
+                        [pscustomobject]@{
+                            Start = '<#'
+                            End = '#>'
+                        }
+                    )
+                },
+                [pscustomobject]@{
+                    Name = 'IniStyle'
+                    Extensions = @('ini', 'cfg', 'conf', 'properties', 'toml', 'yaml', 'yml')
+                    LineCommentTokens = @('#', ';')
+                    BlockCommentPairs = @()
+                }
+            )
+
             # SVG 文字幅推定比率
             SvgCharWidthDefault = 0.56
             SvgCharWidthSpace = 0.33
@@ -683,6 +721,22 @@ function New-NarutoContext
                 'ConvertTo-NarutoResultAdapter',
                 'Throw-NarutoError'
             )
+            # コメント除外判定: 拡張子プロファイル判定と字句走査
+            RunspaceCommentFilterFunctions = @(
+                'Get-ContextRuntimeSwitchValue',
+                'Get-CommentSyntaxProfileByPath',
+                'ConvertTo-CommentOnlyLineMask',
+                'Get-NonCommentLineEntry',
+                'Get-CachedOrFetchCatText',
+                'Get-CatCachePath',
+                'Read-CatCacheFile',
+                'Write-CatCacheFile',
+                'ConvertTo-TextLine',
+                'Invoke-SvnCommandAllowMissingTarget',
+                'ConvertTo-NarutoResultAdapter',
+                'Test-NarutoResultSuccess',
+                'Throw-NarutoError'
+            )
         }
     }
 }
@@ -698,6 +752,7 @@ function Get-RunspaceNarutoContext
     param([hashtable]$Context = $script:NarutoContext)
     $runtimeState = Get-NarutoContextRuntimeState -Context $Context
     $runspaceContext = New-NarutoContext -SvnExecutable $runtimeState.SvnExecutable -SvnGlobalArguments $runtimeState.SvnGlobalArguments
+    $runspaceContext.Runtime.ExcludeCommentOnlyLines = [bool]$runtimeState.ExcludeCommentOnlyLines
     Copy-NarutoContextSection -SourceContext $Context -TargetContext $runspaceContext -SectionName 'Constants'
     Copy-NarutoContextSection -SourceContext $Context -TargetContext $runspaceContext -SectionName 'Metrics'
     # SHA1 インスタンスは runspace 間共有しない
@@ -715,6 +770,7 @@ function Get-NarutoContextRuntimeState
     param([hashtable]$Context = $script:NarutoContext)
     $runtimeSvnExecutable = 'svn'
     $runtimeSvnGlobalArguments = @()
+    $runtimeExcludeCommentOnlyLines = $false
     if ($null -ne $Context -and $null -ne $Context.Runtime)
     {
         if (-not [string]::IsNullOrWhiteSpace([string]$Context.Runtime.SvnExecutable))
@@ -725,10 +781,15 @@ function Get-NarutoContextRuntimeState
         {
             $runtimeSvnGlobalArguments = @($Context.Runtime.SvnGlobalArguments)
         }
+        if ($Context.Runtime.ContainsKey('ExcludeCommentOnlyLines'))
+        {
+            $runtimeExcludeCommentOnlyLines = [bool]$Context.Runtime.ExcludeCommentOnlyLines
+        }
     }
     return [pscustomobject]@{
         SvnExecutable = $runtimeSvnExecutable
         SvnGlobalArguments = @($runtimeSvnGlobalArguments)
+        ExcludeCommentOnlyLines = [bool]$runtimeExcludeCommentOnlyLines
     }
 }
 function Copy-NarutoContextSection
@@ -781,6 +842,34 @@ function Initialize-StrictModeContext
     param([hashtable]$Context = $script:NarutoContext)
     $runtimeState = Get-NarutoContextRuntimeState -Context $Context
     $script:NarutoContext = New-NarutoContext -SvnExecutable $runtimeState.SvnExecutable -SvnGlobalArguments $runtimeState.SvnGlobalArguments
+    $script:NarutoContext.Runtime.ExcludeCommentOnlyLines = [bool]$runtimeState.ExcludeCommentOnlyLines
+}
+function Get-ContextRuntimeSwitchValue
+{
+    <#
+    .SYNOPSIS
+        Context.Runtime 配下のスイッチ値を安全に取得する。
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [hashtable]$Context = $script:NarutoContext,
+        [string]$PropertyName,
+        [bool]$Default = $false
+    )
+    if ([string]::IsNullOrWhiteSpace($PropertyName))
+    {
+        return [bool]$Default
+    }
+    if ($null -eq $Context -or $null -eq $Context.Runtime)
+    {
+        return [bool]$Default
+    }
+    if (-not $Context.Runtime.ContainsKey($PropertyName))
+    {
+        return [bool]$Default
+    }
+    return [bool]$Context.Runtime[$PropertyName]
 }
 function ConvertTo-NormalizedExtension
 {
@@ -1694,9 +1783,11 @@ function Get-BlameMemoryCacheKey
         処理対象のリビジョン値を指定する。
     .PARAMETER FilePath
         処理対象のファイルパスを指定する。
+    .PARAMETER Variant
+        同一 revision/path で用途別キャッシュを分離する識別子を指定する。
     #>
-    param([int]$Revision, [string]$FilePath)
-    return ([string]$Revision + [char]31 + (ConvertTo-PathKey -Path $FilePath))
+    param([int]$Revision, [string]$FilePath, [string]$Variant = '')
+    return ([string]$Revision + [char]31 + (ConvertTo-PathKey -Path $FilePath) + [char]31 + [string]$Variant)
 }
 function Read-BlameCacheFile
 {
@@ -1821,6 +1912,332 @@ function ConvertTo-TextLine
         $lines = @($lines[0..($lines.Count - 2)])
     }
     return @($lines)
+}
+function Get-CommentSyntaxProfileByPath
+{
+    <#
+    .SYNOPSIS
+        ファイル拡張子に対応するコメント記法プロファイルを返す。
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [hashtable]$Context = $script:NarutoContext,
+        [string]$FilePath
+    )
+    $pathKey = ConvertTo-PathKey -Path $FilePath
+    if ([string]::IsNullOrWhiteSpace($pathKey))
+    {
+        return $null
+    }
+    $extension = [System.IO.Path]::GetExtension($pathKey)
+    if ([string]::IsNullOrWhiteSpace($extension))
+    {
+        return $null
+    }
+    $normalizedExtension = $extension.TrimStart('.').ToLowerInvariant()
+    if ([string]::IsNullOrWhiteSpace($normalizedExtension))
+    {
+        return $null
+    }
+    $profiles = @()
+    if ($null -ne $Context -and $null -ne $Context.Constants -and $Context.Constants.ContainsKey('CommentSyntaxProfiles'))
+    {
+        $profiles = @($Context.Constants.CommentSyntaxProfiles)
+    }
+    foreach ($commentSyntaxProfile in $profiles)
+    {
+        if ($null -eq $commentSyntaxProfile)
+        {
+            continue
+        }
+        $extensions = @()
+        if ($commentSyntaxProfile.PSObject.Properties.Match('Extensions').Count -gt 0 -and $null -ne $commentSyntaxProfile.Extensions)
+        {
+            $extensions = @($commentSyntaxProfile.Extensions | ForEach-Object { ([string]$_).Trim().ToLowerInvariant() })
+        }
+        if ($extensions -contains $normalizedExtension)
+        {
+            return $commentSyntaxProfile
+        }
+    }
+    return $null
+}
+function ConvertTo-CommentOnlyLineMask
+{
+    <#
+    .SYNOPSIS
+        行配列から「コメント専用行」判定マスクを生成する。
+    .DESCRIPTION
+        行コメントとブロックコメントの字句走査を行い、コメント専用行のみを true とする。
+        文字列リテラル中のコメントトークンは無効化する。ブロックコメントのネストは未対応。
+    #>
+    [CmdletBinding()]
+    [OutputType([bool[]])]
+    param(
+        [string[]]$Lines,
+        [object]$CommentSyntaxProfile
+    )
+    if ($null -eq $Lines -or @($Lines).Count -eq 0 -or $null -eq $CommentSyntaxProfile)
+    {
+        return (New-Object 'bool[]' 0)
+    }
+
+    $lineCommentTokens = @()
+    if ($CommentSyntaxProfile.PSObject.Properties.Match('LineCommentTokens').Count -gt 0 -and $null -ne $CommentSyntaxProfile.LineCommentTokens)
+    {
+        $lineCommentTokens = @(
+            $CommentSyntaxProfile.LineCommentTokens |
+                ForEach-Object { [string]$_ } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                Sort-Object Length -Descending
+        )
+    }
+
+    $blockCommentPairs = @()
+    if ($CommentSyntaxProfile.PSObject.Properties.Match('BlockCommentPairs').Count -gt 0 -and $null -ne $CommentSyntaxProfile.BlockCommentPairs)
+    {
+        $blockCommentPairs = @(
+            $CommentSyntaxProfile.BlockCommentPairs |
+                Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.Start) -and -not [string]::IsNullOrWhiteSpace([string]$_.End) } |
+                Sort-Object { ([string]$_.Start).Length } -Descending
+        )
+    }
+
+    $mask = New-Object 'bool[]' @($Lines).Count
+    $inBlockComment = $false
+    $activeBlockEndToken = ''
+    for ($lineIndex = 0
+        $lineIndex -lt @($Lines).Count
+        $lineIndex++)
+    {
+        $line = [string]$Lines[$lineIndex]
+        if ($null -eq $line)
+        {
+            $line = ''
+        }
+
+        $charIndex = 0
+        $lineHasCode = $false
+        $lineHasComment = $false
+        $inString = $false
+        $stringDelimiter = [char]0
+        $stringEscapePending = $false
+
+        while ($charIndex -lt $line.Length)
+        {
+            if ($inBlockComment)
+            {
+                $lineHasComment = $true
+                $endPos = $line.IndexOf($activeBlockEndToken, $charIndex, [System.StringComparison]::Ordinal)
+                if ($endPos -lt 0)
+                {
+                    $charIndex = $line.Length
+                    break
+                }
+                $charIndex = $endPos + $activeBlockEndToken.Length
+                $inBlockComment = $false
+                $activeBlockEndToken = ''
+                continue
+            }
+
+            if ($inString)
+            {
+                $ch = $line[$charIndex]
+                if ($stringEscapePending)
+                {
+                    $stringEscapePending = $false
+                    $charIndex++
+                    continue
+                }
+                if ($ch -eq '\' -or $ch -eq '`')
+                {
+                    $stringEscapePending = $true
+                    $charIndex++
+                    continue
+                }
+                if ($ch -eq $stringDelimiter)
+                {
+                    if (($charIndex + 1) -lt $line.Length -and $line[$charIndex + 1] -eq $stringDelimiter)
+                    {
+                        $charIndex += 2
+                        continue
+                    }
+                    $inString = $false
+                    $charIndex++
+                    continue
+                }
+                $charIndex++
+                continue
+            }
+
+            if ([char]::IsWhiteSpace($line[$charIndex]))
+            {
+                $charIndex++
+                continue
+            }
+
+            $matchedLineComment = $false
+            foreach ($token in $lineCommentTokens)
+            {
+                if (($charIndex + $token.Length) -le $line.Length -and [string]::Compare($line, $charIndex, $token, 0, $token.Length, [System.StringComparison]::Ordinal) -eq 0)
+                {
+                    $lineHasComment = $true
+                    $charIndex = $line.Length
+                    $matchedLineComment = $true
+                    break
+                }
+            }
+            if ($matchedLineComment)
+            {
+                break
+            }
+
+            $matchedBlockComment = $false
+            foreach ($pair in $blockCommentPairs)
+            {
+                $startToken = [string]$pair.Start
+                if (($charIndex + $startToken.Length) -le $line.Length -and [string]::Compare($line, $charIndex, $startToken, 0, $startToken.Length, [System.StringComparison]::Ordinal) -eq 0)
+                {
+                    $lineHasComment = $true
+                    $inBlockComment = $true
+                    $activeBlockEndToken = [string]$pair.End
+                    $charIndex += $startToken.Length
+                    $matchedBlockComment = $true
+                    break
+                }
+            }
+            if ($matchedBlockComment)
+            {
+                continue
+            }
+
+            $currentChar = $line[$charIndex]
+            if ($currentChar -eq '"' -or $currentChar -eq [char]39)
+            {
+                $lineHasCode = $true
+                $inString = $true
+                $stringDelimiter = $currentChar
+                $stringEscapePending = $false
+                $charIndex++
+                continue
+            }
+
+            $lineHasCode = $true
+            $charIndex++
+        }
+
+        # 言語横断で改行跨ぎ文字列を完全判定するのは困難なため、行末で文字列状態は破棄する。
+        $inString = $false
+        $stringDelimiter = [char]0
+        $stringEscapePending = $false
+
+        $mask[$lineIndex] = (-not $lineHasCode -and $lineHasComment)
+    }
+
+    return $mask
+}
+function Get-NonCommentLineEntry
+{
+    <#
+    .SYNOPSIS
+        blame 行配列からコメント専用行を除外した配列を返す。
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [object[]]$Lines,
+        [bool[]]$CommentOnlyLineMask
+    )
+    if ($null -eq $Lines)
+    {
+        return @()
+    }
+    if ($null -eq $CommentOnlyLineMask -or $CommentOnlyLineMask.Length -eq 0)
+    {
+        return @($Lines)
+    }
+    $filtered = New-Object 'System.Collections.Generic.List[object]'
+    for ($index = 0
+        $index -lt @($Lines).Count
+        $index++)
+    {
+        $lineEntry = $Lines[$index]
+        $lineNumber = $index + 1
+        if ($null -ne $lineEntry -and $lineEntry.PSObject.Properties.Match('LineNumber').Count -gt 0)
+        {
+            try
+            {
+                $lineNumber = [int]$lineEntry.LineNumber
+            }
+            catch
+            {
+                $lineNumber = $index + 1
+            }
+        }
+        $isCommentOnly = $false
+        if ($lineNumber -gt 0 -and ($lineNumber - 1) -lt $CommentOnlyLineMask.Length)
+        {
+            $isCommentOnly = [bool]$CommentOnlyLineMask[$lineNumber - 1]
+        }
+        elseif ($index -lt $CommentOnlyLineMask.Length)
+        {
+            $isCommentOnly = [bool]$CommentOnlyLineMask[$index]
+        }
+        if (-not $isCommentOnly)
+        {
+            [void]$filtered.Add($lineEntry)
+        }
+    }
+    return @($filtered.ToArray())
+}
+function Get-CachedOrFetchCatText
+{
+    <#
+    .SYNOPSIS
+        cat キャッシュを優先して必要時のみ svn cat を取得する。
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [hashtable]$Context = $script:NarutoContext,
+        [string]$Repo,
+        [string]$FilePath,
+        [int]$Revision,
+        [string]$CacheDir
+    )
+    if ($Revision -le 0 -or [string]::IsNullOrWhiteSpace($Repo) -or [string]::IsNullOrWhiteSpace($FilePath))
+    {
+        return $null
+    }
+    $catText = Read-CatCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
+    if ($null -ne $catText)
+    {
+        return $catText
+    }
+
+    $path = (ConvertTo-PathKey -Path $FilePath).TrimStart('/')
+    $url = $Repo.TrimEnd('/') + '/' + $path + '@' + [string]$Revision
+    $catFetchResult = Invoke-SvnCommandAllowMissingTarget -Context $Context -Arguments @('cat', '-r', [string]$Revision, $url) -ErrorContext ("svn cat {0}@{1}" -f $FilePath, $Revision)
+    $catFetchResult = ConvertTo-NarutoResultAdapter -InputObject $catFetchResult -SuccessCode 'SVN_COMMAND_SUCCEEDED' -SkippedCode 'SVN_TARGET_MISSING'
+    if (-not (Test-NarutoResultSuccess -Result $catFetchResult))
+    {
+        if ([string]$catFetchResult.Status -eq 'Skipped')
+        {
+            return $null
+        }
+        Throw-NarutoError -Category 'SVN' -ErrorCode ([string]$catFetchResult.ErrorCode) -Message ("svn cat failed for '{0}' at r{1}: {2}" -f $FilePath, $Revision, [string]$catFetchResult.Message) -Context @{
+            FilePath = $FilePath
+            Revision = [int]$Revision
+        }
+    }
+
+    $catText = [string]$catFetchResult.Data
+    if ($null -ne $catText)
+    {
+        Write-CatCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath -Content $catText
+    }
+    return $catText
 }
 function Resolve-PathByRenameMap
 {
@@ -2524,16 +2941,35 @@ function New-SvnUnifiedDiffParseState
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     [OutputType([hashtable])]
-    param([int]$DetailLevel = 0)
+    param(
+        [int]$DetailLevel = 0,
+        [switch]$ExcludeCommentOnlyLines,
+        [hashtable]$LineMaskByPath = @{}
+    )
     return @{
         Result = @{}
         DetailLevel = $DetailLevel
+        ExcludeCommentOnlyLines = [bool]$ExcludeCommentOnlyLines
+        LineMaskByPath = if ($null -eq $LineMaskByPath)
+        {
+            @{}
+        }
+        else
+        {
+            $LineMaskByPath
+        }
         Current = $null
         CurrentFile = $null
+        CurrentOldLineMask = $null
+        CurrentNewLineMask = $null
+        CurrentOldCursor = 0
+        CurrentNewCursor = 0
         CurrentHunk = $null
         HunkContextLines = $null
         HunkAddedHashes = $null
         HunkDeletedHashes = $null
+        HunkEffectiveSegments = $null
+        CurrentHunkActiveSegment = $null
     }
 }
 function New-SvnUnifiedDiffFileStat
@@ -2564,7 +3000,36 @@ function Complete-SvnUnifiedDiffCurrentHunk
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     param([hashtable]$ParseState)
-    if ($ParseState.DetailLevel -lt 1 -or $null -eq $ParseState.CurrentHunk -or $null -eq $ParseState.CurrentFile)
+    if ($null -eq $ParseState.CurrentHunk -or $null -eq $ParseState.CurrentFile)
+    {
+        return
+    }
+
+    if ([bool]$ParseState.ExcludeCommentOnlyLines)
+    {
+        if ($null -ne $ParseState.CurrentHunkActiveSegment)
+        {
+            $active = $ParseState.CurrentHunkActiveSegment
+            if ([int]$active.OldCount -gt 0 -or [int]$active.NewCount -gt 0)
+            {
+                [void]$ParseState.HunkEffectiveSegments.Add([pscustomobject]@{
+                        OldStart = [int]$active.OldStart
+                        OldCount = [int]$active.OldCount
+                        NewStart = [int]$active.NewStart
+                        NewCount = [int]$active.NewCount
+                    })
+            }
+            $ParseState.CurrentHunkActiveSegment = $null
+        }
+        $effectiveSegments = @()
+        if ($null -ne $ParseState.HunkEffectiveSegments)
+        {
+            $effectiveSegments = @($ParseState.HunkEffectiveSegments.ToArray())
+        }
+        $ParseState.CurrentHunk.EffectiveSegments = $effectiveSegments
+    }
+
+    if ($ParseState.DetailLevel -lt 1)
     {
         return
     }
@@ -2597,9 +3062,13 @@ function Reset-SvnUnifiedDiffCurrentHunkState
     [CmdletBinding()]
     param([hashtable]$ParseState)
     $ParseState.CurrentHunk = $null
+    $ParseState.CurrentOldCursor = 0
+    $ParseState.CurrentNewCursor = 0
     $ParseState.HunkContextLines = $null
     $ParseState.HunkAddedHashes = $null
     $ParseState.HunkDeletedHashes = $null
+    $ParseState.HunkEffectiveSegments = $null
+    $ParseState.CurrentHunkActiveSegment = $null
 }
 function Start-SvnUnifiedDiffFileSection
 {
@@ -2620,11 +3089,30 @@ function Start-SvnUnifiedDiffFileSection
         }
         $ParseState.Current = $ParseState.Result[$file]
         $ParseState.CurrentFile = $file
+        $ParseState.CurrentOldLineMask = $null
+        $ParseState.CurrentNewLineMask = $null
+        if ([bool]$ParseState.ExcludeCommentOnlyLines -and $null -ne $ParseState.LineMaskByPath -and $ParseState.LineMaskByPath.ContainsKey($file))
+        {
+            $maskEntry = $ParseState.LineMaskByPath[$file]
+            if ($null -ne $maskEntry)
+            {
+                if ($maskEntry.PSObject.Properties.Match('OldMask').Count -gt 0)
+                {
+                    $ParseState.CurrentOldLineMask = $maskEntry.OldMask
+                }
+                if ($maskEntry.PSObject.Properties.Match('NewMask').Count -gt 0)
+                {
+                    $ParseState.CurrentNewLineMask = $maskEntry.NewMask
+                }
+            }
+        }
     }
     else
     {
         $ParseState.Current = $null
         $ParseState.CurrentFile = $null
+        $ParseState.CurrentOldLineMask = $null
+        $ParseState.CurrentNewLineMask = $null
     }
     Reset-SvnUnifiedDiffCurrentHunkState -ParseState $ParseState
 }
@@ -2652,9 +3140,21 @@ function Start-SvnUnifiedDiffHunkSection
         ContextHash = $null
         AddedLineHashes = @()
         DeletedLineHashes = @()
+        EffectiveSegments = $null
     }
     [void]$ParseState.Current.Hunks.Add($hunkObj)
     $ParseState.CurrentHunk = $hunkObj
+    $ParseState.CurrentOldCursor = [int]$OldStart
+    $ParseState.CurrentNewCursor = [int]$NewStart
+    $ParseState.CurrentHunkActiveSegment = $null
+    if ([bool]$ParseState.ExcludeCommentOnlyLines)
+    {
+        $ParseState.HunkEffectiveSegments = New-Object 'System.Collections.Generic.List[object]'
+    }
+    else
+    {
+        $ParseState.HunkEffectiveSegments = $null
+    }
     if ($ParseState.DetailLevel -ge 1)
     {
         $ParseState.HunkContextLines = New-Object 'System.Collections.Generic.List[string]'
@@ -2704,17 +3204,43 @@ function Update-SvnUnifiedDiffLineStat
         {
             return
         }
-        $ParseState.Current.AddedLines++
-        if ($ParseState.DetailLevel -ge 1 -and $null -ne $ParseState.CurrentFile)
+        $isCommentOnly = $false
+        if ([bool]$ParseState.ExcludeCommentOnlyLines -and $null -ne $ParseState.CurrentNewLineMask)
         {
-            $content = $Line.Substring(1)
-            $hashValue = ConvertTo-LineHash -FilePath $ParseState.CurrentFile -Content $content
-            $ParseState.Current.AddedLineHashes.Add($hashValue)
-            if ($null -ne $ParseState.HunkAddedHashes)
+            $newLineIndex = [int]$ParseState.CurrentNewCursor - 1
+            if ($newLineIndex -ge 0 -and $newLineIndex -lt $ParseState.CurrentNewLineMask.Length)
             {
-                $ParseState.HunkAddedHashes.Add($hashValue)
+                $isCommentOnly = [bool]$ParseState.CurrentNewLineMask[$newLineIndex]
             }
         }
+        if (-not $isCommentOnly)
+        {
+            $ParseState.Current.AddedLines++
+            if ($ParseState.DetailLevel -ge 1 -and $null -ne $ParseState.CurrentFile)
+            {
+                $content = $Line.Substring(1)
+                $hashValue = ConvertTo-LineHash -FilePath $ParseState.CurrentFile -Content $content
+                $ParseState.Current.AddedLineHashes.Add($hashValue)
+                if ($null -ne $ParseState.HunkAddedHashes)
+                {
+                    $ParseState.HunkAddedHashes.Add($hashValue)
+                }
+            }
+            if ([bool]$ParseState.ExcludeCommentOnlyLines)
+            {
+                if ($null -eq $ParseState.CurrentHunkActiveSegment)
+                {
+                    $ParseState.CurrentHunkActiveSegment = [pscustomobject]@{
+                        OldStart = [int]$ParseState.CurrentOldCursor
+                        OldCount = 0
+                        NewStart = [int]$ParseState.CurrentNewCursor
+                        NewCount = 0
+                    }
+                }
+                $ParseState.CurrentHunkActiveSegment.NewCount = [int]$ParseState.CurrentHunkActiveSegment.NewCount + 1
+            }
+        }
+        $ParseState.CurrentNewCursor++
         return
     }
     if ($ch -eq '-')
@@ -2723,22 +3249,84 @@ function Update-SvnUnifiedDiffLineStat
         {
             return
         }
-        $ParseState.Current.DeletedLines++
-        if ($ParseState.DetailLevel -ge 1 -and $null -ne $ParseState.CurrentFile)
+        $isCommentOnly = $false
+        if ([bool]$ParseState.ExcludeCommentOnlyLines -and $null -ne $ParseState.CurrentOldLineMask)
         {
-            $content = $Line.Substring(1)
-            $hashValue = ConvertTo-LineHash -FilePath $ParseState.CurrentFile -Content $content
-            $ParseState.Current.DeletedLineHashes.Add($hashValue)
-            if ($null -ne $ParseState.HunkDeletedHashes)
+            $oldLineIndex = [int]$ParseState.CurrentOldCursor - 1
+            if ($oldLineIndex -ge 0 -and $oldLineIndex -lt $ParseState.CurrentOldLineMask.Length)
             {
-                $ParseState.HunkDeletedHashes.Add($hashValue)
+                $isCommentOnly = [bool]$ParseState.CurrentOldLineMask[$oldLineIndex]
             }
         }
+        if (-not $isCommentOnly)
+        {
+            $ParseState.Current.DeletedLines++
+            if ($ParseState.DetailLevel -ge 1 -and $null -ne $ParseState.CurrentFile)
+            {
+                $content = $Line.Substring(1)
+                $hashValue = ConvertTo-LineHash -FilePath $ParseState.CurrentFile -Content $content
+                $ParseState.Current.DeletedLineHashes.Add($hashValue)
+                if ($null -ne $ParseState.HunkDeletedHashes)
+                {
+                    $ParseState.HunkDeletedHashes.Add($hashValue)
+                }
+            }
+            if ([bool]$ParseState.ExcludeCommentOnlyLines)
+            {
+                if ($null -eq $ParseState.CurrentHunkActiveSegment)
+                {
+                    $ParseState.CurrentHunkActiveSegment = [pscustomobject]@{
+                        OldStart = [int]$ParseState.CurrentOldCursor
+                        OldCount = 0
+                        NewStart = [int]$ParseState.CurrentNewCursor
+                        NewCount = 0
+                    }
+                }
+                $ParseState.CurrentHunkActiveSegment.OldCount = [int]$ParseState.CurrentHunkActiveSegment.OldCount + 1
+            }
+        }
+        $ParseState.CurrentOldCursor++
         return
     }
     if ($ch -eq ' ' -and $ParseState.DetailLevel -ge 1 -and $null -ne $ParseState.HunkContextLines)
     {
+        if ([bool]$ParseState.ExcludeCommentOnlyLines -and $null -ne $ParseState.CurrentHunkActiveSegment)
+        {
+            $activeSegment = $ParseState.CurrentHunkActiveSegment
+            if ([int]$activeSegment.OldCount -gt 0 -or [int]$activeSegment.NewCount -gt 0)
+            {
+                [void]$ParseState.HunkEffectiveSegments.Add([pscustomobject]@{
+                        OldStart = [int]$activeSegment.OldStart
+                        OldCount = [int]$activeSegment.OldCount
+                        NewStart = [int]$activeSegment.NewStart
+                        NewCount = [int]$activeSegment.NewCount
+                    })
+            }
+            $ParseState.CurrentHunkActiveSegment = $null
+        }
         $ParseState.HunkContextLines.Add($Line.Substring(1))
+        $ParseState.CurrentOldCursor++
+        $ParseState.CurrentNewCursor++
+        return
+    }
+    if ($ch -eq ' ')
+    {
+        if ([bool]$ParseState.ExcludeCommentOnlyLines -and $null -ne $ParseState.CurrentHunkActiveSegment)
+        {
+            $activeSegment = $ParseState.CurrentHunkActiveSegment
+            if ([int]$activeSegment.OldCount -gt 0 -or [int]$activeSegment.NewCount -gt 0)
+            {
+                [void]$ParseState.HunkEffectiveSegments.Add([pscustomobject]@{
+                        OldStart = [int]$activeSegment.OldStart
+                        OldCount = [int]$activeSegment.OldCount
+                        NewStart = [int]$activeSegment.NewStart
+                        NewCount = [int]$activeSegment.NewCount
+                    })
+            }
+            $ParseState.CurrentHunkActiveSegment = $null
+        }
+        $ParseState.CurrentOldCursor++
+        $ParseState.CurrentNewCursor++
         return
     }
     if ($ch -eq '\' -and $Line -eq '\ No newline at end of file')
@@ -2758,12 +3346,17 @@ function ConvertFrom-SvnUnifiedDiff
     #>
     [CmdletBinding()]
     [OutputType([hashtable])]
-    param([string]$DiffText, [int]$DetailLevel = 0)
+    param(
+        [string]$DiffText,
+        [int]$DetailLevel = 0,
+        [switch]$ExcludeCommentOnlyLines,
+        [hashtable]$LineMaskByPath = @{}
+    )
     if ([string]::IsNullOrWhiteSpace($DiffText))
     {
         return @{}
     }
-    $parseState = New-SvnUnifiedDiffParseState -DetailLevel $DetailLevel
+    $parseState = New-SvnUnifiedDiffParseState -DetailLevel $DetailLevel -ExcludeCommentOnlyLines:$ExcludeCommentOnlyLines -LineMaskByPath $LineMaskByPath
     $lines = $DiffText -split "`r?`n"
     foreach ($line in $lines)
     {
@@ -3000,7 +3593,16 @@ function Get-SvnBlameSummary
     {
         $Context.Caches.SvnBlameSummaryMemoryCache = @{}
     }
-    $cacheKey = Get-BlameMemoryCacheKey -Revision $ToRevision -FilePath $FilePath
+    $excludeCommentOnlyLines = Get-ContextRuntimeSwitchValue -Context $Context -PropertyName 'ExcludeCommentOnlyLines'
+    $summaryCacheVariant = if ($excludeCommentOnlyLines)
+    {
+        'summary.excludecomment.1'
+    }
+    else
+    {
+        'summary.excludecomment.0'
+    }
+    $cacheKey = Get-BlameMemoryCacheKey -Revision $ToRevision -FilePath $FilePath -Variant $summaryCacheVariant
     if ($Context.Caches.SvnBlameSummaryMemoryCache.ContainsKey($cacheKey))
     {
         $Context.Caches.StrictBlameCacheHits++
@@ -3048,7 +3650,71 @@ function Get-SvnBlameSummary
                 Revision = [int]$ToRevision
             })
     }
-    $parsed = ConvertFrom-SvnBlameXml -XmlText $text
+    $commentProfile = $null
+    $contentLines = $null
+    if ($excludeCommentOnlyLines)
+    {
+        $commentProfile = Get-CommentSyntaxProfileByPath -Context $Context -FilePath $FilePath
+        if ($null -ne $commentProfile)
+        {
+            $catText = Get-CachedOrFetchCatText -Context $Context -Repo $Repo -FilePath $FilePath -Revision $ToRevision -CacheDir $CacheDir
+            if ($null -ne $catText)
+            {
+                $contentLines = ConvertTo-TextLine -Text $catText
+            }
+        }
+    }
+    if ($null -ne $contentLines)
+    {
+        $parsed = ConvertFrom-SvnBlameXml -XmlText $text -ContentLines $contentLines
+    }
+    else
+    {
+        $parsed = ConvertFrom-SvnBlameXml -XmlText $text
+    }
+    if ($excludeCommentOnlyLines -and $null -ne $commentProfile -and $null -ne $contentLines)
+    {
+        $commentMask = ConvertTo-CommentOnlyLineMask -Lines $contentLines -CommentSyntaxProfile $commentProfile
+        $filteredLines = @(Get-NonCommentLineEntry -Lines @($parsed.Lines) -CommentOnlyLineMask $commentMask)
+        $lineCountByRevision = @{}
+        $lineCountByAuthor = @{}
+        foreach ($lineEntry in @($filteredLines))
+        {
+            $lineRevision = $null
+            try
+            {
+                $lineRevision = [int]$lineEntry.Revision
+            }
+            catch
+            {
+                $lineRevision = $null
+            }
+            if ($null -ne $lineRevision)
+            {
+                if (-not $lineCountByRevision.ContainsKey($lineRevision))
+                {
+                    $lineCountByRevision[$lineRevision] = 0
+                }
+                $lineCountByRevision[$lineRevision]++
+            }
+            $lineAuthor = [string]$lineEntry.Author
+            if ([string]::IsNullOrWhiteSpace($lineAuthor))
+            {
+                $lineAuthor = '(unknown)'
+            }
+            if (-not $lineCountByAuthor.ContainsKey($lineAuthor))
+            {
+                $lineCountByAuthor[$lineAuthor] = 0
+            }
+            $lineCountByAuthor[$lineAuthor]++
+        }
+        $parsed = [pscustomobject]@{
+            LineCountTotal = @($filteredLines).Count
+            LineCountByRevision = $lineCountByRevision
+            LineCountByAuthor = $lineCountByAuthor
+            Lines = @($filteredLines)
+        }
+    }
     $Context.Caches.SvnBlameSummaryMemoryCache[$cacheKey] = $parsed
     return (New-NarutoResultSuccess -Data $parsed -ErrorCode 'SVN_BLAME_SUMMARY_READY')
 }
@@ -3996,43 +4662,61 @@ function Get-StrictCanonicalHunkEvents
     # 行番号ずれを吸収するため、先に正準範囲へ写像して記録する。
     foreach ($hunk in @($Hunks | Sort-Object OldStart, NewStart))
     {
-        $oldStart = [int]$hunk.OldStart
-        $oldCount = [int]$hunk.OldCount
-        $newCount = [int]$hunk.NewCount
-        if ($oldStart -lt 1)
+        $segments = @()
+        $useEffectiveSegments = ($hunk.PSObject.Properties.Match('EffectiveSegments').Count -gt 0 -and $null -ne $hunk.EffectiveSegments)
+        if ($useEffectiveSegments)
         {
-            continue
+            $segments = @($hunk.EffectiveSegments)
         }
-        $start = Get-CanonicalLineNumber -OffsetEvents $OffsetEvents -LineNumber $oldStart
-        $end = $start
-        if ($oldCount -gt 0)
+        else
         {
-            $end = Get-CanonicalLineNumber -OffsetEvents $OffsetEvents -LineNumber ($oldStart + $oldCount - 1)
-        }
-        if ($end -lt $start)
-        {
-            $tmp = $start
-            $start = $end
-            $end = $tmp
-        }
-        [void]$events.Add([pscustomobject]@{
-                Revision = $Revision
-                Author = $Author
-                Start = $start
-                End = $end
-            })
-        $shift = $newCount - $oldCount
-        if ($shift -ne 0)
-        {
-            $threshold = $oldStart + $oldCount
-            if ($oldCount -eq 0)
-            {
-                $threshold = $oldStart
-            }
-            [void]$pending.Add([pscustomobject]@{
-                    Threshold = $threshold
-                    Delta = $shift
+            $segments = @([pscustomobject]@{
+                    OldStart = [int]$hunk.OldStart
+                    OldCount = [int]$hunk.OldCount
+                    NewStart = [int]$hunk.NewStart
+                    NewCount = [int]$hunk.NewCount
                 })
+        }
+        foreach ($segment in @($segments | Sort-Object OldStart, NewStart))
+        {
+            $oldStart = [int]$segment.OldStart
+            $oldCount = [int]$segment.OldCount
+            $newCount = [int]$segment.NewCount
+            if ($oldStart -lt 1)
+            {
+                continue
+            }
+            $start = Get-CanonicalLineNumber -OffsetEvents $OffsetEvents -LineNumber $oldStart
+            $end = $start
+            if ($oldCount -gt 0)
+            {
+                $end = Get-CanonicalLineNumber -OffsetEvents $OffsetEvents -LineNumber ($oldStart + $oldCount - 1)
+            }
+            if ($end -lt $start)
+            {
+                $tmp = $start
+                $start = $end
+                $end = $tmp
+            }
+            [void]$events.Add([pscustomobject]@{
+                    Revision = $Revision
+                    Author = $Author
+                    Start = $start
+                    End = $end
+                })
+            $shift = $newCount - $oldCount
+            if ($shift -ne 0)
+            {
+                $threshold = $oldStart + $oldCount
+                if ($oldCount -eq 0)
+                {
+                    $threshold = $oldStart
+                }
+                [void]$pending.Add([pscustomobject]@{
+                        Threshold = $threshold
+                        Delta = $shift
+                    })
+            }
         }
     }
     foreach ($shiftEvent in @($pending.ToArray() | Sort-Object Threshold))
@@ -4595,6 +5279,44 @@ function Resolve-StrictTransitionContext
         TransitionDeleted = $transitionDeleted
     }
 }
+function Get-StrictTransitionLineFilterResult
+{
+    <#
+    .SYNOPSIS
+        Strict 遷移比較用の行配列からコメント専用行を除外する。
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [hashtable]$Context = $script:NarutoContext,
+        [object[]]$Lines,
+        [string]$TargetUrl,
+        [string]$FilePath,
+        [int]$Revision,
+        [string]$CacheDir
+    )
+    if (@($Lines).Count -eq 0)
+    {
+        return @()
+    }
+    if (-not (Get-ContextRuntimeSwitchValue -Context $Context -PropertyName 'ExcludeCommentOnlyLines'))
+    {
+        return @($Lines)
+    }
+    $commentProfile = Get-CommentSyntaxProfileByPath -Context $Context -FilePath $FilePath
+    if ($null -eq $commentProfile)
+    {
+        return @($Lines)
+    }
+    $catText = Get-CachedOrFetchCatText -Context $Context -Repo $TargetUrl -FilePath $FilePath -Revision $Revision -CacheDir $CacheDir
+    if ($null -eq $catText)
+    {
+        return @($Lines)
+    }
+    $contentLines = ConvertTo-TextLine -Text $catText
+    $commentMask = ConvertTo-CommentOnlyLineMask -Lines $contentLines -CommentSyntaxProfile $commentProfile
+    return @(Get-NonCommentLineEntry -Lines @($Lines) -CommentOnlyLineMask $commentMask)
+}
 function Get-StrictTransitionComparison
 {
     <#
@@ -4604,6 +5326,7 @@ function Get-StrictTransitionComparison
     [CmdletBinding()]
     [OutputType([object])]
     param(
+        [hashtable]$Context = $script:NarutoContext,
         [object]$TransitionContext,
         [string]$TargetUrl,
         [int]$Revision,
@@ -4635,7 +5358,7 @@ function Get-StrictTransitionComparison
             }
         }
         $currBlame = $currBlameResult.Data
-        $currLines = @($currBlame.Lines)
+        $currLines = @(Get-StrictTransitionLineFilterResult -Context $Context -Lines @($currBlame.Lines) -TargetUrl $TargetUrl -FilePath $afterPath -Revision $Revision -CacheDir $CacheDir)
         $bornOnly = New-Object 'System.Collections.Generic.List[object]'
         for ($currIdx = 0
             $currIdx -lt $currLines.Count
@@ -4682,7 +5405,7 @@ function Get-StrictTransitionComparison
             }
         }
         $prevBlame = $prevBlameResult.Data
-        $prevLines = @($prevBlame.Lines)
+        $prevLines = @(Get-StrictTransitionLineFilterResult -Context $Context -Lines @($prevBlame.Lines) -TargetUrl $TargetUrl -FilePath $beforePath -Revision ($Revision - 1) -CacheDir $CacheDir)
         $killedOnly = New-Object 'System.Collections.Generic.List[object]'
         for ($prevIdx = 0
             $prevIdx -lt $prevLines.Count
@@ -4715,7 +5438,7 @@ function Get-StrictTransitionComparison
             }
         }
         $prevBlame = $prevBlameResult.Data
-        $prevLines = @($prevBlame.Lines)
+        $prevLines = @(Get-StrictTransitionLineFilterResult -Context $Context -Lines @($prevBlame.Lines) -TargetUrl $TargetUrl -FilePath $beforePath -Revision ($Revision - 1) -CacheDir $CacheDir)
     }
     $currLines = @()
     if ($afterPath)
@@ -4730,7 +5453,7 @@ function Get-StrictTransitionComparison
             }
         }
         $currBlame = $currBlameResult.Data
-        $currLines = @($currBlame.Lines)
+        $currLines = @(Get-StrictTransitionLineFilterResult -Context $Context -Lines @($currBlame.Lines) -TargetUrl $TargetUrl -FilePath $afterPath -Revision $Revision -CacheDir $CacheDir)
     }
     return (Compare-BlameOutput -PreviousLines $prevLines -CurrentLines $currLines)
 }
@@ -4925,7 +5648,7 @@ function Invoke-StrictCommitAttribution
             {
                 continue
             }
-            $comparison = Get-StrictTransitionComparison -TransitionContext $transitionContext -TargetUrl $TargetUrl -Revision $revision -CacheDir $CacheDir
+            $comparison = Get-StrictTransitionComparison -Context $Context -TransitionContext $transitionContext -TargetUrl $TargetUrl -Revision $revision -CacheDir $CacheDir
             if ($null -eq $comparison)
             {
                 continue
@@ -9434,6 +10157,8 @@ function Get-SvnDiffArgumentList
         差分取得オプションから svn diff 引数配列を構築する。
     .PARAMETER IgnoreWhitespace
         指定時は空白・改行コード差分を無視する。
+    .PARAMETER ExcludeCommentOnlyLines
+        指定時はコメント専用行を全メトリクス集計から除外する。
     #>
     [CmdletBinding()]
     [OutputType([string[]])]
@@ -9761,6 +10486,7 @@ function Get-RenamePairRealDiffStat
     param(
         [hashtable]$Context = $script:NarutoContext,
         [string]$TargetUrl,
+        [string]$CacheDir = '',
         [string[]]$DiffArguments,
         [string]$OldPath,
         [string]$NewPath,
@@ -9775,7 +10501,41 @@ function Get-RenamePairRealDiffStat
     [void]$compareArguments.Add(($TargetUrl.TrimEnd('/') + '/' + $OldPath + '@' + [string]$CopyRevision))
     [void]$compareArguments.Add(($TargetUrl.TrimEnd('/') + '/' + $NewPath + '@' + [string]$Revision))
     $realDiff = Invoke-SvnCommand -Context $Context -Arguments $compareArguments.ToArray() -ErrorContext ("svn diff rename pair r{0} {1}->{2}" -f $Revision, $OldPath, $NewPath)
-    $realParsed = ConvertFrom-SvnUnifiedDiff -DiffText $realDiff -DetailLevel 2
+    $excludeCommentOnlyLines = Get-ContextRuntimeSwitchValue -Context $Context -PropertyName 'ExcludeCommentOnlyLines'
+    $lineMaskByPath = @{}
+    if ($excludeCommentOnlyLines)
+    {
+        $oldMask = $null
+        $newMask = $null
+        $oldProfile = Get-CommentSyntaxProfileByPath -Context $Context -FilePath $OldPath
+        if ($null -ne $oldProfile)
+        {
+            $oldCat = Get-CachedOrFetchCatText -Context $Context -Repo $TargetUrl -FilePath $OldPath -Revision $CopyRevision -CacheDir $CacheDir
+            if ($null -ne $oldCat)
+            {
+                $oldMask = ConvertTo-CommentOnlyLineMask -Lines (ConvertTo-TextLine -Text $oldCat) -CommentSyntaxProfile $oldProfile
+            }
+        }
+        $newProfile = Get-CommentSyntaxProfileByPath -Context $Context -FilePath $NewPath
+        if ($null -ne $newProfile)
+        {
+            $newCat = Get-CachedOrFetchCatText -Context $Context -Repo $TargetUrl -FilePath $NewPath -Revision $Revision -CacheDir $CacheDir
+            if ($null -ne $newCat)
+            {
+                $newMask = ConvertTo-CommentOnlyLineMask -Lines (ConvertTo-TextLine -Text $newCat) -CommentSyntaxProfile $newProfile
+            }
+        }
+        if ($null -ne $oldMask -or $null -ne $newMask)
+        {
+            $maskEntry = [pscustomobject]@{
+                OldMask = $oldMask
+                NewMask = $newMask
+            }
+            $lineMaskByPath[$OldPath] = $maskEntry
+            $lineMaskByPath[$NewPath] = $maskEntry
+        }
+    }
+    $realParsed = ConvertFrom-SvnUnifiedDiff -DiffText $realDiff -DetailLevel 2 -ExcludeCommentOnlyLines:$excludeCommentOnlyLines -LineMaskByPath $lineMaskByPath
 
     $realStat = $null
     if ($realParsed.ContainsKey($NewPath))
@@ -9843,11 +10603,11 @@ function Update-RenamePairDiffStat
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
-    param([hashtable]$Context = $script:NarutoContext, [object]$Commit, [int]$Revision, [string]$TargetUrl, [string[]]$DiffArguments)
+    param([hashtable]$Context = $script:NarutoContext, [object]$Commit, [int]$Revision, [string]$TargetUrl, [string]$CacheDir = '', [string[]]$DiffArguments)
     $candidates = @(Get-RenameCorrectionCandidates -Commit $Commit -Revision $Revision)
     foreach ($candidate in $candidates)
     {
-        $realStat = Get-RenamePairRealDiffStat -Context $Context -TargetUrl $TargetUrl -DiffArguments $DiffArguments -OldPath ([string]$candidate.OldPath) -NewPath ([string]$candidate.NewPath) -CopyRevision ([int]$candidate.CopyRevision) -Revision $Revision
+        $realStat = Get-RenamePairRealDiffStat -Context $Context -TargetUrl $TargetUrl -CacheDir $CacheDir -DiffArguments $DiffArguments -OldPath ([string]$candidate.OldPath) -NewPath ([string]$candidate.NewPath) -CopyRevision ([int]$candidate.CopyRevision) -Revision $Revision
         Set-RenamePairDiffStatCorrection -Commit $Commit -OldPath ([string]$candidate.OldPath) -NewPath ([string]$candidate.NewPath) -RealStat $realStat
     }
 }
@@ -9965,7 +10725,8 @@ function New-CommitDiffPrefetchPlan
         [string[]]$ExcludeExtensions,
         [string[]]$IncludePathPatterns,
         [string[]]$ExcludePathPatterns,
-        [string]$LogPathPrefix
+        [string]$LogPathPrefix,
+        [switch]$ExcludeCommentOnlyLines
     )
     $revToAuthor = @{}
     $phaseAItems = [System.Collections.Generic.List[object]]::new()
@@ -10013,6 +10774,8 @@ function New-CommitDiffPrefetchPlan
                 CacheDir = $CacheDir
                 TargetUrl = $TargetUrl
                 DiffArguments = @($DiffArguments)
+                ChangedPaths = @($filteredChangedPaths)
+                ExcludeCommentOnlyLines = [bool]$ExcludeCommentOnlyLines
             })
     }
     return [pscustomobject]@{
@@ -10041,7 +10804,52 @@ function Invoke-CommitDiffPrefetch
             [void]$Index # Required by Invoke-ParallelWork contract
             # $NarutoContext は Invoke-ParallelWork の SessionVariables 経由で注入される
             $diffText = Get-CachedOrFetchDiffText -Context $NarutoContext -CacheDir $Item.CacheDir -Revision ([int]$Item.Revision) -TargetUrl $Item.TargetUrl -DiffArguments @($Item.DiffArguments)
-            $rawDiffByPath = ConvertFrom-SvnUnifiedDiff -DiffText $diffText -DetailLevel 2
+            $lineMaskByPath = @{}
+            if ([bool]$Item.ExcludeCommentOnlyLines)
+            {
+                foreach ($pathEntry in @($Item.ChangedPaths))
+                {
+                    if ($null -eq $pathEntry)
+                    {
+                        continue
+                    }
+                    $diffPath = ConvertTo-PathKey -Path ([string]$pathEntry.Path)
+                    if ([string]::IsNullOrWhiteSpace($diffPath))
+                    {
+                        continue
+                    }
+                    $commentProfile = Get-CommentSyntaxProfileByPath -Context $NarutoContext -FilePath $diffPath
+                    if ($null -eq $commentProfile)
+                    {
+                        continue
+                    }
+                    $oldMask = $null
+                    $newMask = $null
+                    if ([int]$Item.Revision -gt 1)
+                    {
+                        $oldCat = Get-CachedOrFetchCatText -Context $NarutoContext -Repo $Item.TargetUrl -FilePath $diffPath -Revision ([int]$Item.Revision - 1) -CacheDir $Item.CacheDir
+                        if ($null -ne $oldCat)
+                        {
+                            $oldLines = ConvertTo-TextLine -Text $oldCat
+                            $oldMask = ConvertTo-CommentOnlyLineMask -Lines $oldLines -CommentSyntaxProfile $commentProfile
+                        }
+                    }
+                    $newCat = Get-CachedOrFetchCatText -Context $NarutoContext -Repo $Item.TargetUrl -FilePath $diffPath -Revision ([int]$Item.Revision) -CacheDir $Item.CacheDir
+                    if ($null -ne $newCat)
+                    {
+                        $newLines = ConvertTo-TextLine -Text $newCat
+                        $newMask = ConvertTo-CommentOnlyLineMask -Lines $newLines -CommentSyntaxProfile $commentProfile
+                    }
+                    if ($null -ne $oldMask -or $null -ne $newMask)
+                    {
+                        $lineMaskByPath[$diffPath] = [pscustomobject]@{
+                            OldMask = $oldMask
+                            NewMask = $newMask
+                        }
+                    }
+                }
+            }
+            $rawDiffByPath = ConvertFrom-SvnUnifiedDiff -DiffText $diffText -DetailLevel 2 -ExcludeCommentOnlyLines:$([bool]$Item.ExcludeCommentOnlyLines) -LineMaskByPath $lineMaskByPath
             [pscustomobject]@{
                 Revision = [int]$Item.Revision
                 RawDiffByPath = $rawDiffByPath
@@ -10050,6 +10858,8 @@ function Invoke-CommitDiffPrefetch
         $phaseAResults = @(Invoke-ParallelWork -InputItems @($PrefetchItems) -WorkerScript $phaseAWorker -MaxParallel $Parallel -RequiredFunctions @(
                 $Context.Constants.RunspaceSvnCoreFunctions +
                 $Context.Constants.RunspaceDiffParserFunctions +
+                $Context.Constants.RunspaceBlameCacheFunctions +
+                $Context.Constants.RunspaceCommentFilterFunctions +
                 @(
                     'Get-CachedOrFetchDiffText'
                 )
@@ -10169,9 +10979,10 @@ function Complete-CommitDiffForCommit
         [object]$Commit,
         [int]$Revision,
         [string]$TargetUrl,
+        [string]$CacheDir = '',
         [string[]]$DiffArguments
     )
-    Update-RenamePairDiffStat -Context $Context -Commit $Commit -Revision $Revision -TargetUrl $TargetUrl -DiffArguments $DiffArguments
+    Update-RenamePairDiffStat -Context $Context -Commit $Commit -Revision $Revision -TargetUrl $TargetUrl -CacheDir $CacheDir -DiffArguments $DiffArguments
     Set-CommitDerivedMetric -Commit $Commit
 }
 function Initialize-CommitDiffData
@@ -10216,9 +11027,10 @@ function Initialize-CommitDiffData
         [string[]]$IncludePathPatterns,
         [string[]]$ExcludePathPatterns,
         [string]$LogPathPrefix,
+        [switch]$ExcludeCommentOnlyLines,
         [int]$Parallel = 1
     )
-    $prefetchPlan = New-CommitDiffPrefetchPlan -Commits $Commits -CacheDir $CacheDir -TargetUrl $TargetUrl -DiffArguments $DiffArguments -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns -LogPathPrefix $LogPathPrefix
+    $prefetchPlan = New-CommitDiffPrefetchPlan -Commits $Commits -CacheDir $CacheDir -TargetUrl $TargetUrl -DiffArguments $DiffArguments -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns -LogPathPrefix $LogPathPrefix -ExcludeCommentOnlyLines:$ExcludeCommentOnlyLines
     $rawDiffByRevision = Invoke-CommitDiffPrefetch -Context $Context -PrefetchItems $prefetchPlan.PrefetchItems -Parallel $Parallel
 
     $commitTotal = @($Commits).Count
@@ -10229,7 +11041,7 @@ function Initialize-CommitDiffData
         Write-Progress -Id 2 -Activity 'コミット差分の統合' -Status ('{0}/{1}' -f ($commitIdx + 1), $commitTotal) -PercentComplete $pct
         $revision = [int]$commit.Revision
         Merge-CommitDiffForCommit -Commit $commit -RawDiffByRevision $rawDiffByRevision -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns -LogPathPrefix $LogPathPrefix
-        Complete-CommitDiffForCommit -Context $Context -Commit $commit -Revision $revision -TargetUrl $TargetUrl -DiffArguments $DiffArguments
+        Complete-CommitDiffForCommit -Context $Context -Commit $commit -Revision $revision -TargetUrl $TargetUrl -CacheDir $CacheDir -DiffArguments $DiffArguments
         $commitIdx++
     }
     Write-Progress -Id 2 -Activity 'コミット差分の統合' -Completed
@@ -10447,6 +11259,7 @@ function Get-StrictOwnershipAggregate
         $ownershipResults = @(Invoke-ParallelWork -InputItems $ownershipItems.ToArray() -WorkerScript $ownershipWorker -MaxParallel $Parallel -RequiredFunctions @(
                 $Context.Constants.RunspaceSvnCoreFunctions +
                 $Context.Constants.RunspaceBlameCacheFunctions +
+                $Context.Constants.RunspaceCommentFilterFunctions +
                 @(
                     'ConvertFrom-SvnXmlText',
                     'ConvertFrom-SvnBlameXml',
@@ -10484,6 +11297,7 @@ function Get-StrictFileBlameWithFallback
     [CmdletBinding()]
     [OutputType([object])]
     param(
+        [hashtable]$Context = $script:NarutoContext,
         [string]$MetricKey,
         [string]$FilePath,
         [string]$ResolvedFilePath,
@@ -10521,7 +11335,7 @@ function Get-StrictFileBlameWithFallback
         }
         try
         {
-            $tmpBlameResult = Get-SvnBlameSummary -Repo $TargetUrl -FilePath $lookup -ToRevision $ToRevision -CacheDir $CacheDir
+            $tmpBlameResult = Get-SvnBlameSummary -Context $Context -Repo $TargetUrl -FilePath $lookup -ToRevision $ToRevision -CacheDir $CacheDir
             $tmpBlameResult = ConvertTo-NarutoResultAdapter -InputObject $tmpBlameResult -SuccessCode 'SVN_BLAME_SUMMARY_READY' -SkippedCode 'SVN_BLAME_SUMMARY_EMPTY'
             if (-not (Test-NarutoResultSuccess -Result $tmpBlameResult))
             {
@@ -10688,7 +11502,7 @@ function Update-FileRowWithStrictMetric
         {
             $resolvedFilePath
         }
-        $lookupResult = Get-StrictFileBlameWithFallback -MetricKey $metricKey -FilePath $filePath -ResolvedFilePath $resolvedFilePath -ExistingFileSet $ExistingFileSet -BlameByFile $BlameByFile -TargetUrl $TargetUrl -ToRevision $ToRevision -CacheDir $CacheDir
+        $lookupResult = Get-StrictFileBlameWithFallback -Context $Context -MetricKey $metricKey -FilePath $filePath -ResolvedFilePath $resolvedFilePath -ExistingFileSet $ExistingFileSet -BlameByFile $BlameByFile -TargetUrl $TargetUrl -ToRevision $ToRevision -CacheDir $CacheDir
         if ([string]$lookupResult.Status -eq 'Failure')
         {
             Throw-NarutoError -Category 'STRICT' -ErrorCode ([string]$lookupResult.ErrorCode) -Message ([string]$lookupResult.Message) -Context @{
@@ -11194,7 +12008,8 @@ function New-RunMetaData
         [string[]]$ExcludeExtensions,
         [switch]$NonInteractive,
         [switch]$TrustServerCert,
-        [switch]$IgnoreWhitespace
+        [switch]$IgnoreWhitespace,
+        [switch]$ExcludeCommentOnlyLines
     )
     $diagnosticWarningCount = 0
     $diagnosticWarningCodes = [ordered]@{}
@@ -11240,6 +12055,7 @@ function New-RunMetaData
             NonInteractive = [bool]$NonInteractive
             TrustServerCert = [bool]$TrustServerCert
             IgnoreWhitespace = [bool]$IgnoreWhitespace
+            ExcludeCommentOnlyLines = [bool]$ExcludeCommentOnlyLines
         }
         Diagnostics = [ordered]@{
             WarningCount = $diagnosticWarningCount
@@ -11491,6 +12307,8 @@ function New-PipelineExecutionState
         svn log パスのリポジトリ相対プレフィックス。
     .PARAMETER SvnVersion
         使用する SVN クライアントのバージョン文字列。
+    .PARAMETER ExcludeCommentOnlyLines
+        指定時はコメント専用行を全メトリクス集計から除外する。
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
@@ -11507,7 +12325,8 @@ function New-PipelineExecutionState
         [string[]]$ExcludeExtensions,
         [string]$TargetUrl,
         [string]$LogPathPrefix,
-        [string]$SvnVersion
+        [string]$SvnVersion,
+        [switch]$ExcludeCommentOnlyLines
     )
     return [pscustomobject]@{
         RepoUrl = $RepoUrl
@@ -11522,6 +12341,7 @@ function New-PipelineExecutionState
         TargetUrl = $TargetUrl
         LogPathPrefix = [string]$LogPathPrefix
         SvnVersion = $SvnVersion
+        ExcludeCommentOnlyLines = [bool]$ExcludeCommentOnlyLines
     }
 }
 function Resolve-PipelineExecutionState
@@ -11543,6 +12363,7 @@ function Resolve-PipelineExecutionState
         - TargetUrl         [string]   SVN 実行用に確定したターゲット URL
         - LogPathPrefix    [string]   svn log パスのリポジトリ相対プレフィックス
         - SvnVersion        [string]   検出した SVN バージョン文字列
+        - ExcludeCommentOnlyLines [bool] コメント専用行除外の有効フラグ
     #>
     [CmdletBinding()]
     [OutputType([object])]
@@ -11560,7 +12381,8 @@ function Resolve-PipelineExecutionState
         [string]$Username,
         [securestring]$Password,
         [switch]$NonInteractive,
-        [switch]$TrustServerCert
+        [switch]$TrustServerCert,
+        [switch]$ExcludeCommentOnlyLines
     )
     $normalizedRange = Get-NormalizedRevisionRange -FromRevision $FromRevision -ToRevision $ToRevision
     $outputState = Resolve-PipelineOutputState -OutDirectory $OutDirectory
@@ -11582,7 +12404,7 @@ function Resolve-PipelineExecutionState
         )
     }
 
-    return (New-PipelineExecutionState -RepoUrl $RepoUrl -FromRevision $normalizedRange.FromRevision -ToRevision $normalizedRange.ToRevision -OutDirectory $outputState.OutDirectory -CacheDir $outputState.CacheDir -IncludePaths $normalizedFilters.IncludePaths -ExcludePaths $normalizedFilters.ExcludePaths -IncludeExtensions $normalizedFilters.IncludeExtensions -ExcludeExtensions $normalizedFilters.ExcludeExtensions -TargetUrl $targetUrl -LogPathPrefix $logPathPrefix -SvnVersion $svnVersion)
+    return (New-PipelineExecutionState -RepoUrl $RepoUrl -FromRevision $normalizedRange.FromRevision -ToRevision $normalizedRange.ToRevision -OutDirectory $outputState.OutDirectory -CacheDir $outputState.CacheDir -IncludePaths $normalizedFilters.IncludePaths -ExcludePaths $normalizedFilters.ExcludePaths -IncludeExtensions $normalizedFilters.IncludeExtensions -ExcludeExtensions $normalizedFilters.ExcludeExtensions -TargetUrl $targetUrl -LogPathPrefix $logPathPrefix -SvnVersion $svnVersion -ExcludeCommentOnlyLines:$ExcludeCommentOnlyLines)
 }
 function Invoke-PipelineLogAndDiffStage
 {
@@ -11609,7 +12431,7 @@ function Invoke-PipelineLogAndDiffStage
 
     Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 3/8: 差分の取得と統計構築' -PercentComplete 15
     $diffArgs = Get-SvnDiffArgumentList -IgnoreWhitespace:$IgnoreWhitespace
-    $revToAuthor = Initialize-CommitDiffData -Context $Context -Commits $commits -CacheDir $ExecutionState.CacheDir -TargetUrl $ExecutionState.TargetUrl -DiffArguments $diffArgs -IncludeExtensions $ExecutionState.IncludeExtensions -ExcludeExtensions $ExecutionState.ExcludeExtensions -IncludePathPatterns $ExecutionState.IncludePaths -ExcludePathPatterns $ExecutionState.ExcludePaths -LogPathPrefix $ExecutionState.LogPathPrefix -Parallel $Parallel
+    $revToAuthor = Initialize-CommitDiffData -Context $Context -Commits $commits -CacheDir $ExecutionState.CacheDir -TargetUrl $ExecutionState.TargetUrl -DiffArguments $diffArgs -IncludeExtensions $ExecutionState.IncludeExtensions -ExcludeExtensions $ExecutionState.ExcludeExtensions -IncludePathPatterns $ExecutionState.IncludePaths -ExcludePathPatterns $ExecutionState.ExcludePaths -LogPathPrefix $ExecutionState.LogPathPrefix -ExcludeCommentOnlyLines:$ExecutionState.ExcludeCommentOnlyLines -Parallel $Parallel
     $renameMap = Get-RenameMap -Commits $commits -LogPathPrefix $ExecutionState.LogPathPrefix
 
     return [pscustomobject]@{
@@ -11799,11 +12621,12 @@ function Write-PipelineRunArtifacts
         [object[]]$FileRows,
         [switch]$NonInteractive,
         [switch]$TrustServerCert,
-        [switch]$IgnoreWhitespace
+        [switch]$IgnoreWhitespace,
+        [switch]$ExcludeCommentOnlyLines
     )
     Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 8/8: メタデータ出力' -PercentComplete 95
     $finishedAt = Get-Date
-    $meta = New-RunMetaData -Context $Context -StartTime $StartedAt -EndTime $finishedAt -TargetUrl $ExecutionState.TargetUrl -FromRevision $ExecutionState.FromRevision -ToRevision $ExecutionState.ToRevision -SvnVersion $ExecutionState.SvnVersion -Parallel $Parallel -TopNCount $TopNCount -Encoding $Encoding -Commits $Commits -FileRows $FileRows -OutDirectory $ExecutionState.OutDirectory -IncludePaths $ExecutionState.IncludePaths -ExcludePaths $ExecutionState.ExcludePaths -IncludeExtensions $ExecutionState.IncludeExtensions -ExcludeExtensions $ExecutionState.ExcludeExtensions -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -IgnoreWhitespace:$IgnoreWhitespace
+    $meta = New-RunMetaData -Context $Context -StartTime $StartedAt -EndTime $finishedAt -TargetUrl $ExecutionState.TargetUrl -FromRevision $ExecutionState.FromRevision -ToRevision $ExecutionState.ToRevision -SvnVersion $ExecutionState.SvnVersion -Parallel $Parallel -TopNCount $TopNCount -Encoding $Encoding -Commits $Commits -FileRows $FileRows -OutDirectory $ExecutionState.OutDirectory -IncludePaths $ExecutionState.IncludePaths -ExcludePaths $ExecutionState.ExcludePaths -IncludeExtensions $ExecutionState.IncludeExtensions -ExcludeExtensions $ExecutionState.ExcludeExtensions -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -IgnoreWhitespace:$IgnoreWhitespace -ExcludeCommentOnlyLines:$ExcludeCommentOnlyLines
     Write-JsonFile -Data $meta -FilePath (Join-Path $ExecutionState.OutDirectory 'run_meta.json') -Depth 12 -EncodingName $Encoding
 
     Write-Progress -Id 0 -Activity 'NarutoCode' -Completed
@@ -11869,19 +12692,21 @@ function Invoke-NarutoCodePipeline
         [string[]]$ExcludeExtensions,
         [int]$TopNCount,
         [string]$Encoding,
-        [switch]$IgnoreWhitespace
+        [switch]$IgnoreWhitespace,
+        [switch]$ExcludeCommentOnlyLines
     )
     $startedAt = Get-Date
     Initialize-StrictModeContext -Context $Context
     $Context = $script:NarutoContext
-    $executionState = Resolve-PipelineExecutionState -Context $Context -RepoUrl $RepoUrl -FromRevision $FromRevision -ToRevision $ToRevision -OutDirectory $OutDirectory -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -SvnExecutable $SvnExecutable -Username $Username -Password $Password -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert
+    $Context.Runtime.ExcludeCommentOnlyLines = [bool]$ExcludeCommentOnlyLines
+    $executionState = Resolve-PipelineExecutionState -Context $Context -RepoUrl $RepoUrl -FromRevision $FromRevision -ToRevision $ToRevision -OutDirectory $OutDirectory -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -SvnExecutable $SvnExecutable -Username $Username -Password $Password -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -ExcludeCommentOnlyLines:$ExcludeCommentOnlyLines
     $logAndDiffStage = Invoke-PipelineLogAndDiffStage -Context $Context -ExecutionState $executionState -IgnoreWhitespace:$IgnoreWhitespace -Parallel $Parallel
     $aggregationStage = Invoke-PipelineAggregationStage -Commits $logAndDiffStage.Commits -RenameMap $logAndDiffStage.RenameMap
     $strictResult = Invoke-PipelineStrictStage -Context $Context -ExecutionState $executionState -LogAndDiffStage $logAndDiffStage -AggregationStage $aggregationStage -Parallel $Parallel
 
     Write-PipelineCsvArtifacts -OutDirectory $executionState.OutDirectory -CommitterRows $aggregationStage.CommitterRows -FileRows $aggregationStage.FileRows -CommitRows $aggregationStage.CommitRows -CouplingRows $aggregationStage.CouplingRows -StrictResult $strictResult -Encoding $Encoding
     Write-PipelineVisualizationArtifacts -OutDirectory $executionState.OutDirectory -CommitterRows $aggregationStage.CommitterRows -FileRows $aggregationStage.FileRows -CommitRows $aggregationStage.CommitRows -CouplingRows $aggregationStage.CouplingRows -StrictResult $strictResult -TopNCount $TopNCount -Encoding $Encoding
-    $meta = Write-PipelineRunArtifacts -Context $Context -StartedAt $startedAt -ExecutionState $executionState -Parallel $Parallel -TopNCount $TopNCount -Encoding $Encoding -Commits $logAndDiffStage.Commits -FileRows $aggregationStage.FileRows -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -IgnoreWhitespace:$IgnoreWhitespace
+    $meta = Write-PipelineRunArtifacts -Context $Context -StartedAt $startedAt -ExecutionState $executionState -Parallel $Parallel -TopNCount $TopNCount -Encoding $Encoding -Commits $logAndDiffStage.Commits -FileRows $aggregationStage.FileRows -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -IgnoreWhitespace:$IgnoreWhitespace -ExcludeCommentOnlyLines:$ExcludeCommentOnlyLines
 
     return (New-PipelineResultObject -OutDirectory $executionState.OutDirectory -CommitterRows $aggregationStage.CommitterRows -FileRows $aggregationStage.FileRows -CommitRows $aggregationStage.CommitRows -CouplingRows $aggregationStage.CouplingRows -RunMeta $meta)
 }
@@ -11890,7 +12715,7 @@ if ($MyInvocation.InvocationName -ne '.')
 {
     try
     {
-        [void](Invoke-NarutoCodePipeline -Context $script:NarutoContext -RepoUrl $RepoUrl -FromRevision $FromRevision -ToRevision $ToRevision -SvnExecutable $SvnExecutable -OutDirectory $OutDirectory -Username $Username -Password $Password -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -Parallel $Parallel -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -TopNCount $TopNCount -Encoding $Encoding -IgnoreWhitespace:$IgnoreWhitespace)
+        [void](Invoke-NarutoCodePipeline -Context $script:NarutoContext -RepoUrl $RepoUrl -FromRevision $FromRevision -ToRevision $ToRevision -SvnExecutable $SvnExecutable -OutDirectory $OutDirectory -Username $Username -Password $Password -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -Parallel $Parallel -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -TopNCount $TopNCount -Encoding $Encoding -IgnoreWhitespace:$IgnoreWhitespace -ExcludeCommentOnlyLines:$ExcludeCommentOnlyLines)
     }
     catch
     {

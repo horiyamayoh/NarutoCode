@@ -378,6 +378,104 @@ Describe 'Strict aggregation refactor' {
     }
 }
 
+Describe 'Strict hunk effective segments' {
+    It 'does not create canonical events from comment-only hunks' {
+        $offsetMap = Initialize-CanonicalOffsetMap
+        $hunks = @(
+            [pscustomobject]@{
+                OldStart = 10
+                OldCount = 1
+                NewStart = 10
+                NewCount = 1
+                EffectiveSegments = @()
+            }
+        )
+        $events = @(Get-StrictCanonicalHunkEvents -Hunks $hunks -Revision 10 -Author 'alice' -OffsetEvents $offsetMap)
+        $events.Count | Should -Be 0
+    }
+
+    It 'uses effective segments for repeated hunk counting' {
+        $commits = @(
+            [pscustomobject]@{
+                Revision = 1
+                Author = 'alice'
+                FilesChanged = @('src/A.cs')
+                FileDiffStats = @{
+                    'src/A.cs' = [pscustomobject]@{
+                        Hunks = @(
+                            [pscustomobject]@{
+                                OldStart = 10
+                                OldCount = 1
+                                NewStart = 10
+                                NewCount = 1
+                                EffectiveSegments = @()
+                            }
+                        )
+                    }
+                }
+            },
+            [pscustomobject]@{
+                Revision = 2
+                Author = 'alice'
+                FilesChanged = @('src/A.cs')
+                FileDiffStats = @{
+                    'src/A.cs' = [pscustomobject]@{
+                        Hunks = @(
+                            [pscustomobject]@{
+                                OldStart = 10
+                                OldCount = 1
+                                NewStart = 10
+                                NewCount = 1
+                                EffectiveSegments = @(
+                                    [pscustomobject]@{
+                                        OldStart = 10
+                                        OldCount = 1
+                                        NewStart = 10
+                                        NewCount = 1
+                                    }
+                                )
+                            }
+                        )
+                    }
+                }
+            },
+            [pscustomobject]@{
+                Revision = 3
+                Author = 'alice'
+                FilesChanged = @('src/A.cs')
+                FileDiffStats = @{
+                    'src/A.cs' = [pscustomobject]@{
+                        Hunks = @(
+                            [pscustomobject]@{
+                                OldStart = 10
+                                OldCount = 1
+                                NewStart = 10
+                                NewCount = 1
+                                EffectiveSegments = @(
+                                    [pscustomobject]@{
+                                        OldStart = 10
+                                        OldCount = 1
+                                        NewStart = 10
+                                        NewCount = 1
+                                    }
+                                )
+                            }
+                        )
+                    }
+                }
+            }
+        )
+        $revToAuthor = @{
+            1 = 'alice'
+            2 = 'alice'
+            3 = 'alice'
+        }
+
+        $detail = Get-StrictHunkDetail -Commits $commits -RevToAuthor $revToAuthor -RenameMap @{}
+        (Get-HashtableIntValue -Table $detail.AuthorRepeatedHunk -Key 'alice') | Should -Be 1
+    }
+}
+
 Describe 'Strict 多リビジョンシナリオ — Compare-BlameOutput の帰属分類' {
     Context '5リビジョンにわたる複数著者の重複編集' {
         It 'born行の数は新しいリビジョンの行の中で当該リビジョンに帰属するものだけ' {

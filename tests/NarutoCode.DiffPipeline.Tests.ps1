@@ -197,6 +197,7 @@ Describe 'Diff pipeline refactor' {
                     [string[]]$IncludePathPatterns,
                     [string[]]$ExcludePathPatterns,
                     [string]$LogPathPrefix,
+                    [switch]$ExcludeCommentOnlyLines,
                     [int]$Parallel
                 )
                 [void]$Context
@@ -209,6 +210,7 @@ Describe 'Diff pipeline refactor' {
                 [void]$IncludePathPatterns
                 [void]$ExcludePathPatterns
                 [void]$LogPathPrefix
+                [void]$ExcludeCommentOnlyLines
                 [void]$Parallel
                 return @{ 5 = 'alice' }
             }
@@ -229,6 +231,7 @@ Describe 'Diff pipeline refactor' {
                 IncludePaths = @('src/*')
                 ExcludePaths = @('tmp/*')
                 LogPathPrefix = ''
+                ExcludeCommentOnlyLines = $false
             }
 
             $result = Invoke-PipelineLogAndDiffStage -ExecutionState $executionState -IgnoreWhitespace -Parallel 4

@@ -747,8 +747,11 @@ $$L(A, B) = \frac{P(A \cap B)}{P(A) \times P(B)}$$
 | `FromRev` / `ToRev` | リビジョン範囲 |
 | `StrictMode` | Strict モード（per-revision blame による厄密計算）の有無 |
 | `CommitCount` / `FileCount` | 検出されたコミット数・ファイル数 |
-| `Parameters` | 使用したフィルタ・オプション一覧（IgnoreWhitespace 等） |
+| `Parameters` | 使用したフィルタ・オプション一覧（IgnoreWhitespace / ExcludeCommentOnlyLines 等） |
 | `Outputs` | 出力されたファイル名の一覧 |
+
+`Parameters.ExcludeCommentOnlyLines` が `true` の場合、コメント専用行（コードを含まない行）は全メトリクスから除外されます。  
+コメント記法は拡張子に応じた組み込みプロファイル（`CStyle` / `PowerShellStyle` / `IniStyle`）で自動判定されます。
 
 > **同じ条件で再実行したい場合**、このファイルを見ればパラメータを復元できます。
 

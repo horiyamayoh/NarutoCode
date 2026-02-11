@@ -440,7 +440,8 @@ BeforeAll {
             [int]$FromRevision,
             [int]$ToRevision,
             [string]$SvnExecutable,
-            [string]$OutDirectory
+            [string]$OutDirectory,
+            [switch]$ExcludeCommentOnlyLines
         )
         $null = & $NarutoScriptPath `
             -RepoUrl $RepoUrl `
@@ -450,6 +451,7 @@ BeforeAll {
             -SvnExecutable $SvnExecutable `
             -Encoding UTF8 `
             -NoProgress `
+            -ExcludeCommentOnlyLines:$ExcludeCommentOnlyLines `
             -ErrorAction Stop
 
         return [pscustomobject]@{
@@ -629,10 +631,12 @@ Describe 'Oracle parity integration - fixture repository' -Tag 'Integration', 'O
     BeforeAll {
         $script:fixtureSkipReason = $null
         $script:fixtureOutDir = $null
+        $script:fixtureOutDirExclude = $null
         $script:fixtureOracleCommitRows = @()
         $script:fixtureOracleCommitterRows = @()
         $script:fixtureActualCommitRows = @()
         $script:fixtureActualCommitterRows = @()
+        $script:fixtureActualCommitRowsExclude = @()
 
         if (-not $script:SvnExecutable)
         {
@@ -649,6 +653,7 @@ Describe 'Oracle parity integration - fixture repository' -Tag 'Integration', 'O
 
         $fixtureRepoUrl = 'file:///' + ($fixtureRepoDir -replace '\\', '/')
         $script:fixtureOutDir = Join-Path $env:TEMP ('narutocode_oracle_fixture_' + [guid]::NewGuid().ToString('N'))
+        $script:fixtureOutDirExclude = Join-Path $env:TEMP ('narutocode_oracle_fixture_exclude_' + [guid]::NewGuid().ToString('N'))
 
         $runResult = Invoke-NarutoCodeOracleRun `
             -NarutoScriptPath $script:NarutoScriptPath `
@@ -660,6 +665,15 @@ Describe 'Oracle parity integration - fixture repository' -Tag 'Integration', 'O
 
         $script:fixtureActualCommitRows = @($runResult.CommitRows)
         $script:fixtureActualCommitterRows = @($runResult.CommitterRows)
+        $runResultExclude = Invoke-NarutoCodeOracleRun `
+            -NarutoScriptPath $script:NarutoScriptPath `
+            -RepoUrl $fixtureRepoUrl `
+            -FromRevision 1 `
+            -ToRevision 20 `
+            -SvnExecutable $script:SvnExecutable `
+            -OutDirectory $script:fixtureOutDirExclude `
+            -ExcludeCommentOnlyLines
+        $script:fixtureActualCommitRowsExclude = @($runResultExclude.CommitRows)
         $script:fixtureOracleCommitRows = @(Get-OracleCommitRows -SvnExecutable $script:SvnExecutable -RepoUrl $fixtureRepoUrl -FromRevision 1 -ToRevision 20)
         $script:fixtureOracleCommitterRows = @(Get-OracleCommitterRows -OracleCommitRows $script:fixtureOracleCommitRows)
     }
@@ -669,6 +683,10 @@ Describe 'Oracle parity integration - fixture repository' -Tag 'Integration', 'O
         {
             Remove-Item -Path $script:fixtureOutDir -Recurse -Force -ErrorAction SilentlyContinue
         }
+        if ($script:fixtureOutDirExclude -and (Test-Path $script:fixtureOutDirExclude))
+        {
+            Remove-Item -Path $script:fixtureOutDirExclude -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 
     It 'matches commits.csv against svn log/diff oracle' -Skip:($null -ne $script:fixtureSkipReason) {
@@ -677,6 +695,24 @@ Describe 'Oracle parity integration - fixture repository' -Tag 'Integration', 'O
 
     It 'matches committers.csv against svn log/diff oracle' -Skip:($null -ne $script:fixtureSkipReason) {
         Assert-OracleCommitterParity -OracleRows $script:fixtureOracleCommitterRows -ActualRows $script:fixtureActualCommitterRows -Label 'fixture r1-r20'
+    }
+
+    It 'keeps comment-exclusion ON commit counts less than or equal to oracle raw diff counts' -Skip:($null -ne $script:fixtureSkipReason) {
+        $oracleByRevision = @{}
+        foreach ($row in @($script:fixtureOracleCommitRows))
+        {
+            $oracleByRevision[[int]$row.Revision] = $row
+        }
+        foreach ($actual in @($script:fixtureActualCommitRowsExclude))
+        {
+            $revision = [int]$actual.Revision
+            $oracle = $oracleByRevision[$revision]
+            ([int]$actual.Added -le [int]$oracle.Added) | Should -BeTrue
+            ([int]$actual.Deleted -le [int]$oracle.Deleted) | Should -BeTrue
+            ([int]$actual.Churn -le [int]$oracle.Churn) | Should -BeTrue
+        }
+        $meta = Get-Content -Path (Join-Path $script:fixtureOutDirExclude 'run_meta.json') -Raw | ConvertFrom-Json
+        [bool]$meta.Parameters.ExcludeCommentOnlyLines | Should -BeTrue
     }
 }
 
