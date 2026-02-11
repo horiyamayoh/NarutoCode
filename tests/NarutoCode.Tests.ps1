@@ -317,7 +317,19 @@ Describe 'Get-TextEncoding' {
     }
 
     It 'throws for unsupported encoding' {
-        { Get-TextEncoding -Name 'EBCDIC' } | Should -Throw -ExpectedMessage '*Unsupported encoding*'
+        $thrown = $null
+        try
+        {
+            [void](Get-TextEncoding -Name 'EBCDIC')
+        }
+        catch
+        {
+            $thrown = $_.Exception
+        }
+        $thrown | Should -Not -BeNullOrEmpty
+        [string]$thrown.Data['ErrorCode'] | Should -Be 'INPUT_UNSUPPORTED_ENCODING'
+        [string]$thrown.Data['Category'] | Should -Be 'INPUT'
+        [string]$thrown.Message | Should -BeLike '*未対応*'
     }
 }
 
@@ -1358,14 +1370,22 @@ Describe 'NarutoCode.ps1 execution' {
     It 'fails when svn executable does not exist' {
         $tempOut = Join-Path $env:TEMP ('narutocode_test_' + [guid]::NewGuid().ToString('N'))
         try {
-            {
-                & $script:ScriptPath `
-                    -RepoUrl 'https://svn.example.com/repos/proj/trunk' `
-                    -FromRevision 1 -ToRevision 2 `
-                    -OutDirectory $tempOut `
-                    -SvnExecutable 'nonexistent_svn_command_xyz' `
-                    -ErrorAction Stop
-            } | Should -Throw -ExpectedMessage '*not found*'
+            & $script:ScriptPath `
+                -RepoUrl 'https://svn.example.com/repos/proj/trunk' `
+                -FromRevision 1 -ToRevision 2 `
+                -OutDirectory $tempOut `
+                -SvnExecutable 'nonexistent_svn_command_xyz'
+
+            $LASTEXITCODE | Should -Be 20
+            $reportPath = Join-Path $tempOut 'error_report.json'
+            (Test-Path -LiteralPath $reportPath) | Should -BeTrue
+            $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json
+            [string]$report.ErrorCode | Should -Be 'ENV_SVN_EXECUTABLE_NOT_FOUND'
+            [string]$report.Category | Should -Be 'ENV'
+            [string]$report.Message | Should -BeLike '*not found*'
+            [int]$report.ExitCode | Should -Be 20
+            [string]$report.Timestamp | Should -Not -BeNullOrEmpty
+            $report.Context | Should -Not -BeNullOrEmpty
         }
         finally {
             Remove-Item -Path $tempOut -Recurse -Force -ErrorAction SilentlyContinue
@@ -2063,8 +2083,10 @@ Describe 'Blame memory cache' {
         $first = Get-SvnBlameSummary -Repo 'https://example.invalid/svn/repo' -FilePath 'trunk/src/A.cs' -ToRevision 10 -CacheDir 'dummy'
         $second = Get-SvnBlameSummary -Repo 'https://example.invalid/svn/repo' -FilePath 'trunk/src/A.cs' -ToRevision 10 -CacheDir 'dummy'
 
-        $first.LineCountTotal | Should -Be 1
-        $second.LineCountTotal | Should -Be 1
+        [string]$first.Status | Should -Be 'Success'
+        [string]$second.Status | Should -Be 'Success'
+        $first.Data.LineCountTotal | Should -Be 1
+        $second.Data.LineCountTotal | Should -Be 1
         Assert-MockCalled Invoke-SvnCommandAllowMissingTarget -Times 1 -Exactly
     }
 
@@ -2104,8 +2126,10 @@ Describe 'Blame memory cache' {
         $first = Get-SvnBlameLine -Repo 'https://example.invalid/svn/repo' -FilePath 'trunk/src/B.cs' -Revision 20 -CacheDir 'dummy'
         $second = Get-SvnBlameLine -Repo 'https://example.invalid/svn/repo' -FilePath 'trunk/src/B.cs' -Revision 20 -CacheDir 'dummy'
 
-        $first.LineCountTotal | Should -Be 1
-        $second.LineCountTotal | Should -Be 1
+        [string]$first.Status | Should -Be 'Success'
+        [string]$second.Status | Should -Be 'Success'
+        $first.Data.LineCountTotal | Should -Be 1
+        $second.Data.LineCountTotal | Should -Be 1
         Assert-MockCalled Invoke-SvnCommandAllowMissingTarget -Times 2 -Exactly
     }
 }
@@ -2499,8 +2523,9 @@ Describe 'Get-StrictFileBlameWithFallback' {
         $blameByFile = @{}
         $result = Get-StrictFileBlameWithFallback -MetricKey 'src/canonical.cs' -FilePath 'src/legacy.cs' -ResolvedFilePath 'src/canonical.cs' -ExistingFileSet $existing -BlameByFile $blameByFile -TargetUrl 'https://example.invalid/svn/repo' -ToRevision 20 -CacheDir 'dummy'
 
-        [bool]$result.ExistsAtToRevision | Should -BeTrue
-        [int]$result.Blame.LineCountTotal | Should -Be 2
+        [string]$result.Status | Should -Be 'Success'
+        [bool]$result.Data.ExistsAtToRevision | Should -BeTrue
+        [int]$result.Data.Blame.LineCountTotal | Should -Be 2
         @($script:blameLookupCalls.ToArray()) | Should -Be @('src/canonical.cs', 'src/legacy.cs')
         $blameByFile.ContainsKey('src/legacy.cs') | Should -BeTrue
     }
@@ -2565,12 +2590,13 @@ Describe 'Test-SvnMissingTargetError' {
 }
 
 Describe 'Invoke-SvnCommandAllowMissingTarget' {
-    It 'missing-target エラー時に null を返す' {
+    It 'missing-target エラー時に Skipped 結果を返す' {
         Mock Invoke-SvnCommand {
             throw "svn: E200009: Some of the specified targets don't exist"
         }
         $result = Invoke-SvnCommandAllowMissingTarget -Arguments @('blame', 'dummy') -ErrorContext 'test'
-        $result | Should -BeNullOrEmpty
+        [string]$result.Status | Should -Be 'Skipped'
+        [string]$result.ErrorCode | Should -Be 'SVN_TARGET_MISSING'
     }
     It 'その他のエラーは再スローする' {
         Mock Invoke-SvnCommand {
@@ -2578,12 +2604,14 @@ Describe 'Invoke-SvnCommandAllowMissingTarget' {
         }
         { Invoke-SvnCommandAllowMissingTarget -Arguments @('blame', 'dummy') -ErrorContext 'test' } | Should -Throw
     }
-    It '正常時は結果をそのまま返す' {
+    It '正常時は Success 結果を返す' {
         Mock Invoke-SvnCommand {
             return '<xml>ok</xml>'
         }
         $result = Invoke-SvnCommandAllowMissingTarget -Arguments @('blame', 'dummy') -ErrorContext 'test'
-        $result | Should -Be '<xml>ok</xml>'
+        [string]$result.Status | Should -Be 'Success'
+        [string]$result.ErrorCode | Should -Be 'SVN_COMMAND_SUCCEEDED'
+        [string]$result.Data | Should -Be '<xml>ok</xml>'
     }
 }
 

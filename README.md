@@ -110,3 +110,35 @@ NarutoCode/
 ## ライセンス
 
 [MIT License](LICENSE) — 自由に改変・再配布できます。
+
+## エラーコード / 終了コード / error_report.json
+
+- コア解析は `fail-fast`、可視化は `best-effort` として動作します。
+- 失敗時は `[ErrorCode] メッセージ` を 1 回だけ表示し、カテゴリ別終了コードで終了します。
+
+| Category | 終了コード |
+|---|---|
+| INPUT | 10 |
+| ENV | 20 |
+| SVN | 30 |
+| PARSE | 40 |
+| STRICT | 50 |
+| OUTPUT | 60 |
+| INTERNAL | 70 |
+
+失敗時には `OutDir` 配下に `error_report.json` を出力します（`OutDir` 未指定時は `NarutoCode_out`）。
+
+`error_report.json` の主なフィールド:
+- `Timestamp`
+- `ErrorCode`
+- `Category`
+- `Message`
+- `Context`
+- `ExitCode`
+
+成功時の `run_meta.json` には `Diagnostics` セクションが追加されます。
+- `WarningCount`
+- `WarningCodes`
+- `SkippedOutputs`
+
+詳細な方針は `docs/error_handling_policy.md` を参照してください。

@@ -99,6 +99,446 @@ if ($NoProgress)
     $ProgressPreference = 'SilentlyContinue'
 }
 
+# region Error and Diagnostics
+function New-NarutoResultSuccess
+{
+    <#
+    .SYNOPSIS
+        成功状態の NarutoResult DTO を生成する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        $Data = $null,
+        [string]$Message = '',
+        [string]$ErrorCode = 'OK',
+        [hashtable]$Context = @{}
+    )
+    return [pscustomobject]@{
+        IsSuccess = $true
+        Status = 'Success'
+        ErrorCode = $ErrorCode
+        Message = $Message
+        Data = $Data
+        Context = if ($null -eq $Context)
+        {
+            @{}
+        }
+        else
+        {
+            $Context
+        }
+    }
+}
+function New-NarutoResultSkipped
+{
+    <#
+    .SYNOPSIS
+        スキップ状態の NarutoResult DTO を生成する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        $Data = $null,
+        [string]$Message,
+        [string]$ErrorCode,
+        [hashtable]$Context = @{}
+    )
+    return [pscustomobject]@{
+        IsSuccess = $false
+        Status = 'Skipped'
+        ErrorCode = $ErrorCode
+        Message = $Message
+        Data = $Data
+        Context = if ($null -eq $Context)
+        {
+            @{}
+        }
+        else
+        {
+            $Context
+        }
+    }
+}
+function New-NarutoResultFailure
+{
+    <#
+    .SYNOPSIS
+        失敗状態の NarutoResult DTO を生成する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        $Data = $null,
+        [string]$Message,
+        [string]$ErrorCode,
+        [hashtable]$Context = @{}
+    )
+    return [pscustomobject]@{
+        IsSuccess = $false
+        Status = 'Failure'
+        ErrorCode = $ErrorCode
+        Message = $Message
+        Data = $Data
+        Context = if ($null -eq $Context)
+        {
+            @{}
+        }
+        else
+        {
+            $Context
+        }
+    }
+}
+function Test-NarutoResultSuccess
+{
+    <#
+    .SYNOPSIS
+        NarutoResult が成功扱い可能かを判定する。
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [object]$Result,
+        [switch]$AllowSkipped
+    )
+    if ($null -eq $Result)
+    {
+        return $false
+    }
+    $status = [string]$Result.Status
+    if ($status -eq 'Success')
+    {
+        return $true
+    }
+    if ($AllowSkipped -and $status -eq 'Skipped')
+    {
+        return $true
+    }
+    return $false
+}
+function ConvertTo-NarutoResultAdapter
+{
+    <#
+    .SYNOPSIS
+        旧戻り値契約を NarutoResult へ段階変換する。
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [object]$InputObject,
+        [string]$SuccessCode = 'OK',
+        [string]$SkippedCode = 'SKIPPED'
+    )
+    if ($null -eq $InputObject)
+    {
+        return (New-NarutoResultSkipped -ErrorCode $SkippedCode -Message '結果が null のためスキップ扱いとしました。')
+    }
+    if ($InputObject.PSObject.Properties.Match('Status').Count -gt 0 -and $InputObject.PSObject.Properties.Match('ErrorCode').Count -gt 0)
+    {
+        return $InputObject
+    }
+    return (New-NarutoResultSuccess -Data $InputObject -ErrorCode $SuccessCode)
+}
+function Throw-NarutoError
+{
+    <#
+    .SYNOPSIS
+        ErrorCode/Category/Context を付与した例外を送出する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseApprovedVerbs', '')]
+    [CmdletBinding()]
+    param(
+        [ValidateSet('INPUT', 'ENV', 'SVN', 'PARSE', 'STRICT', 'OUTPUT', 'INTERNAL')]
+        [string]$Category = 'INTERNAL',
+        [string]$ErrorCode = 'INTERNAL_UNEXPECTED_ERROR',
+        [string]$Message = 'エラーが発生しました。',
+        [hashtable]$Context = @{},
+        [System.Exception]$InnerException = $null
+    )
+    $resolvedMessage = if ([string]::IsNullOrWhiteSpace($Message))
+    {
+        'エラーが発生しました。'
+    }
+    else
+    {
+        $Message
+    }
+    $exception = if ($null -ne $InnerException)
+    {
+        New-Object System.Exception($resolvedMessage, $InnerException)
+    }
+    else
+    {
+        New-Object System.Exception($resolvedMessage)
+    }
+    $exception.Data['ErrorCode'] = $ErrorCode
+    $exception.Data['Category'] = $Category
+    $exception.Data['Context'] = if ($null -eq $Context)
+    {
+        @{}
+    }
+    else
+    {
+        $Context
+    }
+    throw $exception
+}
+function Get-NarutoErrorInfo
+{
+    <#
+    .SYNOPSIS
+        ErrorRecord または Exception から標準化したエラー情報を抽出する。
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$ErrorInput
+    )
+    $errorRecord = $null
+    $exception = $null
+    if ($ErrorInput -is [System.Management.Automation.ErrorRecord])
+    {
+        $errorRecord = $ErrorInput
+        $exception = $errorRecord.Exception
+    }
+    elseif ($ErrorInput -is [System.Exception])
+    {
+        $exception = $ErrorInput
+    }
+    else
+    {
+        $exception = New-Object System.Exception([string]$ErrorInput)
+    }
+    $errorCode = 'INTERNAL_UNEXPECTED_ERROR'
+    $category = 'INTERNAL'
+    $contextData = @{}
+    if ($null -ne $exception -and $null -ne $exception.Data)
+    {
+        if ($exception.Data.Contains('ErrorCode'))
+        {
+            $candidate = [string]$exception.Data['ErrorCode']
+            if (-not [string]::IsNullOrWhiteSpace($candidate))
+            {
+                $errorCode = $candidate
+            }
+        }
+        if ($exception.Data.Contains('Category'))
+        {
+            $candidate = [string]$exception.Data['Category']
+            if (-not [string]::IsNullOrWhiteSpace($candidate))
+            {
+                $category = $candidate
+            }
+        }
+        if ($exception.Data.Contains('Context'))
+        {
+            $rawContext = $exception.Data['Context']
+            if ($rawContext -is [hashtable])
+            {
+                $contextData = $rawContext
+            }
+        }
+    }
+    $scriptStack = ''
+    if ($null -ne $errorRecord -and -not [string]::IsNullOrWhiteSpace([string]$errorRecord.ScriptStackTrace))
+    {
+        $scriptStack = [string]$errorRecord.ScriptStackTrace
+    }
+    elseif ($null -ne $exception -and $exception.PSObject.Properties.Match('ScriptStackTrace').Count -gt 0)
+    {
+        $scriptStack = [string]$exception.ScriptStackTrace
+    }
+    if ($category -eq 'INTERNAL' -and -not [string]::IsNullOrWhiteSpace($errorCode))
+    {
+        if ($null -ne $script:NarutoContext -and $script:NarutoContext.ContainsKey('ErrorCatalog') -and $script:NarutoContext.ErrorCatalog.ContainsKey($errorCode))
+        {
+            $category = [string]$script:NarutoContext.ErrorCatalog[$errorCode]
+        }
+    }
+    return [pscustomobject]@{
+        ErrorCode = $errorCode
+        Category = $category
+        Message = if ($null -ne $exception)
+        {
+            [string]$exception.Message
+        }
+        else
+        {
+            ''
+        }
+        Context = $contextData
+        ScriptStackTrace = $scriptStack
+        Exception = $exception
+    }
+}
+function Resolve-NarutoExitCode
+{
+    <#
+    .SYNOPSIS
+        エラーカテゴリから CLI 終了コードを解決する。
+    #>
+    [CmdletBinding()]
+    [OutputType([int])]
+    param([string]$Category)
+    $resolvedCategory = ''
+    if ($null -ne $Category)
+    {
+        $resolvedCategory = [string]$Category
+    }
+    switch ($resolvedCategory.ToUpperInvariant())
+    {
+        'INPUT'
+        {
+            return 10
+        }
+        'ENV'
+        {
+            return 20
+        }
+        'SVN'
+        {
+            return 30
+        }
+        'PARSE'
+        {
+            return 40
+        }
+        'STRICT'
+        {
+            return 50
+        }
+        'OUTPUT'
+        {
+            return 60
+        }
+        'INTERNAL'
+        {
+            return 70
+        }
+        default
+        {
+            return 70
+        }
+    }
+}
+function Write-NarutoDiagnostic
+{
+    <#
+    .SYNOPSIS
+        Warning/Verbose を標準化し Diagnostics 集計を更新する。
+    #>
+    [CmdletBinding()]
+    param(
+        [hashtable]$Context = $script:NarutoContext,
+        [ValidateSet('Warning', 'Verbose', 'Information')]
+        [string]$Level,
+        [string]$ErrorCode = '',
+        [string]$Message = '',
+        [string]$OutputName = '',
+        [hashtable]$Data = @{}
+    )
+    $prefix = ''
+    if (-not [string]::IsNullOrWhiteSpace($ErrorCode))
+    {
+        $prefix = "[{0}] " -f $ErrorCode
+    }
+    $text = $prefix + $Message
+    if ($Level -eq 'Warning')
+    {
+        Write-Warning $text
+    }
+    elseif ($Level -eq 'Verbose')
+    {
+        Write-Verbose $text
+    }
+    else
+    {
+        Write-Host $text
+    }
+    if ($null -eq $Context -or -not $Context.ContainsKey('Diagnostics'))
+    {
+        return
+    }
+    if ($Level -eq 'Warning')
+    {
+        $Context.Diagnostics.WarningCount = [int]$Context.Diagnostics.WarningCount + 1
+        if (-not [string]::IsNullOrWhiteSpace($ErrorCode))
+        {
+            if (-not $Context.Diagnostics.WarningCodes.ContainsKey($ErrorCode))
+            {
+                $Context.Diagnostics.WarningCodes[$ErrorCode] = 0
+            }
+            $Context.Diagnostics.WarningCodes[$ErrorCode] = [int]$Context.Diagnostics.WarningCodes[$ErrorCode] + 1
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($OutputName))
+    {
+        [void]$Context.Diagnostics.SkippedOutputs.Add([pscustomobject]@{
+                Output = $OutputName
+                ErrorCode = $ErrorCode
+                Message = $Message
+                Data = if ($null -eq $Data)
+                {
+                    @{}
+                }
+                else
+                {
+                    $Data
+                }
+            })
+    }
+}
+function Write-NarutoErrorReport
+{
+    <#
+    .SYNOPSIS
+        失敗時の診断情報を error_report.json として保存する。
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [string]$OutDirectory,
+        [object]$ErrorInfo,
+        [int]$ExitCode
+    )
+    if ([string]::IsNullOrWhiteSpace($OutDirectory))
+    {
+        return (New-NarutoResultSkipped -ErrorCode 'ERROR_REPORT_SKIPPED_NO_OUTDIR' -Message 'OutDirectory が未確定のため error_report.json を出力できません。')
+    }
+    try
+    {
+        if (-not (Test-Path -LiteralPath $OutDirectory))
+        {
+            New-Item -Path $OutDirectory -ItemType Directory -Force -ErrorAction Stop | Out-Null
+        }
+        $reportPath = Join-Path $OutDirectory 'error_report.json'
+        $report = [ordered]@{
+            Timestamp = (Get-Date).ToString('o')
+            ErrorCode = [string]$ErrorInfo.ErrorCode
+            Category = [string]$ErrorInfo.Category
+            Message = [string]$ErrorInfo.Message
+            Context = $ErrorInfo.Context
+            ExitCode = [int]$ExitCode
+            ScriptStackTrace = [string]$ErrorInfo.ScriptStackTrace
+        }
+        $json = $report | ConvertTo-Json -Depth 12
+        [System.IO.File]::WriteAllText($reportPath, $json, (New-Object System.Text.UTF8Encoding($false)))
+        return (New-NarutoResultSuccess -Data $reportPath -ErrorCode 'ERROR_REPORT_WRITTEN' -Message 'error_report.json を出力しました。')
+    }
+    catch
+    {
+        return (New-NarutoResultFailure -ErrorCode 'ERROR_REPORT_WRITE_FAILED' -Message ("error_report.json の出力に失敗しました: {0}" -f $_.Exception.Message) -Context @{
+                OutDirectory = $OutDirectory
+            })
+    }
+}
+# endregion Error and Diagnostics
+
 # region Utility
 function New-NarutoContext
 {
@@ -119,6 +559,40 @@ function New-NarutoContext
             StrictModeEnabled = $true
             SvnExecutable = $SvnExecutable
             SvnGlobalArguments = @($SvnGlobalArguments)
+        }
+        Diagnostics = @{
+            WarningCount = 0
+            WarningCodes = @{}
+            SkippedOutputs = (New-Object 'System.Collections.Generic.List[object]')
+        }
+        ErrorCatalog = @{
+            INPUT_INVALID_ARGUMENT = 'INPUT'
+            INPUT_REQUIRED_VALUE_MISSING = 'INPUT'
+            INPUT_INVALID_REPO_URL = 'INPUT'
+            INPUT_UNSUPPORTED_ENCODING = 'INPUT'
+            ENV_SVN_EXECUTABLE_NOT_FOUND = 'ENV'
+            SVN_COMMAND_FAILED = 'SVN'
+            SVN_TARGET_MISSING = 'SVN'
+            SVN_REPOSITORY_VALIDATION_FAILED = 'SVN'
+            SVN_VERSION_UNAVAILABLE = 'SVN'
+            PARSE_XML_FAILED = 'PARSE'
+            PARSE_SVN_LOG_FAILED = 'PARSE'
+            STRICT_ANALYSIS_FAILED = 'STRICT'
+            STRICT_BLAME_LOOKUP_FAILED = 'STRICT'
+            STRICT_BLAME_ATTRIBUTION_FAILED = 'STRICT'
+            STRICT_HUNK_ANALYSIS_FAILED = 'STRICT'
+            STRICT_OWNERSHIP_BLAME_FAILED = 'STRICT'
+            STRICT_OWNERSHIP_BLAME_SKIPPED = 'STRICT'
+            STRICT_DEATH_ATTRIBUTION_NULL = 'STRICT'
+            STRICT_BLAME_PREFETCH_FAILED = 'STRICT'
+            OUTPUT_DIRECTORY_EMPTY = 'OUTPUT'
+            OUTPUT_DIRECTORY_CREATE_FAILED = 'OUTPUT'
+            OUTPUT_OUT_DIRECTORY_EMPTY = 'OUTPUT'
+            OUTPUT_PLANTUML_NO_DATA = 'OUTPUT'
+            OUTPUT_VISUALIZATION_SKIPPED = 'OUTPUT'
+            OUTPUT_VISUALIZATION_WRITTEN = 'OUTPUT'
+            OUTPUT_NO_DATA = 'OUTPUT'
+            INTERNAL_UNEXPECTED_ERROR = 'INTERNAL'
         }
         Metrics = @{
             ColDeadAdded = '消滅追加行数'  # 追加されたが ToRev 時点で生存していない行数
@@ -203,7 +677,13 @@ function New-NarutoContext
                 'Write-BlameCacheFile',
                 'Test-SvnMissingTargetError',
                 'Invoke-SvnCommandAllowMissingTarget',
-                'Get-EmptyBlameResult'
+                'Get-EmptyBlameResult',
+                'New-NarutoResultSuccess',
+                'New-NarutoResultSkipped',
+                'New-NarutoResultFailure',
+                'Test-NarutoResultSuccess',
+                'ConvertTo-NarutoResultAdapter',
+                'Throw-NarutoError'
             )
         }
     }
@@ -372,13 +852,19 @@ function Initialize-OutputDirectory
         呼び出し元の関数名を指定する（エラーメッセージ用）。
     #>
     [CmdletBinding()]
-    [OutputType([bool])]
+    [OutputType([object])]
     param(
         [Parameter(Mandatory = $true)]
         [string]$Path,
         [Parameter(Mandatory = $false)]
         [string]$CallerName = ''
     )
+    if ([string]::IsNullOrWhiteSpace($Path))
+    {
+        return (New-NarutoResultFailure -ErrorCode 'OUTPUT_DIRECTORY_EMPTY' -Message 'OutDirectory が空です。' -Context @{
+                CallerName = $CallerName
+            })
+    }
     if (-not (Test-Path -LiteralPath $Path))
     {
         try
@@ -387,7 +873,7 @@ function Initialize-OutputDirectory
         }
         catch
         {
-            $context = if ($CallerName)
+            $contextText = if ($CallerName)
             {
                 "${CallerName}: "
             }
@@ -395,11 +881,13 @@ function Initialize-OutputDirectory
             {
                 ''
             }
-            Write-Warning "${context}ディレクトリ作成失敗: $_"
-            return $false
+            return (New-NarutoResultFailure -ErrorCode 'OUTPUT_DIRECTORY_CREATE_FAILED' -Message ("{0}ディレクトリ作成失敗: {1}" -f $contextText, $_.Exception.Message) -Context @{
+                    CallerName = $CallerName
+                    Path = $Path
+                })
         }
     }
-    return $true
+    return (New-NarutoResultSuccess -Data $Path -ErrorCode 'OUTPUT_DIRECTORY_READY')
 }
 # endregion 初期化
 # region エンコーディングと入出力
@@ -454,7 +942,9 @@ function Get-TextEncoding
         }
         default
         {
-            throw "Unsupported encoding: $Name"
+            Throw-NarutoError -Category 'INPUT' -ErrorCode 'INPUT_UNSUPPORTED_ENCODING' -Message ("未対応のエンコーディングです: {0}" -f $Name) -Context @{
+                Encoding = $Name
+            }
         }
     }
 }
@@ -603,7 +1093,10 @@ function Invoke-ParallelWorkSequentialCore
         }
         catch
         {
-            throw ("{0} failed at item index {1}: {2}" -f $ErrorContext, $i, $_.Exception.Message)
+            Throw-NarutoError -Category 'INTERNAL' -ErrorCode 'INTERNAL_PARALLEL_ITEM_FAILED' -Message ("{0} failed at item index {1}: {2}" -f $ErrorContext, $i, $_.Exception.Message) -Context @{
+                ErrorContext = $ErrorContext
+                ItemIndex = $i
+            } -InnerException $_.Exception
         }
     }
     Write-Progress -Id $ProgressId -Activity $ErrorContext -Completed
@@ -677,7 +1170,9 @@ function Invoke-ParallelWorkRunspaceCore
     }
     catch
     {
-        throw ("{0} infrastructure failure: {1}" -f $ErrorContext, $_.Exception.Message)
+        Throw-NarutoError -Category 'INTERNAL' -ErrorCode 'INTERNAL_PARALLEL_INFRASTRUCTURE_FAILED' -Message ("{0} infrastructure failure: {1}" -f $ErrorContext, $_.Exception.Message) -Context @{
+            ErrorContext = $ErrorContext
+        } -InnerException $_.Exception
     }
     finally
     {
@@ -923,7 +1418,9 @@ function Invoke-ParallelWork
     }
     if ($null -eq $WorkerScript)
     {
-        throw "WorkerScript is required for $ErrorContext."
+        Throw-NarutoError -Category 'INPUT' -ErrorCode 'INPUT_WORKER_SCRIPT_REQUIRED' -Message ("WorkerScript is required for {0}." -f $ErrorContext) -Context @{
+            ErrorContext = $ErrorContext
+        }
     }
 
     $effectiveParallel = [Math]::Max(1, [Math]::Min([int]$MaxParallel, $items.Count))
@@ -954,7 +1451,10 @@ function Invoke-ParallelWork
         }
         catch
         {
-            throw ("Required function '{0}' was not found for {1}." -f $name, $ErrorContext)
+            Throw-NarutoError -Category 'INPUT' -ErrorCode 'INPUT_REQUIRED_FUNCTION_NOT_FOUND' -Message ("Required function '{0}' was not found for {1}." -f $name, $ErrorContext) -Context @{
+                FunctionName = $name
+                ErrorContext = $ErrorContext
+            } -InnerException $_.Exception
         }
         $iss.Commands.Add((New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry($name, $definition)))
     }
@@ -1003,7 +1503,10 @@ catch
     if ($failed.Count -gt 0)
     {
         $failureSummary = Get-ParallelFailureSummaryText -FailedEntries @($failed.ToArray())
-        throw ("{0} failed for {1} item(s).`n{2}" -f $ErrorContext, $failed.Count, $failureSummary)
+        Throw-NarutoError -Category 'INTERNAL' -ErrorCode 'INTERNAL_PARALLEL_WORK_FAILED' -Message ("{0} failed for {1} item(s).`n{2}" -f $ErrorContext, $failed.Count, $failureSummary) -Context @{
+            ErrorContext = $ErrorContext
+            FailedCount = $failed.Count
+        }
     }
 
     $results = [System.Collections.Generic.List[object]]::new()
@@ -1601,7 +2104,11 @@ function Invoke-SvnCommand
         $process.WaitForExit()
         if ($process.ExitCode -ne 0)
         {
-            throw "$ErrorContext failed (exit code $($process.ExitCode)).`nSTDERR: $err`nSTDOUT: $out"
+            Throw-NarutoError -Category 'SVN' -ErrorCode 'SVN_COMMAND_FAILED' -Message ("{0} failed (exit code {1}).`nSTDERR: {2}`nSTDOUT: {3}" -f $ErrorContext, $process.ExitCode, $err, $out) -Context @{
+                ErrorContext = $ErrorContext
+                ExitCode = [int]$process.ExitCode
+                Arguments = @($Arguments)
+            }
         }
         return $out
     }
@@ -1638,20 +2145,27 @@ function Invoke-SvnCommandAllowMissingTarget
 {
     <#
     .SYNOPSIS
-        対象不存在時に null を返す SVN コマンド実行。
+        対象不存在を Skipped として返す SVN コマンド実行。
     #>
     [CmdletBinding()]param([hashtable]$Context = $script:NarutoContext, [string[]]$Arguments, [string]$ErrorContext = 'SVN command')
     try
     {
-        return (Invoke-SvnCommand -Context $Context -Arguments $Arguments -ErrorContext $ErrorContext)
+        $out = Invoke-SvnCommand -Context $Context -Arguments $Arguments -ErrorContext $ErrorContext
+        return (New-NarutoResultSuccess -Data $out -ErrorCode 'SVN_COMMAND_SUCCEEDED' -Message ("{0} succeeded." -f $ErrorContext))
     }
     catch
     {
         if (Test-SvnMissingTargetError -Message $_.Exception.Message)
         {
-            return $null
+            return (New-NarutoResultSkipped -ErrorCode 'SVN_TARGET_MISSING' -Message ("{0}: 対象が存在しないためスキップしました。" -f $ErrorContext) -Context @{
+                    ErrorContext = $ErrorContext
+                    Arguments = @($Arguments)
+                })
         }
-        throw
+        Throw-NarutoError -Category 'SVN' -ErrorCode 'SVN_COMMAND_FAILED' -Message ("{0} failed: {1}" -f $ErrorContext, $_.Exception.Message) -Context @{
+            ErrorContext = $ErrorContext
+            Arguments = @($Arguments)
+        } -InnerException $_.Exception
     }
 }
 function Get-EmptyBlameResult
@@ -1704,7 +2218,9 @@ function ConvertFrom-SvnXmlText
     }
     catch
     {
-        throw "Failed to parse XML from $ContextLabel. $($_.Exception.Message)"
+        Throw-NarutoError -Category 'PARSE' -ErrorCode 'PARSE_XML_FAILED' -Message ("{0} の XML パースに失敗しました: {1}" -f $ContextLabel, $_.Exception.Message) -Context @{
+            ContextLabel = $ContextLabel
+        } -InnerException $_.Exception
     }
 }
 function Resolve-SvnTargetUrl
@@ -1716,13 +2232,17 @@ function Resolve-SvnTargetUrl
     param([hashtable]$Context = $script:NarutoContext, [string]$Target)
     if (-not ($Target -match '^(https?|svn|file)://'))
     {
-        throw "RepoUrl must be svn URL. Provided: '$Target'"
+        Throw-NarutoError -Category 'INPUT' -ErrorCode 'INPUT_INVALID_REPO_URL' -Message ("RepoUrl は svn URL 形式で指定してください: '{0}'" -f $Target) -Context @{
+            RepoUrl = $Target
+        }
     }
     $xml = ConvertFrom-SvnXmlText -Text (Invoke-SvnCommand -Context $Context -Arguments @('info', '--xml', $Target) -ErrorContext 'svn info') -ContextLabel 'svn info'
     $url = [string]$xml.info.entry.url
     if ([string]::IsNullOrWhiteSpace($url))
     {
-        throw "Could not validate repository URL: $Target"
+        Throw-NarutoError -Category 'SVN' -ErrorCode 'SVN_REPOSITORY_VALIDATION_FAILED' -Message ("リポジトリ URL を検証できませんでした: {0}" -f $Target) -Context @{
+            RepoUrl = $Target
+        }
     }
     return $url.TrimEnd('/')
 }
@@ -2402,7 +2922,9 @@ function Get-SvnBlameSummary
     .PARAMETER CacheDir
         キャッシュディレクトリのパスを指定する。
     #>
-    [CmdletBinding()]param( [hashtable]$Context = $script:NarutoContext, [string]$Repo, [string]$FilePath, [int]$ToRevision, [string]$CacheDir)
+    [CmdletBinding()]
+    [OutputType([object])]
+    param( [hashtable]$Context = $script:NarutoContext, [string]$Repo, [string]$FilePath, [int]$ToRevision, [string]$CacheDir)
     # インメモリキャッシュにヒットすればディスク読み込み・XML パースを完全に回避する。
     # 所有権分析フェーズでは同一ファイルに複数回アクセスされるため効果が大きい。
     if ($null -eq $Context.Caches.SvnBlameSummaryMemoryCache)
@@ -2413,15 +2935,25 @@ function Get-SvnBlameSummary
     if ($Context.Caches.SvnBlameSummaryMemoryCache.ContainsKey($cacheKey))
     {
         $Context.Caches.StrictBlameCacheHits++
-        return $Context.Caches.SvnBlameSummaryMemoryCache[$cacheKey]
+        return (New-NarutoResultSuccess -Data $Context.Caches.SvnBlameSummaryMemoryCache[$cacheKey] -ErrorCode 'SVN_BLAME_SUMMARY_CACHE_HIT')
     }
 
     $url = $Repo.TrimEnd('/') + '/' + (ConvertTo-PathKey -Path $FilePath).TrimStart('/') + '@' + [string]$ToRevision
     $text = Read-BlameCacheFile -CacheDir $CacheDir -Revision $ToRevision -FilePath $FilePath
+    $fetchResult = $null
     if ([string]::IsNullOrWhiteSpace($text))
     {
         $Context.Caches.StrictBlameCacheMisses++
-        $text = Invoke-SvnCommandAllowMissingTarget -Arguments @('blame', '--xml', '-r', [string]$ToRevision, $url) -ErrorContext ("svn blame $FilePath")
+        $fetchResult = Invoke-SvnCommandAllowMissingTarget -Context $Context -Arguments @('blame', '--xml', '-r', [string]$ToRevision, $url) -ErrorContext ("svn blame $FilePath")
+        $fetchResult = ConvertTo-NarutoResultAdapter -InputObject $fetchResult -SuccessCode 'SVN_COMMAND_SUCCEEDED' -SkippedCode 'SVN_TARGET_MISSING'
+        if (Test-NarutoResultSuccess -Result $fetchResult)
+        {
+            $text = [string]$fetchResult.Data
+        }
+        else
+        {
+            $text = $null
+        }
         if (-not [string]::IsNullOrWhiteSpace($text))
         {
             Write-BlameCacheFile -CacheDir $CacheDir -Revision $ToRevision -FilePath $FilePath -Content $text
@@ -2435,11 +2967,21 @@ function Get-SvnBlameSummary
     {
         $empty = Get-EmptyBlameResult
         $Context.Caches.SvnBlameSummaryMemoryCache[$cacheKey] = $empty
-        return $empty
+        $skipCode = 'SVN_BLAME_SUMMARY_EMPTY'
+        $skipMessage = ("svn blame summary is empty for '{0}' at r{1}." -f $FilePath, $ToRevision)
+        if ($null -ne $fetchResult -and [string]$fetchResult.Status -eq 'Skipped')
+        {
+            $skipCode = [string]$fetchResult.ErrorCode
+            $skipMessage = [string]$fetchResult.Message
+        }
+        return (New-NarutoResultSkipped -Data $empty -ErrorCode $skipCode -Message $skipMessage -Context @{
+                FilePath = $FilePath
+                Revision = [int]$ToRevision
+            })
     }
     $parsed = ConvertFrom-SvnBlameXml -XmlText $text
     $Context.Caches.SvnBlameSummaryMemoryCache[$cacheKey] = $parsed
-    return $parsed
+    return (New-NarutoResultSuccess -Data $parsed -ErrorCode 'SVN_BLAME_SUMMARY_READY')
 }
 function Get-SvnBlameLine
 {
@@ -2456,6 +2998,7 @@ function Get-SvnBlameLine
         キャッシュディレクトリのパスを指定する。
     #>
     [CmdletBinding()]
+    [OutputType([object])]
     param( [hashtable]$Context = $script:NarutoContext, [string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir)
     # インメモリキャッシュにヒットすればディスク読み込み (blame XML + cat テキスト) と
     # XML パースを完全に回避する。同一コミット内で同じファイルが複数トランジションから
@@ -2468,17 +3011,27 @@ function Get-SvnBlameLine
     if ($Context.Caches.SvnBlameLineMemoryCache.ContainsKey($cacheKey))
     {
         $Context.Caches.StrictBlameCacheHits++
-        return $Context.Caches.SvnBlameLineMemoryCache[$cacheKey]
+        return (New-NarutoResultSuccess -Data $Context.Caches.SvnBlameLineMemoryCache[$cacheKey] -ErrorCode 'SVN_BLAME_LINE_CACHE_HIT')
     }
 
     $path = (ConvertTo-PathKey -Path $FilePath).TrimStart('/')
     $url = $Repo.TrimEnd('/') + '/' + $path + '@' + [string]$Revision
 
     $blameXml = Read-BlameCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
+    $blameFetchResult = $null
     if ([string]::IsNullOrWhiteSpace($blameXml))
     {
         $Context.Caches.StrictBlameCacheMisses++
-        $blameXml = Invoke-SvnCommandAllowMissingTarget -Arguments @('blame', '--xml', '-r', [string]$Revision, $url) -ErrorContext ("svn blame $FilePath@$Revision")
+        $blameFetchResult = Invoke-SvnCommandAllowMissingTarget -Context $Context -Arguments @('blame', '--xml', '-r', [string]$Revision, $url) -ErrorContext ("svn blame $FilePath@$Revision")
+        $blameFetchResult = ConvertTo-NarutoResultAdapter -InputObject $blameFetchResult -SuccessCode 'SVN_COMMAND_SUCCEEDED' -SkippedCode 'SVN_TARGET_MISSING'
+        if (Test-NarutoResultSuccess -Result $blameFetchResult)
+        {
+            $blameXml = [string]$blameFetchResult.Data
+        }
+        else
+        {
+            $blameXml = $null
+        }
         if (-not [string]::IsNullOrWhiteSpace($blameXml))
         {
             Write-BlameCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath -Content $blameXml
@@ -2490,9 +3043,19 @@ function Get-SvnBlameLine
     }
 
     $catText = Read-CatCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
+    $catFetchResult = $null
     if ($null -eq $catText)
     {
-        $catText = Invoke-SvnCommandAllowMissingTarget -Arguments @('cat', '-r', [string]$Revision, $url) -ErrorContext ("svn cat $FilePath@$Revision")
+        $catFetchResult = Invoke-SvnCommandAllowMissingTarget -Context $Context -Arguments @('cat', '-r', [string]$Revision, $url) -ErrorContext ("svn cat $FilePath@$Revision")
+        $catFetchResult = ConvertTo-NarutoResultAdapter -InputObject $catFetchResult -SuccessCode 'SVN_COMMAND_SUCCEEDED' -SkippedCode 'SVN_TARGET_MISSING'
+        if (Test-NarutoResultSuccess -Result $catFetchResult)
+        {
+            $catText = [string]$catFetchResult.Data
+        }
+        else
+        {
+            $catText = $null
+        }
         if ($null -ne $catText)
         {
             Write-CatCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath -Content $catText
@@ -2502,12 +3065,27 @@ function Get-SvnBlameLine
     {
         $empty = Get-EmptyBlameResult
         $Context.Caches.SvnBlameLineMemoryCache[$cacheKey] = $empty
-        return $empty
+        $skipCode = 'SVN_BLAME_LINE_EMPTY'
+        $skipMessage = ("svn blame line is empty for '{0}' at r{1}." -f $FilePath, $Revision)
+        if ($null -ne $blameFetchResult -and [string]$blameFetchResult.Status -eq 'Skipped')
+        {
+            $skipCode = [string]$blameFetchResult.ErrorCode
+            $skipMessage = [string]$blameFetchResult.Message
+        }
+        elseif ($null -ne $catFetchResult -and [string]$catFetchResult.Status -eq 'Skipped')
+        {
+            $skipCode = [string]$catFetchResult.ErrorCode
+            $skipMessage = [string]$catFetchResult.Message
+        }
+        return (New-NarutoResultSkipped -Data $empty -ErrorCode $skipCode -Message $skipMessage -Context @{
+                FilePath = $FilePath
+                Revision = [int]$Revision
+            })
     }
     $contentLines = ConvertTo-TextLine -Text $catText
     $parsed = ConvertFrom-SvnBlameXml -XmlText $blameXml -ContentLines $contentLines
     $Context.Caches.SvnBlameLineMemoryCache[$cacheKey] = $parsed
-    return $parsed
+    return (New-NarutoResultSuccess -Data $parsed -ErrorCode 'SVN_BLAME_LINE_READY')
 }
 function Initialize-SvnBlameLineCache
 {
@@ -2528,10 +3106,13 @@ function Initialize-SvnBlameLineCache
     param([string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir)
     if ($Revision -le 0 -or [string]::IsNullOrWhiteSpace($FilePath))
     {
-        return [pscustomobject]@{
-            CacheHits = 0
-            CacheMisses = 0
-        }
+        return (New-NarutoResultSkipped -Data ([pscustomobject]@{
+                    CacheHits = 0
+                    CacheMisses = 0
+                }) -ErrorCode 'SVN_BLAME_CACHE_INVALID_ARGUMENT' -Message 'blame キャッシュ対象の引数が無効なためスキップしました。' -Context @{
+                FilePath = $FilePath
+                Revision = [int]$Revision
+            })
     }
 
     $path = (ConvertTo-PathKey -Path $FilePath).TrimStart('/')
@@ -2539,12 +3120,23 @@ function Initialize-SvnBlameLineCache
 
     $hits = 0
     $misses = 0
+    $skipReason = $null
 
     $blameXml = Read-BlameCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
     if ([string]::IsNullOrWhiteSpace($blameXml))
     {
         $misses++
-        $blameXml = Invoke-SvnCommandAllowMissingTarget -Arguments @('blame', '--xml', '-r', [string]$Revision, $url) -ErrorContext ("svn blame $FilePath@$Revision")
+        $blameFetchResult = Invoke-SvnCommandAllowMissingTarget -Arguments @('blame', '--xml', '-r', [string]$Revision, $url) -ErrorContext ("svn blame $FilePath@$Revision")
+        $blameFetchResult = ConvertTo-NarutoResultAdapter -InputObject $blameFetchResult -SuccessCode 'SVN_COMMAND_SUCCEEDED' -SkippedCode 'SVN_TARGET_MISSING'
+        if (Test-NarutoResultSuccess -Result $blameFetchResult)
+        {
+            $blameXml = [string]$blameFetchResult.Data
+        }
+        else
+        {
+            $blameXml = $null
+            $skipReason = $blameFetchResult
+        }
         if (-not [string]::IsNullOrWhiteSpace($blameXml))
         {
             Write-BlameCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath -Content $blameXml
@@ -2559,7 +3151,20 @@ function Initialize-SvnBlameLineCache
     if ($null -eq $catText)
     {
         $misses++
-        $catText = Invoke-SvnCommandAllowMissingTarget -Arguments @('cat', '-r', [string]$Revision, $url) -ErrorContext ("svn cat $FilePath@$Revision")
+        $catFetchResult = Invoke-SvnCommandAllowMissingTarget -Arguments @('cat', '-r', [string]$Revision, $url) -ErrorContext ("svn cat $FilePath@$Revision")
+        $catFetchResult = ConvertTo-NarutoResultAdapter -InputObject $catFetchResult -SuccessCode 'SVN_COMMAND_SUCCEEDED' -SkippedCode 'SVN_TARGET_MISSING'
+        if (Test-NarutoResultSuccess -Result $catFetchResult)
+        {
+            $catText = [string]$catFetchResult.Data
+        }
+        else
+        {
+            $catText = $null
+            if ($null -eq $skipReason)
+            {
+                $skipReason = $catFetchResult
+            }
+        }
         if ($null -ne $catText)
         {
             Write-CatCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath -Content $catText
@@ -2570,10 +3175,18 @@ function Initialize-SvnBlameLineCache
         $hits++
     }
 
-    return [pscustomobject]@{
+    $cacheStat = [pscustomobject]@{
         CacheHits = $hits
         CacheMisses = $misses
     }
+    if ($null -ne $skipReason -and [string]$skipReason.Status -eq 'Skipped')
+    {
+        return (New-NarutoResultSkipped -Data $cacheStat -ErrorCode ([string]$skipReason.ErrorCode) -Message ([string]$skipReason.Message) -Context @{
+                FilePath = $FilePath
+                Revision = [int]$Revision
+            })
+    }
+    return (New-NarutoResultSuccess -Data $cacheStat -ErrorCode 'SVN_BLAME_CACHE_READY')
 }
 # endregion Blame パース
 # region LCS・Blame 比較
@@ -3705,13 +4318,25 @@ function Invoke-StrictBlameCachePrefetch
             Write-Progress -Id 4 -Activity 'blame キャッシュ構築' -Status ('{0}/{1}' -f ($prefetchIdx + 1), $prefetchTotal) -PercentComplete $pct
             try
             {
-                $prefetchStats = Initialize-SvnBlameLineCache -Repo $TargetUrl -FilePath ([string]$item.FilePath) -Revision ([int]$item.Revision) -CacheDir $CacheDir
+                $prefetchStatsResult = Initialize-SvnBlameLineCache -Repo $TargetUrl -FilePath ([string]$item.FilePath) -Revision ([int]$item.Revision) -CacheDir $CacheDir
+                $prefetchStatsResult = ConvertTo-NarutoResultAdapter -InputObject $prefetchStatsResult -SuccessCode 'SVN_BLAME_CACHE_READY' -SkippedCode 'SVN_BLAME_CACHE_INVALID_ARGUMENT'
+                $prefetchStats = $prefetchStatsResult.Data
+                if ($null -eq $prefetchStats)
+                {
+                    $prefetchStats = [pscustomobject]@{
+                        CacheHits = 0
+                        CacheMisses = 0
+                    }
+                }
                 $Context.Caches.StrictBlameCacheHits += [int]$prefetchStats.CacheHits
                 $Context.Caches.StrictBlameCacheMisses += [int]$prefetchStats.CacheMisses
             }
             catch
             {
-                throw ("Strict blame prefetch failed for '{0}' at r{1}: {2}" -f [string]$item.FilePath, [int]$item.Revision, $_.Exception.Message)
+                Throw-NarutoError -Category 'STRICT' -ErrorCode 'STRICT_BLAME_PREFETCH_FAILED' -Message ("Strict blame prefetch failed for '{0}' at r{1}: {2}" -f [string]$item.FilePath, [int]$item.Revision, $_.Exception.Message) -Context @{
+                    FilePath = [string]$item.FilePath
+                    Revision = [int]$item.Revision
+                } -InnerException $_.Exception
             }
             $prefetchIdx++
         }
@@ -3735,15 +4360,29 @@ function Invoke-StrictBlameCachePrefetch
         [void]$Index # Required by Invoke-ParallelWork contract
         try
         {
-            $stats = Initialize-SvnBlameLineCache -Repo $Item.TargetUrl -FilePath ([string]$Item.FilePath) -Revision ([int]$Item.Revision) -CacheDir $Item.CacheDir
+            $statsResult = Initialize-SvnBlameLineCache -Repo $Item.TargetUrl -FilePath ([string]$Item.FilePath) -Revision ([int]$Item.Revision) -CacheDir $Item.CacheDir
+            $statsResult = ConvertTo-NarutoResultAdapter -InputObject $statsResult -SuccessCode 'SVN_BLAME_CACHE_READY' -SkippedCode 'SVN_BLAME_CACHE_INVALID_ARGUMENT'
+            $stats = $statsResult.Data
+            if ($null -eq $stats)
+            {
+                $stats = [pscustomobject]@{
+                    CacheHits = 0
+                    CacheMisses = 0
+                }
+            }
             [pscustomobject]@{
                 CacheHits = [int]$stats.CacheHits
                 CacheMisses = [int]$stats.CacheMisses
+                Status = [string]$statsResult.Status
+                ErrorCode = [string]$statsResult.ErrorCode
             }
         }
         catch
         {
-            throw ("Strict blame prefetch failed for '{0}' at r{1}: {2}" -f [string]$Item.FilePath, [int]$Item.Revision, $_.Exception.Message)
+            Throw-NarutoError -Category 'STRICT' -ErrorCode 'STRICT_BLAME_PREFETCH_FAILED' -Message ("Strict blame prefetch failed for '{0}' at r{1}: {2}" -f [string]$Item.FilePath, [int]$Item.Revision, $_.Exception.Message) -Context @{
+                FilePath = [string]$Item.FilePath
+                Revision = [int]$Item.Revision
+            } -InnerException $_.Exception
         }
     }
     $results = @(Invoke-ParallelWork -InputItems $prefetchItems.ToArray() -WorkerScript $worker -MaxParallel $Parallel -RequiredFunctions @(
@@ -3917,7 +4556,16 @@ function Get-StrictTransitionComparison
     # 現リビジョンの blame から当該リビジョンで born された行だけを抽出する。
     if ($hasTransitionStat -and $transitionAdded -gt 0 -and $transitionDeleted -eq 0 -and $afterPath)
     {
-        $currBlame = Get-SvnBlameLine -Repo $TargetUrl -FilePath $afterPath -Revision $Revision -CacheDir $CacheDir
+        $currBlameResult = Get-SvnBlameLine -Repo $TargetUrl -FilePath $afterPath -Revision $Revision -CacheDir $CacheDir
+        $currBlameResult = ConvertTo-NarutoResultAdapter -InputObject $currBlameResult -SuccessCode 'SVN_BLAME_LINE_READY' -SkippedCode 'SVN_BLAME_LINE_EMPTY'
+        if (-not (Test-NarutoResultSuccess -Result $currBlameResult))
+        {
+            Throw-NarutoError -Category 'STRICT' -ErrorCode ([string]$currBlameResult.ErrorCode) -Message ("Strict transition blame lookup failed for '{0}' at r{1}: {2}" -f $afterPath, $Revision, [string]$currBlameResult.Message) -Context @{
+                FilePath = $afterPath
+                Revision = [int]$Revision
+            }
+        }
+        $currBlame = $currBlameResult.Data
         $currLines = @($currBlame.Lines)
         $bornOnly = New-Object 'System.Collections.Generic.List[object]'
         for ($currIdx = 0
@@ -3955,7 +4603,16 @@ function Get-StrictTransitionComparison
     # 前リビジョンの全行を killed として扱う。afterPath が null であることが条件。
     if ($hasTransitionStat -and $transitionDeleted -gt 0 -and $transitionAdded -eq 0 -and $beforePath -and (-not $afterPath))
     {
-        $prevBlame = Get-SvnBlameLine -Repo $TargetUrl -FilePath $beforePath -Revision ($Revision - 1) -CacheDir $CacheDir
+        $prevBlameResult = Get-SvnBlameLine -Repo $TargetUrl -FilePath $beforePath -Revision ($Revision - 1) -CacheDir $CacheDir
+        $prevBlameResult = ConvertTo-NarutoResultAdapter -InputObject $prevBlameResult -SuccessCode 'SVN_BLAME_LINE_READY' -SkippedCode 'SVN_BLAME_LINE_EMPTY'
+        if (-not (Test-NarutoResultSuccess -Result $prevBlameResult))
+        {
+            Throw-NarutoError -Category 'STRICT' -ErrorCode ([string]$prevBlameResult.ErrorCode) -Message ("Strict transition blame lookup failed for '{0}' at r{1}: {2}" -f $beforePath, ($Revision - 1), [string]$prevBlameResult.Message) -Context @{
+                FilePath = $beforePath
+                Revision = [int]($Revision - 1)
+            }
+        }
+        $prevBlame = $prevBlameResult.Data
         $prevLines = @($prevBlame.Lines)
         $killedOnly = New-Object 'System.Collections.Generic.List[object]'
         for ($prevIdx = 0
@@ -3979,13 +4636,31 @@ function Get-StrictTransitionComparison
     $prevLines = @()
     if ($beforePath)
     {
-        $prevBlame = Get-SvnBlameLine -Repo $TargetUrl -FilePath $beforePath -Revision ($Revision - 1) -CacheDir $CacheDir
+        $prevBlameResult = Get-SvnBlameLine -Repo $TargetUrl -FilePath $beforePath -Revision ($Revision - 1) -CacheDir $CacheDir
+        $prevBlameResult = ConvertTo-NarutoResultAdapter -InputObject $prevBlameResult -SuccessCode 'SVN_BLAME_LINE_READY' -SkippedCode 'SVN_BLAME_LINE_EMPTY'
+        if (-not (Test-NarutoResultSuccess -Result $prevBlameResult))
+        {
+            Throw-NarutoError -Category 'STRICT' -ErrorCode ([string]$prevBlameResult.ErrorCode) -Message ("Strict transition blame lookup failed for '{0}' at r{1}: {2}" -f $beforePath, ($Revision - 1), [string]$prevBlameResult.Message) -Context @{
+                FilePath = $beforePath
+                Revision = [int]($Revision - 1)
+            }
+        }
+        $prevBlame = $prevBlameResult.Data
         $prevLines = @($prevBlame.Lines)
     }
     $currLines = @()
     if ($afterPath)
     {
-        $currBlame = Get-SvnBlameLine -Repo $TargetUrl -FilePath $afterPath -Revision $Revision -CacheDir $CacheDir
+        $currBlameResult = Get-SvnBlameLine -Repo $TargetUrl -FilePath $afterPath -Revision $Revision -CacheDir $CacheDir
+        $currBlameResult = ConvertTo-NarutoResultAdapter -InputObject $currBlameResult -SuccessCode 'SVN_BLAME_LINE_READY' -SkippedCode 'SVN_BLAME_LINE_EMPTY'
+        if (-not (Test-NarutoResultSuccess -Result $currBlameResult))
+        {
+            Throw-NarutoError -Category 'STRICT' -ErrorCode ([string]$currBlameResult.ErrorCode) -Message ("Strict transition blame lookup failed for '{0}' at r{1}: {2}" -f $afterPath, $Revision, [string]$currBlameResult.Message) -Context @{
+                FilePath = $afterPath
+                Revision = [int]$Revision
+            }
+        }
+        $currBlame = $currBlameResult.Data
         $currLines = @($currBlame.Lines)
     }
     return (Compare-BlameOutput -PreviousLines $prevLines -CurrentLines $currLines)
@@ -4190,7 +4865,11 @@ function Invoke-StrictCommitAttribution
         }
         catch
         {
-            throw ("Strict blame attribution failed at r{0} (before='{1}', after='{2}'): {3}" -f $revision, [string]$transition.BeforePath, [string]$transition.AfterPath, $_.Exception.Message)
+            Throw-NarutoError -Category 'STRICT' -ErrorCode 'STRICT_BLAME_ATTRIBUTION_FAILED' -Message ("Strict blame attribution failed at r{0} (before='{1}', after='{2}'): {3}" -f $revision, [string]$transition.BeforePath, [string]$transition.AfterPath, $_.Exception.Message) -Context @{
+                Revision = [int]$revision
+                BeforePath = [string]$transition.BeforePath
+                AfterPath = [string]$transition.AfterPath
+            } -InnerException $_.Exception
         }
     }
     # コミット間でキャッシュキーの再利用はないため、コミット境界で安全にクリア可能。
@@ -4258,7 +4937,7 @@ function Get-ExactDeathAttribution
     }
     catch
     {
-        throw ("Strict hunk analysis failed: {0}`n{1}" -f $_.Exception.Message, $_.ScriptStackTrace)
+        Throw-NarutoError -Category 'STRICT' -ErrorCode 'STRICT_HUNK_ANALYSIS_FAILED' -Message ("Strict hunk analysis failed: {0}`n{1}" -f $_.Exception.Message, $_.ScriptStackTrace) -Context @{} -InnerException $_.Exception
     }
     return (Get-StrictAttributionResult -Accumulator $accumulator -StrictHunk $strictHunk)
 }
@@ -4922,6 +5601,55 @@ function Get-CoChangeMetric
 }
 # endregion メトリクス計算
 # region PlantUML 出力
+function New-NarutoVisualizationSkippedResult
+{
+    <#
+    .SYNOPSIS
+        可視化出力のスキップ結果を記録し NarutoResult を返す。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [hashtable]$Context = $script:NarutoContext,
+        [ValidateSet('Warning', 'Verbose')]
+        [string]$Level = 'Verbose',
+        [string]$OutputName,
+        [string]$ErrorCode,
+        [string]$Message,
+        [hashtable]$Data = @{}
+    )
+    Write-NarutoDiagnostic -Context $Context -Level $Level -ErrorCode $ErrorCode -Message $Message -OutputName $OutputName -Data $Data
+    return (New-NarutoResultSkipped -ErrorCode $ErrorCode -Message $Message -Context $Data)
+}
+function Initialize-NarutoVisualizationOutputDirectory
+{
+    <#
+    .SYNOPSIS
+        可視化出力用のディレクトリ初期化を統一する。
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [hashtable]$Context = $script:NarutoContext,
+        [string]$OutDirectory,
+        [string]$CallerName,
+        [string]$OutputName
+    )
+    if ([string]::IsNullOrWhiteSpace($OutDirectory))
+    {
+        return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Warning' -OutputName $OutputName -ErrorCode 'OUTPUT_OUT_DIRECTORY_EMPTY' -Message ("{0}: OutDirectory が空です。" -f $CallerName))
+    }
+    $directoryResult = Initialize-OutputDirectory -Path $OutDirectory -CallerName $CallerName
+    if (-not (Test-NarutoResultSuccess -Result $directoryResult))
+    {
+        return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Warning' -OutputName $OutputName -ErrorCode ([string]$directoryResult.ErrorCode) -Message ([string]$directoryResult.Message) -Data @{
+                CallerName = $CallerName
+                OutDirectory = $OutDirectory
+            })
+    }
+    return $directoryResult
+}
 function Write-PlantUmlFile
 {
     <#
@@ -4943,7 +5671,29 @@ function Write-PlantUmlFile
     .PARAMETER EncodingName
         出力時に使用する文字エンコーディングを指定する。
     #>
-    param([string]$OutDirectory, [object[]]$Committers, [object[]]$Files, [object[]]$Couplings, [int]$TopNCount, [string]$EncodingName)
+    [OutputType([object])]
+    param(
+        [hashtable]$Context = $script:NarutoContext,
+        [string]$OutDirectory,
+        [object[]]$Committers,
+        [object[]]$Files,
+        [object[]]$Couplings,
+        [int]$TopNCount,
+        [string]$EncodingName
+    )
+    $initResult = Initialize-NarutoVisualizationOutputDirectory -Context $Context -OutDirectory $OutDirectory -CallerName 'Write-PlantUmlFile' -OutputName 'plantuml'
+    if (-not (Test-NarutoResultSuccess -Result $initResult))
+    {
+        return $initResult
+    }
+    if ($TopNCount -le 0)
+    {
+        return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Verbose' -OutputName 'plantuml' -ErrorCode 'OUTPUT_PLANTUML_SKIPPED_TOPN' -Message 'TopNCount が 0 以下のため PlantUML 出力をスキップしました。')
+    }
+    if ((-not $Committers -or @($Committers).Count -eq 0) -and (-not $Files -or @($Files).Count -eq 0) -and (-not $Couplings -or @($Couplings).Count -eq 0))
+    {
+        return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Verbose' -OutputName 'plantuml' -ErrorCode 'OUTPUT_PLANTUML_NO_DATA' -Message '可視化データが空のため PlantUML 出力をスキップしました。')
+    }
     $topCommitters = @($Committers | Sort-Object -Property @{Expression = '総チャーン'
             Descending = $true
         }, '作者' | Select-Object -First $TopNCount)
@@ -5065,6 +5815,11 @@ function Write-PlantUmlFile
     }
     [void]$sb3.AppendLine('@enduml')
     Write-TextFile -FilePath (Join-Path $OutDirectory 'cochange_network.puml') -Content $sb3.ToString() -EncodingName $EncodingName
+    return (New-NarutoResultSuccess -Data @(
+            (Join-Path $OutDirectory 'contributors_summary.puml'),
+            (Join-Path $OutDirectory 'hotspots.puml'),
+            (Join-Path $OutDirectory 'cochange_network.puml')
+        ) -ErrorCode 'OUTPUT_PLANTUML_WRITTEN' -Message 'PlantUML 出力を生成しました。')
 }
 function ConvertTo-SvgColor
 {
@@ -5143,6 +5898,7 @@ function Write-FileBubbleChart
         Write-FileBubbleChart -OutDirectory '.\output' -Files $fileMetrics -TopNCount 50 -EncodingName 'UTF8'
     #>
     [CmdletBinding()]
+    [OutputType([object])]
     param( [hashtable]$Context = $script:NarutoContext,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
@@ -5156,18 +5912,16 @@ function Write-FileBubbleChart
         [Parameter(Mandatory = $false)]
         [string]$EncodingName = 'UTF-8'
     )
-
-    # 入力検証
-    if ([string]::IsNullOrWhiteSpace($OutDirectory))
+    $outputName = 'file_hotspot.svg'
+    $directoryResult = Initialize-NarutoVisualizationOutputDirectory -Context $Context -OutDirectory $OutDirectory -CallerName 'Write-FileBubbleChart' -OutputName $outputName
+    if (-not (Test-NarutoResultSuccess -Result $directoryResult))
     {
-        Write-Warning 'Write-FileBubbleChart: OutDirectory が空です。'
-        return
+        return $directoryResult
     }
 
     if (-not $Files -or @($Files).Count -eq 0)
     {
-        Write-Verbose 'Write-FileBubbleChart: Files が空です。SVG を生成しません。'
-        return
+        return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Verbose' -OutputName $outputName -ErrorCode 'OUTPUT_FILE_HOTSPOT_NO_DATA' -Message 'Write-FileBubbleChart: Files が空のため SVG を生成しません。')
     }
     $topFiles = @(
         $Files |
@@ -5178,8 +5932,7 @@ function Write-FileBubbleChart
     )
     if ($topFiles.Count -eq 0)
     {
-        Write-Verbose 'Write-FileBubbleChart: blame占有率を持つファイルがありません。SVG を生成しません。'
-        return
+        return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Verbose' -OutputName $outputName -ErrorCode 'OUTPUT_FILE_HOTSPOT_NO_PLOTTABLE_DATA' -Message 'Write-FileBubbleChart: blame占有率を持つファイルがないため SVG を生成しません。')
     }
     if ($TopNCount -gt 0)
     {
@@ -5402,6 +6155,7 @@ function Write-FileBubbleChart
 
     [void]$sb.AppendLine('</svg>')
     Write-TextFile -FilePath (Join-Path $OutDirectory 'file_hotspot.svg') -Content $sb.ToString() -EncodingName $EncodingName
+    return (New-NarutoResultSuccess -Data (Join-Path $OutDirectory 'file_hotspot.svg') -ErrorCode 'OUTPUT_FILE_HOTSPOT_WRITTEN')
 }
 function Write-FileQualityScatterChart
 {
@@ -5429,6 +6183,7 @@ function Write-FileQualityScatterChart
         Write-FileQualityScatterChart -OutDirectory '.\output' -Files $fileRows -TopNCount 50 -EncodingName 'UTF8'
     #>
     [CmdletBinding()]
+    [OutputType([object])]
     param( [hashtable]$Context = $script:NarutoContext,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
@@ -5442,19 +6197,15 @@ function Write-FileQualityScatterChart
         [Parameter(Mandatory = $false)]
         [string]$EncodingName = 'UTF-8'
     )
-    if ([string]::IsNullOrWhiteSpace($OutDirectory))
+    $outputName = 'file_quality_scatter.svg'
+    $directoryResult = Initialize-NarutoVisualizationOutputDirectory -Context $Context -OutDirectory $OutDirectory -CallerName 'Write-FileQualityScatterChart' -OutputName $outputName
+    if (-not (Test-NarutoResultSuccess -Result $directoryResult))
     {
-        Write-Warning 'Write-FileQualityScatterChart: OutDirectory が空です。'
-        return
+        return $directoryResult
     }
     if (-not $Files -or @($Files).Count -eq 0)
     {
-        Write-Verbose 'Write-FileQualityScatterChart: Files が空です。'
-        return
-    }
-    if (-not (Initialize-OutputDirectory -Path $OutDirectory -CallerName 'Write-FileQualityScatterChart'))
-    {
-        return
+        return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Verbose' -OutputName $outputName -ErrorCode 'OUTPUT_FILE_QUALITY_NO_DATA' -Message 'Write-FileQualityScatterChart: Files が空です。')
     }
 
     $topFiles = @(
@@ -5546,7 +6297,7 @@ function Write-FileQualityScatterChart
     }
     if ($scatterData.Count -eq 0)
     {
-        return
+        return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Verbose' -OutputName $outputName -ErrorCode 'OUTPUT_FILE_QUALITY_NO_PLOTTABLE_DATA' -Message 'Write-FileQualityScatterChart: 描画対象データがありません。')
     }
 
     # 描画定数
@@ -5635,6 +6386,7 @@ function Write-FileQualityScatterChart
 
     [void]$sb.AppendLine('</svg>')
     Write-TextFile -FilePath (Join-Path $OutDirectory 'file_quality_scatter.svg') -Content $sb.ToString() -EncodingName $EncodingName
+    return (New-NarutoResultSuccess -Data (Join-Path $OutDirectory 'file_quality_scatter.svg') -ErrorCode 'OUTPUT_FILE_QUALITY_WRITTEN')
 }
 function Write-CommitTimelineChart
 {
@@ -5655,6 +6407,7 @@ function Write-CommitTimelineChart
         Write-CommitTimelineChart -OutDirectory '.\output' -Commits $commitRows -EncodingName 'UTF8'
     #>
     [CmdletBinding()]
+    [OutputType([object])]
     param( [hashtable]$Context = $script:NarutoContext,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
@@ -5666,19 +6419,15 @@ function Write-CommitTimelineChart
         [Parameter(Mandatory = $false)]
         [string]$EncodingName = 'UTF-8'
     )
-    if ([string]::IsNullOrWhiteSpace($OutDirectory))
+    $outputName = 'commit_timeline.svg'
+    $directoryResult = Initialize-NarutoVisualizationOutputDirectory -Context $Context -OutDirectory $OutDirectory -CallerName 'Write-CommitTimelineChart' -OutputName $outputName
+    if (-not (Test-NarutoResultSuccess -Result $directoryResult))
     {
-        Write-Warning 'Write-CommitTimelineChart: OutDirectory が空です。'
-        return
+        return $directoryResult
     }
     if (-not $Commits -or @($Commits).Count -eq 0)
     {
-        Write-Verbose 'Write-CommitTimelineChart: Commits が空です。'
-        return
-    }
-    if (-not (Initialize-OutputDirectory -Path $OutDirectory -CallerName 'Write-CommitTimelineChart'))
-    {
-        return
+        return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Verbose' -OutputName $outputName -ErrorCode 'OUTPUT_COMMIT_TIMELINE_NO_DATA' -Message 'Write-CommitTimelineChart: Commits が空です。')
     }
 
     # コミットデータの解析
@@ -5734,7 +6483,7 @@ function Write-CommitTimelineChart
     }
     if ($commitData.Count -eq 0)
     {
-        return
+        return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Verbose' -OutputName $outputName -ErrorCode 'OUTPUT_COMMIT_TIMELINE_NO_PLOTTABLE_DATA' -Message 'Write-CommitTimelineChart: 描画可能なコミットがありません。')
     }
     $sorted = @($commitData | Sort-Object -Property DateTime)
 
@@ -5845,6 +6594,7 @@ function Write-CommitTimelineChart
 
     [void]$sb.AppendLine('</svg>')
     Write-TextFile -FilePath (Join-Path $OutDirectory 'commit_timeline.svg') -Content $sb.ToString() -EncodingName $EncodingName
+    return (New-NarutoResultSuccess -Data (Join-Path $OutDirectory 'commit_timeline.svg') -ErrorCode 'OUTPUT_COMMIT_TIMELINE_WRITTEN')
 }
 function Write-CommitScatterChart
 {
@@ -5866,6 +6616,7 @@ function Write-CommitScatterChart
         Write-CommitScatterChart -OutDirectory '.\output' -Commits $commitRows -EncodingName 'UTF8'
     #>
     [CmdletBinding()]
+    [OutputType([object])]
     param( [hashtable]$Context = $script:NarutoContext,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
@@ -5877,19 +6628,15 @@ function Write-CommitScatterChart
         [Parameter(Mandatory = $false)]
         [string]$EncodingName = 'UTF-8'
     )
-    if ([string]::IsNullOrWhiteSpace($OutDirectory))
+    $outputName = 'commit_scatter.svg'
+    $directoryResult = Initialize-NarutoVisualizationOutputDirectory -Context $Context -OutDirectory $OutDirectory -CallerName 'Write-CommitScatterChart' -OutputName $outputName
+    if (-not (Test-NarutoResultSuccess -Result $directoryResult))
     {
-        Write-Warning 'Write-CommitScatterChart: OutDirectory が空です。'
-        return
+        return $directoryResult
     }
     if (-not $Commits -or @($Commits).Count -eq 0)
     {
-        Write-Verbose 'Write-CommitScatterChart: Commits が空です。'
-        return
-    }
-    if (-not (Initialize-OutputDirectory -Path $OutDirectory -CallerName 'Write-CommitScatterChart'))
-    {
-        return
+        return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Verbose' -OutputName $outputName -ErrorCode 'OUTPUT_COMMIT_SCATTER_NO_DATA' -Message 'Write-CommitScatterChart: Commits が空です。')
     }
 
     # データ構築
@@ -5944,7 +6691,7 @@ function Write-CommitScatterChart
     }
     if ($scatterData.Count -eq 0)
     {
-        return
+        return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Verbose' -OutputName $outputName -ErrorCode 'OUTPUT_COMMIT_SCATTER_NO_PLOTTABLE_DATA' -Message 'Write-CommitScatterChart: 描画対象データがありません。')
     }
 
     # 作者→色マッピング
@@ -6055,6 +6802,7 @@ function Write-CommitScatterChart
 
     [void]$sb.AppendLine('</svg>')
     Write-TextFile -FilePath (Join-Path $OutDirectory 'commit_scatter.svg') -Content $sb.ToString() -EncodingName $EncodingName
+    return (New-NarutoResultSuccess -Data (Join-Path $OutDirectory 'commit_scatter.svg') -ErrorCode 'OUTPUT_COMMIT_SCATTER_WRITTEN')
 }
 function Get-SafeFileName
 {
@@ -6282,6 +7030,7 @@ function Write-CommitterOutcomeChart
         Write-CommitterOutcomeChart -OutDirectory '.\output' -Committers $committers -TopNCount 10 -EncodingName 'UTF8'
     #>
     [CmdletBinding()]
+    [OutputType([object])]
     param( [hashtable]$Context = $script:NarutoContext,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
@@ -6296,30 +7045,25 @@ function Write-CommitterOutcomeChart
         [Parameter(Mandatory = $false)]
         [string]$EncodingName = 'UTF-8'
     )
-    if ([string]::IsNullOrWhiteSpace($OutDirectory))
+    $outputName = 'committer_outcome'
+    $directoryResult = Initialize-NarutoVisualizationOutputDirectory -Context $Context -OutDirectory $OutDirectory -CallerName 'Write-CommitterOutcomeChart' -OutputName $outputName
+    if (-not (Test-NarutoResultSuccess -Result $directoryResult))
     {
-        Write-Warning 'Write-CommitterOutcomeChart: OutDirectory が空です。'
-        return
+        return $directoryResult
     }
     if ($TopNCount -le 0)
     {
-        Write-Verbose 'Write-CommitterOutcomeChart: TopNCount が 0 以下のため、出力しません。'
-        return
+        return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Verbose' -OutputName $outputName -ErrorCode 'OUTPUT_COMMITTER_OUTCOME_SKIPPED_TOPN' -Message 'Write-CommitterOutcomeChart: TopNCount が 0 以下のため、出力しません。')
     }
     if (-not $Committers -or @($Committers).Count -eq 0)
     {
-        Write-Verbose 'Write-CommitterOutcomeChart: Committers が空です。'
-        return
-    }
-    if (-not (Initialize-OutputDirectory -Path $OutDirectory -CallerName 'Write-CommitterOutcomeChart'))
-    {
-        return
+        return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Verbose' -OutputName $outputName -ErrorCode 'OUTPUT_COMMITTER_OUTCOME_NO_DATA' -Message 'Write-CommitterOutcomeChart: Committers が空です。')
     }
 
     $chartData = @(Get-CommitterOutcomeData -Committers $Committers -TopNCount $TopNCount)
     if ($chartData.Count -eq 0)
     {
-        return
+        return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Verbose' -OutputName $outputName -ErrorCode 'OUTPUT_COMMITTER_OUTCOME_NO_PLOTTABLE_DATA' -Message 'Write-CommitterOutcomeChart: 描画対象データがありません。')
     }
 
     # --- 色定義 ---
@@ -6507,6 +7251,7 @@ function Write-CommitterOutcomeChart
 
     [void]$sb.AppendLine('</svg>')
     Write-TextFile -FilePath (Join-Path $OutDirectory 'committer_outcome_combined.svg') -Content $sb.ToString() -EncodingName $EncodingName
+    return (New-NarutoResultSuccess -Data (Join-Path $OutDirectory 'committer_outcome_combined.svg') -ErrorCode 'OUTPUT_COMMITTER_OUTCOME_WRITTEN')
 }
 function Get-CommitterScatterData
 {
@@ -6603,6 +7348,7 @@ function Write-CommitterScatterChart
         Write-CommitterScatterChart -OutDirectory '.\output' -Committers $committers -TopNCount 10 -EncodingName 'UTF8'
     #>
     [CmdletBinding()]
+    [OutputType([object])]
     param( [hashtable]$Context = $script:NarutoContext,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
@@ -6617,30 +7363,25 @@ function Write-CommitterScatterChart
         [Parameter(Mandatory = $false)]
         [string]$EncodingName = 'UTF-8'
     )
-    if ([string]::IsNullOrWhiteSpace($OutDirectory))
+    $outputName = 'committer_scatter'
+    $directoryResult = Initialize-NarutoVisualizationOutputDirectory -Context $Context -OutDirectory $OutDirectory -CallerName 'Write-CommitterScatterChart' -OutputName $outputName
+    if (-not (Test-NarutoResultSuccess -Result $directoryResult))
     {
-        Write-Warning 'Write-CommitterScatterChart: OutDirectory が空です。'
-        return
+        return $directoryResult
     }
     if ($TopNCount -le 0)
     {
-        Write-Verbose 'Write-CommitterScatterChart: TopNCount が 0 以下のため、出力しません。'
-        return
+        return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Verbose' -OutputName $outputName -ErrorCode 'OUTPUT_COMMITTER_SCATTER_SKIPPED_TOPN' -Message 'Write-CommitterScatterChart: TopNCount が 0 以下のため、出力しません。')
     }
     if (-not $Committers -or @($Committers).Count -eq 0)
     {
-        Write-Verbose 'Write-CommitterScatterChart: Committers が空です。'
-        return
-    }
-    if (-not (Initialize-OutputDirectory -Path $OutDirectory -CallerName 'Write-CommitterScatterChart'))
-    {
-        return
+        return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Verbose' -OutputName $outputName -ErrorCode 'OUTPUT_COMMITTER_SCATTER_NO_DATA' -Message 'Write-CommitterScatterChart: Committers が空です。')
     }
 
     $scatterData = @(Get-CommitterScatterData -Committers $Committers -TopNCount $TopNCount)
     if ($scatterData.Count -eq 0)
     {
-        return
+        return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Verbose' -OutputName $outputName -ErrorCode 'OUTPUT_COMMITTER_SCATTER_NO_PLOTTABLE_DATA' -Message 'Write-CommitterScatterChart: 描画対象データがありません。')
     }
 
     # 描画定数
@@ -6784,6 +7525,7 @@ function Write-CommitterScatterChart
 
     [void]$sb.AppendLine('</svg>')
     Write-TextFile -FilePath (Join-Path $OutDirectory 'committer_scatter_combined.svg') -Content $sb.ToString() -EncodingName $EncodingName
+    return (New-NarutoResultSuccess -Data (Join-Path $OutDirectory 'committer_scatter_combined.svg') -ErrorCode 'OUTPUT_COMMITTER_SCATTER_WRITTEN')
 }
 
 function Write-KillMatrixCsv
@@ -6878,6 +7620,7 @@ function Write-SurvivedShareDonutChart
         出力時に使用する文字エンコーディングを指定する。
     #>
     [CmdletBinding()]
+    [OutputType([object])]
     param( [hashtable]$Context = $script:NarutoContext,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
@@ -6889,13 +7632,15 @@ function Write-SurvivedShareDonutChart
         [Parameter(Mandatory = $false)]
         [string]$EncodingName = 'UTF-8'
     )
-    if ([string]::IsNullOrWhiteSpace($OutDirectory))
+    $outputName = 'team_survived_share.svg'
+    $directoryResult = Initialize-NarutoVisualizationOutputDirectory -Context $Context -OutDirectory $OutDirectory -CallerName 'Write-SurvivedShareDonutChart' -OutputName $outputName
+    if (-not (Test-NarutoResultSuccess -Result $directoryResult))
     {
-        return
+        return $directoryResult
     }
     if (-not $Committers -or @($Committers).Count -eq 0)
     {
-        return
+        return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Verbose' -OutputName $outputName -ErrorCode 'OUTPUT_SURVIVED_SHARE_NO_DATA' -Message 'Write-SurvivedShareDonutChart: Committers が空です。')
     }
     $data = New-Object 'System.Collections.Generic.List[object]'
     foreach ($c in @($Committers))
@@ -6920,17 +7665,13 @@ function Write-SurvivedShareDonutChart
     }
     if ($data.Count -eq 0)
     {
-        return
+        return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Verbose' -OutputName $outputName -ErrorCode 'OUTPUT_SURVIVED_SHARE_NO_PLOTTABLE_DATA' -Message 'Write-SurvivedShareDonutChart: 生存行データがありません。')
     }
     $sorted = @($data.ToArray() | Sort-Object -Property @{Expression = 'Survived'; Descending = $true }, 'Author')
     $total = ($sorted | Measure-Object -Property Survived -Sum).Sum
     if ($total -le 0)
     {
-        return
-    }
-    if (-not (Initialize-OutputDirectory -Path $OutDirectory))
-    {
-        return
+        return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Verbose' -OutputName $outputName -ErrorCode 'OUTPUT_SURVIVED_SHARE_INVALID_TOTAL' -Message 'Write-SurvivedShareDonutChart: 合計生存行数が 0 のためスキップしました。')
     }
 
     $colorPalette = $Context.Constants.DefaultColorPalette
@@ -7014,6 +7755,7 @@ function Write-SurvivedShareDonutChart
 
     [void]$sb.AppendLine('</svg>')
     Write-TextFile -FilePath (Join-Path $OutDirectory 'team_survived_share.svg') -Content $sb.ToString() -EncodingName $EncodingName
+    return (New-NarutoResultSuccess -Data (Join-Path $OutDirectory 'team_survived_share.svg') -ErrorCode 'OUTPUT_SURVIVED_SHARE_WRITTEN')
 }
 
 function Write-TeamInteractionHeatMap
@@ -7037,6 +7779,7 @@ function Write-TeamInteractionHeatMap
         出力時に使用する文字エンコーディングを指定する。
     #>
     [CmdletBinding()]
+    [OutputType([object])]
     param( [hashtable]$Context = $script:NarutoContext,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
@@ -7054,26 +7797,24 @@ function Write-TeamInteractionHeatMap
         [Parameter(Mandatory = $false)]
         [string]$EncodingName = 'UTF-8'
     )
-    if ([string]::IsNullOrWhiteSpace($OutDirectory))
+    $outputName = 'team_interaction_heatmap.svg'
+    $directoryResult = Initialize-NarutoVisualizationOutputDirectory -Context $Context -OutDirectory $OutDirectory -CallerName 'Write-TeamInteractionHeatMap' -OutputName $outputName
+    if (-not (Test-NarutoResultSuccess -Result $directoryResult))
     {
-        return
+        return $directoryResult
     }
     if ($null -eq $KillMatrix -or $null -eq $AuthorSelfDead)
     {
-        return
+        return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Verbose' -OutputName $outputName -ErrorCode 'OUTPUT_TEAM_HEATMAP_MISSING_MATRIX' -Message 'Write-TeamInteractionHeatMap: KillMatrix または AuthorSelfDead が null のためスキップしました。')
     }
     if (-not $Committers -or @($Committers).Count -eq 0)
     {
-        return
+        return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Verbose' -OutputName $outputName -ErrorCode 'OUTPUT_TEAM_HEATMAP_NO_DATA' -Message 'Write-TeamInteractionHeatMap: Committers が空です。')
     }
     $authors = @($Committers | ForEach-Object { Get-NormalizedAuthorName -Author ([string]$_.'作者') } | Sort-Object)
     if ($authors.Count -lt 2)
     {
-        return
-    }
-    if (-not (Initialize-OutputDirectory -Path $OutDirectory))
-    {
-        return
+        return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Verbose' -OutputName $outputName -ErrorCode 'OUTPUT_TEAM_HEATMAP_INSUFFICIENT_AUTHORS' -Message 'Write-TeamInteractionHeatMap: 可視化に必要な作者数が不足しています。')
     }
 
     # 値マトリクスの構築と最大値の取得
@@ -7102,7 +7843,7 @@ function Write-TeamInteractionHeatMap
     }
     if ($maxVal -le 0)
     {
-        return
+        return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Verbose' -OutputName $outputName -ErrorCode 'OUTPUT_TEAM_HEATMAP_ZERO_VALUES' -Message 'Write-TeamInteractionHeatMap: ヒートマップ値が 0 のためスキップしました。')
     }
 
     # レイアウト定数
@@ -7197,6 +7938,7 @@ function Write-TeamInteractionHeatMap
 
     [void]$sb.AppendLine('</svg>')
     Write-TextFile -FilePath (Join-Path $OutDirectory 'team_interaction_heatmap.svg') -Content $sb.ToString() -EncodingName $EncodingName
+    return (New-NarutoResultSuccess -Data (Join-Path $OutDirectory 'team_interaction_heatmap.svg') -ErrorCode 'OUTPUT_TEAM_HEATMAP_WRITTEN')
 }
 
 function Get-TeamActivityProfileData
@@ -7291,6 +8033,7 @@ function Write-TeamActivityProfileChart
         出力時に使用する文字エンコーディングを指定する。
     #>
     [CmdletBinding()]
+    [OutputType([object])]
     param( [hashtable]$Context = $script:NarutoContext,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
@@ -7302,23 +8045,21 @@ function Write-TeamActivityProfileChart
         [Parameter(Mandatory = $false)]
         [string]$EncodingName = 'UTF-8'
     )
-    if ([string]::IsNullOrWhiteSpace($OutDirectory))
+    $outputName = 'team_activity_profile.svg'
+    $directoryResult = Initialize-NarutoVisualizationOutputDirectory -Context $Context -OutDirectory $OutDirectory -CallerName 'Write-TeamActivityProfileChart' -OutputName $outputName
+    if (-not (Test-NarutoResultSuccess -Result $directoryResult))
     {
-        return
+        return $directoryResult
     }
     if (-not $Committers -or @($Committers).Count -eq 0)
     {
-        return
-    }
-    if (-not (Initialize-OutputDirectory -Path $OutDirectory))
-    {
-        return
+        return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Verbose' -OutputName $outputName -ErrorCode 'OUTPUT_TEAM_ACTIVITY_NO_DATA' -Message 'Write-TeamActivityProfileChart: Committers が空です。')
     }
 
     $profileData = @(Get-TeamActivityProfileData -Committers $Committers)
     if ($profileData.Count -eq 0)
     {
-        return
+        return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Verbose' -OutputName $outputName -ErrorCode 'OUTPUT_TEAM_ACTIVITY_NO_PLOTTABLE_DATA' -Message 'Write-TeamActivityProfileChart: 描画対象データがありません。')
     }
 
     # 描画定数
@@ -7399,6 +8140,7 @@ function Write-TeamActivityProfileChart
 
     [void]$sb.AppendLine('</svg>')
     Write-TextFile -FilePath (Join-Path $OutDirectory 'team_activity_profile.svg') -Content $sb.ToString() -EncodingName $EncodingName
+    return (New-NarutoResultSuccess -Data (Join-Path $OutDirectory 'team_activity_profile.svg') -ErrorCode 'OUTPUT_TEAM_ACTIVITY_WRITTEN')
 }
 
 function Write-ProjectCodeFateChart
@@ -7420,6 +8162,7 @@ function Write-ProjectCodeFateChart
         出力時に使用する文字エンコーディングを指定する。
     #>
     [CmdletBinding()]
+    [OutputType([object])]
     param( [hashtable]$Context = $script:NarutoContext,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
@@ -7431,13 +8174,15 @@ function Write-ProjectCodeFateChart
         [Parameter(Mandatory = $false)]
         [string]$EncodingName = 'UTF-8'
     )
-    if ([string]::IsNullOrWhiteSpace($OutDirectory))
+    $outputName = 'project_code_fate.svg'
+    $directoryResult = Initialize-NarutoVisualizationOutputDirectory -Context $Context -OutDirectory $OutDirectory -CallerName 'Write-ProjectCodeFateChart' -OutputName $outputName
+    if (-not (Test-NarutoResultSuccess -Result $directoryResult))
     {
-        return
+        return $directoryResult
     }
     if (-not $Committers -or @($Committers).Count -eq 0)
     {
-        return
+        return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Verbose' -OutputName $outputName -ErrorCode 'OUTPUT_PROJECT_FATE_NO_DATA' -Message 'Write-ProjectCodeFateChart: Committers が空です。')
     }
 
     # 全作者合計を集計
@@ -7458,13 +8203,9 @@ function Write-ProjectCodeFateChart
     }
     if ($totalAdded -le 0)
     {
-        return
+        return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Verbose' -OutputName $outputName -ErrorCode 'OUTPUT_PROJECT_FATE_ZERO_ADDED' -Message 'Write-ProjectCodeFateChart: 追加行数が 0 のためスキップしました。')
     }
     $totalOther = Get-MetricBreakdownResidualValue -MetricName 'CodeFate.OtherDead' -TotalValue $totalAdded -BreakdownValues @($totalSurvived, $totalSelfCancel, $totalRemovedByOthers) -BreakdownLabels @('survived', 'selfCancel', 'removedByOthers')
-    if (-not (Initialize-OutputDirectory -Path $OutDirectory))
-    {
-        return
-    }
 
     $segments = @(
         [pscustomobject]@{ Label = '生存'; Value = $totalSurvived; Color = $Context.Constants.ColorSurvived }
@@ -7476,7 +8217,7 @@ function Write-ProjectCodeFateChart
     $segments = @($segments | Where-Object { $_.Value -gt 0 })
     if ($segments.Count -eq 0)
     {
-        return
+        return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Verbose' -OutputName $outputName -ErrorCode 'OUTPUT_PROJECT_FATE_NO_SEGMENTS' -Message 'Write-ProjectCodeFateChart: 出力対象セグメントがありません。')
     }
 
     $svgW = 640
@@ -7560,6 +8301,7 @@ function Write-ProjectCodeFateChart
 
     [void]$sb.AppendLine('</svg>')
     Write-TextFile -FilePath (Join-Path $OutDirectory 'project_code_fate.svg') -Content $sb.ToString() -EncodingName $EncodingName
+    return (New-NarutoResultSuccess -Data (Join-Path $OutDirectory 'project_code_fate.svg') -ErrorCode 'OUTPUT_PROJECT_FATE_WRITTEN')
 }
 
 function Get-ProjectEfficiencyData
@@ -7676,6 +8418,7 @@ function Write-ProjectEfficiencyQuadrantChart
         出力時に使用する文字エンコーディング名を指定する。
     #>
     [CmdletBinding()]
+    [OutputType([object])]
     param( [hashtable]$Context = $script:NarutoContext,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
@@ -7689,20 +8432,16 @@ function Write-ProjectEfficiencyQuadrantChart
         [Parameter(Mandatory = $false)]
         [string]$EncodingName = 'UTF-8'
     )
-    if ([string]::IsNullOrWhiteSpace($OutDirectory))
+    $outputName = 'project_efficiency_quadrant.svg'
+    $directoryResult = Initialize-NarutoVisualizationOutputDirectory -Context $Context -OutDirectory $OutDirectory -CallerName 'Write-ProjectEfficiencyQuadrantChart' -OutputName $outputName
+    if (-not (Test-NarutoResultSuccess -Result $directoryResult))
     {
-        Write-Warning 'Write-ProjectEfficiencyQuadrantChart: OutDirectory が空です。'
-        return
+        return $directoryResult
     }
     $data = @(Get-ProjectEfficiencyData -Files $Files -TopNCount $TopNCount)
     if ($data.Count -eq 0)
     {
-        Write-Verbose 'Write-ProjectEfficiencyQuadrantChart: 有効なファイルデータがありません。'
-        return
-    }
-    if (-not (Initialize-OutputDirectory -Path $OutDirectory -CallerName 'Write-ProjectEfficiencyQuadrantChart'))
-    {
-        return
+        return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Verbose' -OutputName $outputName -ErrorCode 'OUTPUT_PROJECT_EFFICIENCY_NO_PLOTTABLE_DATA' -Message 'Write-ProjectEfficiencyQuadrantChart: 有効なファイルデータがありません。')
     }
 
     $plotLeft = $Context.Constants.SvgPlotLeft
@@ -7797,6 +8536,7 @@ function Write-ProjectEfficiencyQuadrantChart
 
     [void]$sb.AppendLine('</svg>')
     Write-TextFile -FilePath (Join-Path $OutDirectory 'project_efficiency_quadrant.svg') -Content $sb.ToString() -EncodingName $EncodingName
+    return (New-NarutoResultSuccess -Data (Join-Path $OutDirectory 'project_efficiency_quadrant.svg') -ErrorCode 'OUTPUT_PROJECT_EFFICIENCY_WRITTEN')
 }
 
 function Write-ProjectSummaryDashboard
@@ -7829,6 +8569,7 @@ function Write-ProjectSummaryDashboard
         出力時に使用する文字エンコーディングを指定する。
     #>
     [CmdletBinding()]
+    [OutputType([object])]
     param( [hashtable]$Context = $script:NarutoContext,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
@@ -7850,17 +8591,15 @@ function Write-ProjectSummaryDashboard
         [Parameter(Mandatory = $false)]
         [string]$EncodingName = 'UTF-8'
     )
-    if ([string]::IsNullOrWhiteSpace($OutDirectory))
+    $outputName = 'project_summary_dashboard.svg'
+    $directoryResult = Initialize-NarutoVisualizationOutputDirectory -Context $Context -OutDirectory $OutDirectory -CallerName 'Write-ProjectSummaryDashboard' -OutputName $outputName
+    if (-not (Test-NarutoResultSuccess -Result $directoryResult))
     {
-        return
+        return $directoryResult
     }
     if ((-not $Committers -or @($Committers).Count -eq 0) -and (-not $CommitRows -or @($CommitRows).Count -eq 0))
     {
-        return
-    }
-    if (-not (Initialize-OutputDirectory -Path $OutDirectory))
-    {
-        return
+        return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Verbose' -OutputName $outputName -ErrorCode 'OUTPUT_PROJECT_DASHBOARD_NO_DATA' -Message 'Write-ProjectSummaryDashboard: 入力データが空のためスキップしました。')
     }
 
     # 集計
@@ -8024,6 +8763,7 @@ function Write-ProjectSummaryDashboard
 
     [void]$sb.AppendLine('</svg>')
     Write-TextFile -FilePath (Join-Path $OutDirectory 'project_summary_dashboard.svg') -Content $sb.ToString() -EncodingName $EncodingName
+    return (New-NarutoResultSuccess -Data (Join-Path $OutDirectory 'project_summary_dashboard.svg') -ErrorCode 'OUTPUT_PROJECT_DASHBOARD_WRITTEN')
 }
 
 function Write-ContributorBalanceChart
@@ -8046,6 +8786,7 @@ function Write-ContributorBalanceChart
         出力時に使用する文字エンコーディングを指定する。
     #>
     [CmdletBinding()]
+    [OutputType([object])]
     param( [hashtable]$Context = $script:NarutoContext,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
@@ -8059,13 +8800,15 @@ function Write-ContributorBalanceChart
         [Parameter(Mandatory = $false)]
         [string]$EncodingName = 'UTF-8'
     )
-    if ([string]::IsNullOrWhiteSpace($OutDirectory))
+    $outputName = 'contributor_balance.svg'
+    $directoryResult = Initialize-NarutoVisualizationOutputDirectory -Context $Context -OutDirectory $OutDirectory -CallerName 'Write-ContributorBalanceChart' -OutputName $outputName
+    if (-not (Test-NarutoResultSuccess -Result $directoryResult))
     {
-        return
+        return $directoryResult
     }
     if (-not $Committers -or @($Committers).Count -eq 0)
     {
-        return
+        return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Verbose' -OutputName $outputName -ErrorCode 'OUTPUT_CONTRIBUTOR_BALANCE_NO_DATA' -Message 'Write-ContributorBalanceChart: Committers が空です。')
     }
 
     # データ抽出
@@ -8098,18 +8841,13 @@ function Write-ContributorBalanceChart
     }
     if ($data.Count -eq 0)
     {
-        return
+        return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Verbose' -OutputName $outputName -ErrorCode 'OUTPUT_CONTRIBUTOR_BALANCE_NO_PLOTTABLE_DATA' -Message 'Write-ContributorBalanceChart: 描画対象データがありません。')
     }
     $sorted = @($data.ToArray() | Sort-Object -Property @{Expression = 'TotalChurn'; Descending = $true }, 'Author')
     if ($TopNCount -gt 0 -and $sorted.Count -gt $TopNCount)
     {
         $sorted = @($sorted | Select-Object -First $TopNCount)
     }
-    if (-not (Initialize-OutputDirectory -Path $OutDirectory))
-    {
-        return
-    }
-
     $n = $sorted.Count
     $barHeight = 28
     $barGap = 8
@@ -8205,6 +8943,7 @@ function Write-ContributorBalanceChart
 
     [void]$sb.AppendLine('</svg>')
     Write-TextFile -FilePath (Join-Path $OutDirectory 'contributor_balance.svg') -Content $sb.ToString() -EncodingName $EncodingName
+    return (New-NarutoResultSuccess -Data (Join-Path $OutDirectory 'contributor_balance.svg') -ErrorCode 'OUTPUT_CONTRIBUTOR_BALANCE_WRITTEN')
 }
 
 # endregion PlantUML 出力
@@ -8607,15 +9346,20 @@ function Get-SvnVersionSafe
         利用中の SVN クライアントバージョンを安全に取得する。
     #>
     [CmdletBinding()]
-    [OutputType([string])]
+    [OutputType([object])]
     param([hashtable]$Context = $script:NarutoContext)
     try
     {
-        return (Invoke-SvnCommand -Context $Context -Arguments @('--version', '--quiet') -ErrorContext 'svn version').Split("`n")[0].Trim()
+        $versionText = (Invoke-SvnCommand -Context $Context -Arguments @('--version', '--quiet') -ErrorContext 'svn version').Split("`n")[0].Trim()
+        if ([string]::IsNullOrWhiteSpace($versionText))
+        {
+            return (New-NarutoResultSkipped -ErrorCode 'SVN_VERSION_UNAVAILABLE' -Message 'svn version の取得結果が空のためスキップしました。')
+        }
+        return (New-NarutoResultSuccess -Data $versionText -ErrorCode 'SVN_VERSION_READY')
     }
     catch
     {
-        return $null
+        return (New-NarutoResultSkipped -ErrorCode 'SVN_VERSION_UNAVAILABLE' -Message ("svn version の取得に失敗しました: {0}" -f $_.Exception.Message))
     }
 }
 function Get-SvnDiffArgumentList
@@ -9504,13 +10248,25 @@ function Get-StrictOwnershipAggregate
             Write-Progress -Id 5 -Activity '所有権 blame 解析' -Status ('{0}/{1}' -f ($ownerIdx + 1), $ownerTotal) -PercentComplete $pct
             try
             {
-                $blame = Get-SvnBlameSummary -Context $Context -Repo $TargetUrl -FilePath $file -ToRevision $ToRevision -CacheDir $CacheDir
+                $blameResult = Get-SvnBlameSummary -Context $Context -Repo $TargetUrl -FilePath $file -ToRevision $ToRevision -CacheDir $CacheDir
+                $blameResult = ConvertTo-NarutoResultAdapter -InputObject $blameResult -SuccessCode 'SVN_BLAME_SUMMARY_READY' -SkippedCode 'SVN_BLAME_SUMMARY_EMPTY'
+                if (-not (Test-NarutoResultSuccess -Result $blameResult))
+                {
+                    Throw-NarutoError -Category 'STRICT' -ErrorCode 'STRICT_OWNERSHIP_BLAME_SKIPPED' -Message ("Strict ownership blame was skipped for '{0}' at r{1}: {2}" -f [string]$file, [int]$ToRevision, [string]$blameResult.Message) -Context @{
+                        FilePath = [string]$file
+                        Revision = [int]$ToRevision
+                        ErrorCode = [string]$blameResult.ErrorCode
+                    }
+                }
             }
             catch
             {
-                throw ("Strict ownership blame failed for '{0}' at r{1}: {2}" -f $file, $ToRevision, $_.Exception.Message)
+                Throw-NarutoError -Category 'STRICT' -ErrorCode 'STRICT_OWNERSHIP_BLAME_FAILED' -Message ("Strict ownership blame failed for '{0}' at r{1}: {2}" -f [string]$file, [int]$ToRevision, $_.Exception.Message) -Context @{
+                    FilePath = [string]$file
+                    Revision = [int]$ToRevision
+                } -InnerException $_.Exception
             }
-            Add-StrictOwnershipBlameSummary -BlameByFile $blameByFile -AuthorOwned $authorOwned -OwnedTotal ([ref]$ownedTotal) -FilePath ([string]$file) -Blame $blame
+            Add-StrictOwnershipBlameSummary -BlameByFile $blameByFile -AuthorOwned $authorOwned -OwnedTotal ([ref]$ownedTotal) -FilePath ([string]$file) -Blame $blameResult.Data
             $ownerIdx++
         }
         Write-Progress -Id 5 -Activity '所有権 blame 解析' -Completed
@@ -9533,15 +10289,27 @@ function Get-StrictOwnershipAggregate
             [void]$Index # Required by Invoke-ParallelWork contract
             try
             {
-                $blame = Get-SvnBlameSummary -Context $NarutoContext -Repo $Item.TargetUrl -FilePath ([string]$Item.FilePath) -ToRevision ([int]$Item.ToRevision) -CacheDir $Item.CacheDir
+                $blameResult = Get-SvnBlameSummary -Context $NarutoContext -Repo $Item.TargetUrl -FilePath ([string]$Item.FilePath) -ToRevision ([int]$Item.ToRevision) -CacheDir $Item.CacheDir
+                $blameResult = ConvertTo-NarutoResultAdapter -InputObject $blameResult -SuccessCode 'SVN_BLAME_SUMMARY_READY' -SkippedCode 'SVN_BLAME_SUMMARY_EMPTY'
+                if (-not (Test-NarutoResultSuccess -Result $blameResult))
+                {
+                    Throw-NarutoError -Category 'STRICT' -ErrorCode 'STRICT_OWNERSHIP_BLAME_SKIPPED' -Message ("Strict ownership blame was skipped for '{0}' at r{1}: {2}" -f [string]$Item.FilePath, [int]$Item.ToRevision, [string]$blameResult.Message) -Context @{
+                        FilePath = [string]$Item.FilePath
+                        Revision = [int]$Item.ToRevision
+                        ErrorCode = [string]$blameResult.ErrorCode
+                    }
+                }
                 [pscustomobject]@{
                     FilePath = [string]$Item.FilePath
-                    Blame = $blame
+                    Blame = $blameResult.Data
                 }
             }
             catch
             {
-                throw ("Strict ownership blame failed for '{0}' at r{1}: {2}" -f [string]$Item.FilePath, [int]$Item.ToRevision, $_.Exception.Message)
+                Throw-NarutoError -Category 'STRICT' -ErrorCode 'STRICT_OWNERSHIP_BLAME_FAILED' -Message ("Strict ownership blame failed for '{0}' at r{1}: {2}" -f [string]$Item.FilePath, [int]$Item.ToRevision, $_.Exception.Message) -Context @{
+                    FilePath = [string]$Item.FilePath
+                    Revision = [int]$Item.ToRevision
+                } -InnerException $_.Exception
             }
         }
         $ownershipResults = @(Invoke-ParallelWork -InputItems $ownershipItems.ToArray() -WorkerScript $ownershipWorker -MaxParallel $Parallel -RequiredFunctions @(
@@ -9621,9 +10389,15 @@ function Get-StrictFileBlameWithFallback
         }
         try
         {
-            $tmpBlame = Get-SvnBlameSummary -Repo $TargetUrl -FilePath $lookup -ToRevision $ToRevision -CacheDir $CacheDir
-            $BlameByFile[$lookup] = $tmpBlame
-            $blame = $tmpBlame
+            $tmpBlameResult = Get-SvnBlameSummary -Repo $TargetUrl -FilePath $lookup -ToRevision $ToRevision -CacheDir $CacheDir
+            $tmpBlameResult = ConvertTo-NarutoResultAdapter -InputObject $tmpBlameResult -SuccessCode 'SVN_BLAME_SUMMARY_READY' -SkippedCode 'SVN_BLAME_SUMMARY_EMPTY'
+            if (-not (Test-NarutoResultSuccess -Result $tmpBlameResult))
+            {
+                [void]$lookupErrors.Add(([string]$lookup + ': [' + [string]$tmpBlameResult.ErrorCode + '] ' + [string]$tmpBlameResult.Message))
+                continue
+            }
+            $BlameByFile[$lookup] = $tmpBlameResult.Data
+            $blame = $tmpBlameResult.Data
             break
         }
         catch
@@ -9633,12 +10407,25 @@ function Get-StrictFileBlameWithFallback
     }
     if ($null -eq $blame -and $existsAtToRevision)
     {
-        throw ("Strict file blame lookup failed for '{0}' at r{1}. Attempts: {2}" -f $MetricKey, $ToRevision, ($lookupErrors.ToArray() -join ' | '))
+        return (New-NarutoResultFailure -Data ([pscustomobject]@{
+                    Blame = $null
+                    ExistsAtToRevision = [bool]$existsAtToRevision
+                }) -ErrorCode 'STRICT_BLAME_LOOKUP_FAILED' -Message ("Strict file blame lookup failed for '{0}' at r{1}. Attempts: {2}" -f $MetricKey, $ToRevision, ($lookupErrors.ToArray() -join ' | ')) -Context @{
+                MetricKey = $MetricKey
+                FilePath = $FilePath
+                ResolvedFilePath = $ResolvedFilePath
+                Revision = [int]$ToRevision
+            })
     }
-    return [pscustomobject]@{
+    $data = [pscustomobject]@{
         Blame = $blame
         ExistsAtToRevision = [bool]$existsAtToRevision
     }
+    if (-not $existsAtToRevision)
+    {
+        return (New-NarutoResultSkipped -Data $data -ErrorCode 'STRICT_FILE_NOT_PRESENT_AT_TARGET' -Message ("'{0}' は r{1} 時点に存在しないため strict blame lookup をスキップしました。" -f [string]$MetricKey, [int]$ToRevision))
+    }
+    return (New-NarutoResultSuccess -Data $data -ErrorCode 'STRICT_FILE_BLAME_READY')
 }
 function Get-StrictFileRowMetricValues
 {
@@ -9770,7 +10557,23 @@ function Update-FileRowWithStrictMetric
             $resolvedFilePath
         }
         $lookupResult = Get-StrictFileBlameWithFallback -MetricKey $metricKey -FilePath $filePath -ResolvedFilePath $resolvedFilePath -ExistingFileSet $ExistingFileSet -BlameByFile $BlameByFile -TargetUrl $TargetUrl -ToRevision $ToRevision -CacheDir $CacheDir
-        $values = Get-StrictFileRowMetricValues -StrictDetail $StrictDetail -MetricKey $metricKey -Blame $lookupResult.Blame
+        if ([string]$lookupResult.Status -eq 'Failure')
+        {
+            Throw-NarutoError -Category 'STRICT' -ErrorCode ([string]$lookupResult.ErrorCode) -Message ([string]$lookupResult.Message) -Context @{
+                FilePath = $filePath
+                MetricKey = $metricKey
+                Revision = [int]$ToRevision
+            }
+        }
+        $lookupData = $lookupResult.Data
+        if ($null -eq $lookupData)
+        {
+            $lookupData = [pscustomobject]@{
+                Blame = $null
+                ExistsAtToRevision = $false
+            }
+        }
+        $values = Get-StrictFileRowMetricValues -StrictDetail $StrictDetail -MetricKey $metricKey -Blame $lookupData.Blame
         Set-StrictFileRowMetricValues -Context $Context -Row $row -Values $values
     }
 }
@@ -9975,7 +10778,7 @@ function Get-StrictDeathDetailOrThrow
     $strictDetail = Get-ExactDeathAttribution -Context $Context -Commits $Commits -RevToAuthor $RevToAuthor -TargetUrl $TargetUrl -FromRevision $FromRevision -ToRevision $ToRevision -CacheDir $CacheDir -RenameMap $RenameMap -Parallel $Parallel
     if ($null -eq $strictDetail)
     {
-        throw "Strict death attribution returned null."
+        Throw-NarutoError -Category 'STRICT' -ErrorCode 'STRICT_DEATH_ATTRIBUTION_NULL' -Message 'Strict death attribution returned null.' -Context @{}
     }
     return $strictDetail
 }
@@ -10265,6 +11068,21 @@ function New-RunMetaData
         [switch]$TrustServerCert,
         [switch]$IgnoreWhitespace
     )
+    $diagnosticWarningCount = 0
+    $diagnosticWarningCodes = [ordered]@{}
+    $diagnosticSkippedOutputs = @()
+    if ($null -ne $Context -and $null -ne $Context.Diagnostics)
+    {
+        $diagnosticWarningCount = [int]$Context.Diagnostics.WarningCount
+        if ($null -ne $Context.Diagnostics.WarningCodes)
+        {
+            $diagnosticWarningCodes = [ordered]@{} + $Context.Diagnostics.WarningCodes
+        }
+        if ($null -ne $Context.Diagnostics.SkippedOutputs)
+        {
+            $diagnosticSkippedOutputs = @($Context.Diagnostics.SkippedOutputs.ToArray())
+        }
+    }
     return [ordered]@{
         StartTime = $StartTime.ToString('o')
         EndTime = $EndTime.ToString('o')
@@ -10294,6 +11112,11 @@ function New-RunMetaData
             NonInteractive = [bool]$NonInteractive
             TrustServerCert = [bool]$TrustServerCert
             IgnoreWhitespace = [bool]$IgnoreWhitespace
+        }
+        Diagnostics = [ordered]@{
+            WarningCount = $diagnosticWarningCount
+            WarningCodes = $diagnosticWarningCodes
+            SkippedOutputs = $diagnosticSkippedOutputs
         }
         Outputs = [ordered]@{
             CommittersCsv = 'committers.csv'
@@ -10436,8 +11259,23 @@ function Resolve-PipelineOutputState
         $resolvedOutDirectory = Join-Path (Get-Location) 'NarutoCode_out'
     }
     $resolvedOutDirectory = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($resolvedOutDirectory)
+    $outputInitializeResult = Initialize-OutputDirectory -Path $resolvedOutDirectory -CallerName 'Resolve-PipelineOutputState'
+    if (-not (Test-NarutoResultSuccess -Result $outputInitializeResult))
+    {
+        Throw-NarutoError -Category 'OUTPUT' -ErrorCode ([string]$outputInitializeResult.ErrorCode) -Message ([string]$outputInitializeResult.Message) -Context @{
+            OutDirectory = $resolvedOutDirectory
+            Caller = 'Resolve-PipelineOutputState'
+        }
+    }
     $cacheDir = Join-Path $resolvedOutDirectory 'cache'
-    New-Item -Path $cacheDir -ItemType Directory -Force | Out-Null
+    $cacheInitializeResult = Initialize-OutputDirectory -Path $cacheDir -CallerName 'Resolve-PipelineOutputState.Cache'
+    if (-not (Test-NarutoResultSuccess -Result $cacheInitializeResult))
+    {
+        Throw-NarutoError -Category 'OUTPUT' -ErrorCode ([string]$cacheInitializeResult.ErrorCode) -Message ([string]$cacheInitializeResult.Message) -Context @{
+            CacheDirectory = $cacheDir
+            Caller = 'Resolve-PipelineOutputState.Cache'
+        }
+    }
     return [pscustomobject]@{
         OutDirectory = $resolvedOutDirectory
         CacheDir = $cacheDir
@@ -10484,7 +11322,9 @@ function Initialize-PipelineSvnRuntimeContext
     $svnCmd = Get-Command $SvnExecutable -ErrorAction SilentlyContinue
     if (-not $svnCmd)
     {
-        throw "svn executable not found: '$SvnExecutable'. Install Subversion client or specify -SvnExecutable."
+        Throw-NarutoError -Category 'ENV' -ErrorCode 'ENV_SVN_EXECUTABLE_NOT_FOUND' -Message ("svn executable not found: '{0}'. Install Subversion client or specify -SvnExecutable." -f $SvnExecutable) -Context @{
+            SvnExecutable = $SvnExecutable
+        }
     }
     $Context.Runtime.SvnExecutable = $svnCmd.Source
     $Context.Runtime.SvnGlobalArguments = Get-SvnGlobalArgumentList -Username $Username -Password $Password -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert
@@ -10591,7 +11431,18 @@ function Resolve-PipelineExecutionState
 
     [void](Initialize-PipelineSvnRuntimeContext -Context $Context -SvnExecutable $SvnExecutable -Username $Username -Password $Password -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert)
     $targetUrl = Resolve-SvnTargetUrl -Context $Context -Target $RepoUrl
-    $svnVersion = Get-SvnVersionSafe -Context $Context
+    $svnVersionResult = Get-SvnVersionSafe -Context $Context
+    $svnVersionResult = ConvertTo-NarutoResultAdapter -InputObject $svnVersionResult -SuccessCode 'SVN_VERSION_READY' -SkippedCode 'SVN_VERSION_UNAVAILABLE'
+    $svnVersion = '(unknown)'
+    if (Test-NarutoResultSuccess -Result $svnVersionResult)
+    {
+        $svnVersion = [string]$svnVersionResult.Data
+    }
+    else
+    {
+        Write-NarutoDiagnostic -Context $Context -Level 'Warning' -ErrorCode ([string]$svnVersionResult.ErrorCode) -Message ([string]$svnVersionResult.Message
+        )
+    }
 
     return (New-PipelineExecutionState -RepoUrl $RepoUrl -FromRevision $normalizedRange.FromRevision -ToRevision $normalizedRange.ToRevision -OutDirectory $outputState.OutDirectory -CacheDir $outputState.CacheDir -IncludePaths $normalizedFilters.IncludePaths -ExcludePaths $normalizedFilters.ExcludePaths -IncludeExtensions $normalizedFilters.IncludeExtensions -ExcludeExtensions $normalizedFilters.ExcludeExtensions -TargetUrl $targetUrl -SvnVersion $svnVersion)
 }
@@ -10762,15 +11613,32 @@ function Write-PipelineVisualizationArtifacts
     foreach ($viz in $visualizations)
     {
         $vizArgs = $viz.Args
+        $vizArgs['Context'] = $script:NarutoContext
         $vizArgs['OutDirectory'] = $OutDirectory
         $vizArgs['EncodingName'] = $Encoding
-        & $viz.Fn @vizArgs
+        $vizResult = & $viz.Fn @vizArgs
+        $vizResult = ConvertTo-NarutoResultAdapter -InputObject $vizResult -SuccessCode 'OUTPUT_VISUALIZATION_WRITTEN' -SkippedCode 'OUTPUT_VISUALIZATION_SKIPPED'
+        if ([string]$vizResult.Status -eq 'Failure')
+        {
+            Throw-NarutoError -Category 'OUTPUT' -ErrorCode ([string]$vizResult.ErrorCode) -Message ([string]$vizResult.Message) -Context @{
+                Function = [string]$viz.Fn
+                OutDirectory = $OutDirectory
+            }
+        }
     }
 
     # Strict 結果がある場合のみヒートマップを出力する
     if ($null -ne $StrictResult)
     {
-        Write-TeamInteractionHeatMap -OutDirectory $OutDirectory -KillMatrix $StrictResult.KillMatrix -AuthorSelfDead $StrictResult.AuthorSelfDead -Committers $CommitterRows -EncodingName $Encoding
+        $heatMapResult = Write-TeamInteractionHeatMap -Context $script:NarutoContext -OutDirectory $OutDirectory -KillMatrix $StrictResult.KillMatrix -AuthorSelfDead $StrictResult.AuthorSelfDead -Committers $CommitterRows -EncodingName $Encoding
+        $heatMapResult = ConvertTo-NarutoResultAdapter -InputObject $heatMapResult -SuccessCode 'OUTPUT_VISUALIZATION_WRITTEN' -SkippedCode 'OUTPUT_VISUALIZATION_SKIPPED'
+        if ([string]$heatMapResult.Status -eq 'Failure')
+        {
+            Throw-NarutoError -Category 'OUTPUT' -ErrorCode ([string]$heatMapResult.ErrorCode) -Message ([string]$heatMapResult.Message) -Context @{
+                Function = 'Write-TeamInteractionHeatMap'
+                OutDirectory = $OutDirectory
+            }
+        }
     }
 }
 function Write-PipelineRunArtifacts
@@ -10865,30 +11733,43 @@ function Invoke-NarutoCodePipeline
         [string]$Encoding,
         [switch]$IgnoreWhitespace
     )
-    try
-    {
-        $startedAt = Get-Date
-        Initialize-StrictModeContext -Context $Context
-        $Context = $script:NarutoContext
-        $executionState = Resolve-PipelineExecutionState -Context $Context -RepoUrl $RepoUrl -FromRevision $FromRevision -ToRevision $ToRevision -OutDirectory $OutDirectory -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -SvnExecutable $SvnExecutable -Username $Username -Password $Password -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert
-        $logAndDiffStage = Invoke-PipelineLogAndDiffStage -Context $Context -ExecutionState $executionState -IgnoreWhitespace:$IgnoreWhitespace -Parallel $Parallel
-        $aggregationStage = Invoke-PipelineAggregationStage -Commits $logAndDiffStage.Commits -RenameMap $logAndDiffStage.RenameMap
-        $strictResult = Invoke-PipelineStrictStage -Context $Context -ExecutionState $executionState -LogAndDiffStage $logAndDiffStage -AggregationStage $aggregationStage -Parallel $Parallel
+    $startedAt = Get-Date
+    Initialize-StrictModeContext -Context $Context
+    $Context = $script:NarutoContext
+    $executionState = Resolve-PipelineExecutionState -Context $Context -RepoUrl $RepoUrl -FromRevision $FromRevision -ToRevision $ToRevision -OutDirectory $OutDirectory -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -SvnExecutable $SvnExecutable -Username $Username -Password $Password -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert
+    $logAndDiffStage = Invoke-PipelineLogAndDiffStage -Context $Context -ExecutionState $executionState -IgnoreWhitespace:$IgnoreWhitespace -Parallel $Parallel
+    $aggregationStage = Invoke-PipelineAggregationStage -Commits $logAndDiffStage.Commits -RenameMap $logAndDiffStage.RenameMap
+    $strictResult = Invoke-PipelineStrictStage -Context $Context -ExecutionState $executionState -LogAndDiffStage $logAndDiffStage -AggregationStage $aggregationStage -Parallel $Parallel
 
-        Write-PipelineCsvArtifacts -OutDirectory $executionState.OutDirectory -CommitterRows $aggregationStage.CommitterRows -FileRows $aggregationStage.FileRows -CommitRows $aggregationStage.CommitRows -CouplingRows $aggregationStage.CouplingRows -StrictResult $strictResult -Encoding $Encoding
-        Write-PipelineVisualizationArtifacts -OutDirectory $executionState.OutDirectory -CommitterRows $aggregationStage.CommitterRows -FileRows $aggregationStage.FileRows -CommitRows $aggregationStage.CommitRows -CouplingRows $aggregationStage.CouplingRows -StrictResult $strictResult -TopNCount $TopNCount -Encoding $Encoding
-        $meta = Write-PipelineRunArtifacts -Context $Context -StartedAt $startedAt -ExecutionState $executionState -Parallel $Parallel -TopNCount $TopNCount -Encoding $Encoding -Commits $logAndDiffStage.Commits -FileRows $aggregationStage.FileRows -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -IgnoreWhitespace:$IgnoreWhitespace
+    Write-PipelineCsvArtifacts -OutDirectory $executionState.OutDirectory -CommitterRows $aggregationStage.CommitterRows -FileRows $aggregationStage.FileRows -CommitRows $aggregationStage.CommitRows -CouplingRows $aggregationStage.CouplingRows -StrictResult $strictResult -Encoding $Encoding
+    Write-PipelineVisualizationArtifacts -OutDirectory $executionState.OutDirectory -CommitterRows $aggregationStage.CommitterRows -FileRows $aggregationStage.FileRows -CommitRows $aggregationStage.CommitRows -CouplingRows $aggregationStage.CouplingRows -StrictResult $strictResult -TopNCount $TopNCount -Encoding $Encoding
+    $meta = Write-PipelineRunArtifacts -Context $Context -StartedAt $startedAt -ExecutionState $executionState -Parallel $Parallel -TopNCount $TopNCount -Encoding $Encoding -Commits $logAndDiffStage.Commits -FileRows $aggregationStage.FileRows -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -IgnoreWhitespace:$IgnoreWhitespace
 
-        return (New-PipelineResultObject -OutDirectory $executionState.OutDirectory -CommitterRows $aggregationStage.CommitterRows -FileRows $aggregationStage.FileRows -CommitRows $aggregationStage.CommitRows -CouplingRows $aggregationStage.CouplingRows -RunMeta $meta)
-    }
-    catch
-    {
-        Write-Error ("{0}`n{1}" -f $_.Exception.Message, $_.ScriptStackTrace)
-        throw
-    }
+    return (New-PipelineResultObject -OutDirectory $executionState.OutDirectory -CommitterRows $aggregationStage.CommitterRows -FileRows $aggregationStage.FileRows -CommitRows $aggregationStage.CommitRows -CouplingRows $aggregationStage.CouplingRows -RunMeta $meta)
 }
 
 if ($MyInvocation.InvocationName -ne '.')
 {
-    Invoke-NarutoCodePipeline -Context $script:NarutoContext -RepoUrl $RepoUrl -FromRevision $FromRevision -ToRevision $ToRevision -SvnExecutable $SvnExecutable -OutDirectory $OutDirectory -Username $Username -Password $Password -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -Parallel $Parallel -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -TopNCount $TopNCount -Encoding $Encoding -IgnoreWhitespace:$IgnoreWhitespace
+    try
+    {
+        [void](Invoke-NarutoCodePipeline -Context $script:NarutoContext -RepoUrl $RepoUrl -FromRevision $FromRevision -ToRevision $ToRevision -SvnExecutable $SvnExecutable -OutDirectory $OutDirectory -Username $Username -Password $Password -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -Parallel $Parallel -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -TopNCount $TopNCount -Encoding $Encoding -IgnoreWhitespace:$IgnoreWhitespace)
+    }
+    catch
+    {
+        $errorInfo = Get-NarutoErrorInfo -ErrorInput $_
+        $exitCode = Resolve-NarutoExitCode -Category ([string]$errorInfo.Category)
+        Write-Host ("[{0}] {1}" -f [string]$errorInfo.ErrorCode, [string]$errorInfo.Message)
+
+        $reportOutDirectory = $OutDirectory
+        if ([string]::IsNullOrWhiteSpace($reportOutDirectory))
+        {
+            $reportOutDirectory = Join-Path (Get-Location) 'NarutoCode_out'
+        }
+        $reportResult = Write-NarutoErrorReport -OutDirectory $reportOutDirectory -ErrorInfo $errorInfo -ExitCode $exitCode
+        if (-not (Test-NarutoResultSuccess -Result $reportResult))
+        {
+            Write-NarutoDiagnostic -Context $script:NarutoContext -Level 'Warning' -ErrorCode ([string]$reportResult.ErrorCode) -Message ([string]$reportResult.Message)
+        }
+        exit $exitCode
+    }
 }

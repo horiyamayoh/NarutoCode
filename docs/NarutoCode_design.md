@@ -1263,3 +1263,47 @@ Behavioral guarantees are unchanged:
   - `Get-ObjectNumericPropertyValue`
 - Added `Get-MetricBreakdownResidualValue` for standardized breakdown-vs-total diagnostics.
 - `Write-ProjectCodeFateChart` now uses these helpers and emits unified warning format on residual underflow.
+
+## エラーハンドリング統一フロー（2026 Refresh）
+
+### 方針
+- コア解析（SVN取得・XML解析・Strict集計）は fail-fast。
+- 可視化・補助出力は best-effort。
+- すべての内部関数戻り値は `NarutoResult`（`Success`/`Skipped`/`Failure`）へ統一。
+
+### フロー図
+```text
+Invoke-NarutoCodePipeline
+  -> Resolve-PipelineExecutionState
+  -> Invoke-PipelineLogAndDiffStage
+  -> Invoke-PipelineAggregationStage
+  -> Invoke-PipelineStrictStage
+  -> Write-PipelineCsvArtifacts
+  -> Write-PipelineVisualizationArtifacts
+       |- Success: 出力継続
+       |- Skipped: Write-NarutoDiagnostic (Verbose/Warning) して継続
+       |- Failure: Throw-NarutoError(Category='OUTPUT')
+  -> Write-PipelineRunArtifacts (run_meta.json)
+```
+
+```text
+(スクリプト直実行)
+try {
+  Invoke-NarutoCodePipeline
+} catch {
+  Get-NarutoErrorInfo
+  Resolve-NarutoExitCode(Category)
+  Write-Host "[ErrorCode] Message"  # 1回のみ
+  Write-NarutoErrorReport -> error_report.json
+  exit <CategoryExitCode>
+}
+```
+
+### 例外と終了コード
+- 例外は `Throw-NarutoError` で送出し、`Exception.Data` に `ErrorCode` / `Category` / `Context` を格納する。
+- CLI 終了コードはカテゴリで固定化する。
+  - INPUT=10, ENV=20, SVN=30, PARSE=40, STRICT=50, OUTPUT=60, INTERNAL=70
+
+### 成果物への反映
+- 失敗時: `error_report.json` を出力（`ErrorCode`, `Category`, `Message`, `Context`, `ExitCode`, `Timestamp`）。
+- 成功時: `run_meta.json.Diagnostics` に `WarningCount`, `WarningCodes`, `SkippedOutputs` を記録。
