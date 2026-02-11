@@ -2246,6 +2246,77 @@ function Resolve-SvnTargetUrl
     }
     return $url.TrimEnd('/')
 }
+function Get-SvnLogPathPrefix
+{
+    <#
+    .SYNOPSIS
+        svn info の URL と root から svn log パスのプレフィックスを算出する。
+    .DESCRIPTION
+        svn log --verbose が返す path 要素はリポジトリルート相対パスである。
+        一方 svn diff -c N <TargetUrl> の Index 行は TargetUrl 相対パスである。
+        TargetUrl がリポジトリルートのサブパス (例: trunk/) を指す場合、
+        両者にプレフィックス差が生じるため、この関数でプレフィックスを算出する。
+    .PARAMETER Context
+        NarutoCode コンテキストハッシュテーブル。
+    .PARAMETER TargetUrl
+        Resolve-SvnTargetUrl で確定したターゲット URL。
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([hashtable]$Context = $script:NarutoContext, [string]$TargetUrl)
+    $xml = ConvertFrom-SvnXmlText -Text (Invoke-SvnCommand -Context $Context -Arguments @('info', '--xml', $TargetUrl) -ErrorContext 'svn info (prefix)') -ContextLabel 'svn info (prefix)'
+    $url = [string]$xml.info.entry.url
+    $rootNode = $xml.info.entry.SelectSingleNode('repository/root')
+    if ($null -eq $rootNode)
+    {
+        return ''
+    }
+    $root = [string]$rootNode.InnerText
+    if ([string]::IsNullOrWhiteSpace($root) -or [string]::IsNullOrWhiteSpace($url))
+    {
+        return ''
+    }
+    $root = $root.TrimEnd('/')
+    $url = $url.TrimEnd('/')
+    if ($url.Length -le $root.Length)
+    {
+        return ''
+    }
+    $prefix = $url.Substring($root.Length).TrimStart('/')
+    if ($prefix)
+    {
+        return $prefix + '/'
+    }
+    return ''
+}
+function ConvertTo-DiffRelativePath
+{
+    <#
+    .SYNOPSIS
+        svn log パスからリポジトリ相対プレフィックスを除去し diff 相対パスへ変換する。
+    .DESCRIPTION
+        TargetUrl がリポジトリルートのサブパスを指す場合に、
+        svn log の path 要素から該当プレフィックスを除去して
+        svn diff の Index 行パスと一致させる。
+        プレフィックスが空か一致しない場合はパスをそのまま返す。
+    .PARAMETER Path
+        ConvertTo-PathKey 適用済みのログパス。
+    .PARAMETER LogPathPrefix
+        Get-SvnLogPathPrefix で算出したプレフィックス文字列。
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([string]$Path, [string]$LogPathPrefix)
+    if ([string]::IsNullOrWhiteSpace($LogPathPrefix))
+    {
+        return $Path
+    }
+    if ($Path.StartsWith($LogPathPrefix, [System.StringComparison]::OrdinalIgnoreCase))
+    {
+        return $Path.Substring($LogPathPrefix.Length)
+    }
+    return $Path
+}
 # endregion SVN コマンド
 # region ログ・差分パース
 function ConvertFrom-SvnLogXml
@@ -9885,6 +9956,8 @@ function New-CommitDiffPrefetchPlan
     <#
     .SYNOPSIS
         コミット差分取得の事前計画を構築する。
+    .PARAMETER LogPathPrefix
+        svn log パスのリポジトリ相対プレフィックス。
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
@@ -9897,7 +9970,8 @@ function New-CommitDiffPrefetchPlan
         [string[]]$IncludeExtensions,
         [string[]]$ExcludeExtensions,
         [string[]]$IncludePathPatterns,
-        [string[]]$ExcludePathPatterns
+        [string[]]$ExcludePathPatterns,
+        [string]$LogPathPrefix
     )
     $revToAuthor = @{}
     $phaseAItems = [System.Collections.Generic.List[object]]::new()
@@ -9905,7 +9979,36 @@ function New-CommitDiffPrefetchPlan
     {
         $revision = [int]$commit.Revision
         $revToAuthor[$revision] = [string]$commit.Author
-        $filteredChangedPaths = @(Get-FilteredChangedPathEntry -ChangedPaths @($commit.ChangedPaths) -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns)
+        # ChangedPaths のパスからプレフィックスを除去してからフィルタリングする
+        $normalizedChangedPaths = New-Object 'System.Collections.Generic.List[object]'
+        foreach ($pathEntry in @($commit.ChangedPaths))
+        {
+            if ($null -eq $pathEntry)
+            {
+                continue
+            }
+            $normalizedPath = ConvertTo-DiffRelativePath -Path (ConvertTo-PathKey -Path ([string]$pathEntry.Path)) -LogPathPrefix $LogPathPrefix
+            $normalizedCopyFrom = [string]$pathEntry.CopyFromPath
+            if ($normalizedCopyFrom)
+            {
+                $normalizedCopyFrom = ConvertTo-DiffRelativePath -Path (ConvertTo-PathKey -Path $normalizedCopyFrom) -LogPathPrefix $LogPathPrefix
+            }
+            [void]$normalizedChangedPaths.Add([pscustomobject]@{
+                    Path = $normalizedPath
+                    Action = [string]$pathEntry.Action
+                    CopyFromPath = $normalizedCopyFrom
+                    CopyFromRev = $pathEntry.CopyFromRev
+                    IsDirectory = if ($pathEntry.PSObject.Properties.Match('IsDirectory').Count -gt 0)
+                    {
+                        [bool]$pathEntry.IsDirectory
+                    }
+                    else
+                    {
+                        $false
+                    }
+                })
+        }
+        $filteredChangedPaths = @(Get-FilteredChangedPathEntry -ChangedPaths @($normalizedChangedPaths.ToArray()) -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns)
         $commit.ChangedPathsFiltered = $filteredChangedPaths
         if ($filteredChangedPaths.Count -le 0)
         {
@@ -9983,7 +10086,8 @@ function Merge-CommitDiffForCommit
         [string[]]$IncludeExtensions,
         [string[]]$ExcludeExtensions,
         [string[]]$IncludePathPatterns,
-        [string[]]$ExcludePathPatterns
+        [string[]]$ExcludePathPatterns,
+        [string]$LogPathPrefix
     )
     $revision = [int]$Commit.Revision
     $rawDiffByPath = @{}
@@ -10007,12 +10111,15 @@ function Merge-CommitDiffForCommit
     }
 
     $allowedFilePathSet = New-Object 'System.Collections.Generic.HashSet[string]'
+    $logToDiffPathMap = @{}
     foreach ($pathEntry in @($Commit.ChangedPathsFiltered))
     {
-        $path = ConvertTo-PathKey -Path ([string]$pathEntry.Path)
-        if ($path)
+        $logPath = ConvertTo-PathKey -Path ([string]$pathEntry.Path)
+        if ($logPath)
         {
-            [void]$allowedFilePathSet.Add($path)
+            $diffPath = ConvertTo-DiffRelativePath -Path $logPath -LogPathPrefix $LogPathPrefix
+            [void]$allowedFilePathSet.Add($diffPath)
+            $logToDiffPathMap[$logPath] = $diffPath
         }
     }
 
@@ -10026,6 +10133,34 @@ function Merge-CommitDiffForCommit
     }
     $Commit.FileDiffStats = $filteredByLog
     $Commit.FilesChanged = @($Commit.FileDiffStats.Keys | Sort-Object)
+
+    # ChangedPathsFiltered のパスも diff 相対パスに統一する
+    if ($LogPathPrefix)
+    {
+        $normalizedEntries = New-Object 'System.Collections.Generic.List[object]'
+        foreach ($pathEntry in @($Commit.ChangedPathsFiltered))
+        {
+            $logPath = ConvertTo-PathKey -Path ([string]$pathEntry.Path)
+            $diffPath = $logPath
+            if ($logToDiffPathMap.ContainsKey($logPath))
+            {
+                $diffPath = $logToDiffPathMap[$logPath]
+            }
+            $copyFromPath = [string]$pathEntry.CopyFromPath
+            if ($copyFromPath)
+            {
+                $copyFromPath = ConvertTo-DiffRelativePath -Path (ConvertTo-PathKey -Path $copyFromPath) -LogPathPrefix $LogPathPrefix
+            }
+            [void]$normalizedEntries.Add([pscustomobject]@{
+                    Path = $diffPath
+                    Action = [string]$pathEntry.Action
+                    CopyFromPath = $copyFromPath
+                    CopyFromRev = $pathEntry.CopyFromRev
+                    IsDirectory = $false
+                })
+        }
+        $Commit.ChangedPathsFiltered = $normalizedEntries.ToArray()
+    }
 }
 function Complete-CommitDiffForCommit
 {
@@ -10070,6 +10205,8 @@ function Initialize-CommitDiffData
         対象を絞り込むための包含または除外条件を指定する。
     .PARAMETER ExcludePathPatterns
         対象を絞り込むための包含または除外条件を指定する。
+    .PARAMETER LogPathPrefix
+        svn log パスのリポジトリ相対プレフィックス。
     .PARAMETER Parallel
         並列実行時の最大ワーカー数を指定する。
     #>
@@ -10084,9 +10221,10 @@ function Initialize-CommitDiffData
         [string[]]$ExcludeExtensions,
         [string[]]$IncludePathPatterns,
         [string[]]$ExcludePathPatterns,
+        [string]$LogPathPrefix,
         [int]$Parallel = 1
     )
-    $prefetchPlan = New-CommitDiffPrefetchPlan -Commits $Commits -CacheDir $CacheDir -TargetUrl $TargetUrl -DiffArguments $DiffArguments -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns
+    $prefetchPlan = New-CommitDiffPrefetchPlan -Commits $Commits -CacheDir $CacheDir -TargetUrl $TargetUrl -DiffArguments $DiffArguments -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns -LogPathPrefix $LogPathPrefix
     $rawDiffByRevision = Invoke-CommitDiffPrefetch -Context $Context -PrefetchItems $prefetchPlan.PrefetchItems -Parallel $Parallel
 
     $commitTotal = @($Commits).Count
@@ -10096,7 +10234,7 @@ function Initialize-CommitDiffData
         $pct = [Math]::Min(100, [int](($commitIdx / [Math]::Max(1, $commitTotal)) * 100))
         Write-Progress -Id 2 -Activity 'コミット差分の統合' -Status ('{0}/{1}' -f ($commitIdx + 1), $commitTotal) -PercentComplete $pct
         $revision = [int]$commit.Revision
-        Merge-CommitDiffForCommit -Commit $commit -RawDiffByRevision $rawDiffByRevision -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns
+        Merge-CommitDiffForCommit -Commit $commit -RawDiffByRevision $rawDiffByRevision -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns -LogPathPrefix $LogPathPrefix
         Complete-CommitDiffForCommit -Context $Context -Commit $commit -Revision $revision -TargetUrl $TargetUrl -DiffArguments $DiffArguments
         $commitIdx++
     }
@@ -11183,9 +11321,13 @@ function Get-RenameMap
     .DESCRIPTION
         コミット履歴を時系列で走査し、旧パスから最新パスへの対応を段階的に構築する。
         連鎖リネームを伝播更新して、後段の path 解決が一意になるよう整備する。
+    .PARAMETER Commits
+        解析対象のコミット配列を指定する。
+    .PARAMETER LogPathPrefix
+        svn log パスのリポジトリ相対プレフィックス。
     #>
     [CmdletBinding()]
-    param([object[]]$Commits)
+    param([object[]]$Commits, [string]$LogPathPrefix)
     $map = @{}
     foreach ($c in ($Commits | Sort-Object Revision))
     {
@@ -11198,8 +11340,8 @@ function Get-RenameMap
             $action = ([string]$p.Action).ToUpperInvariant()
             if (($action -eq 'A' -or $action -eq 'R') -and $p.CopyFromPath)
             {
-                $oldPath = ConvertTo-PathKey -Path ([string]$p.CopyFromPath)
-                $newPath = ConvertTo-PathKey -Path ([string]$p.Path)
+                $oldPath = ConvertTo-DiffRelativePath -Path (ConvertTo-PathKey -Path ([string]$p.CopyFromPath)) -LogPathPrefix $LogPathPrefix
+                $newPath = ConvertTo-DiffRelativePath -Path (ConvertTo-PathKey -Path ([string]$p.Path)) -LogPathPrefix $LogPathPrefix
                 if ($oldPath -and $newPath -and $oldPath -ne $newPath)
                 {
                     $map[$oldPath] = $newPath
@@ -11355,6 +11497,8 @@ function New-PipelineExecutionState
         解析対象から除外する拡張子フィルタ。
     .PARAMETER TargetUrl
         解析対象の SVN パス URL。
+    .PARAMETER LogPathPrefix
+        svn log パスのリポジトリ相対プレフィックス。
     .PARAMETER SvnVersion
         使用する SVN クライアントのバージョン文字列。
     #>
@@ -11372,6 +11516,7 @@ function New-PipelineExecutionState
         [string[]]$IncludeExtensions,
         [string[]]$ExcludeExtensions,
         [string]$TargetUrl,
+        [string]$LogPathPrefix,
         [string]$SvnVersion
     )
     return [pscustomobject]@{
@@ -11385,6 +11530,7 @@ function New-PipelineExecutionState
         IncludeExtensions = @($IncludeExtensions)
         ExcludeExtensions = @($ExcludeExtensions)
         TargetUrl = $TargetUrl
+        LogPathPrefix = [string]$LogPathPrefix
         SvnVersion = $SvnVersion
     }
 }
@@ -11405,6 +11551,7 @@ function Resolve-PipelineExecutionState
         - IncludeExtensions [string[]] 正規化済み拡張子包含リスト
         - ExcludeExtensions [string[]] 正規化済み拡張子除外リスト
         - TargetUrl         [string]   SVN 実行用に確定したターゲット URL
+        - LogPathPrefix    [string]   svn log パスのリポジトリ相対プレフィックス
         - SvnVersion        [string]   検出した SVN バージョン文字列
     #>
     [CmdletBinding()]
@@ -11431,6 +11578,7 @@ function Resolve-PipelineExecutionState
 
     [void](Initialize-PipelineSvnRuntimeContext -Context $Context -SvnExecutable $SvnExecutable -Username $Username -Password $Password -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert)
     $targetUrl = Resolve-SvnTargetUrl -Context $Context -Target $RepoUrl
+    $logPathPrefix = Get-SvnLogPathPrefix -Context $Context -TargetUrl $targetUrl
     $svnVersionResult = Get-SvnVersionSafe -Context $Context
     $svnVersionResult = ConvertTo-NarutoResultAdapter -InputObject $svnVersionResult -SuccessCode 'SVN_VERSION_READY' -SkippedCode 'SVN_VERSION_UNAVAILABLE'
     $svnVersion = '(unknown)'
@@ -11444,7 +11592,7 @@ function Resolve-PipelineExecutionState
         )
     }
 
-    return (New-PipelineExecutionState -RepoUrl $RepoUrl -FromRevision $normalizedRange.FromRevision -ToRevision $normalizedRange.ToRevision -OutDirectory $outputState.OutDirectory -CacheDir $outputState.CacheDir -IncludePaths $normalizedFilters.IncludePaths -ExcludePaths $normalizedFilters.ExcludePaths -IncludeExtensions $normalizedFilters.IncludeExtensions -ExcludeExtensions $normalizedFilters.ExcludeExtensions -TargetUrl $targetUrl -SvnVersion $svnVersion)
+    return (New-PipelineExecutionState -RepoUrl $RepoUrl -FromRevision $normalizedRange.FromRevision -ToRevision $normalizedRange.ToRevision -OutDirectory $outputState.OutDirectory -CacheDir $outputState.CacheDir -IncludePaths $normalizedFilters.IncludePaths -ExcludePaths $normalizedFilters.ExcludePaths -IncludeExtensions $normalizedFilters.IncludeExtensions -ExcludeExtensions $normalizedFilters.ExcludeExtensions -TargetUrl $targetUrl -LogPathPrefix $logPathPrefix -SvnVersion $svnVersion)
 }
 function Invoke-PipelineLogAndDiffStage
 {
@@ -11471,8 +11619,8 @@ function Invoke-PipelineLogAndDiffStage
 
     Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 3/8: 差分の取得と統計構築' -PercentComplete 15
     $diffArgs = Get-SvnDiffArgumentList -IgnoreWhitespace:$IgnoreWhitespace
-    $revToAuthor = Initialize-CommitDiffData -Context $Context -Commits $commits -CacheDir $ExecutionState.CacheDir -TargetUrl $ExecutionState.TargetUrl -DiffArguments $diffArgs -IncludeExtensions $ExecutionState.IncludeExtensions -ExcludeExtensions $ExecutionState.ExcludeExtensions -IncludePathPatterns $ExecutionState.IncludePaths -ExcludePathPatterns $ExecutionState.ExcludePaths -Parallel $Parallel
-    $renameMap = Get-RenameMap -Commits $commits
+    $revToAuthor = Initialize-CommitDiffData -Context $Context -Commits $commits -CacheDir $ExecutionState.CacheDir -TargetUrl $ExecutionState.TargetUrl -DiffArguments $diffArgs -IncludeExtensions $ExecutionState.IncludeExtensions -ExcludeExtensions $ExecutionState.ExcludeExtensions -IncludePathPatterns $ExecutionState.IncludePaths -ExcludePathPatterns $ExecutionState.ExcludePaths -LogPathPrefix $ExecutionState.LogPathPrefix -Parallel $Parallel
+    $renameMap = Get-RenameMap -Commits $commits -LogPathPrefix $ExecutionState.LogPathPrefix
 
     return [pscustomobject]@{
         Commits = $commits
@@ -11773,3 +11921,4 @@ if ($MyInvocation.InvocationName -ne '.')
         exit $exitCode
     }
 }
+

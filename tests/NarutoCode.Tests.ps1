@@ -1635,11 +1635,13 @@ Describe 'Resolve-PipelineExecutionState' {
     BeforeAll {
         $script:origResolveSvnTargetUrlForExecutionState = (Get-Item function:Resolve-SvnTargetUrl).ScriptBlock.ToString()
         $script:origGetSvnVersionSafeForExecutionState = (Get-Item function:Get-SvnVersionSafe).ScriptBlock.ToString()
+        $script:origGetSvnLogPathPrefixForExecutionState = (Get-Item function:Get-SvnLogPathPrefix).ScriptBlock.ToString()
     }
 
     AfterAll {
         Set-Item -Path function:Resolve-SvnTargetUrl -Value $script:origResolveSvnTargetUrlForExecutionState
         Set-Item -Path function:Get-SvnVersionSafe -Value $script:origGetSvnVersionSafeForExecutionState
+        Set-Item -Path function:Get-SvnLogPathPrefix -Value $script:origGetSvnLogPathPrefixForExecutionState
     }
 
     It 'normalizes revisions and filter inputs while resolving runtime state' {
@@ -1653,6 +1655,12 @@ Describe 'Resolve-PipelineExecutionState' {
             param([hashtable]$Context)
             [void]$Context
             return '1.14.2'
+        }
+        Set-Item -Path function:Get-SvnLogPathPrefix -Value {
+            param([hashtable]$Context, [string]$TargetUrl)
+            [void]$Context
+            [void]$TargetUrl
+            return 'proj/trunk/'
         }
 
         $outDir = Join-Path $env:TEMP ('narutocode_exec_state_' + [guid]::NewGuid().ToString('N'))
@@ -1678,6 +1686,7 @@ Describe 'Resolve-PipelineExecutionState' {
             $script:NarutoContext.Runtime.SvnGlobalArguments -contains 'tester' | Should -BeTrue
             $script:NarutoContext.Runtime.SvnGlobalArguments -contains '--non-interactive' | Should -BeTrue
             $script:NarutoContext.Runtime.SvnGlobalArguments -contains '--trust-server-cert' | Should -BeTrue
+            $state.LogPathPrefix | Should -Be 'proj/trunk/'
         }
         finally {
             Remove-Item -Path $outDir -Recurse -Force -ErrorAction SilentlyContinue

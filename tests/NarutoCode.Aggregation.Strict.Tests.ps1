@@ -377,3 +377,319 @@ Describe 'Strict aggregation refactor' {
         }
     }
 }
+
+Describe 'Strict 多リビジョンシナリオ — Compare-BlameOutput の帰属分類' {
+    Context '5リビジョンにわたる複数著者の重複編集' {
+        It 'born行の数は新しいリビジョンの行の中で当該リビジョンに帰属するものだけ' {
+            # before(r3): alice wrote line1, bob wrote line2
+            # after(r4):  alice wrote line1, bob wrote line2, carol wrote line3
+            # → bornは line3(carol) の1行のみ
+            $prevLines = @(
+                [pscustomobject]@{ LineNumber = 1; Content = 'line1'; Revision = 1; Author = 'alice' }
+                [pscustomobject]@{ LineNumber = 2; Content = 'line2'; Revision = 2; Author = 'bob' }
+            )
+            $currLines = @(
+                [pscustomobject]@{ LineNumber = 1; Content = 'line1'; Revision = 1; Author = 'alice' }
+                [pscustomobject]@{ LineNumber = 2; Content = 'line2'; Revision = 2; Author = 'bob' }
+                [pscustomobject]@{ LineNumber = 3; Content = 'line3'; Revision = 4; Author = 'carol' }
+            )
+            $result = Compare-BlameOutput -PreviousLines $prevLines -CurrentLines $currLines
+
+            @($result.BornLines).Count | Should -Be 1
+            $result.BornLines[0].Line.Author | Should -Be 'carol'
+            @($result.KilledLines).Count | Should -Be 0
+        }
+
+        It 'dead行の数は消えた行のみ（作者は元の行の帰属）' {
+            # before(r4): alice line1, bob line2, carol line3
+            # after(r5):  alice line1, carol line3
+            # → dead は line2(bob) の1行
+            $prevLines = @(
+                [pscustomobject]@{ LineNumber = 1; Content = 'line1'; Revision = 1; Author = 'alice' }
+                [pscustomobject]@{ LineNumber = 2; Content = 'line2'; Revision = 2; Author = 'bob' }
+                [pscustomobject]@{ LineNumber = 3; Content = 'line3'; Revision = 4; Author = 'carol' }
+            )
+            $currLines = @(
+                [pscustomobject]@{ LineNumber = 1; Content = 'line1'; Revision = 1; Author = 'alice' }
+                [pscustomobject]@{ LineNumber = 2; Content = 'line3'; Revision = 4; Author = 'carol' }
+            )
+            $result = Compare-BlameOutput -PreviousLines $prevLines -CurrentLines $currLines
+
+            @($result.KilledLines).Count | Should -Be 1
+            $result.KilledLines[0].Line.Author | Should -Be 'bob'
+            @($result.BornLines).Count | Should -Be 0
+        }
+
+        It '行の置換（delete+add）で dead と born が各1行' {
+            # before: alice line1
+            # after:  bob newline1
+            $prevLines = @(
+                [pscustomobject]@{ LineNumber = 1; Content = 'line1'; Revision = 1; Author = 'alice' }
+            )
+            $currLines = @(
+                [pscustomobject]@{ LineNumber = 1; Content = 'newline1'; Revision = 5; Author = 'bob' }
+            )
+            $result = Compare-BlameOutput -PreviousLines $prevLines -CurrentLines $currLines
+
+            @($result.KilledLines).Count | Should -Be 1
+            $result.KilledLines[0].Line.Author | Should -Be 'alice'
+            @($result.BornLines).Count | Should -Be 1
+            $result.BornLines[0].Line.Author | Should -Be 'bob'
+        }
+
+        It '空ファイルから複数行追加ですべてborn' {
+            $prevLines = @()
+            $currLines = @(
+                [pscustomobject]@{ LineNumber = 1; Content = 'line1'; Revision = 1; Author = 'alice' }
+                [pscustomobject]@{ LineNumber = 2; Content = 'line2'; Revision = 1; Author = 'alice' }
+                [pscustomobject]@{ LineNumber = 3; Content = 'line3'; Revision = 1; Author = 'alice' }
+            )
+            $result = Compare-BlameOutput -PreviousLines $prevLines -CurrentLines $currLines
+
+            @($result.BornLines).Count | Should -Be 3
+            @($result.KilledLines).Count | Should -Be 0
+        }
+
+        It '全行削除ですべてdead' {
+            $prevLines = @(
+                [pscustomobject]@{ LineNumber = 1; Content = 'line1'; Revision = 1; Author = 'alice' }
+                [pscustomobject]@{ LineNumber = 2; Content = 'line2'; Revision = 2; Author = 'bob' }
+            )
+            $currLines = @()
+            $result = Compare-BlameOutput -PreviousLines $prevLines -CurrentLines $currLines
+
+            @($result.KilledLines).Count | Should -Be 2
+            @($result.BornLines).Count | Should -Be 0
+        }
+
+        It '行の移動（順序変更）はmoveとして分類される' {
+            # before: alice line1, bob line2
+            # after:  bob line2, alice line1 (順序反転、同一内容+帰属)
+            $prevLines = @(
+                [pscustomobject]@{ LineNumber = 1; Content = 'line1'; Revision = 1; Author = 'alice' }
+                [pscustomobject]@{ LineNumber = 2; Content = 'line2'; Revision = 2; Author = 'bob' }
+            )
+            $currLines = @(
+                [pscustomobject]@{ LineNumber = 1; Content = 'line2'; Revision = 2; Author = 'bob' }
+                [pscustomobject]@{ LineNumber = 2; Content = 'line1'; Revision = 1; Author = 'alice' }
+            )
+            $result = Compare-BlameOutput -PreviousLines $prevLines -CurrentLines $currLines
+
+            # 行内容+帰属は同一なので killed/born ではなく matched/moved
+            @($result.KilledLines).Count | Should -Be 0
+            @($result.BornLines).Count | Should -Be 0
+            @($result.MovedPairs).Count | Should -BeGreaterOrEqual 1
+        }
+    }
+
+    Context 'Update-StrictAccumulatorFromComparison の帰属カウンタ' {
+        It '範囲外リビジョンのborn行は加算されない' {
+            $accumulator = New-StrictAttributionAccumulator
+            $comparison = [pscustomobject]@{
+                BornLines = @(
+                    [pscustomobject]@{ Line = [pscustomobject]@{ Revision = 3; Author = 'alice' } }
+                    [pscustomobject]@{ Line = [pscustomobject]@{ Revision = 10; Author = 'bob' } }
+                )
+                KilledLines = @()
+                MovedPairs  = @()
+            }
+
+            # 範囲 FromRevision=5, ToRevision=10 → r3は範囲外
+            Update-StrictAccumulatorFromComparison -Accumulator $accumulator -Comparison $comparison -Revision 10 -Killer 'carol' -MetricFile 'src/A.cs' -FromRevision 5 -ToRevision 10
+
+            # bornはr10の分のみ(Revision==currentRevision条件)
+            [int]$accumulator.AuthorBorn['bob'] | Should -Be 1
+            $accumulator.AuthorBorn.ContainsKey('alice') | Should -BeFalse
+        }
+
+        It 'born行のRevisionが現在リビジョンと一致しない場合はスキップされる' {
+            $accumulator = New-StrictAttributionAccumulator
+            $comparison = [pscustomobject]@{
+                BornLines = @(
+                    [pscustomobject]@{ Line = [pscustomobject]@{ Revision = 8; Author = 'alice' } }
+                )
+                KilledLines = @()
+                MovedPairs  = @()
+            }
+
+            # 現在リビジョンは10だがborn行のリビジョンは8
+            Update-StrictAccumulatorFromComparison -Accumulator $accumulator -Comparison $comparison -Revision 10 -Killer 'bob' -MetricFile 'src/A.cs' -FromRevision 1 -ToRevision 10
+
+            $accumulator.AuthorBorn.ContainsKey('alice') | Should -BeFalse
+        }
+
+        It 'self-dead: キラーとborn作者が同一の場合AuthorSelfDeadに加算' {
+            $accumulator = New-StrictAttributionAccumulator
+            # alice が r5 で書いた行を alice 自身が r10 で削除
+            $comparison = [pscustomobject]@{
+                BornLines   = @()
+                KilledLines = @(
+                    [pscustomobject]@{ Line = [pscustomobject]@{ Revision = 5; Author = 'alice' } }
+                )
+                MovedPairs  = @()
+            }
+
+            Update-StrictAccumulatorFromComparison -Accumulator $accumulator -Comparison $comparison -Revision 10 -Killer 'alice' -MetricFile 'src/A.cs' -FromRevision 1 -ToRevision 10
+
+            [int]$accumulator.AuthorSelfDead['alice'] | Should -Be 1
+            [int]$accumulator.AuthorDead['alice'] | Should -Be 1
+            $accumulator.AuthorOtherDead.ContainsKey('alice') | Should -BeFalse
+        }
+
+        It 'other-dead: キラーとborn作者が異なる場合AuthorOtherDeadとKillMatrixに加算' {
+            $accumulator = New-StrictAttributionAccumulator
+            # alice が r5 で書いた行を bob が r10 で削除
+            $comparison = [pscustomobject]@{
+                BornLines   = @()
+                KilledLines = @(
+                    [pscustomobject]@{ Line = [pscustomobject]@{ Revision = 5; Author = 'alice' } }
+                )
+                MovedPairs  = @()
+            }
+
+            Update-StrictAccumulatorFromComparison -Accumulator $accumulator -Comparison $comparison -Revision 10 -Killer 'bob' -MetricFile 'src/A.cs' -FromRevision 1 -ToRevision 10
+
+            [int]$accumulator.AuthorOtherDead['alice'] | Should -Be 1
+            [int]$accumulator.AuthorDead['alice'] | Should -Be 1
+            [int]$accumulator.KillMatrix['bob']['alice'] | Should -Be 1
+            [int]$accumulator.AuthorModifiedOthersCode['bob'] | Should -Be 1
+            $accumulator.AuthorSelfDead.ContainsKey('alice') | Should -BeFalse
+        }
+
+        It 'survived = born - dead が正しく追跡される' {
+            $accumulator = New-StrictAttributionAccumulator
+            # alice: r5で3行born、r10でそのうち1行dead
+            $bornComparison = [pscustomobject]@{
+                BornLines = @(
+                    [pscustomobject]@{ Line = [pscustomobject]@{ Revision = 5; Author = 'alice' } }
+                    [pscustomobject]@{ Line = [pscustomobject]@{ Revision = 5; Author = 'alice' } }
+                    [pscustomobject]@{ Line = [pscustomobject]@{ Revision = 5; Author = 'alice' } }
+                )
+                KilledLines = @()
+                MovedPairs  = @()
+            }
+            Update-StrictAccumulatorFromComparison -Accumulator $accumulator -Comparison $bornComparison -Revision 5 -Killer 'alice' -MetricFile 'src/A.cs' -FromRevision 1 -ToRevision 10
+
+            [int]$accumulator.AuthorSurvived['alice'] | Should -Be 3 -Because 'born直後のsurvived'
+            [int]$accumulator.AuthorBorn['alice'] | Should -Be 3
+
+            $deadComparison = [pscustomobject]@{
+                BornLines   = @()
+                KilledLines = @(
+                    [pscustomobject]@{ Line = [pscustomobject]@{ Revision = 5; Author = 'alice' } }
+                )
+                MovedPairs  = @()
+            }
+            Update-StrictAccumulatorFromComparison -Accumulator $accumulator -Comparison $deadComparison -Revision 10 -Killer 'bob' -MetricFile 'src/A.cs' -FromRevision 1 -ToRevision 10
+
+            [int]$accumulator.AuthorSurvived['alice'] | Should -Be 2 -Because 'dead後のsurvived = 3 - 1'
+            [int]$accumulator.AuthorDead['alice'] | Should -Be 1
+        }
+
+        It '範囲外リビジョンのdead行は加算されない' {
+            $accumulator = New-StrictAttributionAccumulator
+            # r3(範囲外)で生まれた行がr10で消された場合
+            $comparison = [pscustomobject]@{
+                BornLines   = @()
+                KilledLines = @(
+                    [pscustomobject]@{ Line = [pscustomobject]@{ Revision = 3; Author = 'alice' } }
+                )
+                MovedPairs  = @()
+            }
+
+            Update-StrictAccumulatorFromComparison -Accumulator $accumulator -Comparison $comparison -Revision 10 -Killer 'bob' -MetricFile 'src/A.cs' -FromRevision 5 -ToRevision 10
+
+            $accumulator.AuthorDead.ContainsKey('alice') | Should -BeFalse
+        }
+
+        It '内部移動はAuthorInternalMoveとFileInternalMoveに加算される' {
+            $accumulator = New-StrictAttributionAccumulator
+            $comparison = [pscustomobject]@{
+                BornLines   = @()
+                KilledLines = @()
+                MovedPairs  = @(
+                    [pscustomobject]@{ PrevIndex = 0; CurrIndex = 2 }
+                    [pscustomobject]@{ PrevIndex = 1; CurrIndex = 3 }
+                )
+            }
+
+            Update-StrictAccumulatorFromComparison -Accumulator $accumulator -Comparison $comparison -Revision 10 -Killer 'alice' -MetricFile 'src/A.cs' -FromRevision 1 -ToRevision 10
+
+            [int]$accumulator.AuthorInternalMove['alice'] | Should -Be 2
+            [int]$accumulator.FileInternalMove['src/A.cs'] | Should -Be 2
+        }
+
+        It '複数リビジョンで累積カウントが正しい' {
+            $accumulator = New-StrictAttributionAccumulator
+
+            # r5: alice が 3行born
+            $comp5 = [pscustomobject]@{
+                BornLines = @(
+                    [pscustomobject]@{ Line = [pscustomobject]@{ Revision = 5; Author = 'alice' } }
+                    [pscustomobject]@{ Line = [pscustomobject]@{ Revision = 5; Author = 'alice' } }
+                    [pscustomobject]@{ Line = [pscustomobject]@{ Revision = 5; Author = 'alice' } }
+                )
+                KilledLines = @()
+                MovedPairs  = @()
+            }
+            Update-StrictAccumulatorFromComparison -Accumulator $accumulator -Comparison $comp5 -Revision 5 -Killer 'alice' -MetricFile 'src/A.cs' -FromRevision 1 -ToRevision 20
+
+            # r7: bob が 2行born
+            $comp7 = [pscustomobject]@{
+                BornLines = @(
+                    [pscustomobject]@{ Line = [pscustomobject]@{ Revision = 7; Author = 'bob' } }
+                    [pscustomobject]@{ Line = [pscustomobject]@{ Revision = 7; Author = 'bob' } }
+                )
+                KilledLines = @()
+                MovedPairs  = @()
+            }
+            Update-StrictAccumulatorFromComparison -Accumulator $accumulator -Comparison $comp7 -Revision 7 -Killer 'bob' -MetricFile 'src/A.cs' -FromRevision 1 -ToRevision 20
+
+            # r10: carol が alice の1行を消し、bob の1行を消す
+            $comp10 = [pscustomobject]@{
+                BornLines   = @(
+                    [pscustomobject]@{ Line = [pscustomobject]@{ Revision = 10; Author = 'carol' } }
+                )
+                KilledLines = @(
+                    [pscustomobject]@{ Line = [pscustomobject]@{ Revision = 5; Author = 'alice' } }
+                    [pscustomobject]@{ Line = [pscustomobject]@{ Revision = 7; Author = 'bob' } }
+                )
+                MovedPairs  = @()
+            }
+            Update-StrictAccumulatorFromComparison -Accumulator $accumulator -Comparison $comp10 -Revision 10 -Killer 'carol' -MetricFile 'src/A.cs' -FromRevision 1 -ToRevision 20
+
+            # r15: alice が自分の1行を消す (self-dead)
+            $comp15 = [pscustomobject]@{
+                BornLines   = @()
+                KilledLines = @(
+                    [pscustomobject]@{ Line = [pscustomobject]@{ Revision = 5; Author = 'alice' } }
+                )
+                MovedPairs  = @()
+            }
+            Update-StrictAccumulatorFromComparison -Accumulator $accumulator -Comparison $comp15 -Revision 15 -Killer 'alice' -MetricFile 'src/A.cs' -FromRevision 1 -ToRevision 20
+
+            # 検証
+            [int]$accumulator.AuthorBorn['alice'] | Should -Be 3
+            [int]$accumulator.AuthorBorn['bob'] | Should -Be 2
+            [int]$accumulator.AuthorBorn['carol'] | Should -Be 1
+
+            [int]$accumulator.AuthorDead['alice'] | Should -Be 2 -Because 'r10で1行, r15で1行'
+            [int]$accumulator.AuthorDead['bob'] | Should -Be 1
+            $accumulator.AuthorDead.ContainsKey('carol') | Should -BeFalse
+
+            [int]$accumulator.AuthorSelfDead['alice'] | Should -Be 1 -Because 'r15で自身が削除'
+            [int]$accumulator.AuthorOtherDead['alice'] | Should -Be 1 -Because 'r10でcarolが削除'
+            [int]$accumulator.AuthorOtherDead['bob'] | Should -Be 1
+
+            [int]$accumulator.AuthorSurvived['alice'] | Should -Be 1 -Because '3born - 2dead'
+            [int]$accumulator.AuthorSurvived['bob'] | Should -Be 1 -Because '2born - 1dead'
+            [int]$accumulator.AuthorSurvived['carol'] | Should -Be 1
+
+            [int]$accumulator.KillMatrix['carol']['alice'] | Should -Be 1
+            [int]$accumulator.KillMatrix['carol']['bob'] | Should -Be 1
+
+            [int]$accumulator.FileSurvived['src/A.cs'] | Should -Be 3 -Because '(3+2+1)born - (1+1+1)dead'
+            [int]$accumulator.FileDead['src/A.cs'] | Should -Be 3
+        }
+    }
+}

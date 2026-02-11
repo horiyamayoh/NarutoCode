@@ -196,6 +196,7 @@ Describe 'Diff pipeline refactor' {
                     [string[]]$ExcludeExtensions,
                     [string[]]$IncludePathPatterns,
                     [string[]]$ExcludePathPatterns,
+                    [string]$LogPathPrefix,
                     [int]$Parallel
                 )
                 [void]$Context
@@ -207,12 +208,14 @@ Describe 'Diff pipeline refactor' {
                 [void]$ExcludeExtensions
                 [void]$IncludePathPatterns
                 [void]$ExcludePathPatterns
+                [void]$LogPathPrefix
                 [void]$Parallel
                 return @{ 5 = 'alice' }
             }
             Set-Item -Path function:Get-RenameMap -Value {
-                param([object[]]$Commits)
+                param([object[]]$Commits, [string]$LogPathPrefix)
                 [void]$Commits
+                [void]$LogPathPrefix
                 return @{ 'src/old.cs' = 'src/new.cs' }
             }
 
@@ -225,6 +228,7 @@ Describe 'Diff pipeline refactor' {
                 ExcludeExtensions = @('bin')
                 IncludePaths = @('src/*')
                 ExcludePaths = @('tmp/*')
+                LogPathPrefix = ''
             }
 
             $result = Invoke-PipelineLogAndDiffStage -ExecutionState $executionState -IgnoreWhitespace -Parallel 4
