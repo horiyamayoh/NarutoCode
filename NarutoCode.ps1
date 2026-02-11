@@ -1703,6 +1703,13 @@ function Invoke-ParallelWork
 param([string]$WorkerText, [object]$Item, [int]$Index)
 try
 {
+    # SessionVariables 経由で注入された $NarutoContext を $script:NarutoContext へ転写する。
+    # これにより Runspace 内の全関数が既定パラメータ $Context = $script:NarutoContext を
+    # 正しく解決できるようになる。
+    if ($null -ne $NarutoContext)
+    {
+        $script:NarutoContext = $NarutoContext
+    }
     $worker = [scriptblock]::Create($WorkerText)
     $result = & $worker -Item $Item -Index $Index
     [pscustomobject]@{
@@ -1807,9 +1814,14 @@ function Get-Sha1Hex
     }
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
     # 並列 runspace では SharedSha1 が存在しないため都度生成する
-    $sha = if ($Context.Caches.SharedSha1)
+    $shared = $null
+    if ($null -ne $Context -and $null -ne $Context.Caches)
     {
-        $Context.Caches.SharedSha1
+        $shared = $Context.Caches.SharedSha1
+    }
+    $sha = if ($shared)
+    {
+        $shared
     }
     else
     {
@@ -1823,7 +1835,7 @@ function Get-Sha1Hex
     finally
     {
         # 共有インスタンスは破棄せず、フォールバック生成分のみ Dispose する
-        if ($sha -ne $Context.Caches.SharedSha1)
+        if ($sha -ne $shared)
         {
             $sha.Dispose()
         }
@@ -1835,8 +1847,8 @@ function Get-PathCacheHash
     .SYNOPSIS
         パス文字列からキャッシュファイル名用ハッシュを生成する。
     #>
-    param([string]$FilePath)
-    return Get-Sha1Hex -Text (ConvertTo-PathKey -Path $FilePath)
+    param([hashtable]$Context = $script:NarutoContext, [string]$FilePath)
+    return Get-Sha1Hex -Context $Context -Text (ConvertTo-PathKey -Path $FilePath)
 }
 function Get-BlameCachePath
 {
@@ -3164,11 +3176,11 @@ function ConvertTo-LineHash
     .DESCRIPTION
         空白を正規化したうえでファイルパスと結合し、Get-Sha1Hex でハッシュ化する。
     #>
-    param([string]$FilePath, [string]$Content)
+    param([hashtable]$Context = $script:NarutoContext, [string]$FilePath, [string]$Content)
     $norm = $Content -replace '\s+', ' '
     $norm = $norm.Trim()
     $raw = $FilePath + [char]0 + $norm
-    return Get-Sha1Hex -Text $raw
+    return Get-Sha1Hex -Context $Context -Text $raw
 }
 function ConvertTo-ContextHash
 {
@@ -3203,7 +3215,7 @@ function ConvertTo-ContextHash
         }
     }
     $raw = $FilePath + '|' + ($first -join '|') + '|' + ($last -join '|')
-    return Get-Sha1Hex -Text $raw
+    return Get-Sha1Hex -Context $Context -Text $raw
 }
 function ConvertFrom-SvnUnifiedDiffPathHeader
 {
@@ -4250,7 +4262,7 @@ function Initialize-SvnBlameLineCache
     #>
     [CmdletBinding()]
     [OutputType([object])]
-    param([string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir)
+    param([hashtable]$Context = $script:NarutoContext, [string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir)
     if ($Revision -le 0 -or [string]::IsNullOrWhiteSpace($FilePath))
     {
         return (New-NarutoResultSkipped -Data ([pscustomobject]@{
@@ -4273,7 +4285,7 @@ function Initialize-SvnBlameLineCache
     if ([string]::IsNullOrWhiteSpace($blameXml))
     {
         $misses++
-        $blameFetchResult = Invoke-SvnCommandAllowMissingTarget -Arguments @('blame', '--xml', '-r', [string]$Revision, $url) -ErrorContext ("svn blame $FilePath@$Revision")
+        $blameFetchResult = Invoke-SvnCommandAllowMissingTarget -Context $Context -Arguments @('blame', '--xml', '-r', [string]$Revision, $url) -ErrorContext ("svn blame $FilePath@$Revision")
         $blameFetchResult = ConvertTo-NarutoResultAdapter -InputObject $blameFetchResult -SuccessCode 'SVN_COMMAND_SUCCEEDED' -SkippedCode 'SVN_TARGET_MISSING'
         if (Test-NarutoResultSuccess -Result $blameFetchResult)
         {
@@ -4298,7 +4310,7 @@ function Initialize-SvnBlameLineCache
     if ($null -eq $catText)
     {
         $misses++
-        $catFetchResult = Invoke-SvnCommandAllowMissingTarget -Arguments @('cat', '-r', [string]$Revision, $url) -ErrorContext ("svn cat $FilePath@$Revision")
+        $catFetchResult = Invoke-SvnCommandAllowMissingTarget -Context $Context -Arguments @('cat', '-r', [string]$Revision, $url) -ErrorContext ("svn cat $FilePath@$Revision")
         $catFetchResult = ConvertTo-NarutoResultAdapter -InputObject $catFetchResult -SuccessCode 'SVN_COMMAND_SUCCEEDED' -SkippedCode 'SVN_TARGET_MISSING'
         if (Test-NarutoResultSuccess -Result $catFetchResult)
         {
@@ -5483,7 +5495,7 @@ function Invoke-StrictBlameCachePrefetch
             Write-Progress -Id 4 -Activity 'blame キャッシュ構築' -Status ('{0}/{1}' -f ($prefetchIdx + 1), $prefetchTotal) -PercentComplete $pct
             try
             {
-                $prefetchStatsResult = Initialize-SvnBlameLineCache -Repo $TargetUrl -FilePath ([string]$item.FilePath) -Revision ([int]$item.Revision) -CacheDir $CacheDir
+                $prefetchStatsResult = Initialize-SvnBlameLineCache -Context $Context -Repo $TargetUrl -FilePath ([string]$item.FilePath) -Revision ([int]$item.Revision) -CacheDir $CacheDir
                 $prefetchStatsResult = ConvertTo-NarutoResultAdapter -InputObject $prefetchStatsResult -SuccessCode 'SVN_BLAME_CACHE_READY' -SkippedCode 'SVN_BLAME_CACHE_INVALID_ARGUMENT'
                 $prefetchStats = $prefetchStatsResult.Data
                 if ($null -eq $prefetchStats)
@@ -5525,7 +5537,7 @@ function Invoke-StrictBlameCachePrefetch
         [void]$Index # Required by Invoke-ParallelWork contract
         try
         {
-            $statsResult = Initialize-SvnBlameLineCache -Repo $Item.TargetUrl -FilePath ([string]$Item.FilePath) -Revision ([int]$Item.Revision) -CacheDir $Item.CacheDir
+            $statsResult = Initialize-SvnBlameLineCache -Context $NarutoContext -Repo $Item.TargetUrl -FilePath ([string]$Item.FilePath) -Revision ([int]$Item.Revision) -CacheDir $Item.CacheDir
             $statsResult = ConvertTo-NarutoResultAdapter -InputObject $statsResult -SuccessCode 'SVN_BLAME_CACHE_READY' -SkippedCode 'SVN_BLAME_CACHE_INVALID_ARGUMENT'
             $stats = $statsResult.Data
             if ($null -eq $stats)
