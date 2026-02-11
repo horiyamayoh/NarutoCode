@@ -751,7 +751,7 @@ $$L(A, B) = \frac{P(A \cap B)}{P(A) \times P(B)}$$
 | `Outputs` | 出力されたファイル名の一覧 |
 
 `Parameters.ExcludeCommentOnlyLines` が `true` の場合、コメント専用行（コードを含まない行）は全メトリクスから除外されます。  
-コメント記法は拡張子に応じた組み込みプロファイル（`CStyle` / `PowerShellStyle` / `IniStyle`）で自動判定されます。
+判定は拡張子に応じた組み込みプロファイル（`CStyle` / `CSharpStyle` / `JsTsStyle` / `PowerShellStyle` / `IniStyle`）を使い、コメント記法と文字列リテラル境界を併用して行われます。
 
 > **同じ条件で再実行したい場合**、このファイルを見ればパラメータを復元できます。
 

@@ -1035,6 +1035,54 @@ Phase F: テスト・ドキュメント
 | PlantUML TopN | 可視化の制限であり指標の近似ではない |
 | 作者エイリアス | SVN 情報のみでは判定不可能。別パラメータとして設計 |
 
+## 15. コメント専用行除外の厳密判定仕様（ExcludeCommentOnlyLines）
+
+### 15.1 判定入力
+
+- 拡張子ごとに `CommentSyntaxProfile` を 1 つ選択する。
+- 各プロファイルは以下を持つ。
+  - `LineCommentTokens`
+  - `BlockCommentPairs`
+  - `StringLiteralMarkers`（`Start` / `End` / `CanSpanLines` / `EscapeMode` / `AllowDoubleEnd` / `EndMustBeAtLineStart`）
+
+### 15.2 字句状態
+
+1 行ごとに次の状態を更新する。
+
+- `inBlockComment`: ブロックコメント内かどうか
+- `inString`: 文字列リテラル内かどうか
+- `activeStringMarker`: 現在有効な文字列マーカー
+- `stringEscapePending`: エスケープ直後状態
+
+判定結果は `mask[line] = (lineHasComment AND NOT lineHasCode)` とする。
+
+### 15.3 状態遷移規則
+
+1. `inBlockComment=true` の間は `BlockCommentPairs.End` のみ終端として扱う。  
+   ブロックコメント終端が現れない限り、その行はコメント行扱いとなる。
+2. `inString=true` の間は `activeStringMarker.End` のみ終端として扱う。  
+   `EscapeMode`（`Backslash` / `Backtick` / `None`）と `AllowDoubleEnd` に従い終端トークンの無効化を判定する。
+3. `inString=true` かつ `CanSpanLines=false` の場合は行末で文字列状態を閉じる。  
+   `CanSpanLines=true` の場合は次行へ状態を持ち越す。
+4. 文字列開始は `StringLiteralMarkers.Start` の完全一致のみで認識する。  
+   マーカーに一致しない文字は文字列開始・終了とみなさない。
+5. `EndMustBeAtLineStart=true` の場合、終端トークンは行頭（先頭が空白のみ）にあるときのみマッチする。  
+   PowerShell here-string の `"@` / `'@` が行中に埋め込まれていても誤終端しない。
+6. ブロックコメントのネストは行わない（非対応仕様）。
+
+### 15.4 保証範囲
+
+- C# の `@"..."`（複数行）および PowerShell here-string（`@"..."@` / `@'...'@`）内のコメントトークン誤検出を防ぐ。
+- PowerShell here-string の終端 `"@` / `'@` は行頭（先行空白のみ）でのみマッチする（`EndMustBeAtLineStart`）。
+- TOML `"""` 複数行文字列内の `#` 誤検出を防ぐ。
+- rename/copy を含む差分でも `Index/---/+++` の old/new 実体（path + revision）からコメントマスクを生成する。
+
+### 15.5 非対応範囲
+
+- プロファイル未定義の拡張子はコメント除外判定を行わない（従来仕様）。
+- 言語仕様上の任意ネストブロックコメント等、プロファイル表現不能な構文は対象外とする。
+- C# 11 raw string literal は `"""` 3 文字固定のみ対応。`""""` 以上の可変長デリミタは静的プロファイルでは表現不可能なため非対応。
+
 ## Strict Refactor Responsibility Update (2026-02)
 
 The Strict pipeline keeps output compatibility while splitting responsibilities into smaller units.

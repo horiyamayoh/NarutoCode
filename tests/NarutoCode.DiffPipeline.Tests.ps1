@@ -109,6 +109,215 @@ Describe 'Diff pipeline refactor' {
         }
     }
 
+    Context 'Invoke-CommitDiffPrefetch comment mask with rename header' {
+        BeforeEach {
+            $script:origGetCachedOrFetchDiffTextPrefetch = (Get-Item function:Get-CachedOrFetchDiffText).ScriptBlock.ToString()
+            $script:origGetCachedOrFetchCatTextPrefetch = (Get-Item function:Get-CachedOrFetchCatText).ScriptBlock.ToString()
+            $script:origConvertFromSvnUnifiedDiffPrefetch = (Get-Item function:ConvertFrom-SvnUnifiedDiff).ScriptBlock.ToString()
+            $script:prefetchCatLookups = New-Object 'System.Collections.Generic.List[string]'
+            $script:prefetchLineMaskByPath = $null
+        }
+
+        AfterEach {
+            Set-Item -Path function:Get-CachedOrFetchDiffText -Value $script:origGetCachedOrFetchDiffTextPrefetch
+            Set-Item -Path function:Get-CachedOrFetchCatText -Value $script:origGetCachedOrFetchCatTextPrefetch
+            Set-Item -Path function:ConvertFrom-SvnUnifiedDiff -Value $script:origConvertFromSvnUnifiedDiffPrefetch
+        }
+
+        It 'uses old path/revision from diff header when building comment masks' {
+            Set-Item -Path function:Get-CachedOrFetchDiffText -Value {
+                param(
+                    [hashtable]$Context,
+                    [string]$CacheDir,
+                    [int]$Revision,
+                    [string]$TargetUrl,
+                    [string[]]$DiffArguments
+                )
+                [void]$Context
+                [void]$CacheDir
+                [void]$Revision
+                [void]$TargetUrl
+                [void]$DiffArguments
+                return @"
+Index: src/new.cs
+===================================================================
+--- src/old.cs	(revision 9)
++++ src/new.cs	(revision 10)
+@@ -1 +1 @@
+-// old comment
++int x = 1;
+"@
+            }
+            Set-Item -Path function:Get-CachedOrFetchCatText -Value {
+                param(
+                    [hashtable]$Context,
+                    [string]$Repo,
+                    [string]$FilePath,
+                    [int]$Revision,
+                    [string]$CacheDir
+                )
+                [void]$Context
+                [void]$Repo
+                [void]$CacheDir
+                $lookupKey = [string]$FilePath + '@' + [string]$Revision
+                [void]$script:prefetchCatLookups.Add($lookupKey)
+                if ($FilePath -eq 'src/old.cs' -and $Revision -eq 9)
+                {
+                    return "// old comment`n"
+                }
+                if ($FilePath -eq 'src/new.cs' -and $Revision -eq 10)
+                {
+                    return "int x = 1;`n"
+                }
+                return $null
+            }
+            Set-Item -Path function:ConvertFrom-SvnUnifiedDiff -Value {
+                param(
+                    [string]$DiffText,
+                    [int]$DetailLevel,
+                    [switch]$ExcludeCommentOnlyLines,
+                    [hashtable]$LineMaskByPath
+                )
+                [void]$DiffText
+                [void]$DetailLevel
+                [void]$ExcludeCommentOnlyLines
+                $script:prefetchLineMaskByPath = $LineMaskByPath
+                return @{
+                    'src/new.cs' = [pscustomobject]@{
+                        AddedLines = 0
+                        DeletedLines = 0
+                        Hunks = @()
+                        IsBinary = $false
+                        AddedLineHashes = @()
+                        DeletedLineHashes = @()
+                    }
+                }
+            }
+
+            $prefetchItems = @(
+                [pscustomobject]@{
+                    Revision = 10
+                    CacheDir = '.cache'
+                    TargetUrl = 'https://example.invalid/svn/repo'
+                    DiffArguments = @('diff', '--internal-diff')
+                    ChangedPaths = @(
+                        [pscustomobject]@{
+                            Path = 'src/new.cs'
+                            Action = 'A'
+                            CopyFromPath = 'src/old.cs'
+                            CopyFromRev = 9
+                        }
+                    )
+                    ExcludeCommentOnlyLines = $true
+                }
+            )
+
+            $raw = Invoke-CommitDiffPrefetch -Context $script:NarutoContext -PrefetchItems $prefetchItems -Parallel 1
+
+            $raw.ContainsKey(10) | Should -BeTrue
+            @($script:prefetchCatLookups) | Should -Be @('src/old.cs@9', 'src/new.cs@10')
+            $script:prefetchLineMaskByPath.ContainsKey('src/new.cs') | Should -BeTrue
+            @($script:prefetchLineMaskByPath['src/new.cs'].OldMask) | Should -Be @($true)
+            @($script:prefetchLineMaskByPath['src/new.cs'].NewMask) | Should -Be @($false)
+        }
+    }
+
+    Context 'Invoke-CommitDiffPrefetch Replace fallback without copyFromPath' {
+        BeforeEach {
+            $script:origGetCachedOrFetchDiffTextReplace = (Get-Item function:Get-CachedOrFetchDiffText).ScriptBlock.ToString()
+            $script:origGetCachedOrFetchCatTextReplace = (Get-Item function:Get-CachedOrFetchCatText).ScriptBlock.ToString()
+            $script:origConvertFromSvnUnifiedDiffReplace = (Get-Item function:ConvertFrom-SvnUnifiedDiff).ScriptBlock.ToString()
+            $script:replaceCatLookups = New-Object 'System.Collections.Generic.List[string]'
+            $script:replaceLineMaskByPath = $null
+        }
+
+        AfterEach {
+            Set-Item -Path function:Get-CachedOrFetchDiffText -Value $script:origGetCachedOrFetchDiffTextReplace
+            Set-Item -Path function:Get-CachedOrFetchCatText -Value $script:origGetCachedOrFetchCatTextReplace
+            Set-Item -Path function:ConvertFrom-SvnUnifiedDiff -Value $script:origConvertFromSvnUnifiedDiffReplace
+        }
+
+        It 'uses same path at revision-1 as old when Replace has no copyFromPath and no diff header' {
+            Set-Item -Path function:Get-CachedOrFetchDiffText -Value {
+                param(
+                    [hashtable]$Context,
+                    [string]$CacheDir,
+                    [int]$Revision,
+                    [string]$TargetUrl,
+                    [string[]]$DiffArguments
+                )
+                [void]$Context
+                [void]$CacheDir
+                [void]$Revision
+                [void]$TargetUrl
+                [void]$DiffArguments
+                # diff ヘッダーなし（フォールバック経路を強制）
+                return ''
+            }
+            Set-Item -Path function:Get-CachedOrFetchCatText -Value {
+                param(
+                    [hashtable]$Context,
+                    [string]$Repo,
+                    [string]$FilePath,
+                    [int]$Revision,
+                    [string]$CacheDir
+                )
+                [void]$Context
+                [void]$Repo
+                [void]$CacheDir
+                $lookupKey = [string]$FilePath + '@' + [string]$Revision
+                [void]$script:replaceCatLookups.Add($lookupKey)
+                if ($FilePath -eq 'src/target.cs' -and $Revision -eq 9)
+                {
+                    return "// old version`n"
+                }
+                if ($FilePath -eq 'src/target.cs' -and $Revision -eq 10)
+                {
+                    return "int y = 2;`n"
+                }
+                return $null
+            }
+            Set-Item -Path function:ConvertFrom-SvnUnifiedDiff -Value {
+                param(
+                    [string]$DiffText,
+                    [int]$DetailLevel,
+                    [switch]$ExcludeCommentOnlyLines,
+                    [hashtable]$LineMaskByPath
+                )
+                [void]$DiffText
+                [void]$DetailLevel
+                [void]$ExcludeCommentOnlyLines
+                $script:replaceLineMaskByPath = $LineMaskByPath
+                return @{}
+            }
+
+            $prefetchItems = @(
+                [pscustomobject]@{
+                    Revision = 10
+                    CacheDir = '.cache'
+                    TargetUrl = 'https://example.invalid/svn/repo'
+                    DiffArguments = @('diff', '--internal-diff')
+                    ChangedPaths = @(
+                        [pscustomobject]@{
+                            Path = 'src/target.cs'
+                            Action = 'R'
+                            CopyFromPath = ''
+                            CopyFromRev = $null
+                        }
+                    )
+                    ExcludeCommentOnlyLines = $true
+                }
+            )
+
+            Invoke-CommitDiffPrefetch -Context $script:NarutoContext -PrefetchItems $prefetchItems -Parallel 1
+
+            @($script:replaceCatLookups) | Should -Be @('src/target.cs@9', 'src/target.cs@10')
+            $script:replaceLineMaskByPath.ContainsKey('src/target.cs') | Should -BeTrue
+            @($script:replaceLineMaskByPath['src/target.cs'].OldMask) | Should -Be @($true)
+            @($script:replaceLineMaskByPath['src/target.cs'].NewMask) | Should -Be @($false)
+        }
+    }
+
     Context 'Set-CommitDerivedMetric' {
         It 'updates churn and message summary fields' {
             $longMessage = ('x' * 150) + "`r`nsecond line"

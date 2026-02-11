@@ -60,7 +60,7 @@ SVN リポジトリの履歴を解析し、コミット品質・変更傾向の�
 | `-NoProgress` | | | 進捗バー表示を抑止 |
 
 > 旧パラメータ名（`-Path`, `-FromRevision`, `-ToRevision` 等）はエイリアスとして引き続き使用可能です。
-> `-ExcludeCommentOnlyLines` は拡張子ごとの組み込みコメント記法（`CStyle` / `PowerShellStyle` / `IniStyle`）を使って判定します。
+> `-ExcludeCommentOnlyLines` は拡張子ごとの組み込みプロファイル（`CStyle` / `CSharpStyle` / `JsTsStyle` / `PowerShellStyle` / `IniStyle`）を使い、コメント記法と文字列リテラル境界の両方を判定します。
 
 ## 出力ファイル
 

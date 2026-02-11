@@ -116,9 +116,43 @@ svn:mime-type = application/octet-stream
     }
 }
 
+Describe 'Get-SvnUnifiedDiffHeaderSectionList' {
+    It 'extracts old/new path and revision per index section' {
+        $diff = @"
+Index: src/new.cs
+===================================================================
+--- src/old.cs	(revision 9)
++++ src/new.cs	(revision 10)
+@@ -1 +1 @@
+-old
++new
+Index: src/add.cs
+===================================================================
+--- src/add.cs	(nonexistent)
++++ src/add.cs	(revision 10)
+@@ -0,0 +1 @@
++line
+"@
+        $sections = @(Get-SvnUnifiedDiffHeaderSectionList -DiffText $diff)
+        $sections.Count | Should -Be 2
+        $sections[0].IndexPath | Should -Be 'src/new.cs'
+        $sections[0].OldPath | Should -Be 'src/old.cs'
+        $sections[0].OldRevision | Should -Be 9
+        $sections[0].NewPath | Should -Be 'src/new.cs'
+        $sections[0].NewRevision | Should -Be 10
+        $sections[1].IndexPath | Should -Be 'src/add.cs'
+        $sections[1].OldPath | Should -BeNullOrEmpty
+        $sections[1].OldRevision | Should -BeNullOrEmpty
+        $sections[1].NewPath | Should -Be 'src/add.cs'
+        $sections[1].NewRevision | Should -Be 10
+    }
+}
+
 Describe 'Comment syntax profile and line mask' {
     It 'resolves profile by extension' {
         (Get-CommentSyntaxProfileByPath -FilePath 'src/main.c').Name | Should -Be 'CStyle'
+        (Get-CommentSyntaxProfileByPath -FilePath 'src/main.cs').Name | Should -Be 'CSharpStyle'
+        (Get-CommentSyntaxProfileByPath -FilePath 'src/main.ts').Name | Should -Be 'JsTsStyle'
         (Get-CommentSyntaxProfileByPath -FilePath 'scripts/build.ps1').Name | Should -Be 'PowerShellStyle'
         (Get-CommentSyntaxProfileByPath -FilePath 'config/app.ini').Name | Should -Be 'IniStyle'
     }
@@ -127,7 +161,7 @@ Describe 'Comment syntax profile and line mask' {
         Get-CommentSyntaxProfileByPath -FilePath 'docs/readme.txt' | Should -BeNullOrEmpty
     }
 
-    It 'marks comment-only lines for CStyle and ignores comment tokens in strings' {
+    It 'marks comment-only lines for CSharpStyle and ignores comment tokens in strings' {
         $profile = Get-CommentSyntaxProfileByPath -FilePath 'src/main.cs'
         $lines = @(
             '// line comment'
@@ -140,6 +174,52 @@ Describe 'Comment syntax profile and line mask' {
         )
         $mask = ConvertTo-CommentOnlyLineMask -Lines $lines -CommentSyntaxProfile $profile
         @($mask) | Should -Be @($true, $false, $true, $true, $true, $false, $false)
+    }
+
+    It 'does not treat C# verbatim multi-line string lines as comment-only' {
+        $profile = Get-CommentSyntaxProfileByPath -FilePath 'src/main.cs'
+        $lines = @(
+            'var text = @"'
+            '// inside verbatim'
+            'line2";'
+            '// real comment'
+        )
+        $mask = ConvertTo-CommentOnlyLineMask -Lines $lines -CommentSyntaxProfile $profile
+        @($mask) | Should -Be @($false, $false, $false, $true)
+    }
+
+    It 'does not treat PowerShell here-string lines as comment-only' {
+        $profile = Get-CommentSyntaxProfileByPath -FilePath 'scripts/build.ps1'
+        $lines = @(
+            '@"'
+            '# inside here-string'
+            '"@'
+            '# real comment'
+        )
+        $mask = ConvertTo-CommentOnlyLineMask -Lines $lines -CommentSyntaxProfile $profile
+        @($mask) | Should -Be @($false, $false, $false, $true)
+    }
+
+    It 'does not skip YAML single-quote string ending with backslash' {
+        $iniProfile = Get-CommentSyntaxProfileByPath -FilePath 'config/app.yaml'
+        $lines = @(
+            "key: 'path\to\dir'"
+            '# real comment'
+        )
+        $mask = ConvertTo-CommentOnlyLineMask -Lines $lines -CommentSyntaxProfile $iniProfile
+        @($mask) | Should -Be @($false, $true)
+    }
+
+    It 'does not escape next line start in JS template literal ending with backslash' {
+        $jsProfile = Get-CommentSyntaxProfileByPath -FilePath 'src/app.js'
+        $lines = @(
+            'var t = `line1\'
+            '// still template'
+            '`;'
+            '// real comment'
+        )
+        $mask = ConvertTo-CommentOnlyLineMask -Lines $lines -CommentSyntaxProfile $jsProfile
+        @($mask) | Should -Be @($false, $false, $false, $true)
     }
 
     It 'marks comment-only lines for PowerShellStyle and IniStyle' {
@@ -163,6 +243,79 @@ Describe 'Comment syntax profile and line mask' {
         )
         $iniMask = ConvertTo-CommentOnlyLineMask -Lines $iniLines -CommentSyntaxProfile $iniProfile
         @($iniMask) | Should -Be @($true, $true, $false, $false)
+    }
+
+    It 'does not treat C# raw string """ content as comment-only' {
+        $profile = Get-CommentSyntaxProfileByPath -FilePath 'src/main.cs'
+        $lines = @(
+            'var s = """'
+            '// inside raw string'
+            'line with "embedded"'
+            '"""'
+            '// real comment'
+        )
+        $mask = ConvertTo-CommentOnlyLineMask -Lines $lines -CommentSyntaxProfile $profile
+        @($mask)[0] | Should -Be $false
+        @($mask)[1] | Should -Be $false
+        @($mask)[2] | Should -Be $false
+        @($mask)[3] | Should -Be $false
+        @($mask)[4] | Should -Be $true
+    }
+
+    It 'handles C# verbatim @" with doubled-quote escape' {
+        $profile = Get-CommentSyntaxProfileByPath -FilePath 'src/main.cs'
+        $lines = @(
+            'var s = @"He said ""hello""";'
+            '// real comment'
+        )
+        $mask = ConvertTo-CommentOnlyLineMask -Lines $lines -CommentSyntaxProfile $profile
+        @($mask) | Should -Be @($false, $true)
+    }
+
+    It 'marks remaining lines as code when multi-line string never closes' {
+        $profile = Get-CommentSyntaxProfileByPath -FilePath 'src/main.cs'
+        $lines = @(
+            'var s = @"'
+            '// still inside string'
+            '# also inside'
+        )
+        $mask = ConvertTo-CommentOnlyLineMask -Lines $lines -CommentSyntaxProfile $profile
+        @($mask) | Should -Be @($false, $false, $false)
+    }
+
+    It 'does not treat TOML multi-line string content as comment-only' {
+        $profile = Get-CommentSyntaxProfileByPath -FilePath 'config/app.toml'
+        $lines = @(
+            'desc = """'
+            '# not a comment'
+            'content'
+            '"""'
+            '# real comment'
+        )
+        $mask = ConvertTo-CommentOnlyLineMask -Lines $lines -CommentSyntaxProfile $profile
+        @($mask)[0] | Should -Be $false
+        @($mask)[1] | Should -Be $false
+        @($mask)[2] | Should -Be $false
+        @($mask)[3] | Should -Be $false
+        @($mask)[4] | Should -Be $true
+    }
+
+    It 'does not close PowerShell here-string when "@ appears mid-line' {
+        $profile = Get-CommentSyntaxProfileByPath -FilePath 'scripts/build.ps1'
+        $lines = @(
+            '@"'
+            'user"@example.com'
+            '"@'
+            '# real comment'
+        )
+        $mask = ConvertTo-CommentOnlyLineMask -Lines $lines -CommentSyntaxProfile $profile
+        @($mask) | Should -Be @($false, $false, $false, $true)
+    }
+
+    It 'returns empty mask for null or empty input' {
+        @(ConvertTo-CommentOnlyLineMask -Lines @() -CommentSyntaxProfile ([pscustomobject]@{ LineCommentTokens = @('#') })).Count | Should -Be 0
+        @(ConvertTo-CommentOnlyLineMask -Lines $null -CommentSyntaxProfile ([pscustomobject]@{ LineCommentTokens = @('#') })).Count | Should -Be 0
+        @(ConvertTo-CommentOnlyLineMask -Lines @('# comment') -CommentSyntaxProfile $null).Count | Should -Be 0
     }
 }
 

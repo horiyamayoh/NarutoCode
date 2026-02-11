@@ -643,16 +643,107 @@ function New-NarutoContext
             HeatmapLightTextThreshold = 0.6
 
             # コメント記法プロファイル（組み込み固定）
-            # Extensions は小文字比較。LineCommentTokens/BlockCommentPairs は字句走査で使用する。
+            # Extensions は小文字比較。LineCommentTokens/BlockCommentPairs/StringLiteralMarkers は字句走査で使用する。
             CommentSyntaxProfiles = @(
                 [pscustomobject]@{
                     Name = 'CStyle'
-                    Extensions = @('c', 'cc', 'cpp', 'cxx', 'h', 'hh', 'hpp', 'hxx', 'cs', 'java', 'js', 'jsx', 'ts', 'tsx', 'go', 'php', 'swift', 'kt', 'kts', 'scala')
+                    Extensions = @('c', 'cc', 'cpp', 'cxx', 'h', 'hh', 'hpp', 'hxx', 'java', 'go', 'php', 'swift', 'kt', 'kts', 'scala')
                     LineCommentTokens = @('//')
                     BlockCommentPairs = @(
                         [pscustomobject]@{
                             Start = '/*'
                             End = '*/'
+                        }
+                    )
+                    StringLiteralMarkers = @(
+                        [pscustomobject]@{
+                            Start = '"'
+                            End = '"'
+                            CanSpanLines = $false
+                            EscapeMode = 'Backslash'
+                            AllowDoubleEnd = $false
+                        },
+                        [pscustomobject]@{
+                            Start = [string][char]39
+                            End = [string][char]39
+                            CanSpanLines = $false
+                            EscapeMode = 'Backslash'
+                            AllowDoubleEnd = $false
+                        }
+                    )
+                },
+                [pscustomobject]@{
+                    Name = 'CSharpStyle'
+                    Extensions = @('cs')
+                    LineCommentTokens = @('//')
+                    BlockCommentPairs = @(
+                        [pscustomobject]@{
+                            Start = '/*'
+                            End = '*/'
+                        }
+                    )
+                    StringLiteralMarkers = @(
+                        [pscustomobject]@{
+                            Start = '"""'
+                            End = '"""'
+                            CanSpanLines = $true
+                            EscapeMode = 'None'
+                            AllowDoubleEnd = $false
+                        },
+                        [pscustomobject]@{
+                            Start = '@"'
+                            End = '"'
+                            CanSpanLines = $true
+                            EscapeMode = 'None'
+                            AllowDoubleEnd = $true
+                        },
+                        [pscustomobject]@{
+                            Start = '"'
+                            End = '"'
+                            CanSpanLines = $false
+                            EscapeMode = 'Backslash'
+                            AllowDoubleEnd = $false
+                        },
+                        [pscustomobject]@{
+                            Start = [string][char]39
+                            End = [string][char]39
+                            CanSpanLines = $false
+                            EscapeMode = 'Backslash'
+                            AllowDoubleEnd = $false
+                        }
+                    )
+                },
+                [pscustomobject]@{
+                    Name = 'JsTsStyle'
+                    Extensions = @('js', 'jsx', 'ts', 'tsx')
+                    LineCommentTokens = @('//')
+                    BlockCommentPairs = @(
+                        [pscustomobject]@{
+                            Start = '/*'
+                            End = '*/'
+                        }
+                    )
+                    StringLiteralMarkers = @(
+                        [pscustomobject]@{
+                            Start = [string][char]96
+                            End = [string][char]96
+                            CanSpanLines = $true
+                            EscapeMode = 'Backslash'
+                            AllowDoubleEnd = $false
+                        },
+                        [pscustomobject]@{
+                            Start = '"'
+                            End = '"'
+                            CanSpanLines = $false
+                            EscapeMode = 'Backslash'
+                            AllowDoubleEnd = $false
+                        },
+                        [pscustomobject]@{
+                            Start = [string][char]39
+                            End = [string][char]39
+                            CanSpanLines = $false
+                            EscapeMode = 'Backslash'
+                            AllowDoubleEnd = $false
                         }
                     )
                 },
@@ -666,12 +757,67 @@ function New-NarutoContext
                             End = '#>'
                         }
                     )
+                    StringLiteralMarkers = @(
+                        [pscustomobject]@{
+                            Start = '@"'
+                            End = '"@'
+                            CanSpanLines = $true
+                            EscapeMode = 'None'
+                            AllowDoubleEnd = $false
+                            EndMustBeAtLineStart = $true
+                        },
+                        [pscustomobject]@{
+                            Start = "@'"
+                            End = "'@"
+                            CanSpanLines = $true
+                            EscapeMode = 'None'
+                            AllowDoubleEnd = $false
+                            EndMustBeAtLineStart = $true
+                        },
+                        [pscustomobject]@{
+                            Start = '"'
+                            End = '"'
+                            CanSpanLines = $false
+                            EscapeMode = 'Backtick'
+                            AllowDoubleEnd = $false
+                        },
+                        [pscustomobject]@{
+                            Start = [string][char]39
+                            End = [string][char]39
+                            CanSpanLines = $false
+                            EscapeMode = 'None'
+                            AllowDoubleEnd = $true
+                        }
+                    )
                 },
                 [pscustomobject]@{
                     Name = 'IniStyle'
                     Extensions = @('ini', 'cfg', 'conf', 'properties', 'toml', 'yaml', 'yml')
                     LineCommentTokens = @('#', ';')
                     BlockCommentPairs = @()
+                    StringLiteralMarkers = @(
+                        [pscustomobject]@{
+                            Start = '"""'
+                            End = '"""'
+                            CanSpanLines = $true
+                            EscapeMode = 'Backslash'
+                            AllowDoubleEnd = $false
+                        },
+                        [pscustomobject]@{
+                            Start = '"'
+                            End = '"'
+                            CanSpanLines = $false
+                            EscapeMode = 'Backslash'
+                            AllowDoubleEnd = $false
+                        },
+                        [pscustomobject]@{
+                            Start = [string][char]39
+                            End = [string][char]39
+                            CanSpanLines = $false
+                            EscapeMode = 'None'
+                            AllowDoubleEnd = $true
+                        }
+                    )
                 }
             )
 
@@ -694,6 +840,8 @@ function New-NarutoContext
                 'Get-Sha1Hex',
                 'ConvertTo-LineHash',
                 'ConvertTo-ContextHash',
+                'ConvertFrom-SvnUnifiedDiffPathHeader',
+                'Get-SvnUnifiedDiffHeaderSectionList',
                 'New-SvnUnifiedDiffParseState',
                 'New-SvnUnifiedDiffFileStat',
                 'Complete-SvnUnifiedDiffCurrentHunk',
@@ -1970,7 +2118,8 @@ function ConvertTo-CommentOnlyLineMask
         行配列から「コメント専用行」判定マスクを生成する。
     .DESCRIPTION
         行コメントとブロックコメントの字句走査を行い、コメント専用行のみを true とする。
-        文字列リテラル中のコメントトークンは無効化する。ブロックコメントのネストは未対応。
+        拡張子プロファイル定義の StringLiteralMarkers を用いて文字列境界を厳密判定し、
+        複数行文字列中のコメントトークン誤検出を抑止する。ブロックコメントのネストは未対応。
     #>
     [CmdletBinding()]
     [OutputType([bool[]])]
@@ -2004,9 +2153,74 @@ function ConvertTo-CommentOnlyLineMask
         )
     }
 
+    $stringLiteralMarkers = @()
+    if ($CommentSyntaxProfile.PSObject.Properties.Match('StringLiteralMarkers').Count -gt 0 -and $null -ne $CommentSyntaxProfile.StringLiteralMarkers)
+    {
+        $normalizedMarkers = [System.Collections.Generic.List[object]]::new()
+        foreach ($marker in @($CommentSyntaxProfile.StringLiteralMarkers))
+        {
+            if ($null -eq $marker)
+            {
+                continue
+            }
+            $startToken = [string]$marker.Start
+            $endToken = [string]$marker.End
+            if ([string]::IsNullOrWhiteSpace($startToken) -or [string]::IsNullOrWhiteSpace($endToken))
+            {
+                continue
+            }
+            $escapeMode = 'None'
+            if ($marker.PSObject.Properties.Match('EscapeMode').Count -gt 0 -and -not [string]::IsNullOrWhiteSpace([string]$marker.EscapeMode))
+            {
+                $candidateEscapeMode = [string]$marker.EscapeMode
+                if ([string]::Equals($candidateEscapeMode, 'Backslash', [System.StringComparison]::OrdinalIgnoreCase))
+                {
+                    $escapeMode = 'Backslash'
+                }
+                elseif ([string]::Equals($candidateEscapeMode, 'Backtick', [System.StringComparison]::OrdinalIgnoreCase))
+                {
+                    $escapeMode = 'Backtick'
+                }
+            }
+            [void]$normalizedMarkers.Add([pscustomobject]@{
+                    Start = $startToken
+                    End = $endToken
+                    CanSpanLines = if ($marker.PSObject.Properties.Match('CanSpanLines').Count -gt 0)
+                    {
+                        [bool]$marker.CanSpanLines
+                    }
+                    else
+                    {
+                        $false
+                    }
+                    EscapeMode = $escapeMode
+                    AllowDoubleEnd = if ($marker.PSObject.Properties.Match('AllowDoubleEnd').Count -gt 0)
+                    {
+                        [bool]$marker.AllowDoubleEnd
+                    }
+                    else
+                    {
+                        $false
+                    }
+                    EndMustBeAtLineStart = if ($marker.PSObject.Properties.Match('EndMustBeAtLineStart').Count -gt 0)
+                    {
+                        [bool]$marker.EndMustBeAtLineStart
+                    }
+                    else
+                    {
+                        $false
+                    }
+                })
+        }
+        $stringLiteralMarkers = @($normalizedMarkers.ToArray() | Sort-Object { ([string]$_.Start).Length } -Descending)
+    }
+
     $mask = New-Object 'bool[]' @($Lines).Count
     $inBlockComment = $false
     $activeBlockEndToken = ''
+    $inString = $false
+    $activeStringMarker = $null
+    $stringEscapePending = $false
     for ($lineIndex = 0
         $lineIndex -lt @($Lines).Count
         $lineIndex++)
@@ -2020,9 +2234,6 @@ function ConvertTo-CommentOnlyLineMask
         $charIndex = 0
         $lineHasCode = $false
         $lineHasComment = $false
-        $inString = $false
-        $stringDelimiter = [char]0
-        $stringEscapePending = $false
 
         while ($charIndex -lt $line.Length)
         {
@@ -2043,30 +2254,83 @@ function ConvertTo-CommentOnlyLineMask
 
             if ($inString)
             {
-                $ch = $line[$charIndex]
+                $lineHasCode = $true
+                $activeEndToken = [string]$activeStringMarker.End
+                $activeEscapeMode = [string]$activeStringMarker.EscapeMode
+                $allowDoubleEnd = [bool]$activeStringMarker.AllowDoubleEnd
+
                 if ($stringEscapePending)
                 {
                     $stringEscapePending = $false
                     $charIndex++
                     continue
                 }
-                if ($ch -eq '\' -or $ch -eq '`')
+
+                $activeChar = $line[$charIndex]
+                # 行末がエスケープ文字の場合は stringEscapePending を設定しない。
+                # ECMAScript の行継続（\+改行）は次行冒頭文字をスキップしないため、
+                # CanSpanLines=true でも次行冒頭をエスケープしない現在の動作が正しい。
+                if ($activeEscapeMode -eq 'Backslash' -and $activeChar -eq '\')
                 {
-                    $stringEscapePending = $true
+                    if (($charIndex + 1) -lt $line.Length)
+                    {
+                        $stringEscapePending = $true
+                    }
                     $charIndex++
                     continue
                 }
-                if ($ch -eq $stringDelimiter)
+                if ($activeEscapeMode -eq 'Backtick' -and $activeChar -eq '`')
                 {
-                    if (($charIndex + 1) -lt $line.Length -and $line[$charIndex + 1] -eq $stringDelimiter)
+                    if (($charIndex + 1) -lt $line.Length)
                     {
-                        $charIndex += 2
-                        continue
+                        $stringEscapePending = $true
+                    }
+                    $charIndex++
+                    continue
+                }
+
+                $matchedEndToken = $false
+                if (($charIndex + $activeEndToken.Length) -le $line.Length -and [string]::Compare($line, $charIndex, $activeEndToken, 0, $activeEndToken.Length, [System.StringComparison]::Ordinal) -eq 0)
+                {
+                    if ([bool]$activeStringMarker.EndMustBeAtLineStart)
+                    {
+                        $prefixIsWhitespace = $true
+                        for ($pi = 0; $pi -lt $charIndex; $pi++)
+                        {
+                            if (-not [char]::IsWhiteSpace($line[$pi]))
+                            {
+                                $prefixIsWhitespace = $false
+                                break
+                            }
+                        }
+                        if ($prefixIsWhitespace)
+                        {
+                            $matchedEndToken = $true
+                        }
+                    }
+                    else
+                    {
+                        $matchedEndToken = $true
+                    }
+                }
+                if ($matchedEndToken)
+                {
+                    if ($allowDoubleEnd)
+                    {
+                        $nextStart = $charIndex + $activeEndToken.Length
+                        if (($nextStart + $activeEndToken.Length) -le $line.Length -and [string]::Compare($line, $nextStart, $activeEndToken, 0, $activeEndToken.Length, [System.StringComparison]::Ordinal) -eq 0)
+                        {
+                            $charIndex += ($activeEndToken.Length * 2)
+                            continue
+                        }
                     }
                     $inString = $false
-                    $charIndex++
+                    $activeStringMarker = $null
+                    $stringEscapePending = $false
+                    $charIndex += $activeEndToken.Length
                     continue
                 }
+
                 $charIndex++
                 continue
             }
@@ -2112,14 +2376,23 @@ function ConvertTo-CommentOnlyLineMask
                 continue
             }
 
-            $currentChar = $line[$charIndex]
-            if ($currentChar -eq '"' -or $currentChar -eq [char]39)
+            $matchedStringMarker = $null
+            foreach ($marker in $stringLiteralMarkers)
+            {
+                $startToken = [string]$marker.Start
+                if (($charIndex + $startToken.Length) -le $line.Length -and [string]::Compare($line, $charIndex, $startToken, 0, $startToken.Length, [System.StringComparison]::Ordinal) -eq 0)
+                {
+                    $matchedStringMarker = $marker
+                    break
+                }
+            }
+            if ($null -ne $matchedStringMarker)
             {
                 $lineHasCode = $true
                 $inString = $true
-                $stringDelimiter = $currentChar
+                $activeStringMarker = $matchedStringMarker
                 $stringEscapePending = $false
-                $charIndex++
+                $charIndex += ([string]$matchedStringMarker.Start).Length
                 continue
             }
 
@@ -2127,10 +2400,12 @@ function ConvertTo-CommentOnlyLineMask
             $charIndex++
         }
 
-        # 言語横断で改行跨ぎ文字列を完全判定するのは困難なため、行末で文字列状態は破棄する。
-        $inString = $false
-        $stringDelimiter = [char]0
-        $stringEscapePending = $false
+        if ($inString -and $null -ne $activeStringMarker -and -not [bool]$activeStringMarker.CanSpanLines)
+        {
+            $inString = $false
+            $activeStringMarker = $null
+            $stringEscapePending = $false
+        }
 
         $mask[$lineIndex] = (-not $lineHasCode -and $lineHasComment)
     }
@@ -2929,6 +3204,143 @@ function ConvertTo-ContextHash
     }
     $raw = $FilePath + '|' + ($first -join '|') + '|' + ($last -join '|')
     return Get-Sha1Hex -Text $raw
+}
+function ConvertFrom-SvnUnifiedDiffPathHeader
+{
+    <#
+    .SYNOPSIS
+        Unified diff の --- / +++ ヘッダー行から path/revision を抽出する。
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param([string]$Line)
+    if ([string]::IsNullOrWhiteSpace($Line))
+    {
+        return $null
+    }
+    if (-not ($Line -like '--- *' -or $Line -like '+++ *'))
+    {
+        return $null
+    }
+
+    $payload = $Line.Substring(4).TrimStart()
+    if ([string]::IsNullOrWhiteSpace($payload))
+    {
+        return [pscustomobject]@{
+            Path = $null
+            Revision = $null
+        }
+    }
+
+    $pathPart = $payload.Trim()
+    $metadata = $null
+    $metadataStart = $payload.LastIndexOf('(')
+    if ($metadataStart -gt 0 -and $payload.EndsWith(')') -and [char]::IsWhiteSpace($payload[$metadataStart - 1]))
+    {
+        $pathPart = $payload.Substring(0, $metadataStart).TrimEnd()
+        $metadata = $payload.Substring($metadataStart + 1, $payload.Length - $metadataStart - 2).Trim()
+    }
+
+    $revision = $null
+    if (-not [string]::IsNullOrWhiteSpace($metadata))
+    {
+        if ($metadata -match '^revision\s+(\d+)$')
+        {
+            try
+            {
+                $revision = [int]$Matches[1]
+            }
+            catch
+            {
+                $revision = $null
+            }
+        }
+        elseif ([string]::Equals($metadata, 'nonexistent', [System.StringComparison]::OrdinalIgnoreCase))
+        {
+            $pathPart = $null
+        }
+    }
+
+    $path = $null
+    if (-not [string]::IsNullOrWhiteSpace($pathPart))
+    {
+        $path = ConvertTo-PathKey -Path $pathPart
+    }
+    return [pscustomobject]@{
+        Path = $path
+        Revision = $revision
+    }
+}
+function Get-SvnUnifiedDiffHeaderSectionList
+{
+    <#
+    .SYNOPSIS
+        Unified diff テキストから Index 単位の old/new path+revision を抽出する。
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param([string]$DiffText)
+    if ([string]::IsNullOrWhiteSpace($DiffText))
+    {
+        return @()
+    }
+
+    $sections = [System.Collections.Generic.List[object]]::new()
+    $currentSection = $null
+    $lines = $DiffText -split "`r?`n"
+    foreach ($line in $lines)
+    {
+        if ($line -like 'Index: *')
+        {
+            if ($null -ne $currentSection)
+            {
+                [void]$sections.Add($currentSection)
+            }
+            $indexPath = ConvertTo-PathKey -Path $line.Substring(7).Trim()
+            if ([string]::IsNullOrWhiteSpace($indexPath))
+            {
+                $currentSection = $null
+                continue
+            }
+            $currentSection = [pscustomobject]@{
+                IndexPath = $indexPath
+                OldPath = $null
+                OldRevision = $null
+                NewPath = $null
+                NewRevision = $null
+            }
+            continue
+        }
+        if ($null -eq $currentSection)
+        {
+            continue
+        }
+        if ($line -like '--- *')
+        {
+            $oldHeader = ConvertFrom-SvnUnifiedDiffPathHeader -Line $line
+            if ($null -ne $oldHeader)
+            {
+                $currentSection.OldPath = $oldHeader.Path
+                $currentSection.OldRevision = $oldHeader.Revision
+            }
+            continue
+        }
+        if ($line -like '+++ *')
+        {
+            $newHeader = ConvertFrom-SvnUnifiedDiffPathHeader -Line $line
+            if ($null -ne $newHeader)
+            {
+                $currentSection.NewPath = $newHeader.Path
+                $currentSection.NewRevision = $newHeader.Revision
+            }
+            continue
+        }
+    }
+    if ($null -ne $currentSection)
+    {
+        [void]$sections.Add($currentSection)
+    }
+    return @($sections.ToArray())
 }
 function New-SvnUnifiedDiffParseState
 {
@@ -10807,6 +11219,101 @@ function Invoke-CommitDiffPrefetch
             $lineMaskByPath = @{}
             if ([bool]$Item.ExcludeCommentOnlyLines)
             {
+                $targetPathSet = New-Object 'System.Collections.Generic.HashSet[string]'
+                foreach ($pathEntry in @($Item.ChangedPaths))
+                {
+                    if ($null -eq $pathEntry)
+                    {
+                        continue
+                    }
+                    $targetPath = ConvertTo-PathKey -Path ([string]$pathEntry.Path)
+                    if (-not [string]::IsNullOrWhiteSpace($targetPath))
+                    {
+                        [void]$targetPathSet.Add($targetPath)
+                    }
+                }
+
+                $commentMaskCache = @{}
+                $getCommentMask = {
+                    param(
+                        [string]$FilePath,
+                        [object]$Revision
+                    )
+                    if ([string]::IsNullOrWhiteSpace($FilePath) -or $null -eq $Revision)
+                    {
+                        return $null
+                    }
+                    $normalizedPath = ConvertTo-PathKey -Path $FilePath
+                    if ([string]::IsNullOrWhiteSpace($normalizedPath))
+                    {
+                        return $null
+                    }
+                    $normalizedRevision = $null
+                    try
+                    {
+                        $normalizedRevision = [int]$Revision
+                    }
+                    catch
+                    {
+                        return $null
+                    }
+                    if ($normalizedRevision -le 0)
+                    {
+                        return $null
+                    }
+
+                    $cacheKey = [string]$normalizedRevision + [char]31 + $normalizedPath
+                    if ($commentMaskCache.ContainsKey($cacheKey))
+                    {
+                        return $commentMaskCache[$cacheKey]
+                    }
+
+                    $commentProfile = Get-CommentSyntaxProfileByPath -Context $NarutoContext -FilePath $normalizedPath
+                    if ($null -eq $commentProfile)
+                    {
+                        $commentMaskCache[$cacheKey] = $null
+                        return $null
+                    }
+                    $catText = Get-CachedOrFetchCatText -Context $NarutoContext -Repo $Item.TargetUrl -FilePath $normalizedPath -Revision $normalizedRevision -CacheDir $Item.CacheDir
+                    if ($null -eq $catText)
+                    {
+                        $commentMaskCache[$cacheKey] = $null
+                        return $null
+                    }
+                    $contentLines = ConvertTo-TextLine -Text $catText
+                    $commentMask = ConvertTo-CommentOnlyLineMask -Lines $contentLines -CommentSyntaxProfile $commentProfile
+                    $commentMaskCache[$cacheKey] = $commentMask
+                    return $commentMask
+                }
+
+                $diffSections = @(Get-SvnUnifiedDiffHeaderSectionList -DiffText $diffText)
+                foreach ($section in $diffSections)
+                {
+                    if ($null -eq $section)
+                    {
+                        continue
+                    }
+                    $indexPath = ConvertTo-PathKey -Path ([string]$section.IndexPath)
+                    if ([string]::IsNullOrWhiteSpace($indexPath))
+                    {
+                        continue
+                    }
+                    if ($targetPathSet.Count -gt 0 -and -not $targetPathSet.Contains($indexPath))
+                    {
+                        continue
+                    }
+                    $oldMask = & $getCommentMask -FilePath ([string]$section.OldPath) -Revision $section.OldRevision
+                    $newMask = & $getCommentMask -FilePath ([string]$section.NewPath) -Revision $section.NewRevision
+                    if ($null -ne $oldMask -or $null -ne $newMask)
+                    {
+                        $lineMaskByPath[$indexPath] = [pscustomobject]@{
+                            OldMask = $oldMask
+                            NewMask = $newMask
+                        }
+                    }
+                }
+
+                # ヘッダー欠落時の後方互換フォールバック
                 foreach ($pathEntry in @($Item.ChangedPaths))
                 {
                     if ($null -eq $pathEntry)
@@ -10814,32 +11321,93 @@ function Invoke-CommitDiffPrefetch
                         continue
                     }
                     $diffPath = ConvertTo-PathKey -Path ([string]$pathEntry.Path)
-                    if ([string]::IsNullOrWhiteSpace($diffPath))
+                    if ([string]::IsNullOrWhiteSpace($diffPath) -or $lineMaskByPath.ContainsKey($diffPath))
                     {
                         continue
                     }
-                    $commentProfile = Get-CommentSyntaxProfileByPath -Context $NarutoContext -FilePath $diffPath
-                    if ($null -eq $commentProfile)
+                    $action = ([string]$pathEntry.Action).ToUpperInvariant()
+                    $copyFromPath = ConvertTo-PathKey -Path ([string]$pathEntry.CopyFromPath)
+                    $copyFromRevision = $null
+                    if ($pathEntry.PSObject.Properties.Match('CopyFromRev').Count -gt 0 -and $null -ne $pathEntry.CopyFromRev)
                     {
-                        continue
-                    }
-                    $oldMask = $null
-                    $newMask = $null
-                    if ([int]$Item.Revision -gt 1)
-                    {
-                        $oldCat = Get-CachedOrFetchCatText -Context $NarutoContext -Repo $Item.TargetUrl -FilePath $diffPath -Revision ([int]$Item.Revision - 1) -CacheDir $Item.CacheDir
-                        if ($null -ne $oldCat)
+                        try
                         {
-                            $oldLines = ConvertTo-TextLine -Text $oldCat
-                            $oldMask = ConvertTo-CommentOnlyLineMask -Lines $oldLines -CommentSyntaxProfile $commentProfile
+                            $copyFromRevision = [int]$pathEntry.CopyFromRev
+                        }
+                        catch
+                        {
+                            $copyFromRevision = $null
                         }
                     }
-                    $newCat = Get-CachedOrFetchCatText -Context $NarutoContext -Repo $Item.TargetUrl -FilePath $diffPath -Revision ([int]$Item.Revision) -CacheDir $Item.CacheDir
-                    if ($null -ne $newCat)
+
+                    $oldPath = $null
+                    $oldRevision = $null
+                    $newPath = $null
+                    $newRevision = $null
+                    switch ($action)
                     {
-                        $newLines = ConvertTo-TextLine -Text $newCat
-                        $newMask = ConvertTo-CommentOnlyLineMask -Lines $newLines -CommentSyntaxProfile $commentProfile
+                        'A'
+                        {
+                            $newPath = $diffPath
+                            $newRevision = [int]$Item.Revision
+                            if (-not [string]::IsNullOrWhiteSpace($copyFromPath))
+                            {
+                                $oldPath = $copyFromPath
+                                if ($null -ne $copyFromRevision -and $copyFromRevision -gt 0)
+                                {
+                                    $oldRevision = [int]$copyFromRevision
+                                }
+                                elseif ([int]$Item.Revision -gt 1)
+                                {
+                                    $oldRevision = [int]$Item.Revision - 1
+                                }
+                            }
+                        }
+                        'R'
+                        {
+                            $newPath = $diffPath
+                            $newRevision = [int]$Item.Revision
+                            if (-not [string]::IsNullOrWhiteSpace($copyFromPath))
+                            {
+                                $oldPath = $copyFromPath
+                                if ($null -ne $copyFromRevision -and $copyFromRevision -gt 0)
+                                {
+                                    $oldRevision = [int]$copyFromRevision
+                                }
+                                elseif ([int]$Item.Revision -gt 1)
+                                {
+                                    $oldRevision = [int]$Item.Revision - 1
+                                }
+                            }
+                            elseif ([int]$Item.Revision -gt 1)
+                            {
+                                # Replace は既存パスの上書きのため、コピー元が未指定でも旧版が存在する
+                                $oldPath = $diffPath
+                                $oldRevision = [int]$Item.Revision - 1
+                            }
+                        }
+                        'D'
+                        {
+                            if ([int]$Item.Revision -gt 1)
+                            {
+                                $oldPath = $diffPath
+                                $oldRevision = [int]$Item.Revision - 1
+                            }
+                        }
+                        default
+                        {
+                            if ([int]$Item.Revision -gt 1)
+                            {
+                                $oldPath = $diffPath
+                                $oldRevision = [int]$Item.Revision - 1
+                            }
+                            $newPath = $diffPath
+                            $newRevision = [int]$Item.Revision
+                        }
                     }
+
+                    $oldMask = & $getCommentMask -FilePath $oldPath -Revision $oldRevision
+                    $newMask = & $getCommentMask -FilePath $newPath -Revision $newRevision
                     if ($null -ne $oldMask -or $null -ne $newMask)
                     {
                         $lineMaskByPath[$diffPath] = [pscustomobject]@{
