@@ -22,7 +22,33 @@ if (-not (Test-Path $settingsPath))
 Write-Host 'フォーマット適用中...' -ForegroundColor Cyan
 
 $code = Get-Content -Path $scriptPath -Raw -Encoding UTF8
-$formatted = Invoke-Formatter -ScriptDefinition $code -Settings $settingsPath
+if ([string]::IsNullOrWhiteSpace($code))
+{
+    Write-Error "スクリプトの内容が空です: $scriptPath"
+    return
+}
+
+try
+{
+    $formatted = Invoke-Formatter -ScriptDefinition $code -Settings $settingsPath
+}
+catch
+{
+    Write-Error "Invoke-Formatter でエラーが発生しました: $_"
+    return
+}
+
+if ([string]::IsNullOrWhiteSpace($formatted))
+{
+    Write-Error "フォーマット結果が空です。ファイルを上書きせずに中断します。"
+    return
+}
+
+if ($formatted.Length -lt ($code.Length * 0.5))
+{
+    Write-Error "フォーマット結果が元のサイズの半分未満です (元: $($code.Length) 文字 → 結果: $($formatted.Length) 文字)。安全のため中断します。"
+    return
+}
 
 # BOM 付き UTF-8 で保存
 [System.IO.File]::WriteAllText($scriptPath, $formatted, [System.Text.UTF8Encoding]::new($true))
