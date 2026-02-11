@@ -23,6 +23,7 @@ Describe 'Diff pipeline refactor' {
         It 'applies corrected diff to new path and clears old path stats' {
             Set-Item -Path function:Get-RenamePairRealDiffStat -Value {
                 param(
+                    [hashtable]$Context,
                     [string]$TargetUrl,
                     [string[]]$DiffArguments,
                     [string]$OldPath,
@@ -30,6 +31,7 @@ Describe 'Diff pipeline refactor' {
                     [int]$CopyRevision,
                     [int]$Revision
                 )
+                [void]$Context
                 [void]$TargetUrl
                 [void]$DiffArguments
                 [void]$OldPath

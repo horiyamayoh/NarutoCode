@@ -1256,8 +1256,16 @@ function Get-AllRepositoryFile
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
-    param([string]$TargetUrl, [int]$Revision, [string[]]$IncludeExtensions, [string[]]$ExcludeExtensions, [string[]]$IncludePathPatterns, [string[]]$ExcludePathPatterns)
-    $xmlText = Invoke-SvnCommand -Arguments @('list', '-R', '--xml', '-r', [string]$Revision, $TargetUrl) -ErrorContext 'svn list'
+    param(
+        [hashtable]$Context = $script:NarutoContext,
+        [string]$TargetUrl,
+        [int]$Revision,
+        [string[]]$IncludeExtensions,
+        [string[]]$ExcludeExtensions,
+        [string[]]$IncludePathPatterns,
+        [string[]]$ExcludePathPatterns
+    )
+    $xmlText = Invoke-SvnCommand -Context $Context -Arguments @('list', '-R', '--xml', '-r', [string]$Revision, $TargetUrl) -ErrorContext 'svn list'
     $xml = ConvertFrom-SvnXmlText -Text $xmlText -ContextLabel 'svn list'
     $nodes = @()
     if ($xml)
@@ -1522,10 +1530,10 @@ function Invoke-SvnCommandAllowMissingTarget
     .SYNOPSIS
         対象不存在時に null を返す SVN コマンド実行。
     #>
-    [CmdletBinding()]param([string[]]$Arguments, [string]$ErrorContext = 'SVN command')
+    [CmdletBinding()]param([hashtable]$Context = $script:NarutoContext, [string[]]$Arguments, [string]$ErrorContext = 'SVN command')
     try
     {
-        return (Invoke-SvnCommand -Arguments $Arguments -ErrorContext $ErrorContext)
+        return (Invoke-SvnCommand -Context $Context -Arguments $Arguments -ErrorContext $ErrorContext)
     }
     catch
     {
@@ -1595,12 +1603,12 @@ function Resolve-SvnTargetUrl
     .SYNOPSIS
         入力 URL を SVN 実行用の正規化ターゲットに確定する。
     #>
-    param([string]$Target)
+    param([hashtable]$Context = $script:NarutoContext, [string]$Target)
     if (-not ($Target -match '^(https?|svn|file)://'))
     {
         throw "RepoUrl must be svn URL. Provided: '$Target'"
     }
-    $xml = ConvertFrom-SvnXmlText -Text (Invoke-SvnCommand -Arguments @('info', '--xml', $Target) -ErrorContext 'svn info') -ContextLabel 'svn info'
+    $xml = ConvertFrom-SvnXmlText -Text (Invoke-SvnCommand -Context $Context -Arguments @('info', '--xml', $Target) -ErrorContext 'svn info') -ContextLabel 'svn info'
     $url = [string]$xml.info.entry.url
     if ([string]::IsNullOrWhiteSpace($url))
     {
@@ -8177,10 +8185,10 @@ function Get-SvnVersionSafe
     #>
     [CmdletBinding()]
     [OutputType([string])]
-    param()
+    param([hashtable]$Context = $script:NarutoContext)
     try
     {
-        return (Invoke-SvnCommand -Arguments @('--version', '--quiet') -ErrorContext 'svn version').Split("`n")[0].Trim()
+        return (Invoke-SvnCommand -Context $Context -Arguments @('--version', '--quiet') -ErrorContext 'svn version').Split("`n")[0].Trim()
     }
     catch
     {
@@ -8225,7 +8233,7 @@ function Get-CachedOrFetchDiffText
     #>
     [CmdletBinding()]
     [OutputType([string])]
-    param([string]$CacheDir, [int]$Revision, [string]$TargetUrl, [string[]]$DiffArguments)
+    param([hashtable]$Context = $script:NarutoContext, [string]$CacheDir, [int]$Revision, [string]$TargetUrl, [string[]]$DiffArguments)
     $cacheFile = Join-Path $CacheDir ("diff_r{0}.txt" -f $Revision)
     if ([System.IO.File]::Exists($cacheFile))
     {
@@ -8240,7 +8248,7 @@ function Get-CachedOrFetchDiffText
     [void]$fetchArgs.Add('-c')
     [void]$fetchArgs.Add([string]$Revision)
     [void]$fetchArgs.Add($TargetUrl)
-    $diffText = Invoke-SvnCommand -Arguments $fetchArgs.ToArray() -ErrorContext ("svn diff -c {0}" -f $Revision)
+    $diffText = Invoke-SvnCommand -Context $Context -Arguments $fetchArgs.ToArray() -ErrorContext ("svn diff -c {0}" -f $Revision)
     [System.IO.File]::WriteAllText($cacheFile, $diffText, [System.Text.Encoding]::UTF8)
     return $diffText
 }
@@ -8519,6 +8527,7 @@ function Get-RenamePairRealDiffStat
     [CmdletBinding()]
     [OutputType([object])]
     param(
+        [hashtable]$Context = $script:NarutoContext,
         [string]$TargetUrl,
         [string[]]$DiffArguments,
         [string]$OldPath,
@@ -8533,7 +8542,7 @@ function Get-RenamePairRealDiffStat
     }
     [void]$compareArguments.Add(($TargetUrl.TrimEnd('/') + '/' + $OldPath + '@' + [string]$CopyRevision))
     [void]$compareArguments.Add(($TargetUrl.TrimEnd('/') + '/' + $NewPath + '@' + [string]$Revision))
-    $realDiff = Invoke-SvnCommand -Arguments $compareArguments.ToArray() -ErrorContext ("svn diff rename pair r{0} {1}->{2}" -f $Revision, $OldPath, $NewPath)
+    $realDiff = Invoke-SvnCommand -Context $Context -Arguments $compareArguments.ToArray() -ErrorContext ("svn diff rename pair r{0} {1}->{2}" -f $Revision, $OldPath, $NewPath)
     $realParsed = ConvertFrom-SvnUnifiedDiff -DiffText $realDiff -DetailLevel 2
 
     $realStat = $null
@@ -8602,11 +8611,11 @@ function Update-RenamePairDiffStat
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
-    param([object]$Commit, [int]$Revision, [string]$TargetUrl, [string[]]$DiffArguments)
+    param([hashtable]$Context = $script:NarutoContext, [object]$Commit, [int]$Revision, [string]$TargetUrl, [string[]]$DiffArguments)
     $candidates = @(Get-RenameCorrectionCandidates -Commit $Commit -Revision $Revision)
     foreach ($candidate in $candidates)
     {
-        $realStat = Get-RenamePairRealDiffStat -TargetUrl $TargetUrl -DiffArguments $DiffArguments -OldPath ([string]$candidate.OldPath) -NewPath ([string]$candidate.NewPath) -CopyRevision ([int]$candidate.CopyRevision) -Revision $Revision
+        $realStat = Get-RenamePairRealDiffStat -Context $Context -TargetUrl $TargetUrl -DiffArguments $DiffArguments -OldPath ([string]$candidate.OldPath) -NewPath ([string]$candidate.NewPath) -CopyRevision ([int]$candidate.CopyRevision) -Revision $Revision
         Set-RenamePairDiffStatCorrection -Commit $Commit -OldPath ([string]$candidate.OldPath) -NewPath ([string]$candidate.NewPath) -RealStat $realStat
     }
 }
@@ -8766,7 +8775,8 @@ function Invoke-CommitDiffPrefetch
         $phaseAWorker = {
             param($Item, $Index)
             [void]$Index # Required by Invoke-ParallelWork contract
-            $diffText = Get-CachedOrFetchDiffText -CacheDir $Item.CacheDir -Revision ([int]$Item.Revision) -TargetUrl $Item.TargetUrl -DiffArguments @($Item.DiffArguments)
+            # $NarutoContext は Invoke-ParallelWork の SessionVariables 経由で注入される
+            $diffText = Get-CachedOrFetchDiffText -Context $NarutoContext -CacheDir $Item.CacheDir -Revision ([int]$Item.Revision) -TargetUrl $Item.TargetUrl -DiffArguments @($Item.DiffArguments)
             $rawDiffByPath = ConvertFrom-SvnUnifiedDiff -DiffText $diffText -DetailLevel 2
             [pscustomobject]@{
                 Revision = [int]$Item.Revision
@@ -8862,12 +8872,13 @@ function Complete-CommitDiffForCommit
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     param(
+        [hashtable]$Context = $script:NarutoContext,
         [object]$Commit,
         [int]$Revision,
         [string]$TargetUrl,
         [string[]]$DiffArguments
     )
-    Update-RenamePairDiffStat -Commit $Commit -Revision $Revision -TargetUrl $TargetUrl -DiffArguments $DiffArguments
+    Update-RenamePairDiffStat -Context $Context -Commit $Commit -Revision $Revision -TargetUrl $TargetUrl -DiffArguments $DiffArguments
     Set-CommitDerivedMetric -Commit $Commit
 }
 function Initialize-CommitDiffData
@@ -8922,7 +8933,7 @@ function Initialize-CommitDiffData
         Write-Progress -Id 2 -Activity 'コミット差分の統合' -Status ('{0}/{1}' -f ($commitIdx + 1), $commitTotal) -PercentComplete $pct
         $revision = [int]$commit.Revision
         Merge-CommitDiffForCommit -Commit $commit -RawDiffByRevision $rawDiffByRevision -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns
-        Complete-CommitDiffForCommit -Commit $commit -Revision $revision -TargetUrl $TargetUrl -DiffArguments $DiffArguments
+        Complete-CommitDiffForCommit -Context $Context -Commit $commit -Revision $revision -TargetUrl $TargetUrl -DiffArguments $DiffArguments
         $commitIdx++
     }
     Write-Progress -Id 2 -Activity 'コミット差分の統合' -Completed
@@ -9053,7 +9064,7 @@ function Get-StrictOwnershipAggregate
         [string[]]$ExcludePaths,
         [int]$Parallel = 1
     )
-    $ownershipTargets = @(Get-AllRepositoryFile -TargetUrl $TargetUrl -Revision $ToRevision -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePaths -ExcludePathPatterns $ExcludePaths)
+    $ownershipTargets = @(Get-AllRepositoryFile -Context $Context -TargetUrl $TargetUrl -Revision $ToRevision -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePaths -ExcludePathPatterns $ExcludePaths)
     $existingFileSet = New-Object 'System.Collections.Generic.HashSet[string]'
     foreach ($file in $ownershipTargets)
     {
@@ -9073,7 +9084,7 @@ function Get-StrictOwnershipAggregate
             Write-Progress -Id 5 -Activity '所有権 blame 解析' -Status ('{0}/{1}' -f ($ownerIdx + 1), $ownerTotal) -PercentComplete $pct
             try
             {
-                $blame = Get-SvnBlameSummary -Repo $TargetUrl -FilePath $file -ToRevision $ToRevision -CacheDir $CacheDir
+                $blame = Get-SvnBlameSummary -Context $Context -Repo $TargetUrl -FilePath $file -ToRevision $ToRevision -CacheDir $CacheDir
             }
             catch
             {
@@ -9102,7 +9113,7 @@ function Get-StrictOwnershipAggregate
             [void]$Index # Required by Invoke-ParallelWork contract
             try
             {
-                $blame = Get-SvnBlameSummary -Repo $Item.TargetUrl -FilePath ([string]$Item.FilePath) -ToRevision ([int]$Item.ToRevision) -CacheDir $Item.CacheDir
+                $blame = Get-SvnBlameSummary -Context $NarutoContext -Repo $Item.TargetUrl -FilePath ([string]$Item.FilePath) -ToRevision ([int]$Item.ToRevision) -CacheDir $Item.CacheDir
                 [pscustomobject]@{
                     FilePath = [string]$Item.FilePath
                     Blame = $blame
@@ -9869,6 +9880,335 @@ function Get-RenameMap
 
 # endregion ヘッダーとメタデータ
 # endregion Utility
+function Resolve-PipelineExecutionState
+{
+    <#
+    .SYNOPSIS
+        パイプライン実行前の入力正規化と実行環境確定を行う。
+    .DESCRIPTION
+        戻り値プロパティ:
+        - RepoUrl           [string]   入力リポジトリ URL
+        - FromRevision      [int]      正規化済み開始リビジョン
+        - ToRevision        [int]      正規化済み終了リビジョン
+        - OutDirectory      [string]   絶対パスに解決済みの出力ディレクトリ
+        - CacheDir          [string]   キャッシュディレクトリパス
+        - IncludePaths      [string[]] 正規化済みパス包含パターン
+        - ExcludePaths      [string[]] 正規化済みパス除外パターン
+        - IncludeExtensions [string[]] 正規化済み拡張子包含リスト
+        - ExcludeExtensions [string[]] 正規化済み拡張子除外リスト
+        - TargetUrl         [string]   SVN 実行用に確定したターゲット URL
+        - SvnVersion        [string]   検出した SVN バージョン文字列
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [hashtable]$Context = $script:NarutoContext,
+        [string]$RepoUrl,
+        [int]$FromRevision,
+        [int]$ToRevision,
+        [string]$OutDirectory,
+        [string[]]$IncludePaths,
+        [string[]]$ExcludePaths,
+        [string[]]$IncludeExtensions,
+        [string[]]$ExcludeExtensions,
+        [string]$SvnExecutable,
+        [string]$Username,
+        [securestring]$Password,
+        [switch]$NonInteractive,
+        [switch]$TrustServerCert
+    )
+    $normalizedFrom = $FromRevision
+    $normalizedTo = $ToRevision
+    if ($normalizedFrom -gt $normalizedTo)
+    {
+        $tmp = $normalizedFrom
+        $normalizedFrom = $normalizedTo
+        $normalizedTo = $tmp
+    }
+
+    $resolvedOutDirectory = $OutDirectory
+    if (-not $resolvedOutDirectory)
+    {
+        $resolvedOutDirectory = Join-Path (Get-Location) 'NarutoCode_out'
+    }
+    $resolvedOutDirectory = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($resolvedOutDirectory)
+
+    $cacheDir = Join-Path $resolvedOutDirectory 'cache'
+    New-Item -Path $cacheDir -ItemType Directory -Force | Out-Null
+
+    $normalizedIncludeExtensions = ConvertTo-NormalizedExtension -Extensions $IncludeExtensions
+    $normalizedExcludeExtensions = ConvertTo-NormalizedExtension -Extensions $ExcludeExtensions
+    $normalizedIncludePaths = ConvertTo-NormalizedPatternList -Patterns $IncludePaths
+    $normalizedExcludePaths = ConvertTo-NormalizedPatternList -Patterns $ExcludePaths
+
+    $svnCmd = Get-Command $SvnExecutable -ErrorAction SilentlyContinue
+    if (-not $svnCmd)
+    {
+        throw "svn executable not found: '$SvnExecutable'. Install Subversion client or specify -SvnExecutable."
+    }
+    $Context.Runtime.SvnExecutable = $svnCmd.Source
+    $Context.Runtime.SvnGlobalArguments = Get-SvnGlobalArgumentList -Username $Username -Password $Password -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert
+
+    $targetUrl = Resolve-SvnTargetUrl -Context $Context -Target $RepoUrl
+    $svnVersion = Get-SvnVersionSafe -Context $Context
+
+    return [pscustomobject]@{
+        RepoUrl = $RepoUrl
+        FromRevision = [int]$normalizedFrom
+        ToRevision = [int]$normalizedTo
+        OutDirectory = $resolvedOutDirectory
+        CacheDir = $cacheDir
+        IncludePaths = @($normalizedIncludePaths)
+        ExcludePaths = @($normalizedExcludePaths)
+        IncludeExtensions = @($normalizedIncludeExtensions)
+        ExcludeExtensions = @($normalizedExcludeExtensions)
+        TargetUrl = $targetUrl
+        SvnVersion = $svnVersion
+    }
+}
+function Invoke-PipelineLogAndDiffStage
+{
+    <#
+    .SYNOPSIS
+        SVN ログ取得と差分統合ステージを実行する。
+    .DESCRIPTION
+        戻り値プロパティ:
+        - Commits     [object[]]  パース済みコミット配列
+        - RevToAuthor [hashtable] リビジョン→作者名マッピング
+        - RenameMap   [hashtable] リネーム元パス→最新パスのマッピング
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [hashtable]$Context = $script:NarutoContext,
+        [object]$ExecutionState,
+        [switch]$IgnoreWhitespace,
+        [int]$Parallel
+    )
+    Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 2/8: SVN ログの取得' -PercentComplete 5
+    $logText = Invoke-SvnCommand -Context $Context -Arguments @('log', '--xml', '--verbose', '-r', ("{0}:{1}" -f $ExecutionState.FromRevision, $ExecutionState.ToRevision), $ExecutionState.TargetUrl) -ErrorContext 'svn log'
+    $commits = @(ConvertFrom-SvnLogXml -XmlText $logText)
+
+    Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 3/8: 差分の取得と統計構築' -PercentComplete 15
+    $diffArgs = Get-SvnDiffArgumentList -IgnoreWhitespace:$IgnoreWhitespace
+    $revToAuthor = Initialize-CommitDiffData -Context $Context -Commits $commits -CacheDir $ExecutionState.CacheDir -TargetUrl $ExecutionState.TargetUrl -DiffArguments $diffArgs -IncludeExtensions $ExecutionState.IncludeExtensions -ExcludeExtensions $ExecutionState.ExcludeExtensions -IncludePathPatterns $ExecutionState.IncludePaths -ExcludePathPatterns $ExecutionState.ExcludePaths -Parallel $Parallel
+    $renameMap = Get-RenameMap -Commits $commits
+
+    return [pscustomobject]@{
+        Commits = $commits
+        RevToAuthor = $revToAuthor
+        RenameMap = $renameMap
+    }
+}
+function Invoke-PipelineAggregationStage
+{
+    <#
+    .SYNOPSIS
+        基本メトリクス集計ステージを実行する。
+    .DESCRIPTION
+        戻り値プロパティ:
+        - CommitterRows [object[]] コミッター別メトリクス行
+        - FileRows      [object[]] ファイル別メトリクス行
+        - CouplingRows  [object[]] 共変更カップリング行
+        - CommitRows    [object[]] コミット別サマリー行
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [object[]]$Commits,
+        [hashtable]$RenameMap
+    )
+    Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 4/8: 基本メトリクス算出' -PercentComplete 35
+    $committerRows = @(Get-CommitterMetric -Commits $Commits -RenameMap $RenameMap)
+    $fileRows = @(Get-FileMetric -Commits $Commits -RenameMap $RenameMap)
+    $couplingRows = @(Get-CoChangeMetric -Commits $Commits -TopNCount 0 -RenameMap $RenameMap)
+    $commitRows = @(New-CommitRowFromCommit -Commits $Commits)
+
+    return [pscustomobject]@{
+        CommitterRows = $committerRows
+        FileRows = $fileRows
+        CouplingRows = $couplingRows
+        CommitRows = $commitRows
+    }
+}
+function Invoke-PipelineStrictStage
+{
+    <#
+    .SYNOPSIS
+        Strict 帰属解析ステージを実行する。
+    .DESCRIPTION
+        Update-StrictAttributionMetric への依存注入レイヤーとして機能する。
+        前段ステージの出力を展開して渡すことで、パイプラインと Strict 帰属
+        ロジックの結合を分離し、Strict 処理の独立テストを容易にする。
+        戻り値は Update-StrictAttributionMetric の出力をそのまま返す。
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [hashtable]$Context = $script:NarutoContext,
+        [object]$ExecutionState,
+        [object]$LogAndDiffStage,
+        [object]$AggregationStage,
+        [int]$Parallel
+    )
+    Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 5/8: Strict 帰属解析' -PercentComplete 45
+    return (Update-StrictAttributionMetric -Context $Context -Commits $LogAndDiffStage.Commits -RevToAuthor $LogAndDiffStage.RevToAuthor -TargetUrl $ExecutionState.TargetUrl -FromRevision $ExecutionState.FromRevision -ToRevision $ExecutionState.ToRevision -CacheDir $ExecutionState.CacheDir -IncludeExtensions $ExecutionState.IncludeExtensions -ExcludeExtensions $ExecutionState.ExcludeExtensions -IncludePaths $ExecutionState.IncludePaths -ExcludePaths $ExecutionState.ExcludePaths -FileRows $AggregationStage.FileRows -CommitterRows $AggregationStage.CommitterRows -Parallel $Parallel -RenameMap $LogAndDiffStage.RenameMap)
+}
+function Write-PipelineCsvArtifacts
+{
+    <#
+    .SYNOPSIS
+        CSV 成果物出力ステージを実行する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '')]
+    [CmdletBinding()]
+    param(
+        [string]$OutDirectory,
+        [object[]]$CommitterRows,
+        [object[]]$FileRows,
+        [object[]]$CommitRows,
+        [object[]]$CouplingRows,
+        [object]$StrictResult,
+        [string]$Encoding
+    )
+    Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 6/8: CSV レポート出力' -PercentComplete 80
+    $headers = Get-MetricHeader
+    Write-CsvFile -FilePath (Join-Path $OutDirectory 'committers.csv') -Rows $CommitterRows -Headers $headers.Committer -EncodingName $Encoding
+    Write-CsvFile -FilePath (Join-Path $OutDirectory 'files.csv') -Rows $FileRows -Headers $headers.File -EncodingName $Encoding
+    Write-CsvFile -FilePath (Join-Path $OutDirectory 'commits.csv') -Rows $CommitRows -Headers $headers.Commit -EncodingName $Encoding
+    Write-CsvFile -FilePath (Join-Path $OutDirectory 'couplings.csv') -Rows $CouplingRows -Headers $headers.Coupling -EncodingName $Encoding
+    if ($null -ne $StrictResult)
+    {
+        Write-KillMatrixCsv -OutDirectory $OutDirectory -KillMatrix $StrictResult.KillMatrix -AuthorSelfDead $StrictResult.AuthorSelfDead -Committers $CommitterRows -EncodingName $Encoding
+    }
+}
+function Write-PipelineVisualizationArtifacts
+{
+    <#
+    .SYNOPSIS
+        可視化成果物出力ステージを実行する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '')]
+    [CmdletBinding()]
+    param(
+        [string]$OutDirectory,
+        [object[]]$CommitterRows,
+        [object[]]$FileRows,
+        [object[]]$CommitRows,
+        [object[]]$CouplingRows,
+        [object]$StrictResult,
+        [int]$TopNCount,
+        [string]$Encoding
+    )
+    Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 7/8: 可視化出力' -PercentComplete 88
+
+    # --- Strict 依存データの安全な展開 ---
+    # $StrictResult が $null の場合は $authorBorn = $null になる。
+    # Write-ProjectSummaryDashboard は $AuthorBorn が $null でも安全に動作する
+    # （$null -ne $AuthorBorn ガードで Born 集計をスキップする）。
+    $authorBorn = $null
+    if ($null -ne $StrictResult)
+    {
+        $authorBorn = $StrictResult.AuthorBorn
+    }
+
+    # --- テーブル駆動の可視化ディスパッチ ---
+    # 各エントリは @{ Fn = '関数名'; Args = @{パラメータ名 = 値} } で定義する。
+    # 共通パラメータ（OutDirectory / EncodingName）は後続ループで自動付与される。
+    $visualizations = @(
+        @{ Fn = 'Write-PlantUmlFile'; Args = @{ Committers = $CommitterRows; Files = $FileRows; Couplings = $CouplingRows; TopNCount = $TopNCount } }
+        @{ Fn = 'Write-FileBubbleChart'; Args = @{ Files = $FileRows; TopNCount = $TopNCount } }
+        @{ Fn = 'Write-CommitterOutcomeChart'; Args = @{ Committers = $CommitterRows; TopNCount = $TopNCount } }
+        @{ Fn = 'Write-CommitterScatterChart'; Args = @{ Committers = $CommitterRows; TopNCount = $TopNCount } }
+        @{ Fn = 'Write-SurvivedShareDonutChart'; Args = @{ Committers = $CommitterRows } }
+        @{ Fn = 'Write-TeamActivityProfileChart'; Args = @{ Committers = $CommitterRows } }
+        @{ Fn = 'Write-FileQualityScatterChart'; Args = @{ Files = $FileRows; TopNCount = $TopNCount } }
+        @{ Fn = 'Write-CommitTimelineChart'; Args = @{ Commits = $CommitRows } }
+        @{ Fn = 'Write-CommitScatterChart'; Args = @{ Commits = $CommitRows } }
+        @{ Fn = 'Write-ProjectCodeFateChart'; Args = @{ Committers = $CommitterRows } }
+        @{ Fn = 'Write-ProjectEfficiencyQuadrantChart'; Args = @{ Files = $FileRows; TopNCount = $TopNCount } }
+        @{ Fn = 'Write-ProjectSummaryDashboard'; Args = @{ Committers = $CommitterRows; FileRows = $FileRows; CommitRows = $CommitRows; AuthorBorn = $authorBorn } }
+        @{ Fn = 'Write-ContributorBalanceChart'; Args = @{ Committers = $CommitterRows; TopNCount = $TopNCount } }
+    )
+    foreach ($viz in $visualizations)
+    {
+        $vizArgs = $viz.Args
+        $vizArgs['OutDirectory'] = $OutDirectory
+        $vizArgs['EncodingName'] = $Encoding
+        & $viz.Fn @vizArgs
+    }
+
+    # Strict 結果がある場合のみヒートマップを出力する
+    if ($null -ne $StrictResult)
+    {
+        Write-TeamInteractionHeatMap -OutDirectory $OutDirectory -KillMatrix $StrictResult.KillMatrix -AuthorSelfDead $StrictResult.AuthorSelfDead -Committers $CommitterRows -EncodingName $Encoding
+    }
+}
+function Write-PipelineRunArtifacts
+{
+    <#
+    .SYNOPSIS
+        実行メタデータとサマリー出力ステージを実行する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '')]
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [hashtable]$Context = $script:NarutoContext,
+        [datetime]$StartedAt,
+        [object]$ExecutionState,
+        [int]$Parallel,
+        [int]$TopNCount,
+        [string]$Encoding,
+        [object[]]$Commits,
+        [object[]]$FileRows,
+        [switch]$NonInteractive,
+        [switch]$TrustServerCert,
+        [switch]$IgnoreWhitespace
+    )
+    Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 8/8: メタデータ出力' -PercentComplete 95
+    $finishedAt = Get-Date
+    $meta = New-RunMetaData -Context $Context -StartTime $StartedAt -EndTime $finishedAt -TargetUrl $ExecutionState.TargetUrl -FromRevision $ExecutionState.FromRevision -ToRevision $ExecutionState.ToRevision -SvnVersion $ExecutionState.SvnVersion -Parallel $Parallel -TopNCount $TopNCount -Encoding $Encoding -Commits $Commits -FileRows $FileRows -OutDirectory $ExecutionState.OutDirectory -IncludePaths $ExecutionState.IncludePaths -ExcludePaths $ExecutionState.ExcludePaths -IncludeExtensions $ExecutionState.IncludeExtensions -ExcludeExtensions $ExecutionState.ExcludeExtensions -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -IgnoreWhitespace:$IgnoreWhitespace
+    Write-JsonFile -Data $meta -FilePath (Join-Path $ExecutionState.OutDirectory 'run_meta.json') -Depth 12 -EncodingName $Encoding
+
+    Write-Progress -Id 0 -Activity 'NarutoCode' -Completed
+    Write-RunSummary -TargetUrl $ExecutionState.TargetUrl -FromRevision $ExecutionState.FromRevision -ToRevision $ExecutionState.ToRevision -Commits $Commits -FileRows $FileRows -OutDirectory $ExecutionState.OutDirectory
+    return [pscustomobject]$meta
+}
+function New-PipelineResultObject
+{
+    <#
+    .SYNOPSIS
+        パイプライン実行結果を返却用オブジェクトへ整形する。
+    .DESCRIPTION
+        戻り値プロパティ:
+        - OutDirectory [string]   解決済み出力ディレクトリの絶対パス
+        - Committers   [object[]] コミッター別メトリクス行
+        - Files        [object[]] ファイル別メトリクス行
+        - Commits      [object[]] コミット別サマリー行
+        - Couplings    [object[]] 共変更カップリング行
+        - RunMeta      [object]   実行メタデータ
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [string]$OutDirectory,
+        [object[]]$CommitterRows,
+        [object[]]$FileRows,
+        [object[]]$CommitRows,
+        [object[]]$CouplingRows,
+        [object]$RunMeta
+    )
+    return [pscustomobject]@{
+        OutDirectory = (Resolve-Path $OutDirectory).Path
+        Committers = $CommitterRows
+        Files = $FileRows
+        Commits = $CommitRows
+        Couplings = $CouplingRows
+        RunMeta = $RunMeta
+    }
+}
 function Invoke-NarutoCodePipeline
 {
     <#
@@ -9898,116 +10238,19 @@ function Invoke-NarutoCodePipeline
     )
     try
     {
-        # --- ステップ 1: パラメータの初期化と検証 ---
         $startedAt = Get-Date
         Initialize-StrictModeContext -Context $Context
         $Context = $script:NarutoContext
-        if ($FromRevision -gt $ToRevision)
-        {
-            $tmp = $FromRevision
-            $FromRevision = $ToRevision
-            $ToRevision = $tmp
-        }
-        if (-not $OutDirectory)
-        {
-            $OutDirectory = Join-Path (Get-Location) 'NarutoCode_out'
-        }
+        $executionState = Resolve-PipelineExecutionState -Context $Context -RepoUrl $RepoUrl -FromRevision $FromRevision -ToRevision $ToRevision -OutDirectory $OutDirectory -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -SvnExecutable $SvnExecutable -Username $Username -Password $Password -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert
+        $logAndDiffStage = Invoke-PipelineLogAndDiffStage -Context $Context -ExecutionState $executionState -IgnoreWhitespace:$IgnoreWhitespace -Parallel $Parallel
+        $aggregationStage = Invoke-PipelineAggregationStage -Commits $logAndDiffStage.Commits -RenameMap $logAndDiffStage.RenameMap
+        $strictResult = Invoke-PipelineStrictStage -Context $Context -ExecutionState $executionState -LogAndDiffStage $logAndDiffStage -AggregationStage $aggregationStage -Parallel $Parallel
 
-        # Resolve relative OutDirectory to absolute path based on PowerShell $PWD
-        $OutDirectory = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutDirectory)
-        $cacheDir = Join-Path $OutDirectory 'cache'
-        New-Item -Path $cacheDir -ItemType Directory -Force | Out-Null
+        Write-PipelineCsvArtifacts -OutDirectory $executionState.OutDirectory -CommitterRows $aggregationStage.CommitterRows -FileRows $aggregationStage.FileRows -CommitRows $aggregationStage.CommitRows -CouplingRows $aggregationStage.CouplingRows -StrictResult $strictResult -Encoding $Encoding
+        Write-PipelineVisualizationArtifacts -OutDirectory $executionState.OutDirectory -CommitterRows $aggregationStage.CommitterRows -FileRows $aggregationStage.FileRows -CommitRows $aggregationStage.CommitRows -CouplingRows $aggregationStage.CouplingRows -StrictResult $strictResult -TopNCount $TopNCount -Encoding $Encoding
+        $meta = Write-PipelineRunArtifacts -Context $Context -StartedAt $startedAt -ExecutionState $executionState -Parallel $Parallel -TopNCount $TopNCount -Encoding $Encoding -Commits $logAndDiffStage.Commits -FileRows $aggregationStage.FileRows -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -IgnoreWhitespace:$IgnoreWhitespace
 
-        $IncludeExtensions = ConvertTo-NormalizedExtension -Extensions $IncludeExtensions
-        $ExcludeExtensions = ConvertTo-NormalizedExtension -Extensions $ExcludeExtensions
-        $IncludePaths = ConvertTo-NormalizedPatternList -Patterns $IncludePaths
-        $ExcludePaths = ConvertTo-NormalizedPatternList -Patterns $ExcludePaths
-
-        $svnCmd = Get-Command $SvnExecutable -ErrorAction SilentlyContinue
-        if (-not $svnCmd)
-        {
-            throw "svn executable not found: '$SvnExecutable'. Install Subversion client or specify -SvnExecutable."
-        }
-
-        $Context.Runtime.SvnExecutable = $svnCmd.Source
-        $Context.Runtime.SvnGlobalArguments = Get-SvnGlobalArgumentList -Username $Username -Password $Password -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert
-
-        $targetUrl = Resolve-SvnTargetUrl -Target $RepoUrl
-        $svnVersion = Get-SvnVersionSafe
-
-        # --- ステップ 2: SVN ログの取得とパース ---
-        Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 2/8: SVN ログの取得' -PercentComplete 5
-        $logText = Invoke-SvnCommand -Arguments @('log', '--xml', '--verbose', '-r', "$FromRevision`:$ToRevision", $targetUrl) -ErrorContext 'svn log'
-        $commits = @(ConvertFrom-SvnLogXml -XmlText $logText)
-
-        # --- ステップ 3: 差分の取得とコミット単位の差分統計構築 ---
-        Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 3/8: 差分の取得と統計構築' -PercentComplete 15
-        $diffArgs = Get-SvnDiffArgumentList -IgnoreWhitespace:$IgnoreWhitespace
-        $revToAuthor = Initialize-CommitDiffData -Commits $commits -CacheDir $cacheDir -TargetUrl $targetUrl -DiffArguments $diffArgs -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePaths -ExcludePathPatterns $ExcludePaths -Parallel $Parallel
-
-        # --- ステップ 3.5: リネームマップの構築（基本メトリクスと strict 帰属の両方で使用） ---
-        $renameMap = Get-RenameMap -Commits $commits
-
-        # --- ステップ 4: 基本メトリクス算出（コミッター / ファイル / カップリング / コミット） ---
-        Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 4/8: 基本メトリクス算出' -PercentComplete 35
-        $committerRows = @(Get-CommitterMetric -Commits $commits -RenameMap $renameMap)
-        $fileRows = @(Get-FileMetric -Commits $commits -RenameMap $renameMap)
-        # couplings.csv は常に全件を出力し、TopN は可視化側でのみ適用する。
-        $couplingRows = @(Get-CoChangeMetric -Commits $commits -TopNCount 0 -RenameMap $renameMap)
-        $commitRows = @(New-CommitRowFromCommit -Commits $commits)
-
-        # --- ステップ 5: Strict 死亡帰属（blame ベースの行追跡） ---
-        Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 5/8: Strict 帰属解析' -PercentComplete 45
-        $strictResult = Update-StrictAttributionMetric -Commits $commits -RevToAuthor $revToAuthor -TargetUrl $targetUrl -FromRevision $FromRevision -ToRevision $ToRevision -CacheDir $cacheDir -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -FileRows $fileRows -CommitterRows $committerRows -Parallel $Parallel -RenameMap $renameMap
-
-        # --- ステップ 6: CSV レポート出力 ---
-        Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 6/8: CSV レポート出力' -PercentComplete 80
-        $headers = Get-MetricHeader
-        Write-CsvFile -FilePath (Join-Path $OutDirectory 'committers.csv') -Rows $committerRows -Headers $headers.Committer -EncodingName $Encoding
-        Write-CsvFile -FilePath (Join-Path $OutDirectory 'files.csv') -Rows $fileRows -Headers $headers.File -EncodingName $Encoding
-        Write-CsvFile -FilePath (Join-Path $OutDirectory 'commits.csv') -Rows $commitRows -Headers $headers.Commit -EncodingName $Encoding
-        Write-CsvFile -FilePath (Join-Path $OutDirectory 'couplings.csv') -Rows $couplingRows -Headers $headers.Coupling -EncodingName $Encoding
-        if ($null -ne $strictResult)
-        {
-            Write-KillMatrixCsv -OutDirectory $OutDirectory -KillMatrix $strictResult.KillMatrix -AuthorSelfDead $strictResult.AuthorSelfDead -Committers $committerRows -EncodingName $Encoding
-        }
-        # --- ステップ 7: 可視化出力 ---
-        Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 7/8: 可視化出力' -PercentComplete 88
-        Write-PlantUmlFile -OutDirectory $OutDirectory -Committers $committerRows -Files $fileRows -Couplings $couplingRows -TopNCount $TopNCount -EncodingName $Encoding
-        Write-FileBubbleChart -OutDirectory $OutDirectory -Files $fileRows -TopNCount $TopNCount -EncodingName $Encoding
-        Write-CommitterOutcomeChart -OutDirectory $OutDirectory -Committers $committerRows -TopNCount $TopNCount -EncodingName $Encoding
-        Write-CommitterScatterChart -OutDirectory $OutDirectory -Committers $committerRows -TopNCount $TopNCount -EncodingName $Encoding
-        Write-SurvivedShareDonutChart -OutDirectory $OutDirectory -Committers $committerRows -EncodingName $Encoding
-        if ($null -ne $strictResult)
-        {
-            Write-TeamInteractionHeatMap -OutDirectory $OutDirectory -KillMatrix $strictResult.KillMatrix -AuthorSelfDead $strictResult.AuthorSelfDead -Committers $committerRows -EncodingName $Encoding
-        }
-        Write-TeamActivityProfileChart -OutDirectory $OutDirectory -Committers $committerRows -EncodingName $Encoding
-        Write-FileQualityScatterChart -OutDirectory $OutDirectory -Files $fileRows -TopNCount $TopNCount -EncodingName $Encoding
-        Write-CommitTimelineChart -OutDirectory $OutDirectory -Commits $commitRows -EncodingName $Encoding
-        Write-CommitScatterChart -OutDirectory $OutDirectory -Commits $commitRows -EncodingName $Encoding
-        Write-ProjectCodeFateChart -OutDirectory $OutDirectory -Committers $committerRows -EncodingName $Encoding
-        Write-ProjectEfficiencyQuadrantChart -OutDirectory $OutDirectory -Files $fileRows -TopNCount $TopNCount -EncodingName $Encoding
-        Write-ProjectSummaryDashboard -OutDirectory $OutDirectory -Committers $committerRows -FileRows $fileRows -CommitRows $commitRows -AuthorBorn $strictResult.AuthorBorn -EncodingName $Encoding
-        Write-ContributorBalanceChart -OutDirectory $OutDirectory -Committers $committerRows -TopNCount $TopNCount -EncodingName $Encoding
-
-        # --- ステップ 8: 実行メタデータとサマリーの書き出し ---
-        Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 8/8: メタデータ出力' -PercentComplete 95
-        $finishedAt = Get-Date
-        $meta = New-RunMetaData -StartTime $startedAt -EndTime $finishedAt -TargetUrl $targetUrl -FromRevision $FromRevision -ToRevision $ToRevision -SvnVersion $svnVersion -Parallel $Parallel -TopNCount $TopNCount -Encoding $Encoding -Commits $commits -FileRows $fileRows -OutDirectory $OutDirectory -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -IgnoreWhitespace:$IgnoreWhitespace
-        Write-JsonFile -Data $meta -FilePath (Join-Path $OutDirectory 'run_meta.json') -Depth 12 -EncodingName $Encoding
-
-        Write-Progress -Id 0 -Activity 'NarutoCode' -Completed
-        Write-RunSummary -TargetUrl $targetUrl -FromRevision $FromRevision -ToRevision $ToRevision -Commits $commits -FileRows $fileRows -OutDirectory $OutDirectory
-
-        return [pscustomobject]@{
-            OutDirectory = (Resolve-Path $OutDirectory).Path
-            Committers = $committerRows
-            Files = $fileRows
-            Commits = $commitRows
-            Couplings = $couplingRows
-            RunMeta = [pscustomobject]$meta
-        }
+        return (New-PipelineResultObject -OutDirectory $executionState.OutDirectory -CommitterRows $aggregationStage.CommitterRows -FileRows $aggregationStage.FileRows -CommitRows $aggregationStage.CommitRows -CouplingRows $aggregationStage.CouplingRows -RunMeta $meta)
     }
     catch
     {
@@ -10020,6 +10263,4 @@ if ($MyInvocation.InvocationName -ne '.')
 {
     Invoke-NarutoCodePipeline -Context $script:NarutoContext -RepoUrl $RepoUrl -FromRevision $FromRevision -ToRevision $ToRevision -SvnExecutable $SvnExecutable -OutDirectory $OutDirectory -Username $Username -Password $Password -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -Parallel $Parallel -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -TopNCount $TopNCount -Encoding $Encoding -IgnoreWhitespace:$IgnoreWhitespace
 }
-
-
 

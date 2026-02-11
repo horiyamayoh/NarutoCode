@@ -1144,3 +1144,45 @@ Strict processing is split into:
 
 - `Get-MetricColumnDefinitions` is the shared source for metric column arrays.
 - `Get-MetricHeader` now reads from this shared definition to reduce duplication risk.
+
+## Pipeline Dependency-Explicit Refactor (2026-02)
+
+The main pipeline orchestration is split into stage functions while preserving CLI and output compatibility.
+
+### Main orchestration flow
+
+1. `Resolve-PipelineExecutionState`
+- Normalizes revisions and output paths.
+- Resolves SVN executable and global authentication arguments.
+- Produces normalized include/exclude filters.
+- Resolves `TargetUrl` and `SvnVersion` with explicit `Context`.
+
+2. `Invoke-PipelineLogAndDiffStage`
+- Executes `svn log` retrieval and parsing.
+- Executes diff prefetch/integration with normalized filters.
+- Builds `RevToAuthor` and `RenameMap`.
+
+3. `Invoke-PipelineAggregationStage`
+- Computes committer/file/co-change/commit rows from normalized commits.
+
+4. `Invoke-PipelineStrictStage`
+- Runs strict attribution with explicit dependencies passed from stage outputs.
+
+5. Output stages
+- `Write-PipelineCsvArtifacts`
+- `Write-PipelineVisualizationArtifacts`
+- `Write-PipelineRunArtifacts`
+- `New-PipelineResultObject`
+
+### Context propagation policy
+
+The following SVN I/O helpers now accept explicit `Context` and are called through it in the main pipeline path:
+
+- `Get-AllRepositoryFile`
+- `Resolve-SvnTargetUrl`
+- `Invoke-SvnCommandAllowMissingTarget`
+- `Get-SvnVersionSafe`
+- `Get-CachedOrFetchDiffText`
+- `Get-RenamePairRealDiffStat`
+
+This keeps runtime dependency flow explicit and reduces hidden reliance on script-scope defaults.

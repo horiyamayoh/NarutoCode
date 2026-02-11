@@ -1737,7 +1737,8 @@ Describe 'Initialize-CommitDiffData parallel consistency' {
     BeforeAll {
         $script:origGetCachedOrFetchDiffText = (Get-Item function:Get-CachedOrFetchDiffText).ScriptBlock.ToString()
         Set-Item -Path function:Get-CachedOrFetchDiffText -Value {
-            param([string]$CacheDir, [int]$Revision, [string]$TargetUrl, [string[]]$DiffArguments)
+            param([hashtable]$Context, [string]$CacheDir, [int]$Revision, [string]$TargetUrl, [string[]]$DiffArguments)
+            [void]$Context
             @"
 Index: trunk/src/file$Revision.txt
 ===================================================================
@@ -1825,7 +1826,8 @@ Describe 'Initialize-CommitDiffData skip non-target commit' {
 
     It 'does not call svn diff fetch when filtered changed paths are empty' {
         Set-Item -Path function:Get-CachedOrFetchDiffText -Value {
-            param([string]$CacheDir, [int]$Revision, [string]$TargetUrl, [string[]]$DiffArguments)
+            param([hashtable]$Context, [string]$CacheDir, [int]$Revision, [string]$TargetUrl, [string[]]$DiffArguments)
+            [void]$Context
             throw 'Get-CachedOrFetchDiffText should not be called for filtered-out commit'
         }
 
@@ -2131,7 +2133,8 @@ Describe 'Update-StrictAttributionMetric parallel consistency' {
             }
         }
         Set-Item -Path function:Get-AllRepositoryFile -Value {
-            param([string]$TargetUrl, [int]$Revision, [string[]]$IncludeExtensions, [string[]]$ExcludeExtensions, [string[]]$IncludePathPatterns, [string[]]$ExcludePathPatterns)
+            param([hashtable]$Context, [string]$TargetUrl, [int]$Revision, [string[]]$IncludeExtensions, [string[]]$ExcludeExtensions, [string[]]$IncludePathPatterns, [string[]]$ExcludePathPatterns)
+            [void]$Context
             @('src/a.cs', 'src/b.cs', 'src/c.cs')
         }
         Set-Item -Path function:Get-SvnBlameSummary -Value {
@@ -2229,7 +2232,8 @@ Describe 'Get-StrictOwnershipAggregate' {
         $script:origInvokeParallelWorkOwnership = (Get-Item function:Invoke-ParallelWork).ScriptBlock.ToString()
 
         Set-Item -Path function:Get-AllRepositoryFile -Value {
-            param([string]$TargetUrl, [int]$Revision, [string[]]$IncludeExtensions, [string[]]$ExcludeExtensions, [string[]]$IncludePathPatterns, [string[]]$ExcludePathPatterns)
+            param([hashtable]$Context, [string]$TargetUrl, [int]$Revision, [string[]]$IncludeExtensions, [string[]]$ExcludeExtensions, [string[]]$IncludePathPatterns, [string[]]$ExcludePathPatterns)
+            [void]$Context
             @('src/a.cs', 'src/b.cs')
         }
         Set-Item -Path function:Get-SvnBlameSummary -Value {
