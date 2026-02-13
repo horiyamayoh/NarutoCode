@@ -836,6 +836,7 @@ Describe 'New-RunMetaData' {
         $meta.Outputs.KillMatrixCsv | Should -Be 'kill_matrix.csv'
         $meta.Outputs.SurvivedShareDonutSvg | Should -Be 'team_survived_share.svg'
         $meta.Outputs.CommitTimelineSvg | Should -Be 'commit_timeline.svg'
+        $meta.Outputs.PSObject.Properties.Name | Should -Not -Contain 'ContributorBalanceSvg'
     }
 }
 
@@ -1450,8 +1451,14 @@ Describe 'Write-FileBubbleChart' {
         Test-Path $svgPath | Should -BeTrue
         $content = Get-Content -Path $svgPath -Raw -Encoding UTF8
         $content | Should -Match '<circle'
-        $content | Should -Match 'ホットスポットスコア'
+        $content | Should -Match '>ホットスポットスコア<'
+        $content | Should -Match '対数スコア'
         $content | Should -Match '最多作者blame占有率'
+        # 対数スケール目盛り: 0 および 10 の累乗が表示される（maxScore=2160 → ceil(log10(2161))=4）
+        $content | Should -Match '>0<'
+        $content | Should -Match '>10<'
+        $content | Should -Match '>100<'
+        $content | Should -Match '>1000<'
     }
 }
 
@@ -2125,6 +2132,11 @@ Describe 'Integration — test SVN repo output matches baseline' -Tag 'Integrati
         $meta.Encoding      | Should -Be 'UTF8'
         [bool]$meta.Parameters.ExcludeCommentOnlyLines | Should -BeFalse
         $meta.Outputs.SurvivedShareDonutSvg | Should -Be 'team_survived_share.svg'
+        $meta.Outputs.PSObject.Properties.Name | Should -Not -Contain 'ContributorBalanceSvg'
+    }
+
+    It 'does not generate contributor_balance.svg in pipeline output' -Skip:($null -ne $script:skipReason) {
+        Test-Path (Join-Path $script:actualDir 'contributor_balance.svg') | Should -BeFalse
     }
 
     It 'keeps couplings.csv full even when TopNCount is 1' -Skip:($null -ne $script:skipReason) {
@@ -3155,47 +3167,64 @@ Describe 'Write-TeamInteractionHeatMap' {
 }
 
 Describe 'Get-TeamActivityProfileData' {
-    It 'calculates intervention rate from deleted and others-modified lines' {
+    It 'calculates intervention rate and outcome balance from intervention/survived outcome lines' {
         $committers = @(
             [pscustomobject]@{
-                '作者' = 'alice'; '削除行数' = 20; '他者コード変更行数' = 1
-                '他者コード変更生存率' = 0; '総チャーン' = 400
+                '作者' = 'alice'; '他者コード変更行数' = 40
+                '他者コード変更生存行数' = 30; '総チャーン' = 400
             }
             [pscustomobject]@{
-                '作者' = 'bob'; '削除行数' = 6; '他者コード変更行数' = 6
-                '他者コード変更生存率' = 0.833; '総チャーン' = 123
+                '作者' = 'bob'; '他者コード変更行数' = 6
+                '他者コード変更生存行数' = 12; '総チャーン' = 120
             }
             [pscustomobject]@{
-                '作者' = 'charlie'; '削除行数' = 58; '他者コード変更行数' = 55
-                '他者コード変更生存率' = 0.382; '総チャーン' = 174
+                '作者' = 'charlie'; '他者コード変更行数' = 50
+                '他者コード変更生存行数' = 50; '総チャーン' = 100
             }
         )
 
         $data = @(Get-TeamActivityProfileData -Committers $committers)
         $data.Count | Should -Be 3
+        $data[0].Author | Should -Be 'alice'
 
         $alice = $data | Where-Object { $_.Author -eq 'alice' }
-        $alice.InterventionRate | Should -BeGreaterThan 0.04
-        $alice.InterventionRate | Should -BeLessThan 0.06
+        $alice.InterventionRate | Should -Be 0.1
+        $alice.OutcomeBalance | Should -BeGreaterThan -0.15
+        $alice.OutcomeBalance | Should -BeLessThan -0.14
+        $alice.InterventionLines | Should -Be 40
+        $alice.SurvivedOutcomeLines | Should -Be 30
 
         $bob = $data | Where-Object { $_.Author -eq 'bob' }
-        $bob.InterventionRate | Should -Be 1.0
+        $bob.InterventionRate | Should -Be 0.05
+        $bob.OutcomeBalance | Should -BeGreaterThan 0.33
+        $bob.OutcomeBalance | Should -BeLessThan 0.34
 
         $charlie = $data | Where-Object { $_.Author -eq 'charlie' }
-        $charlie.InterventionRate | Should -BeGreaterThan 0.94
-        $charlie.InterventionRate | Should -BeLessThan 0.96
+        $charlie.InterventionRate | Should -Be 0.5
+        $charlie.OutcomeBalance | Should -Be 0.0
     }
 
-    It 'returns 0 intervention rate when deleted is 0' {
+    It 'skips rows when total churn is 0 or outcome denominator is 0' {
         $committers = @(
             [pscustomobject]@{
-                '作者' = 'newbie'; '削除行数' = 0; '他者コード変更行数' = 0
-                '他者コード変更生存率' = 0; '総チャーン' = 10
+                '作者' = 'newbie'; '他者コード変更行数' = 0
+                '他者コード変更生存行数' = 0; '総チャーン' = 10
+            }
+            [pscustomobject]@{
+                '作者' = 'ghost'; '他者コード変更行数' = 5
+                '他者コード変更生存行数' = 2; '総チャーン' = 0
+            }
+            [pscustomobject]@{
+                '作者' = 'valid'; '他者コード変更行数' = 3
+                '他者コード変更生存行数' = 1; '総チャーン' = 20
             }
         )
 
         $data = @(Get-TeamActivityProfileData -Committers $committers)
-        $data[0].InterventionRate | Should -Be 0.0
+        $data.Count | Should -Be 1
+        $data[0].Author | Should -Be 'valid'
+        $data[0].InterventionRate | Should -Be 0.15
+        $data[0].OutcomeBalance | Should -Be -0.5
     }
 }
 
@@ -3211,12 +3240,12 @@ Describe 'Write-TeamActivityProfileChart' {
     It 'creates team activity profile SVG with quadrant labels' {
         $committers = @(
             [pscustomobject]@{
-                '作者' = 'alice'; '削除行数' = 20; '他者コード変更行数' = 1
-                '他者コード変更生存率' = 0; '総チャーン' = 400
+                '作者' = 'alice'; '他者コード変更行数' = 40
+                '他者コード変更生存行数' = 30; '総チャーン' = 400
             }
             [pscustomobject]@{
-                '作者' = 'bob'; '削除行数' = 6; '他者コード変更行数' = 6
-                '他者コード変更生存率' = 0.833; '総チャーン' = 123
+                '作者' = 'bob'; '他者コード変更行数' = 6
+                '他者コード変更生存行数' = 12; '総チャーン' = 123
             }
         )
 
@@ -3231,12 +3260,12 @@ Describe 'Write-TeamActivityProfileChart' {
         $content | Should -Match '<circle'
         $content | Should -Match 'alice'
         $content | Should -Match 'bob'
-        $content | Should -Match '独立型'
-        $content | Should -Match '改善者'
-        $content | Should -Match '孤立型'
-        $content | Should -Match '破壊者'
-        $content | Should -Match '他者コード削除介入度'
-        $content | Should -Match '他者コード変更生存率'
+        $content | Should -Match '低介入・生存優位'
+        $content | Should -Match '高介入・生存優位'
+        $content | Should -Match '低介入・消滅優位'
+        $content | Should -Match '高介入・消滅優位'
+        $content | Should -Match '他者コード介入率'
+        $content | Should -Match '介入結果生死差分指数'
     }
 
     It 'does not create SVG when Committers is empty' {
@@ -3601,7 +3630,8 @@ Describe 'Write-ProjectEfficiencyQuadrantChart' {
         $content | Should -Match '高効率安定'
         $content | Should -Match '高リスク不安定'
         $content | Should -Match '過修正安定'
-        $content | Should -Match '無駄な変動'
+        $content | Should -Match '意図的改修'
+        $content | Should -Not -Match '無駄な変動'
     }
 
     It 'does not create SVG when Files is empty' {

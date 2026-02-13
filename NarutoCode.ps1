@@ -7095,9 +7095,9 @@ function Write-FileBubbleChart
     .SYNOPSIS
         ファイルホットスポット分析をバブルチャート SVG として出力する。
     .DESCRIPTION
-        TopN のファイルをホットスポット順位順で選び、ホットスポットスコアと最多作者blame占有率を軸に配置する。
+        TopN のファイルをホットスポット順位順で選び、ホットスポットスコア（対数スケール）と最多作者blame占有率を軸に配置する。
         バブル面積は総チャーンに比例させ、色はホットスポット順位を赤から緑で表現する。
-        X軸: ホットスポットスコア、Y軸: 最多作者blame占有率、バブルサイズ: 総チャーン、色: ホットスポット順位
+        X軸: ホットスポットスコア（対数スケール、目盛りは10の累乗）、Y軸: 最多作者blame占有率、バブルサイズ: 総チャーン、色: ホットスポット順位
     .PARAMETER OutDirectory
         出力先ディレクトリを指定する（必須）。
     .PARAMETER Files
@@ -7161,19 +7161,24 @@ function Write-FileBubbleChart
     $plotBottom = $plotTop + $plotHeight
     $tickCount = 6
 
-    $maxScore = 0.0
+    $maxRawScore = 0.0
+    $maxLogScore = 0.0
     $maxBlameShare = 0.0
     $maxChurn = 0.0
     $maxRank = 1
     foreach ($f in $topFiles)
     {
         $scoreCount = [double]$f.'ホットスポットスコア'
+        if ($scoreCount -lt 0.0)
+        {
+            $scoreCount = 0.0
+        }
         $blameShare = [double]$f.'最多作者blame占有率'
         $churnCount = [double]$f.'総チャーン'
         $rank = [int]$f.'ホットスポット順位'
-        if ($scoreCount -gt $maxScore)
+        if ($scoreCount -gt $maxRawScore)
         {
-            $maxScore = $scoreCount
+            $maxRawScore = $scoreCount
         }
         if ($blameShare -gt $maxBlameShare)
         {
@@ -7188,9 +7193,14 @@ function Write-FileBubbleChart
             $maxRank = $rank
         }
     }
-    if ($maxScore -le 0.0)
+    if ($maxRawScore -le 0.0)
     {
-        $maxScore = 1.0
+        $maxRawScore = 1.0
+    }
+    $maxLogScore = [Math]::Ceiling([Math]::Log10(1.0 + $maxRawScore))
+    if ($maxLogScore -le 0)
+    {
+        $maxLogScore = 1
     }
     if ($maxBlameShare -le 0.0)
     {
@@ -7239,21 +7249,27 @@ function Write-FileBubbleChart
 '@))
     [void]$sb.AppendLine('<rect width="100%" height="100%" fill="#fafafa"/>')
     [void]$sb.AppendLine('<text class="title" x="20" y="28">ファイルホットスポット分析</text>')
-    [void]$sb.AppendLine(('<text class="subtitle" x="20" y="44">X: ホットスポットスコア（コミット数{0}×作者数×総チャーン÷max(活動期間日数,1)） / Y: 最多作者blame占有率（max(作者別生存行数)÷生存行数合計）</text>' -f [char]0x00B2))
+    [void]$sb.AppendLine(('<text class="subtitle" x="20" y="44">X: ホットスポットスコア（スコア=コミット数{0}×作者数×総チャーン÷max(活動期間日数,1)） / Y: 最多作者blame占有率（max(作者別生存行数)÷生存行数合計）</text>' -f [char]0x00B2))
     [void]$sb.AppendLine('<text class="subtitle" x="20" y="58">円: 総チャーン / 色: ホットスポット順位（＝スコア降順）</text>')
 
     # プロットエリア
     [void]$sb.AppendLine(('<rect x="{0}" y="{1}" width="{2}" height="{3}" fill="#fff" stroke="#ddd"/>' -f [int]$plotLeft, [int]$plotTop, [int]$plotWidth, [int]$plotHeight))
 
-    # X軸グリッド線とラベル（ホットスポットスコア）
-    for ($i = 0
-        $i -le $tickCount
-        $i++)
+    # X軸グリッド線とラベル（ホットスポットスコア、対数スケール：0 および 10 の累乗で目盛り）
+    # 目盛り 0 （プロット左端）
+    $xTick0 = [Math]::Round($plotLeft, 2)
+    [void]$sb.AppendLine(('<line class="grid-line" x1="{0}" y1="{1}" x2="{0}" y2="{2}"/>' -f $xTick0, [int]$plotTop, [int]$plotBottom))
+    [void]$sb.AppendLine(('<text class="tick-label" x="{0}" y="{1}" text-anchor="middle">{2}</text>' -f $xTick0, [int]($plotBottom + 16), 0))
+    # 目盛り 10^1, 10^2, ... 10^maxLogScore
+    for ($exp = 1
+        $exp -le $maxLogScore
+        $exp++)
     {
-        $xValue = ($maxScore * $i) / [double]$tickCount
-        $x = $plotLeft + (($plotWidth * $i) / [double]$tickCount)
+        $tickValue = [Math]::Pow(10.0, $exp)
+        $logTickValue = [Math]::Log10(1.0 + $tickValue)
+        $x = $plotLeft + (($logTickValue / [double]$maxLogScore) * $plotWidth)
         $xRounded = [Math]::Round($x, 2)
-        $xLabel = [int][Math]::Round($xValue)
+        $xLabel = [long]$tickValue
         [void]$sb.AppendLine(('<line class="grid-line" x1="{0}" y1="{1}" x2="{0}" y2="{2}"/>' -f $xRounded, [int]$plotTop, [int]$plotBottom))
         [void]$sb.AppendLine(('<text class="tick-label" x="{0}" y="{1}" text-anchor="middle">{2}</text>' -f $xRounded, [int]($plotBottom + 16), $xLabel))
     }
@@ -7294,12 +7310,17 @@ function Write-FileBubbleChart
     {
         $filePath = [string]$f.'ファイルパス'
         $scoreCount = [double]$f.'ホットスポットスコア'
+        if ($scoreCount -lt 0.0)
+        {
+            $scoreCount = 0.0
+        }
+        $scoreCountLog = [Math]::Log10(1.0 + $scoreCount)
         $blameShare = [double]$f.'最多作者blame占有率'
         $churnCount = [double]$f.'総チャーン'
         $rank = [int]$f.'ホットスポット順位'
 
         $radius = & $radiusCalculator -ChurnValue $churnCount
-        $x = $plotLeft + (($scoreCount / $maxScore) * $plotWidth)
+        $x = $plotLeft + (($scoreCountLog / $maxLogScore) * $plotWidth)
         $y = $plotBottom - (($blameShare / $maxBlameShare) * $plotHeight)
         $x = [Math]::Min($plotRight - $radius - 1.0, [Math]::Max($plotLeft + $radius + 1.0, $x))
         $y = [Math]::Min($plotBottom - $radius - 1.0, [Math]::Max($plotTop + $radius + 1.0, $y))
@@ -7315,7 +7336,7 @@ function Write-FileBubbleChart
             $safePath = ''
         }
         $blamePct = [Math]::Round($blameShare * 100.0, 1)
-        $tooltip = ('{0}&#10;スコア={1}, blame占有率={2}%, 総チャーン={3}, 順位={4}' -f $safePath, [Math]::Round($scoreCount, 2), $blamePct, [int][Math]::Round($churnCount), $rank)
+        $tooltip = ('{0}&#10;生値スコア={1}, 対数スコア={2}, blame占有率={3}%, 総チャーン={4}, 順位={5}' -f $safePath, [Math]::Round($scoreCount, 2), [Math]::Round($scoreCountLog, 4), $blamePct, [int][Math]::Round($churnCount), $rank)
 
         $xRounded = [Math]::Round($x, 2)
         $yRounded = [Math]::Round($y, 2)
@@ -9159,8 +9180,8 @@ function Get-TeamActivityProfileData
     .SYNOPSIS
         チーム活動プロファイル散布図用のデータを抽出する。
     .DESCRIPTION
-        X 軸: 他者コード削除介入度（他者コード変更行数 / 削除行数）
-        Y 軸: 他者コード変更生存率
+        X 軸: 他者コード介入率（他者コード変更行数 / 総チャーン）
+        Y 軸: 介入結果生死差分指数（(生存成果行数 - 介入行数) / (生存成果行数 + 介入行数)）
         バブルサイズ: 総チャーン
     .PARAMETER Committers
         Get-CommitterMetric が返すコミッター行配列を指定する。
@@ -9180,40 +9201,38 @@ function Get-TeamActivityProfileData
         {
             continue
         }
-        $deleted = 0.0
-        if ($null -ne $c.'削除行数')
-        {
-            $deleted = [double]$c.'削除行数'
-        }
-        $othersModified = 0.0
+        $interventionLines = 0.0
         if ($null -ne $c.'他者コード変更行数')
         {
-            $othersModified = [double]$c.'他者コード変更行数'
+            $interventionLines = [double]$c.'他者コード変更行数'
         }
-        $othersSurvivalRate = 0.0
-        if ($null -ne $c.'他者コード変更生存率')
+        $survivedOutcomeLines = 0.0
+        if ($null -ne $c.'他者コード変更生存行数')
         {
-            $othersSurvivalRate = [double]$c.'他者コード変更生存率'
+            $survivedOutcomeLines = [double]$c.'他者コード変更生存行数'
         }
         $totalChurn = 0.0
         if ($null -ne $c.'総チャーン')
         {
             $totalChurn = [double]$c.'総チャーン'
         }
-        # 削除行数が 0 の場合は介入度を 0 とする
-        $interventionRate = 0.0
-        if ($deleted -gt 0)
+        if ($totalChurn -le 0.0)
         {
-            $interventionRate = $othersModified / $deleted
-            if ($interventionRate -gt 1.0)
-            {
-                $interventionRate = 1.0
-            }
+            continue
         }
+        $denominator = $survivedOutcomeLines + $interventionLines
+        if ($denominator -le 0.0)
+        {
+            continue
+        }
+        $interventionRate = $interventionLines / $totalChurn
+        $outcomeBalance = ($survivedOutcomeLines - $interventionLines) / $denominator
         [void]$rows.Add([pscustomobject][ordered]@{
                 Author = (Get-NormalizedAuthorName -Author ([string]$c.'作者'))
                 InterventionRate = $interventionRate
-                OthersSurvivalRate = $othersSurvivalRate
+                OutcomeBalance = $outcomeBalance
+                InterventionLines = $interventionLines
+                SurvivedOutcomeLines = $survivedOutcomeLines
                 TotalChurn = $totalChurn
             })
     }
@@ -9230,13 +9249,14 @@ function Write-TeamActivityProfileChart
     .SYNOPSIS
         チーム活動プロファイルの散布図 SVG を出力する。
     .DESCRIPTION
-        X 軸に他者コード削除介入度（他者コード変更行数 / 削除行数）、
-        Y 軸に他者コード変更生存率を取り、バブルサイズに総チャーンを反映した
+        X 軸に他者コード介入率（他者コード変更行数 / 総チャーン）、
+        Y 軸に介入結果生死差分指数（(生存成果行数 - 介入行数) / (生存成果行数 + 介入行数)）
+        を取り、バブルサイズに総チャーンを反映した
         散布図を生成する。4 象限の解釈:
-        - 左上: 独立型（他者コードをあまり触らない）
-        - 右上: 改善者（他者コードを積極的に改善し、結果が定着）
-        - 左下: 孤立型（活動が少なく他者との接点も少ない）
-        - 右下: 破壊者（他者コードを積極的に消すが定着しない）
+        - 左上: 低介入・生存優位
+        - 右上: 高介入・生存優位
+        - 左下: 低介入・消滅優位
+        - 右下: 高介入・消滅優位
     .PARAMETER OutDirectory
         出力先ディレクトリを指定する。
     .PARAMETER Committers
@@ -9284,6 +9304,11 @@ function Write-TeamActivityProfileChart
     $midX = $plotLeft + $plotWidth / 2.0
     $midY = $plotTop + $plotHeight / 2.0
 
+    $maxInterventionRate = ($profileData | Measure-Object -Property InterventionRate -Maximum).Maximum
+    if ($maxInterventionRate -le 0)
+    {
+        $maxInterventionRate = 1.0
+    }
     $maxChurn = ($profileData | Measure-Object -Property TotalChurn -Maximum).Maximum
     if ($maxChurn -le 0)
     {
@@ -9294,10 +9319,10 @@ function Write-TeamActivityProfileChart
 
     # 象限ラベル
     $quadrants = @(
-        [pscustomobject]@{ X = $plotLeft + $plotWidth * 0.25; Y = $plotTop + $plotHeight * 0.2; Label = '🏠 独立型' }
-        [pscustomobject]@{ X = $plotLeft + $plotWidth * 0.75; Y = $plotTop + $plotHeight * 0.2; Label = '🌟 改善者' }
-        [pscustomobject]@{ X = $plotLeft + $plotWidth * 0.25; Y = $plotTop + $plotHeight * 0.8; Label = '🏝️ 孤立型' }
-        [pscustomobject]@{ X = $plotLeft + $plotWidth * 0.75; Y = $plotTop + $plotHeight * 0.8; Label = '💥 破壊者' }
+        [pscustomobject]@{ X = $plotLeft + $plotWidth * 0.25; Y = $plotTop + $plotHeight * 0.2; Label = '低介入・生存優位' }
+        [pscustomobject]@{ X = $plotLeft + $plotWidth * 0.75; Y = $plotTop + $plotHeight * 0.2; Label = '高介入・生存優位' }
+        [pscustomobject]@{ X = $plotLeft + $plotWidth * 0.25; Y = $plotTop + $plotHeight * 0.8; Label = '低介入・消滅優位' }
+        [pscustomobject]@{ X = $plotLeft + $plotWidth * 0.75; Y = $plotTop + $plotHeight * 0.8; Label = '高介入・消滅優位' }
     )
 
     $svgW = 640
@@ -9313,21 +9338,27 @@ function Write-TeamActivityProfileChart
 '@))
     [void]$sb.AppendLine('<rect width="100%" height="100%" fill="#fafafa"/>')
     [void]$sb.AppendLine('<text class="title" x="20" y="28">チーム活動プロファイル</text>')
-    [void]$sb.AppendLine('<text class="subtitle" x="20" y="46">X: 他者コード削除介入度（他者変更行数÷削除行数） / Y: 他者コード変更生存率 / 円: 総チャーン</text>')
+    [void]$sb.AppendLine('<text class="subtitle" x="20" y="46">X: 他者コード介入率（他者変更行数÷総チャーン） / Y: 介入結果生死差分指数（(生存成果-介入削除)÷(生存成果+介入削除)） / 円: 総チャーン</text>')
 
     # プロットエリア
     [void]$sb.AppendLine(('<rect x="{0}" y="{1}" width="{2}" height="{3}" fill="#fff" stroke="#ddd"/>' -f [int]$plotLeft, [int]$plotTop, [int]$plotWidth, [int]$plotHeight))
     [void]$sb.AppendLine(('<line class="mid-line" x1="{0}" y1="{1}" x2="{0}" y2="{2}"/>' -f [int]$midX, [int]$plotTop, [int]$plotBottom))
     [void]$sb.AppendLine(('<line class="mid-line" x1="{0}" y1="{1}" x2="{2}" y2="{1}"/>' -f [int]$plotLeft, [int]$midY, [int]$plotRight))
     # 軸ラベル
-    [void]$sb.AppendLine(('<text class="axis-label" x="{0}" y="{1}" text-anchor="middle">他者コード削除介入度</text>' -f [int]($plotLeft + $plotWidth / 2.0), [int]($plotBottom + 36)))
-    [void]$sb.AppendLine(('<text class="axis-label" x="16" y="{0}" text-anchor="middle" transform="rotate(-90,16,{0})">他者コード変更生存率</text>' -f [int]($plotTop + $plotHeight / 2.0)))
-    # 目盛り
+    [void]$sb.AppendLine(('<text class="axis-label" x="{0}" y="{1}" text-anchor="middle">他者コード介入率</text>' -f [int]($plotLeft + $plotWidth / 2.0), [int]($plotBottom + 36)))
+    [void]$sb.AppendLine(('<text class="axis-label" x="16" y="{0}" text-anchor="middle" transform="rotate(-90,16,{0})">介入結果生死差分指数</text>' -f [int]($plotTop + $plotHeight / 2.0)))
+    # X 軸目盛り
     for ($tick = 0.0; $tick -le 1.01; $tick += $Context.Constants.SvgQuadrantTickStep)
     {
         $tx = $plotLeft + $tick * $plotWidth
-        $ty = $plotBottom - $tick * $plotHeight
-        [void]$sb.AppendLine(('<text class="tick-label" x="{0:F0}" y="{1}" text-anchor="middle">{2:F0}%</text>' -f $tx, [int]($plotBottom + 16), ($tick * 100)))
+        $xValue = $maxInterventionRate * $tick
+        [void]$sb.AppendLine(('<text class="tick-label" x="{0:F0}" y="{1}" text-anchor="middle">{2:F1}%</text>' -f $tx, [int]($plotBottom + 16), ($xValue * 100)))
+    }
+    # Y 軸目盛り（-100% ～ +100%）
+    for ($tick = -1.0; $tick -le 1.01; $tick += 0.5)
+    {
+        $normalized = ($tick + 1.0) / 2.0
+        $ty = $plotBottom - $normalized * $plotHeight
         [void]$sb.AppendLine(('<text class="tick-label" x="{0}" y="{1:F0}" text-anchor="end">{2:F0}%</text>' -f [int]($plotLeft - 6), ($ty + 4), ($tick * 100)))
     }
     # 象限ラベル
@@ -9341,12 +9372,14 @@ function Write-TeamActivityProfileChart
     for ($ci = 0; $ci -lt $sortedByChurn.Count; $ci++)
     {
         $d = $sortedByChurn[$ci]
-        $bx = $plotLeft + $d.InterventionRate * $plotWidth
-        $by = $plotBottom - $d.OthersSurvivalRate * $plotHeight
+        $bx = $plotLeft + (($d.InterventionRate / $maxInterventionRate) * $plotWidth)
+        $outcomeBalanceNormalized = ($d.OutcomeBalance + 1.0) / 2.0
+        $outcomeBalanceNormalized = [Math]::Max(0.0, [Math]::Min(1.0, $outcomeBalanceNormalized))
+        $by = $plotBottom - $outcomeBalanceNormalized * $plotHeight
         $br = $minBubble + ($maxBubble - $minBubble) * [Math]::Sqrt($d.TotalChurn / $maxChurn)
         $cIdx = $ci % $colorPalette.Count
         $bColor = $colorPalette[$cIdx]
-        [void]$sb.AppendLine(('<circle cx="{0:F1}" cy="{1:F1}" r="{2:F1}" fill="{3}" fill-opacity="0.55" stroke="{3}" stroke-width="1.2"><title>{4} (介入度:{5:F1}%, 生存率:{6:F1}%, チャーン:{7})</title></circle>' -f $bx, $by, $br, $bColor, (ConvertTo-SvgEscapedText -Text $d.Author), ($d.InterventionRate * 100), ($d.OthersSurvivalRate * 100), [int]$d.TotalChurn))
+        [void]$sb.AppendLine(('<circle cx="{0:F1}" cy="{1:F1}" r="{2:F1}" fill="{3}" fill-opacity="0.55" stroke="{3}" stroke-width="1.2"><title>{4} (介入率:{5:F1}%, 生死差分指数:{6:F1}%, 介入行数:{7}, 生存成果行数:{8}, チャーン:{9})</title></circle>' -f $bx, $by, $br, $bColor, (ConvertTo-SvgEscapedText -Text $d.Author), ($d.InterventionRate * 100), ($d.OutcomeBalance * 100), [int]$d.InterventionLines, [int]$d.SurvivedOutcomeLines, [int]$d.TotalChurn))
         [void]$sb.AppendLine(('<text class="author-label" x="{0:F1}" y="{1:F1}">{2}</text>' -f $bx, ($by - $br - 4.0), (ConvertTo-SvgEscapedText -Text $d.Author)))
     }
 
@@ -9617,7 +9650,7 @@ function Write-ProjectEfficiencyQuadrantChart
         （|純増行数|÷総チャーン）を取り、バブルサイズに総チャーンを反映した
         散布図を生成する。
         右上 = 高効率安定（生存率もチャーン効率も高い理想的なファイル）
-        左上 = 無駄な変動（効率は高いが最終的にコードが残らない）
+        左上 = 意図的改修（効率は高いが最終的な残存率は低い）
         右下 = 過修正安定（コードは残るが手戻りが多い）
         左下 = 高リスク不安定（生存率もチャーン効率も低い問題ファイル）
     .PARAMETER OutDirectory
@@ -9713,7 +9746,7 @@ function Write-ProjectEfficiencyQuadrantChart
 
     # 4象限ラベル
     $quadrants = @(
-        @{ X = $plotLeft + $plotWidth * 0.25; Y = $plotTop + $plotHeight * 0.15; Text = '🔥 無駄な変動' }
+        @{ X = $plotLeft + $plotWidth * 0.25; Y = $plotTop + $plotHeight * 0.15; Text = '🔥 意図的改修' }
         @{ X = $plotLeft + $plotWidth * 0.75; Y = $plotTop + $plotHeight * 0.15; Text = '✅ 高効率安定' }
         @{ X = $plotLeft + $plotWidth * 0.25; Y = $plotTop + $plotHeight * 0.85; Text = '💀 高リスク不安定' }
         @{ X = $plotLeft + $plotWidth * 0.75; Y = $plotTop + $plotHeight * 0.85; Text = '⚠️ 過修正安定' }
@@ -12666,7 +12699,6 @@ function New-RunMetaData
             ProjectCodeFateSvg = 'project_code_fate.svg'
             ProjectEfficiencyQuadrantSvg = 'project_efficiency_quadrant.svg'
             ProjectSummaryDashboardSvg = 'project_summary_dashboard.svg'
-            ContributorBalanceSvg = 'contributor_balance.svg'
         }
     }
 }
@@ -13148,7 +13180,6 @@ function Write-PipelineVisualizationArtifacts
         @{ Fn = 'Write-ProjectCodeFateChart'; Args = @{ Committers = $CommitterRows } }
         @{ Fn = 'Write-ProjectEfficiencyQuadrantChart'; Args = @{ Files = $FileRows; TopNCount = $TopNCount } }
         @{ Fn = 'Write-ProjectSummaryDashboard'; Args = @{ Committers = $CommitterRows; FileRows = $FileRows; CommitRows = $CommitRows; AuthorBorn = $authorBorn } }
-        @{ Fn = 'Write-ContributorBalanceChart'; Args = @{ Committers = $CommitterRows; TopNCount = $TopNCount } }
     )
     foreach ($viz in $visualizations)
     {
