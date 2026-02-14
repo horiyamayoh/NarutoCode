@@ -1114,7 +1114,7 @@ This phase keeps the single-file constraint (`NarutoCode.ps1`) and reorganizes a
 ### Diff processing pipeline
 
 - `New-CommitDiffPrefetchPlan`: build filtered path targets and prefetch candidates.
-- `Invoke-CommitDiffPrefetch`: fetch/collect raw diff inputs (sequential or parallel).
+- `Invoke-CommitDiffPrefetch`: fetch/collect raw diff inputs per streaming batch.
 - `Merge-CommitDiffForCommit`: merge raw diff result with log path metadata.
 - `Complete-CommitDiffForCommit`: apply rename correction and finalize derived commit-level metrics.
 
@@ -1323,3 +1323,6 @@ try {
 - Post-strict cleanup releases large stage payloads early (`step3_diff`).
 - `run_meta.json` now includes memory pressure and throttle telemetry.
 - Hard pressure mode can switch strict blame preload to commit-window execution.
+- Step3 diff integration now uses commit-order batch streaming to avoid full `rawDiffByRevision` retention.
+- SvnGateway `CommandCache` now enforces max-entry budget and stops insertion during hard pressure.
+- Memory sampling entry point is `Watch-MemoryGovernor` (approved verb).

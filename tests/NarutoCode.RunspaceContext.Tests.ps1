@@ -298,6 +298,64 @@ Describe 'Svn gateway in-flight dedup' {
     }
 }
 
+Describe 'Svn gateway command cache budget' {
+    BeforeEach {
+        $script:origInvokeSvnCommandCoreBudget = (Get-Item function:Invoke-SvnCommandCore).ScriptBlock
+        $script:gatewayBudgetExecutionCount = 0
+        Set-Item -Path function:Invoke-SvnCommandCore -Value {
+            param(
+                [hashtable]$Context,
+                [string[]]$Arguments,
+                [string]$ErrorContext
+            )
+            [void]$Context
+            [void]$ErrorContext
+            $script:gatewayBudgetExecutionCount++
+            return ('gateway-budget:' + ($Arguments -join ' '))
+        }
+    }
+
+    AfterEach {
+        Set-Item -Path function:Invoke-SvnCommandCore -Value $script:origInvokeSvnCommandCoreBudget
+    }
+
+    It 'does not grow command cache beyond configured max entries' {
+        $context = New-NarutoContext -SvnExecutable 'svn'
+        $context = Initialize-StrictModeContext -Context $context
+        $context.Constants.SvnGatewayCommandCacheMaxEntries = 1
+
+        $first = Invoke-SvnGatewayCommand -Context $context -Arguments @('log', '--xml', 'https://example.invalid/svn/repo/trunk/A.cs') -ErrorContext 'gateway cache budget test'
+        $second = Invoke-SvnGatewayCommand -Context $context -Arguments @('log', '--xml', 'https://example.invalid/svn/repo/trunk/B.cs') -ErrorContext 'gateway cache budget test'
+        $third = Invoke-SvnGatewayCommand -Context $context -Arguments @('log', '--xml', 'https://example.invalid/svn/repo/trunk/B.cs') -ErrorContext 'gateway cache budget test'
+
+        $gateway = Get-ContextSvnGatewayState -Context $context
+
+        $first | Should -Not -BeNullOrEmpty
+        $second | Should -Be $third
+        [int]$gateway.SourceCommandCount | Should -Be 3
+        [int]$gateway.CommandCache.Count | Should -Be 1
+        [int]$gateway.CommandCacheInsertSkippedCount | Should -BeGreaterOrEqual 2
+    }
+
+    It 'stops command cache insertions during hard memory pressure' {
+        $context = New-NarutoContext -SvnExecutable 'svn'
+        $context = Initialize-StrictModeContext -Context $context
+        $context.Runtime.MemoryGovernor = @{
+            CurrentLevel = 'Hard'
+        }
+
+        $resultA = Invoke-SvnGatewayCommand -Context $context -Arguments @('log', '--xml', 'https://example.invalid/svn/repo/trunk/C.cs') -ErrorContext 'gateway hard pressure test'
+        $resultB = Invoke-SvnGatewayCommand -Context $context -Arguments @('log', '--xml', 'https://example.invalid/svn/repo/trunk/C.cs') -ErrorContext 'gateway hard pressure test'
+
+        $gateway = Get-ContextSvnGatewayState -Context $context
+
+        $resultA | Should -Be $resultB
+        [int]$gateway.SourceCommandCount | Should -Be 2
+        [int]$gateway.CommandCache.Count | Should -Be 0
+        [int]$gateway.CommandCacheInsertSkippedCount | Should -BeGreaterOrEqual 2
+    }
+}
+
 Describe 'Pipeline DAG guard' {
     It 'throws INTERNAL_DAG_CYCLE_DETECTED on cyclic dependencies' {
         $context = New-NarutoContext -SvnExecutable 'svn'
@@ -499,9 +557,9 @@ Describe 'Memory governor pressure streak' {
         $governor.HardLimitBytes = 1L
         $baselinePurgeCount = [int]$governor.CachePurgeCount
 
-        [void](Observe-MemoryGovernor -Context $context -Reason 'hard-1')
-        [void](Observe-MemoryGovernor -Context $context -Reason 'hard-2')
-        [void](Observe-MemoryGovernor -Context $context -Reason 'hard-3')
+        [void](Watch-MemoryGovernor -Context $context -Reason 'hard-1')
+        [void](Watch-MemoryGovernor -Context $context -Reason 'hard-2')
+        [void](Watch-MemoryGovernor -Context $context -Reason 'hard-3')
 
         [string]$governor.CurrentLevel | Should -Be 'Hard'
         [int]$governor.HardStreak | Should -BeGreaterOrEqual 3

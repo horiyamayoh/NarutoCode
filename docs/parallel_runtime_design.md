@@ -80,7 +80,7 @@
 
 | Step | 状態 | Broker化 | Gateway融合対応 | 決定性テスト | 性能計測日 | 備考 |
 |---|---|---|---|---|---|---|
-| Step 2/3: Log+Diff | Done | Done | Done | Done | 2026-02-14 | Diff prefetch を登録/待機/還元に移行 |
+| Step 2/3: Log+Diff | Done | Done | Done | Done | 2026-02-14 | Diff prefetch をコミット順バッチ streaming 還元に移行 |
 | Step 4: Aggregation | Done | N/A | N/A | Done | 2026-02-14 | 純計算フェーズのため SVN I/O なし。4 DAG ノード（committer/file/coupling/commit）に分割し並列実行 |
 | Step 5: Strict Attribution | Done | Done | Done | Done | 2026-02-14 | 遷移計画と preloaded blame の二相実行へ移行 |
 | Step 6: CSV | Done | N/A | N/A | Done | 2026-02-14 | 成果物単位（committers/files/commits/couplings/kill_matrix）ノードへ分解 |
@@ -116,6 +116,12 @@
   - stores `CommitCount` into `Runtime.DerivedMeta`
   - releases `StageResults['step3_diff']`
   - clears strict memory caches and gateway command cache
+- Step3 diff integration:
+  - `Initialize-CommitDiffData` processes commits in order with bounded prefetch batches
+  - only batch-local `rawDiffByRevision` is retained, then released
+- SvnGateway command cache policy:
+  - max-entry budget (`SvnGatewayCommandCacheMaxEntries`) is enforced
+  - insertion is suspended during `Hard` memory pressure
 - `run_meta.json` now records:
   - `PeakPrivateMemoryMB`, `PeakWorkingSetMB`
   - `MemoryPressureSoftCount`, `MemoryPressureHardCount`

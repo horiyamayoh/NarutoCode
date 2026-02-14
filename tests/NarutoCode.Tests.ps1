@@ -2404,6 +2404,111 @@ Describe 'Initialize-CommitDiffData skip non-target commit' {
     }
 }
 
+Describe 'Initialize-CommitDiffData streaming batch' {
+    BeforeEach {
+        $script:origInvokeCommitDiffPrefetchBatch = (Get-Item function:Invoke-CommitDiffPrefetch).ScriptBlock
+        $script:origMergeCommitDiffForCommitBatch = (Get-Item function:Merge-CommitDiffForCommit).ScriptBlock
+        $script:origCompleteCommitDiffForCommitBatch = (Get-Item function:Complete-CommitDiffForCommit).ScriptBlock
+    }
+
+    AfterEach {
+        Set-Item -Path function:Invoke-CommitDiffPrefetch -Value $script:origInvokeCommitDiffPrefetchBatch
+        Set-Item -Path function:Merge-CommitDiffForCommit -Value $script:origMergeCommitDiffForCommitBatch
+        Set-Item -Path function:Complete-CommitDiffForCommit -Value $script:origCompleteCommitDiffForCommitBatch
+    }
+
+    It 'processes commit diffs in batches while preserving commit order' {
+        $context = New-NarutoContext -SvnExecutable 'svn'
+        $context = Initialize-StrictModeContext -Context $context
+        $context.Constants.CommitDiffPrefetchBatchSize = 3
+
+        $script:prefetchBatchSizes = New-Object 'System.Collections.Generic.List[int]'
+        $script:mergedRevisionOrder = New-Object 'System.Collections.Generic.List[int]'
+
+        Set-Item -Path function:Invoke-CommitDiffPrefetch -Value {
+            param(
+                [hashtable]$Context,
+                [object[]]$PrefetchItems,
+                [int]$Parallel
+            )
+            [void]$Context
+            [void]$Parallel
+            [void]$script:prefetchBatchSizes.Add(@($PrefetchItems).Count)
+            $mockRawDiffByRevision = @{}
+            foreach ($item in @($PrefetchItems))
+            {
+                $mockRawDiffByRevision[[int]$item.Revision] = @{}
+            }
+            return $mockRawDiffByRevision
+        }
+        Set-Item -Path function:Merge-CommitDiffForCommit -Value {
+            param(
+                [object]$Commit,
+                [hashtable]$RawDiffByRevision,
+                [string[]]$IncludeExtensions,
+                [string[]]$ExcludeExtensions,
+                [string[]]$IncludePathPatterns,
+                [string[]]$ExcludePathPatterns,
+                [string]$LogPathPrefix
+            )
+            [void]$RawDiffByRevision
+            [void]$IncludeExtensions
+            [void]$ExcludeExtensions
+            [void]$IncludePathPatterns
+            [void]$ExcludePathPatterns
+            [void]$LogPathPrefix
+            [void]$script:mergedRevisionOrder.Add([int]$Commit.Revision)
+            $Commit.FileDiffStats = @{}
+            $Commit.FilesChanged = @()
+        }
+        Set-Item -Path function:Complete-CommitDiffForCommit -Value {
+            param(
+                [hashtable]$Context,
+                [object]$Commit,
+                [int]$Revision,
+                [string]$TargetUrl,
+                [string]$CacheDir,
+                [string[]]$DiffArguments
+            )
+            [void]$Context
+            [void]$Commit
+            [void]$Revision
+            [void]$TargetUrl
+            [void]$CacheDir
+            [void]$DiffArguments
+        }
+
+        $commits = New-Object 'System.Collections.Generic.List[object]'
+        for ($rev = 1; $rev -le 10; $rev++)
+        {
+            [void]$commits.Add([pscustomobject]@{
+                    Revision = $rev
+                    Author = 'alice'
+                    Date = [datetime]'2026-01-01T00:00:00Z'
+                    Message = "m$rev"
+                    ChangedPaths = @(
+                        [pscustomobject]@{
+                            Path = "trunk/src/file$rev.cs"
+                            Action = 'M'
+                            CopyFromPath = $null
+                            CopyFromRev = $null
+                            IsDirectory = $false
+                        }
+                    )
+                    ChangedPathsFiltered = @()
+                    FileDiffStats = @{}
+                    FilesChanged = @()
+                })
+        }
+
+        $revToAuthor = Initialize-CommitDiffData -Context $context -Commits @($commits.ToArray()) -CacheDir 'dummy' -TargetUrl 'https://example.invalid/svn/repo' -DiffArguments @('diff') -IncludeExtensions @() -ExcludeExtensions @() -IncludePathPatterns @() -ExcludePathPatterns @() -Parallel 1
+
+        @($script:prefetchBatchSizes.ToArray()) | Should -Be @(3, 3, 3, 1)
+        @($script:mergedRevisionOrder.ToArray()) | Should -Be @(1..10)
+        @($revToAuthor.Keys | Sort-Object) | Should -Be @(1..10)
+    }
+}
+
 Describe 'Blame memory cache' {
     BeforeEach {
         $script:TestContext = Initialize-StrictModeContext -Context $script:TestContext

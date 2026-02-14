@@ -663,6 +663,8 @@ function New-NarutoContext
             CommitMessageMaxLength = 140
             HashTruncateLength = 8
             HeatmapLightTextThreshold = 0.6
+            CommitDiffPrefetchBatchSize = 64
+            SvnGatewayCommandCacheMaxEntries = 4096
 
             # コメント記法プロファイル（組み込み固定）
             # Extensions は小文字比較。LineCommentTokens/BlockCommentPairs/StringLiteralMarkers は字句走査で使用する。
@@ -1686,11 +1688,29 @@ function Get-ContextSvnGatewayState
     Invoke-WithContextLock -Context $Context -Kind 'Gateway' -Action {
         if ($null -eq $Context.Runtime.SvnGateway)
         {
+            $commandCacheMaxEntries = 4096
+            if ($null -ne $Context.Constants -and $Context.Constants.ContainsKey('SvnGatewayCommandCacheMaxEntries'))
+            {
+                try
+                {
+                    $commandCacheMaxEntries = [int]$Context.Constants.SvnGatewayCommandCacheMaxEntries
+                }
+                catch
+                {
+                    $commandCacheMaxEntries = 4096
+                }
+            }
+            if ($commandCacheMaxEntries -lt 1)
+            {
+                $commandCacheMaxEntries = 1
+            }
             $Context.Runtime.SvnGateway = @{
                 CommandCache = (New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::Ordinal))
                 InFlightCommands = (New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::Ordinal))
                 SyncRoot = (Get-ContextSyncRoot -Context $Context -Kind 'Gateway')
                 SourceCommandCount = 0
+                CommandCacheMaxEntries = [int]$commandCacheMaxEntries
+                CommandCacheInsertSkippedCount = 0
             }
         }
         if (-not $Context.Runtime.SvnGateway.ContainsKey('CommandCache') -or $null -eq $Context.Runtime.SvnGateway.CommandCache)
@@ -1722,6 +1742,35 @@ function Get-ContextSvnGatewayState
         if (-not $Context.Runtime.SvnGateway.ContainsKey('SyncRoot') -or $null -eq $Context.Runtime.SvnGateway.SyncRoot)
         {
             $Context.Runtime.SvnGateway.SyncRoot = (Get-ContextSyncRoot -Context $Context -Kind 'Gateway')
+        }
+        if (-not $Context.Runtime.SvnGateway.ContainsKey('CommandCacheMaxEntries'))
+        {
+            $Context.Runtime.SvnGateway.CommandCacheMaxEntries = 4096
+        }
+        $commandCacheMaxEntries = [int]$Context.Runtime.SvnGateway.CommandCacheMaxEntries
+        if ($null -ne $Context.Constants -and $Context.Constants.ContainsKey('SvnGatewayCommandCacheMaxEntries'))
+        {
+            try
+            {
+                $commandCacheMaxEntries = [int]$Context.Constants.SvnGatewayCommandCacheMaxEntries
+            }
+            catch
+            {
+                $commandCacheMaxEntries = [int]$Context.Runtime.SvnGateway.CommandCacheMaxEntries
+            }
+        }
+        if ($commandCacheMaxEntries -lt 1)
+        {
+            $commandCacheMaxEntries = 1
+        }
+        $Context.Runtime.SvnGateway.CommandCacheMaxEntries = [int]$commandCacheMaxEntries
+        if (-not $Context.Runtime.SvnGateway.ContainsKey('CommandCacheInsertSkippedCount'))
+        {
+            $Context.Runtime.SvnGateway.CommandCacheInsertSkippedCount = 0
+        }
+        elseif ($null -eq $Context.Runtime.SvnGateway.CommandCacheInsertSkippedCount)
+        {
+            $Context.Runtime.SvnGateway.CommandCacheInsertSkippedCount = 0
         }
     }
     return $Context.Runtime.SvnGateway
@@ -2318,14 +2367,13 @@ function Invoke-MemoryGovernorEmergencyPurge
     [GC]::WaitForPendingFinalizers()
     [GC]::Collect()
 }
-function Observe-MemoryGovernor
+function Watch-MemoryGovernor
 {
     <#
     .SYNOPSIS
         メモリ観測を行い、圧迫レベルに応じた制御を適用する。
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
-    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseApprovedVerbs', '')]
     [CmdletBinding()]
     [OutputType([string])]
     param(
@@ -2482,7 +2530,7 @@ function Register-MemoryGovernorRequestCompletion
     $governor.RequestCompletionCount = [int]$governor.RequestCompletionCount + 1
     if (([int]$governor.RequestCompletionCount % [int]$ObservationInterval) -eq 0)
     {
-        [void](Observe-MemoryGovernor -Context $Context -Reason 'request-completion')
+        [void](Watch-MemoryGovernor -Context $Context -Reason 'request-completion')
     }
 }
 function New-PipelineRuntime
@@ -2516,7 +2564,7 @@ function New-PipelineRuntime
     $Context.Runtime.PipelineRuntime = $runtime
     $Context.Runtime.RequestBroker = $runtime.RequestBroker
     $Context.Runtime.MemoryGovernor = $runtime.MemoryGovernor
-    [void](Observe-MemoryGovernor -Context $Context -Reason 'runtime-init' -ForceCimRefresh)
+    [void](Watch-MemoryGovernor -Context $Context -Reason 'runtime-init' -ForceCimRefresh)
     return $runtime
 }
 function Set-PipelineStageDuration
@@ -2744,7 +2792,7 @@ function Invoke-PipelineDag
         [Parameter(Mandatory = $true)][hashtable]$Runtime,
         [Parameter(Mandatory = $true)][object[]]$Nodes
     )
-    [void](Observe-MemoryGovernor -Context $Context -Reason 'dag-start')
+    [void](Watch-MemoryGovernor -Context $Context -Reason 'dag-start')
     $nodeMap = @{}
     foreach ($node in @($Nodes))
     {
@@ -2813,21 +2861,21 @@ function Invoke-PipelineDag
         foreach ($node in @($serialNodes.ToArray() | Sort-Object Id))
         {
             $nodeId = [string]$node.Id
-            [void](Observe-MemoryGovernor -Context $Context -Reason ("stage-start:{0}" -f $nodeId))
+            [void](Watch-MemoryGovernor -Context $Context -Reason ("stage-start:{0}" -f $nodeId))
             $stageStartedAt = Get-Date
             $result = & $node.Action
             $stageEndedAt = Get-Date
             $Runtime.StageResults[$nodeId] = $result
             [void]$Runtime.CompletedNodeIds.Add($nodeId)
             Set-PipelineStageDuration -Runtime $Runtime -StageId $nodeId -Seconds ((New-TimeSpan -Start $stageStartedAt -End $stageEndedAt).TotalSeconds)
-            [void](Observe-MemoryGovernor -Context $Context -Reason ("stage-end:{0}" -f $nodeId))
+            [void](Watch-MemoryGovernor -Context $Context -Reason ("stage-end:{0}" -f $nodeId))
         }
 
         $parallelBatch = @($parallelNodes.ToArray() | Sort-Object Id)
         if ($parallelBatch.Count -gt 0)
         {
             $parallelLimit = Get-ContextParallelLimit -Context $Context -Default $Runtime.Parallel
-            [void](Observe-MemoryGovernor -Context $Context -Reason 'parallel-batch-start')
+            [void](Watch-MemoryGovernor -Context $Context -Reason 'parallel-batch-start')
             $parallelItems = New-Object 'System.Collections.Generic.List[object]'
             foreach ($parallelNode in $parallelBatch)
             {
@@ -2875,12 +2923,12 @@ function Invoke-PipelineDag
                 $Runtime.StageResults[$nodeId] = $dagResult.Result
                 [void]$Runtime.CompletedNodeIds.Add($nodeId)
                 Set-PipelineStageDuration -Runtime $Runtime -StageId $nodeId -Seconds ([double]$dagResult.Seconds)
-                [void](Observe-MemoryGovernor -Context $Context -Reason ("stage-end:{0}" -f $nodeId))
+                [void](Watch-MemoryGovernor -Context $Context -Reason ("stage-end:{0}" -f $nodeId))
             }
-            [void](Observe-MemoryGovernor -Context $Context -Reason 'parallel-batch-end')
+            [void](Watch-MemoryGovernor -Context $Context -Reason 'parallel-batch-end')
         }
     }
-    [void](Observe-MemoryGovernor -Context $Context -Reason 'dag-end')
+    [void](Watch-MemoryGovernor -Context $Context -Reason 'dag-end')
     return $Runtime.StageResults
 }
 function Get-NarutoFunctionNameCatalog
@@ -4718,8 +4766,45 @@ function Invoke-SvnGatewayCommand
             Invoke-WithContextLock -Context $Context -Kind 'Gateway' -Action {
                 if ($null -eq $commandError)
                 {
-                    $gatewayState.CommandCache[$commandKey] = $output
                     $gatewayState.SourceCommandCount = [int]$gatewayState.SourceCommandCount + 1
+                    $cacheInsertAllowed = $true
+                    $commandCacheMaxEntries = 4096
+                    if ($gatewayState.ContainsKey('CommandCacheMaxEntries'))
+                    {
+                        try
+                        {
+                            $commandCacheMaxEntries = [int]$gatewayState.CommandCacheMaxEntries
+                        }
+                        catch
+                        {
+                            $commandCacheMaxEntries = 4096
+                        }
+                    }
+                    if ($commandCacheMaxEntries -lt 1)
+                    {
+                        $commandCacheMaxEntries = 1
+                    }
+                    if ([int]$gatewayState.CommandCache.Count -ge [int]$commandCacheMaxEntries)
+                    {
+                        $cacheInsertAllowed = $false
+                    }
+                    $isHardPressure = $false
+                    if ($null -ne $Context.Runtime -and $null -ne $Context.Runtime.MemoryGovernor)
+                    {
+                        $isHardPressure = ([string]$Context.Runtime.MemoryGovernor.CurrentLevel -eq 'Hard')
+                    }
+                    if ($isHardPressure)
+                    {
+                        $cacheInsertAllowed = $false
+                    }
+                    if ($cacheInsertAllowed)
+                    {
+                        $gatewayState.CommandCache[$commandKey] = $output
+                    }
+                    else
+                    {
+                        $gatewayState.CommandCacheInsertSkippedCount = [int]$gatewayState.CommandCacheInsertSkippedCount + 1
+                    }
                     $inFlight.Output = $output
                 }
                 else
@@ -8458,7 +8543,7 @@ function Get-ExactDeathAttribution
     )
     $accumulator = New-StrictAttributionAccumulator
     $transitionPlan = New-StrictTransitionExecutionPlan -Context $Context -Commits $Commits -RevToAuthor $RevToAuthor -FromRevision $FromRevision -ToRevision $ToRevision -RenameMap $RenameMap
-    [void](Observe-MemoryGovernor -Context $Context -Reason 'strict-attribution-start')
+    [void](Watch-MemoryGovernor -Context $Context -Reason 'strict-attribution-start')
     $useCommitWindowMode = Test-UseStrictCommitWindowMode -Context $Context
     $preloadedBlameByKey = @{}
     if (-not $useCommitWindowMode)
@@ -8544,7 +8629,7 @@ function Get-ExactDeathAttribution
         {
             $deathIdx++
         }
-        [void](Observe-MemoryGovernor -Context $Context -Reason ("strict-commit:{0}" -f $revision))
+        [void](Watch-MemoryGovernor -Context $Context -Reason ("strict-commit:{0}" -f $revision))
     }
     Write-Progress -Id 3 -Activity '行単位の帰属解析' -Completed
     try
@@ -13772,6 +13857,53 @@ function Invoke-CommitDiffPrefetch
     }
     return $rawDiffByRevision
 }
+function Get-CommitDiffStreamingBatchSize
+{
+    <#
+    .SYNOPSIS
+        コミット差分 prefetch のバッチ件数を決定する。
+    #>
+    [CmdletBinding()]
+    [OutputType([int])]
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Context,
+        [ValidateRange(1, 128)][int]$Parallel = 1
+    )
+    $batchSize = 64
+    if ($null -ne $Context -and $null -ne $Context.Constants -and $Context.Constants.ContainsKey('CommitDiffPrefetchBatchSize'))
+    {
+        try
+        {
+            $batchSize = [int]$Context.Constants.CommitDiffPrefetchBatchSize
+        }
+        catch
+        {
+            $batchSize = 64
+        }
+    }
+    if ($batchSize -lt 1)
+    {
+        $batchSize = 1
+    }
+    $governor = Get-ContextMemoryGovernor -Context $Context
+    if ($null -ne $governor)
+    {
+        $level = [string]$governor.CurrentLevel
+        if ($level -eq 'Hard')
+        {
+            $batchSize = [Math]::Max(4, [int][Math]::Floor(([double]$batchSize) / 4.0))
+        }
+        elseif ($level -eq 'Soft')
+        {
+            $batchSize = [Math]::Max(8, [int][Math]::Floor(([double]$batchSize) / 2.0))
+        }
+    }
+    if ($batchSize -lt [int]$Parallel)
+    {
+        $batchSize = [int]$Parallel
+    }
+    return [int]$batchSize
+}
 function Merge-CommitDiffForCommit
 {
     <#
@@ -13927,18 +14059,57 @@ function Initialize-CommitDiffData
         [int]$Parallel = 1
     )
     $prefetchPlan = New-CommitDiffPrefetchPlan -Commits $Commits -CacheDir $CacheDir -TargetUrl $TargetUrl -DiffArguments $DiffArguments -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns -LogPathPrefix $LogPathPrefix -ExcludeCommentOnlyLines:$ExcludeCommentOnlyLines
-    $rawDiffByRevision = Invoke-CommitDiffPrefetch -Context $Context -PrefetchItems $prefetchPlan.PrefetchItems -Parallel $Parallel
-
+    $prefetchItemByRevision = @{}
+    foreach ($prefetchItem in @($prefetchPlan.PrefetchItems))
+    {
+        if ($null -eq $prefetchItem)
+        {
+            continue
+        }
+        $prefetchRevision = [int]$prefetchItem.Revision
+        $prefetchItemByRevision[$prefetchRevision] = $prefetchItem
+    }
+    $commitBatchSize = Get-CommitDiffStreamingBatchSize -Context $Context -Parallel $Parallel
     $commitTotal = @($Commits).Count
     $commitIdx = 0
-    foreach ($commit in @($Commits))
+    for ($batchStart = 0; $batchStart -lt $commitTotal; $batchStart += $commitBatchSize)
     {
-        $pct = [Math]::Min(100, [int](($commitIdx / [Math]::Max(1, $commitTotal)) * 100))
-        Write-Progress -Id 2 -Activity 'コミット差分の統合' -Status ('{0}/{1}' -f ($commitIdx + 1), $commitTotal) -PercentComplete $pct
-        $revision = [int]$commit.Revision
-        Merge-CommitDiffForCommit -Commit $commit -RawDiffByRevision $rawDiffByRevision -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns -LogPathPrefix $LogPathPrefix
-        Complete-CommitDiffForCommit -Context $Context -Commit $commit -Revision $revision -TargetUrl $TargetUrl -CacheDir $CacheDir -DiffArguments $DiffArguments
-        $commitIdx++
+        $batchEnd = [Math]::Min(($commitTotal - 1), ($batchStart + $commitBatchSize - 1))
+        $batchPrefetchItems = New-Object 'System.Collections.Generic.List[object]'
+        for ($batchIndex = $batchStart; $batchIndex -le $batchEnd; $batchIndex++)
+        {
+            $batchCommit = $Commits[$batchIndex]
+            if ($null -eq $batchCommit)
+            {
+                continue
+            }
+            $batchRevision = [int]$batchCommit.Revision
+            if ($prefetchItemByRevision.ContainsKey($batchRevision))
+            {
+                [void]$batchPrefetchItems.Add($prefetchItemByRevision[$batchRevision])
+            }
+        }
+
+        $batchRawDiffByRevision = @{}
+        if ($batchPrefetchItems.Count -gt 0)
+        {
+            $batchRawDiffByRevision = Invoke-CommitDiffPrefetch -Context $Context -PrefetchItems @($batchPrefetchItems.ToArray()) -Parallel $Parallel
+        }
+
+        for ($batchIndex = $batchStart; $batchIndex -le $batchEnd; $batchIndex++)
+        {
+            $commit = $Commits[$batchIndex]
+            $pct = [Math]::Min(100, [int](($commitIdx / [Math]::Max(1, $commitTotal)) * 100))
+            Write-Progress -Id 2 -Activity 'コミット差分の統合' -Status ('{0}/{1}' -f ($commitIdx + 1), $commitTotal) -PercentComplete $pct
+            $revision = [int]$commit.Revision
+            Merge-CommitDiffForCommit -Commit $commit -RawDiffByRevision $batchRawDiffByRevision -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns -LogPathPrefix $LogPathPrefix
+            Complete-CommitDiffForCommit -Context $Context -Commit $commit -Revision $revision -TargetUrl $TargetUrl -CacheDir $CacheDir -DiffArguments $DiffArguments
+            $commitIdx++
+        }
+        if ($null -ne $batchRawDiffByRevision)
+        {
+            $batchRawDiffByRevision.Clear()
+        }
     }
     Write-Progress -Id 2 -Activity 'コミット差分の統合' -Completed
     return $prefetchPlan.RevToAuthor
@@ -15600,7 +15771,7 @@ function Invoke-PipelinePostStrictCleanupStage
         $Runtime.DerivedMeta['CommitCount'] = [int]$commitCount
     }
     Invoke-MemoryGovernorPurge -Context $Context -IncludeGatewayCache
-    [void](Observe-MemoryGovernor -Context $Context -Reason 'post-strict-cleanup')
+    [void](Watch-MemoryGovernor -Context $Context -Reason 'post-strict-cleanup')
     return [pscustomobject]@{
         CommitCount = [int]$commitCount
     }
@@ -16199,31 +16370,19 @@ if ($MyInvocation.InvocationName -ne '.')
     {
         if ($null -ne $_.Exception -and $_.Exception -is [System.OutOfMemoryException])
         {
-            if ($null -eq $_.Exception.Data)
+            if (-not $_.Exception.Data.Contains('ErrorCode'))
             {
                 $_.Exception.Data['ErrorCode'] = 'INTERNAL_MEMORY_PRESSURE_EXHAUSTED'
+            }
+            if (-not $_.Exception.Data.Contains('Category'))
+            {
                 $_.Exception.Data['Category'] = 'INTERNAL'
+            }
+            if (-not $_.Exception.Data.Contains('Context'))
+            {
                 $_.Exception.Data['Context'] = @{
                     ExceptionType = 'OutOfMemoryException'
                     Message = [string]$_.Exception.Message
-                }
-            }
-            else
-            {
-                if (-not $_.Exception.Data.Contains('ErrorCode'))
-                {
-                    $_.Exception.Data['ErrorCode'] = 'INTERNAL_MEMORY_PRESSURE_EXHAUSTED'
-                }
-                if (-not $_.Exception.Data.Contains('Category'))
-                {
-                    $_.Exception.Data['Category'] = 'INTERNAL'
-                }
-                if (-not $_.Exception.Data.Contains('Context'))
-                {
-                    $_.Exception.Data['Context'] = @{
-                        ExceptionType = 'OutOfMemoryException'
-                        Message = [string]$_.Exception.Message
-                    }
                 }
             }
         }
