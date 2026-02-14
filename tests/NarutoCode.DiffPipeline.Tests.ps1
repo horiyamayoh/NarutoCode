@@ -7,7 +7,9 @@ BeforeAll {
     $here = Split-Path -Parent $PSCommandPath
     $script:ScriptPath = Join-Path (Join-Path $here '..') 'NarutoCode.ps1'
     . $script:ScriptPath -RepoUrl 'https://example.invalid/repos/proj/trunk' -FromRevision 1 -ToRevision 1
-    Initialize-StrictModeContext
+    $script:TestContext = New-NarutoContext -SvnExecutable 'svn'
+    $script:TestContext = Initialize-StrictModeContext -Context $script:TestContext
+    $PSDefaultParameterValues['*:Context'] = $script:TestContext
 }
 
 Describe 'Diff pipeline refactor' {
@@ -212,7 +214,7 @@ Index: src/new.cs
                 }
             )
 
-            $raw = Invoke-CommitDiffPrefetch -Context $script:NarutoContext -PrefetchItems $prefetchItems -Parallel 1
+            $raw = Invoke-CommitDiffPrefetch -Context $script:TestContext -PrefetchItems $prefetchItems -Parallel 1
 
             $raw.ContainsKey(10) | Should -BeTrue
             @($script:prefetchCatLookups) | Should -Be @('src/old.cs@9', 'src/new.cs@10')
@@ -309,7 +311,7 @@ Index: src/new.cs
                 }
             )
 
-            Invoke-CommitDiffPrefetch -Context $script:NarutoContext -PrefetchItems $prefetchItems -Parallel 1
+            Invoke-CommitDiffPrefetch -Context $script:TestContext -PrefetchItems $prefetchItems -Parallel 1
 
             @($script:replaceCatLookups) | Should -Be @('src/target.cs@9', 'src/target.cs@10')
             $script:replaceLineMaskByPath.ContainsKey('src/target.cs') | Should -BeTrue
@@ -344,7 +346,7 @@ Index: src/new.cs
             $commit.Entropy | Should -Be 1
             $commit.MsgLen | Should -Be $longMessage.Length
             $commit.MessageShort.Contains("`n") | Should -BeFalse
-            $commit.MessageShort.Length | Should -Be ($script:NarutoContext.Constants.CommitMessageMaxLength + 3)
+            $commit.MessageShort.Length | Should -Be ($script:TestContext.Constants.CommitMessageMaxLength + 3)
             $commit.MessageShort.EndsWith('...') | Should -BeTrue
         }
     }
@@ -557,3 +559,9 @@ Index: src/new.cs
         }
     }
 }
+
+
+
+
+
+

@@ -1,4 +1,4 @@
-# NarutoCode
+﻿# NarutoCode
 
 SVN リポジトリの履歴を解析し、コミット品質・変更傾向のメトリクスを生成する PowerShell スクリプトです。
 
@@ -156,3 +156,11 @@ NarutoCode/
 
 `RunTests.ps1` は既定で `Oracle` タグ付きテストを除外します。
 `-RunOracleIntegration` を指定したときだけ、`Oracle` タグ付き統合テストを実行します。
+
+## Breaking change: explicit Context for library-style usage
+
+When dot-sourcing NarutoCode.ps1 and calling functions directly, implicit global context is no longer used.
+
+- Create a context explicitly with New-NarutoContext.
+- Initialize runtime/strict sections with Initialize-StrictModeContext -Context <ctx> when needed.
+- Pass -Context <ctx> explicitly to Context-aware functions.

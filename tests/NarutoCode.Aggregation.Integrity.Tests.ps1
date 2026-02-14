@@ -7,8 +7,10 @@ BeforeAll {
     $here = Split-Path -Parent $PSCommandPath
     $script:ScriptPath = Join-Path (Join-Path $here '..') 'NarutoCode.ps1'
     . $script:ScriptPath -RepoUrl 'https://example.invalid/repos/proj/trunk' -FromRevision 1 -ToRevision 1
-    Initialize-StrictModeContext
-    $script:Headers = Get-MetricHeader -Context $script:NarutoContext
+    $script:TestContext = New-NarutoContext -SvnExecutable 'svn'
+    $script:TestContext = Initialize-StrictModeContext -Context $script:TestContext
+    $PSDefaultParameterValues['*:Context'] = $script:TestContext
+    $script:Headers = Get-MetricHeader -Context $script:TestContext
 
     # region ヘルパー関数
     function New-TestCommit
@@ -981,3 +983,9 @@ Describe 'New-CommitDiffPrefetchPlan with LogPathPrefix' {
         $commits[0].ChangedPathsFiltered[0].Path | Should -Be 'src/Main.cs'
     }
 }
+
+
+
+
+
+

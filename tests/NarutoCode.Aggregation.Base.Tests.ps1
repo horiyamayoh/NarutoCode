@@ -7,9 +7,10 @@ BeforeAll {
     $here = Split-Path -Parent $PSCommandPath
     $script:ScriptPath = Join-Path (Join-Path $here '..') 'NarutoCode.ps1'
     . $script:ScriptPath -RepoUrl 'https://example.invalid/repos/proj/trunk' -FromRevision 1 -ToRevision 1
-    Initialize-StrictModeContext
-
-    $script:Headers = Get-MetricHeader -Context $script:NarutoContext
+    $script:TestContext = New-NarutoContext -SvnExecutable 'svn'
+    $script:TestContext = Initialize-StrictModeContext -Context $script:TestContext
+    $PSDefaultParameterValues['*:Context'] = $script:TestContext
+    $script:Headers = Get-MetricHeader -Context $script:TestContext
 
     $script:BaseCommits = @(
         [pscustomobject]@{
@@ -100,7 +101,7 @@ Describe 'Base aggregation refactor' {
     }
 
     It 'uses shared metric column definitions for headers' {
-        $definitions = Get-MetricColumnDefinitions -Context $script:NarutoContext
+        $definitions = Get-MetricColumnDefinitions -Context $script:TestContext
         ($definitions.Committer -join '|') | Should -Be ($script:Headers.Committer -join '|')
         ($definitions.File -join '|') | Should -Be ($script:Headers.File -join '|')
         ($definitions.Commit -join '|') | Should -Be ($script:Headers.Commit -join '|')
@@ -131,3 +132,9 @@ Describe 'Base aggregation refactor' {
         }
     }
 }
+
+
+
+
+
+

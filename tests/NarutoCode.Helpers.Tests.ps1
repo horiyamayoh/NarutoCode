@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
 Helper function unit tests for refactored pipeline, aggregation, and strict modules.
 #>
@@ -7,7 +7,9 @@ BeforeAll {
     $here = Split-Path -Parent $PSCommandPath
     $script:ScriptPath = Join-Path (Join-Path $here '..') 'NarutoCode.ps1'
     . $script:ScriptPath -RepoUrl 'https://example.invalid/repos/proj/trunk' -FromRevision 1 -ToRevision 1
-    Initialize-StrictModeContext
+    $script:TestContext = New-NarutoContext -SvnExecutable 'svn'
+    $script:TestContext = Initialize-StrictModeContext -Context $script:TestContext
+    $PSDefaultParameterValues['*:Context'] = $script:TestContext
 }
 
 Describe 'Test-StrictHunkRangeOverlap' {
@@ -120,7 +122,7 @@ Describe 'Get-CommitMessageSummary' {
         $longMsg = 'x' * 200
         $result = Get-CommitMessageSummary -Message $longMsg
         $result.Short.EndsWith('...') | Should -BeTrue
-        $result.Short.Length | Should -Be ($script:NarutoContext.Constants.CommitMessageMaxLength + 3)
+        $result.Short.Length | Should -Be ($script:TestContext.Constants.CommitMessageMaxLength + 3)
     }
 
     It 'collapses multi-line messages to single line' {
@@ -421,3 +423,9 @@ Describe 'Set-RenamePairDiffStatCorrection' {
         $commit.FileDiffStats['src/Old.cs'].DeletedLines | Should -Be 0
     }
 }
+
+
+
+
+
+

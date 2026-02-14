@@ -7,7 +7,9 @@ BeforeAll {
     $here = Split-Path -Parent $PSCommandPath
     $script:ScriptPath = Join-Path (Join-Path $here '..') 'NarutoCode.ps1'
     . $script:ScriptPath -RepoUrl 'https://example.invalid/repos/proj/trunk' -FromRevision 1 -ToRevision 1
-    Initialize-StrictModeContext
+    $script:TestContext = New-NarutoContext -SvnExecutable 'svn'
+    $script:TestContext = Initialize-StrictModeContext -Context $script:TestContext
+    $PSDefaultParameterValues['*:Context'] = $script:TestContext
 }
 
 Describe 'ConvertTo-NormalizedExtension' {
@@ -509,23 +511,23 @@ Describe 'NarutoCode.ps1 parameter definition' {
 
 Describe 'Invoke-SvnCommand' {
     It 'returns stdout on success' {
-        $script:NarutoContext.Runtime.SvnExecutable = 'powershell'
+        $script:TestContext.Runtime.SvnExecutable = 'powershell'
         try {
             $text = Invoke-SvnCommand -Arguments @('-NoProfile','-Command','Write-Output hello') -ErrorContext 'test'
             $text.Trim() | Should -Be 'hello'
         }
         finally {
-            $script:NarutoContext.Runtime.SvnExecutable = 'svn'
+            $script:TestContext.Runtime.SvnExecutable = 'svn'
         }
     }
 
     It 'throws on non-zero exit code' {
-        $script:NarutoContext.Runtime.SvnExecutable = 'powershell'
+        $script:TestContext.Runtime.SvnExecutable = 'powershell'
         try {
             { Invoke-SvnCommand -Arguments @('-NoProfile','-Command','exit 1') -ErrorContext 'test fail' } | Should -Throw
         }
         finally {
-            $script:NarutoContext.Runtime.SvnExecutable = 'svn'
+            $script:TestContext.Runtime.SvnExecutable = 'svn'
         }
     }
 }
@@ -1677,6 +1679,12 @@ Describe 'NarutoCode.ps1 execution' {
 
 }
 
+Describe 'Contributor balance removal' {
+    It 'does not export Write-ContributorBalanceChart function' {
+        Get-Command -Name 'Write-ContributorBalanceChart' -ErrorAction SilentlyContinue | Should -BeNullOrEmpty
+    }
+}
+
 # ===== Phase 2 Tests =====
 
 Describe 'ConvertTo-LineHash' {
@@ -1948,7 +1956,7 @@ Describe 'Resolve-PipelineExecutionState' {
         $outDir = Join-Path $env:TEMP ('narutocode_exec_state_' + [guid]::NewGuid().ToString('N'))
         $password = ConvertTo-SecureString -String 'p@ss' -AsPlainText -Force
         try {
-            $state = Resolve-PipelineExecutionState -Context $script:NarutoContext -RepoUrl 'https://example.invalid/repos/proj/trunk' -FromRevision 20 -ToRevision 10 -OutDirectory $outDir -IncludePaths @(' src/* ', 'src/*') -ExcludePaths @(' tmp/* ', 'tmp/*') -IncludeExtensions @('.cs', 'CS') -ExcludeExtensions @(' .bin ', 'BIN') -SvnExecutable 'powershell' -Username 'tester' -Password $password -NonInteractive -TrustServerCert -ExcludeCommentOnlyLines
+            $state = Resolve-PipelineExecutionState -Context $script:TestContext -RepoUrl 'https://example.invalid/repos/proj/trunk' -FromRevision 20 -ToRevision 10 -OutDirectory $outDir -IncludePaths @(' src/* ', 'src/*') -ExcludePaths @(' tmp/* ', 'tmp/*') -IncludeExtensions @('.cs', 'CS') -ExcludeExtensions @(' .bin ', 'BIN') -SvnExecutable 'powershell' -Username 'tester' -Password $password -NonInteractive -TrustServerCert -ExcludeCommentOnlyLines
 
             $state.FromRevision | Should -Be 10
             $state.ToRevision | Should -Be 20
@@ -1964,10 +1972,10 @@ Describe 'Resolve-PipelineExecutionState' {
             $state.IncludeExtensions[0] | Should -Be 'cs'
             $state.ExcludeExtensions.Count | Should -Be 1
             $state.ExcludeExtensions[0] | Should -Be 'bin'
-            $script:NarutoContext.Runtime.SvnGlobalArguments -contains '--username' | Should -BeTrue
-            $script:NarutoContext.Runtime.SvnGlobalArguments -contains 'tester' | Should -BeTrue
-            $script:NarutoContext.Runtime.SvnGlobalArguments -contains '--non-interactive' | Should -BeTrue
-            $script:NarutoContext.Runtime.SvnGlobalArguments -contains '--trust-server-cert' | Should -BeTrue
+            $script:TestContext.Runtime.SvnGlobalArguments -contains '--username' | Should -BeTrue
+            $script:TestContext.Runtime.SvnGlobalArguments -contains 'tester' | Should -BeTrue
+            $script:TestContext.Runtime.SvnGlobalArguments -contains '--non-interactive' | Should -BeTrue
+            $script:TestContext.Runtime.SvnGlobalArguments -contains '--trust-server-cert' | Should -BeTrue
             [bool]$state.ExcludeCommentOnlyLines | Should -BeTrue
             $state.LogPathPrefix | Should -Be 'proj/trunk/'
         }
@@ -2362,7 +2370,8 @@ Describe 'Initialize-CommitDiffData skip non-target commit' {
 
 Describe 'Blame memory cache' {
     BeforeEach {
-        Initialize-StrictModeContext
+        $script:TestContext = Initialize-StrictModeContext -Context $script:TestContext
+    $PSDefaultParameterValues['*:Context'] = $script:TestContext
     }
 
     It 'reuses Get-SvnBlameSummary result without extra svn command call' {
@@ -2412,15 +2421,15 @@ Describe 'Blame memory cache' {
             return $null
         }
 
-        $script:NarutoContext.Runtime.ExcludeCommentOnlyLines = $false
+        $script:TestContext.Runtime.ExcludeCommentOnlyLines = $false
         $off = Get-SvnBlameSummary -Repo 'https://example.invalid/svn/repo' -FilePath 'trunk/src/A.cs' -ToRevision 10 -CacheDir 'dummy'
         $off.Data.LineCountTotal | Should -Be 2
 
-        $script:NarutoContext.Runtime.ExcludeCommentOnlyLines = $true
+        $script:TestContext.Runtime.ExcludeCommentOnlyLines = $true
         $on = Get-SvnBlameSummary -Repo 'https://example.invalid/svn/repo' -FilePath 'trunk/src/A.cs' -ToRevision 10 -CacheDir 'dummy'
         $on.Data.LineCountTotal | Should -Be 1
 
-        $script:NarutoContext.Runtime.ExcludeCommentOnlyLines = $false
+        $script:TestContext.Runtime.ExcludeCommentOnlyLines = $false
         $offAgain = Get-SvnBlameSummary -Repo 'https://example.invalid/svn/repo' -FilePath 'trunk/src/A.cs' -ToRevision 10 -CacheDir 'dummy'
         $offAgain.Data.LineCountTotal | Should -Be 2
         Assert-MockCalled Invoke-SvnCommandAllowMissingTarget -Times 0 -Exactly
@@ -2481,7 +2490,7 @@ Describe 'Get-StrictTransitionComparison fast path' {
         Set-Item -Path function:Get-SvnBlameLine -Value $script:origGetSvnBlameLineFastCmp
         Set-Item -Path function:Compare-BlameOutput -Value $script:origCompareBlameOutputFastCmp
         Set-Item -Path function:Get-CachedOrFetchCatText -Value $script:origGetCachedOrFetchCatTextFastCmp
-        $script:NarutoContext.Runtime.ExcludeCommentOnlyLines = $false
+        $script:TestContext.Runtime.ExcludeCommentOnlyLines = $false
     }
 
     It 'uses add-only fast path without calling Compare-BlameOutput' {
@@ -2517,8 +2526,9 @@ Describe 'Get-StrictTransitionComparison fast path' {
     }
 
     It 'applies comment-only filtering in add-only fast path when option is enabled' {
-        Initialize-StrictModeContext
-        $script:NarutoContext.Runtime.ExcludeCommentOnlyLines = $true
+        $script:TestContext = Initialize-StrictModeContext -Context $script:TestContext
+    $PSDefaultParameterValues['*:Context'] = $script:TestContext
+        $script:TestContext.Runtime.ExcludeCommentOnlyLines = $true
 
         Set-Item -Path function:Get-SvnBlameLine -Value {
             param([string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir)
@@ -2554,7 +2564,7 @@ Describe 'Get-StrictTransitionComparison fast path' {
             TransitionAdded = 2
             TransitionDeleted = 0
         }
-        $cmp = Get-StrictTransitionComparison -Context $script:NarutoContext -TransitionContext $context -TargetUrl 'https://example.invalid/svn/repo' -Revision 10 -CacheDir 'dummy'
+        $cmp = Get-StrictTransitionComparison -Context $script:TestContext -TransitionContext $context -TargetUrl 'https://example.invalid/svn/repo' -Revision 10 -CacheDir 'dummy'
         @($cmp.BornLines).Count | Should -Be 1
         $cmp.BornLines[0].Line.Content | Should -Be 'code line'
     }
@@ -2790,10 +2800,12 @@ Describe 'Update-StrictAttributionMetric parallel consistency' {
             [pscustomobject]@{ '作者' = 'bob'; '生存行数' = $null; '所有行数' = $null; '他者コード変更生存行数' = $null }
         )
 
-        Initialize-StrictModeContext
+        $script:TestContext = Initialize-StrictModeContext -Context $script:TestContext
+    $PSDefaultParameterValues['*:Context'] = $script:TestContext
         Update-StrictAttributionMetric -Commits $commits -RevToAuthor $revToAuthor -TargetUrl 'https://example.invalid/svn/repo' -FromRevision 1 -ToRevision 20 -CacheDir 'dummy' -IncludeExtensions @() -ExcludeExtensions @() -IncludePaths @() -ExcludePaths @() -FileRows $fileRowsSeq -CommitterRows $committerRowsSeq -Parallel 1
 
-        Initialize-StrictModeContext
+        $script:TestContext = Initialize-StrictModeContext -Context $script:TestContext
+    $PSDefaultParameterValues['*:Context'] = $script:TestContext
         Update-StrictAttributionMetric -Commits $commits -RevToAuthor $revToAuthor -TargetUrl 'https://example.invalid/svn/repo' -FromRevision 1 -ToRevision 20 -CacheDir 'dummy' -IncludeExtensions @() -ExcludeExtensions @() -IncludePaths @() -ExcludePaths @() -FileRows $fileRowsPar -CommitterRows $committerRowsPar -Parallel 4
 
         ($fileRowsSeq | ConvertTo-Json -Depth 10 -Compress) | Should -Be ($fileRowsPar | ConvertTo-Json -Depth 10 -Compress)
@@ -2936,15 +2948,17 @@ Describe 'Invoke-StrictBlameCachePrefetch parallel consistency' {
             [pscustomobject]@{ FilePath = 'src/hit-c.cs'; Revision = 11 }
         )
 
-        Initialize-StrictModeContext
+        $script:TestContext = Initialize-StrictModeContext -Context $script:TestContext
+    $PSDefaultParameterValues['*:Context'] = $script:TestContext
         Invoke-StrictBlameCachePrefetch -Targets $targets -TargetUrl 'https://example.invalid/svn/repo' -CacheDir 'dummy' -Parallel 1
-        $seqHits = [int]$script:NarutoContext.Caches.StrictBlameCacheHits
-        $seqMisses = [int]$script:NarutoContext.Caches.StrictBlameCacheMisses
+        $seqHits = [int]$script:TestContext.Caches.StrictBlameCacheHits
+        $seqMisses = [int]$script:TestContext.Caches.StrictBlameCacheMisses
 
-        Initialize-StrictModeContext
+        $script:TestContext = Initialize-StrictModeContext -Context $script:TestContext
+    $PSDefaultParameterValues['*:Context'] = $script:TestContext
         Invoke-StrictBlameCachePrefetch -Targets $targets -TargetUrl 'https://example.invalid/svn/repo' -CacheDir 'dummy' -Parallel 4
-        $parHits = [int]$script:NarutoContext.Caches.StrictBlameCacheHits
-        $parMisses = [int]$script:NarutoContext.Caches.StrictBlameCacheMisses
+        $parHits = [int]$script:TestContext.Caches.StrictBlameCacheHits
+        $parMisses = [int]$script:TestContext.Caches.StrictBlameCacheMisses
 
         $seqHits | Should -Be $parHits
         $seqMisses | Should -Be $parMisses
@@ -3183,7 +3197,7 @@ Describe 'Get-TeamActivityProfileData' {
             }
         )
 
-        $data = @(Get-TeamActivityProfileData -Committers $committers)
+        $data = @(Get-TeamActivityProfileData -Context $script:TestContext -Committers $committers)
         $data.Count | Should -Be 3
         $data[0].Author | Should -Be 'alice'
 
@@ -3220,11 +3234,34 @@ Describe 'Get-TeamActivityProfileData' {
             }
         )
 
-        $data = @(Get-TeamActivityProfileData -Committers $committers)
+        $data = @(Get-TeamActivityProfileData -Context $script:TestContext -Committers $committers)
         $data.Count | Should -Be 1
         $data[0].Author | Should -Be 'valid'
         $data[0].InterventionRate | Should -Be 0.15
         $data[0].OutcomeBalance | Should -Be -0.5
+    }
+
+    It 'clamps overflow intervention rate to 100% and records warning diagnostic' {
+        $script:TestContext.Diagnostics.WarningCount = 0
+        $script:TestContext.Diagnostics.WarningCodes = @{}
+        $script:TestContext.Diagnostics.SkippedOutputs = (New-Object 'System.Collections.Generic.List[object]')
+
+        $committers = @(
+            [pscustomobject]@{
+                '作者' = 'overflow-user'
+                '他者コード変更行数' = 300
+                '他者コード変更生存行数' = 120
+                '総チャーン' = 100
+            }
+        )
+
+        $data = @(Get-TeamActivityProfileData -Context $script:TestContext -Committers $committers 3>$null)
+        $data.Count | Should -Be 1
+        $data[0].RawInterventionRate | Should -Be 3.0
+        $data[0].InterventionRate | Should -Be 1.0
+        $script:TestContext.Diagnostics.WarningCount | Should -Be 1
+        $script:TestContext.Diagnostics.WarningCodes.ContainsKey('OUTPUT_TEAM_ACTIVITY_INTERVENTION_RATE_OVERFLOW') | Should -BeTrue
+        $script:TestContext.Diagnostics.WarningCodes['OUTPUT_TEAM_ACTIVITY_INTERVENTION_RATE_OVERFLOW'] | Should -Be 1
     }
 }
 
@@ -3249,7 +3286,7 @@ Describe 'Write-TeamActivityProfileChart' {
             }
         )
 
-        Write-TeamActivityProfileChart -OutDirectory $script:profileDir -Committers $committers -EncodingName 'UTF8'
+        Write-TeamActivityProfileChart -Context $script:TestContext -OutDirectory $script:profileDir -Committers $committers -EncodingName 'UTF8'
 
         $svgPath = Join-Path $script:profileDir 'team_activity_profile.svg'
         Test-Path $svgPath | Should -BeTrue
@@ -3269,8 +3306,41 @@ Describe 'Write-TeamActivityProfileChart' {
     }
 
     It 'does not create SVG when Committers is empty' {
-        Write-TeamActivityProfileChart -OutDirectory $script:profileDir -Committers @() -EncodingName 'UTF8'
+        Write-TeamActivityProfileChart -Context $script:TestContext -OutDirectory $script:profileDir -Committers @() -EncodingName 'UTF8'
         Test-Path (Join-Path $script:profileDir 'team_activity_profile.svg') | Should -BeFalse
+    }
+
+    It 'uses fixed absolute x-axis ticks and places overflow point at 100%' {
+        $script:TestContext.Diagnostics.WarningCount = 0
+        $script:TestContext.Diagnostics.WarningCodes = @{}
+        $script:TestContext.Diagnostics.SkippedOutputs = (New-Object 'System.Collections.Generic.List[object]')
+
+        $committers = @(
+            [pscustomobject]@{
+                '作者' = 'overflow-user'
+                '他者コード変更行数' = 300
+                '他者コード変更生存行数' = 120
+                '総チャーン' = 100
+            }
+        )
+        Write-TeamActivityProfileChart -Context $script:TestContext -OutDirectory $script:profileDir -Committers $committers -EncodingName 'UTF8' 3>$null
+
+        $svgPath = Join-Path $script:profileDir 'team_activity_profile.svg'
+        Test-Path $svgPath | Should -BeTrue
+        $content = Get-Content -Path $svgPath -Raw -Encoding UTF8
+        $content | Should -Match '0%'
+        $content | Should -Match '25%'
+        $content | Should -Match '50%'
+        $content | Should -Match '75%'
+        $content | Should -Match '100%'
+        $content | Should -Match '介入率\(raw\):300\.0%'
+        $content | Should -Match '介入率\(描画\):100\.0%'
+
+        $plotRight = [double]$script:TestContext.Constants.SvgPlotLeft + [double]$script:TestContext.Constants.SvgPlotWidth
+        $expectedCx = ('<circle cx="{0:F1}"' -f $plotRight)
+        $content | Should -Match ([regex]::Escape($expectedCx))
+
+        $script:TestContext.Diagnostics.WarningCodes.ContainsKey('OUTPUT_TEAM_ACTIVITY_INTERVENTION_RATE_OVERFLOW') | Should -BeTrue
     }
 }
 
@@ -3521,7 +3591,7 @@ Describe 'Write-ProjectCodeFateChart' {
             [pscustomobject]@{ '作者' = 'alice'; '追加行数' = 100; '生存行数' = 80; '自己相殺行数' = 15; '他者差戻行数' = 10 }
         )
 
-        Write-ProjectCodeFateChart -OutDirectory $script:fateDir -Committers $committers -EncodingName 'UTF8'
+        Write-ProjectCodeFateChart -OutDirectory $script:fateDir -Committers $committers -EncodingName 'UTF8' 3>$null
 
         $content = Get-Content -Path (Join-Path $script:fateDir 'project_code_fate.svg') -Raw -Encoding UTF8
         $content | Should -Match '生存'
@@ -3702,67 +3772,6 @@ Describe 'Write-ProjectSummaryDashboard' {
     }
 }
 
-Describe 'Write-ContributorBalanceChart' {
-    BeforeEach {
-        $script:balDir = Join-Path $env:TEMP ('narutocode_bal_' + [guid]::NewGuid().ToString('N'))
-        New-Item -Path $script:balDir -ItemType Directory -Force | Out-Null
-    }
-    AfterEach {
-        Remove-Item -Path $script:balDir -Recurse -Force -ErrorAction SilentlyContinue
-    }
-
-    It 'creates butterfly SVG with bars for each committer' {
-        $committers = @(
-            [pscustomobject]@{ '作者' = 'alice'; '総チャーン' = 400; '生存行数' = 300 }
-            [pscustomobject]@{ '作者' = 'bob'; '総チャーン' = 100; '生存行数' = 20 }
-        )
-
-        Write-ContributorBalanceChart -OutDirectory $script:balDir -Committers $committers -EncodingName 'UTF8'
-
-        $svgPath = Join-Path $script:balDir 'contributor_balance.svg'
-        Test-Path $svgPath | Should -BeTrue
-
-        $content = Get-Content -Path $svgPath -Raw -Encoding UTF8
-        $content | Should -Match '<svg'
-        $content | Should -Match '</svg>'
-        $content | Should -Match '<rect'
-        $content | Should -Match 'alice'
-        $content | Should -Match 'bob'
-        $content | Should -Match '総チャーン'
-        $content | Should -Match '生存行数'
-        $content | Should -Match '投入量'
-        $content | Should -Match '最終成果'
-    }
-
-    It 'respects TopNCount parameter' {
-        $committers = @(
-            [pscustomobject]@{ '作者' = 'alice'; '総チャーン' = 400; '生存行数' = 300 }
-            [pscustomobject]@{ '作者' = 'bob'; '総チャーン' = 100; '生存行数' = 20 }
-            [pscustomobject]@{ '作者' = 'charlie'; '総チャーン' = 50; '生存行数' = 10 }
-        )
-
-        Write-ContributorBalanceChart -OutDirectory $script:balDir -Committers $committers -TopNCount 2 -EncodingName 'UTF8'
-
-        $content = Get-Content -Path (Join-Path $script:balDir 'contributor_balance.svg') -Raw -Encoding UTF8
-        $content | Should -Match 'alice'
-        $content | Should -Match 'bob'
-        $content | Should -Not -Match 'charlie'
-    }
-
-    It 'does not create SVG when Committers is empty' {
-        Write-ContributorBalanceChart -OutDirectory $script:balDir -Committers @() -EncodingName 'UTF8'
-        Test-Path (Join-Path $script:balDir 'contributor_balance.svg') | Should -BeFalse
-    }
-
-    It 'skips committers with zero churn and zero survived' {
-        $committers = @(
-            [pscustomobject]@{ '作者' = 'ghost'; '総チャーン' = 0; '生存行数' = 0 }
-        )
-        Write-ContributorBalanceChart -OutDirectory $script:balDir -Committers $committers -EncodingName 'UTF8'
-        Test-Path (Join-Path $script:balDir 'contributor_balance.svg') | Should -BeFalse
-    }
-}
-
 Describe 'SvnBlameLineMemoryCache eviction at commit boundary' {
     BeforeAll {
         $script:origGetStrictBlamePrefetchTargetEvict = (Get-Item function:Get-StrictBlamePrefetchTarget).ScriptBlock.ToString()
@@ -3779,8 +3788,8 @@ Describe 'SvnBlameLineMemoryCache eviction at commit boundary' {
     }
 
     It 'clears line memory cache after each commit so earlier entries do not persist' {
-        Initialize-StrictModeContext
-
+        $script:TestContext = Initialize-StrictModeContext -Context $script:TestContext
+    $PSDefaultParameterValues['*:Context'] = $script:TestContext
         Set-Item -Path function:Get-StrictBlamePrefetchTarget -Value {
             param([object[]]$Commits, [int]$FromRevision, [int]$ToRevision, [string]$CacheDir)
             return @()
@@ -3848,14 +3857,14 @@ Describe 'SvnBlameLineMemoryCache eviction at commit boundary' {
         # コミット1 (rev10) のキャッシュキーがエビクション済みであること
         $key10 = Get-BlameMemoryCacheKey -Revision 10 -FilePath 'src/file1.cs'
         $key9  = Get-BlameMemoryCacheKey -Revision 9  -FilePath 'src/file1.cs'
-        $script:NarutoContext.Caches.SvnBlameLineMemoryCache.ContainsKey($key10) | Should -BeFalse
-        $script:NarutoContext.Caches.SvnBlameLineMemoryCache.ContainsKey($key9)  | Should -BeFalse
+        $script:TestContext.Caches.SvnBlameLineMemoryCache.ContainsKey($key10) | Should -BeFalse
+        $script:TestContext.Caches.SvnBlameLineMemoryCache.ContainsKey($key9)  | Should -BeFalse
 
         # コミット2 (rev20) のキャッシュも最終コミット処理後にクリアされている
         $key20 = Get-BlameMemoryCacheKey -Revision 20 -FilePath 'src/file2.cs'
         $key19 = Get-BlameMemoryCacheKey -Revision 19 -FilePath 'src/file2.cs'
-        $script:NarutoContext.Caches.SvnBlameLineMemoryCache.ContainsKey($key20) | Should -BeFalse
-        $script:NarutoContext.Caches.SvnBlameLineMemoryCache.ContainsKey($key19) | Should -BeFalse
+        $script:TestContext.Caches.SvnBlameLineMemoryCache.ContainsKey($key20) | Should -BeFalse
+        $script:TestContext.Caches.SvnBlameLineMemoryCache.ContainsKey($key19) | Should -BeFalse
 
         # blame 呼び出し自体は行われていることを確認(キャッシュではなく実際に呼ばれた)
         $blameCallLog.Count | Should -BeGreaterOrEqual 4
@@ -4069,3 +4078,9 @@ Describe 'Resolve-PathByRenameMap - 連鎖解決' {
         $result | Should -Be 'src/a.cpp'
     }
 }
+
+
+
+
+
+

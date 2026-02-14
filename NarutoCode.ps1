@@ -301,6 +301,8 @@ function Get-NarutoErrorInfo
     [OutputType([object])]
     param(
         [Parameter(Mandatory = $true)]
+        [hashtable]$Context,
+        [Parameter(Mandatory = $true)]
         [object]$ErrorInput
     )
     $errorRecord = $null
@@ -359,9 +361,9 @@ function Get-NarutoErrorInfo
     }
     if ($category -eq 'INTERNAL' -and -not [string]::IsNullOrWhiteSpace($errorCode))
     {
-        if ($null -ne $script:NarutoContext -and $script:NarutoContext.ContainsKey('ErrorCatalog') -and $script:NarutoContext.ErrorCatalog.ContainsKey($errorCode))
+        if ($null -ne $Context -and $Context.ContainsKey('ErrorCatalog') -and $Context.ErrorCatalog.ContainsKey($errorCode))
         {
-            $category = [string]$script:NarutoContext.ErrorCatalog[$errorCode]
+            $category = [string]$Context.ErrorCatalog[$errorCode]
         }
     }
     return [pscustomobject]@{
@@ -438,7 +440,7 @@ function Write-NarutoDiagnostic
     #>
     [CmdletBinding()]
     param(
-        [hashtable]$Context = $script:NarutoContext,
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [ValidateSet('Warning', 'Verbose', 'Information')]
         [string]$Level,
         [string]$ErrorCode = '',
@@ -596,6 +598,8 @@ function New-NarutoContext
             OUTPUT_PLANTUML_NO_DATA = 'OUTPUT'
             OUTPUT_VISUALIZATION_SKIPPED = 'OUTPUT'
             OUTPUT_VISUALIZATION_WRITTEN = 'OUTPUT'
+            OUTPUT_TEAM_ACTIVITY_INTERVENTION_RATE_OVERFLOW = 'OUTPUT'
+            OUTPUT_METRIC_BREAKDOWN_OVERFLOW = 'OUTPUT'
             OUTPUT_NO_DATA = 'OUTPUT'
             INTERNAL_UNEXPECTED_ERROR = 'INTERNAL'
         }
@@ -897,7 +901,7 @@ function Get-RunspaceNarutoContext
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     [OutputType([hashtable])]
-    param([hashtable]$Context = $script:NarutoContext)
+    param([Parameter(Mandatory = $true)][hashtable]$Context)
     $runtimeState = Get-NarutoContextRuntimeState -Context $Context
     $runspaceContext = New-NarutoContext -SvnExecutable $runtimeState.SvnExecutable -SvnGlobalArguments $runtimeState.SvnGlobalArguments
     $runspaceContext.Runtime.ExcludeCommentOnlyLines = [bool]$runtimeState.ExcludeCommentOnlyLines
@@ -915,7 +919,7 @@ function Get-NarutoContextRuntimeState
     #>
     [CmdletBinding()]
     [OutputType([object])]
-    param([hashtable]$Context = $script:NarutoContext)
+    param([Parameter(Mandatory = $true)][hashtable]$Context)
     $runtimeSvnExecutable = 'svn'
     $runtimeSvnGlobalArguments = @()
     $runtimeExcludeCommentOnlyLines = $false
@@ -978,8 +982,6 @@ function Copy-NarutoContextSection
         $targetSection[$key] = $value
     }
 }
-$script:NarutoContext = New-NarutoContext -SvnExecutable $SvnExecutable
-
 # region 初期化
 function Initialize-StrictModeContext
 {
@@ -987,10 +989,11 @@ function Initialize-StrictModeContext
     .SYNOPSIS
         Strict モード実行に必要なスクリプト状態を初期化する。
     #>
-    param([hashtable]$Context = $script:NarutoContext)
+    param([Parameter(Mandatory = $true)][hashtable]$Context)
     $runtimeState = Get-NarutoContextRuntimeState -Context $Context
-    $script:NarutoContext = New-NarutoContext -SvnExecutable $runtimeState.SvnExecutable -SvnGlobalArguments $runtimeState.SvnGlobalArguments
-    $script:NarutoContext.Runtime.ExcludeCommentOnlyLines = [bool]$runtimeState.ExcludeCommentOnlyLines
+    $normalizedContext = New-NarutoContext -SvnExecutable $runtimeState.SvnExecutable -SvnGlobalArguments $runtimeState.SvnGlobalArguments
+    $normalizedContext.Runtime.ExcludeCommentOnlyLines = [bool]$runtimeState.ExcludeCommentOnlyLines
+    return $normalizedContext
 }
 function Get-ContextRuntimeSwitchValue
 {
@@ -1001,7 +1004,7 @@ function Get-ContextRuntimeSwitchValue
     [CmdletBinding()]
     [OutputType([bool])]
     param(
-        [hashtable]$Context = $script:NarutoContext,
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [string]$PropertyName,
         [bool]$Default = $false
     )
@@ -1697,19 +1700,19 @@ function Invoke-ParallelWork
     {
         $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry([string]$key, $SessionVariables[$key], ("Injected for {0}" -f $ErrorContext))))
     }
+    # Context が SessionVariables に含まれている場合、Runspace 内で Mandatory な -Context パラメータが
+    # 対話的プロンプトでハングすることを防止するため $PSDefaultParameterValues を注入する。
+    if ($SessionVariables.ContainsKey('Context'))
+    {
+        $contextDefaultParams = @{ '*:Context' = $SessionVariables['Context'] }
+        $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry('PSDefaultParameterValues', $contextDefaultParams, ("Default Context for {0}" -f $ErrorContext))))
+    }
 
     $workerText = $WorkerScript.ToString()
     $invokeScript = @'
 param([string]$WorkerText, [object]$Item, [int]$Index)
 try
 {
-    # SessionVariables 経由で注入された $NarutoContext を $script:NarutoContext へ転写する。
-    # これにより Runspace 内の全関数が既定パラメータ $Context = $script:NarutoContext を
-    # 正しく解決できるようになる。
-    if ($null -ne $NarutoContext)
-    {
-        $script:NarutoContext = $NarutoContext
-    }
     $worker = [scriptblock]::Create($WorkerText)
     $result = & $worker -Item $Item -Index $Index
     [pscustomobject]@{
@@ -1807,7 +1810,7 @@ function Get-Sha1Hex
         SHA1CryptoServiceProvider.ComputeHash はスレッドセーフでないため
         インスタンス共有は単一スレッド内に限定する。
     #>
-    param( [hashtable]$Context = $script:NarutoContext, [string]$Text)
+    param( [Parameter(Mandatory = $true)][hashtable]$Context, [string]$Text)
     if ($null -eq $Text)
     {
         $Text = ''
@@ -1847,7 +1850,7 @@ function Get-PathCacheHash
     .SYNOPSIS
         パス文字列からキャッシュファイル名用ハッシュを生成する。
     #>
-    param([hashtable]$Context = $script:NarutoContext, [string]$FilePath)
+    param([Parameter(Mandatory = $true)][hashtable]$Context, [string]$FilePath)
     return Get-Sha1Hex -Context $Context -Text (ConvertTo-PathKey -Path $FilePath)
 }
 function Get-BlameCachePath
@@ -1862,9 +1865,14 @@ function Get-BlameCachePath
     .PARAMETER FilePath
         処理対象のファイルパスを指定する。
     #>
-    param([string]$CacheDir, [int]$Revision, [string]$FilePath)
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Context,
+        [string]$CacheDir,
+        [int]$Revision,
+        [string]$FilePath
+    )
     $dir = Join-Path (Join-Path $CacheDir 'blame') ("r{0}" -f $Revision)
-    return Join-Path $dir ((Get-PathCacheHash -FilePath $FilePath) + '.xml')
+    return Join-Path $dir ((Get-PathCacheHash -Context $Context -FilePath $FilePath) + '.xml')
 }
 function Get-CatCachePath
 {
@@ -1878,9 +1886,14 @@ function Get-CatCachePath
     .PARAMETER FilePath
         処理対象のファイルパスを指定する。
     #>
-    param([string]$CacheDir, [int]$Revision, [string]$FilePath)
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Context,
+        [string]$CacheDir,
+        [int]$Revision,
+        [string]$FilePath
+    )
     $dir = Join-Path (Join-Path $CacheDir 'cat') ("r{0}" -f $Revision)
-    return Join-Path $dir ((Get-PathCacheHash -FilePath $FilePath) + '.txt')
+    return Join-Path $dir ((Get-PathCacheHash -Context $Context -FilePath $FilePath) + '.txt')
 }
 function Test-BlameCacheFileExistence
 {
@@ -1898,12 +1911,17 @@ function Test-BlameCacheFileExistence
     .PARAMETER FilePath
         処理対象のファイルパスを指定する。
     #>
-    param([string]$CacheDir, [int]$Revision, [string]$FilePath)
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Context,
+        [string]$CacheDir,
+        [int]$Revision,
+        [string]$FilePath
+    )
     if ([string]::IsNullOrWhiteSpace($CacheDir))
     {
         return $false
     }
-    $path = Get-BlameCachePath -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
+    $path = Get-BlameCachePath -Context $Context -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
     return [System.IO.File]::Exists($path)
 }
 function Test-CatCacheFileExistence
@@ -1922,12 +1940,17 @@ function Test-CatCacheFileExistence
     .PARAMETER FilePath
         処理対象のファイルパスを指定する。
     #>
-    param([string]$CacheDir, [int]$Revision, [string]$FilePath)
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Context,
+        [string]$CacheDir,
+        [int]$Revision,
+        [string]$FilePath
+    )
     if ([string]::IsNullOrWhiteSpace($CacheDir))
     {
         return $false
     }
-    $path = Get-CatCachePath -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
+    $path = Get-CatCachePath -Context $Context -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
     return [System.IO.File]::Exists($path)
 }
 function Get-BlameMemoryCacheKey
@@ -1961,12 +1984,17 @@ function Read-BlameCacheFile
     .PARAMETER FilePath
         処理対象のファイルパスを指定する。
     #>
-    param([string]$CacheDir, [int]$Revision, [string]$FilePath)
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Context,
+        [string]$CacheDir,
+        [int]$Revision,
+        [string]$FilePath
+    )
     if ([string]::IsNullOrWhiteSpace($CacheDir))
     {
         return $null
     }
-    $path = Get-BlameCachePath -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
+    $path = Get-BlameCachePath -Context $Context -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
     if (-not [System.IO.File]::Exists($path))
     {
         return $null
@@ -1987,12 +2015,18 @@ function Write-BlameCacheFile
     .PARAMETER Content
         解析対象のテキスト入力を指定する。
     #>
-    param([string]$CacheDir, [int]$Revision, [string]$FilePath, [string]$Content)
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Context,
+        [string]$CacheDir,
+        [int]$Revision,
+        [string]$FilePath,
+        [string]$Content
+    )
     if ([string]::IsNullOrWhiteSpace($CacheDir))
     {
         return
     }
-    $path = Get-BlameCachePath -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
+    $path = Get-BlameCachePath -Context $Context -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
     $dir = [System.IO.Path]::GetDirectoryName($path)
     if (-not [System.IO.Directory]::Exists($dir))
     {
@@ -2012,12 +2046,17 @@ function Read-CatCacheFile
     .PARAMETER FilePath
         処理対象のファイルパスを指定する。
     #>
-    param([string]$CacheDir, [int]$Revision, [string]$FilePath)
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Context,
+        [string]$CacheDir,
+        [int]$Revision,
+        [string]$FilePath
+    )
     if ([string]::IsNullOrWhiteSpace($CacheDir))
     {
         return $null
     }
-    $path = Get-CatCachePath -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
+    $path = Get-CatCachePath -Context $Context -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
     if (-not [System.IO.File]::Exists($path))
     {
         return $null
@@ -2038,12 +2077,18 @@ function Write-CatCacheFile
     .PARAMETER Content
         解析対象のテキスト入力を指定する。
     #>
-    param([string]$CacheDir, [int]$Revision, [string]$FilePath, [string]$Content)
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Context,
+        [string]$CacheDir,
+        [int]$Revision,
+        [string]$FilePath,
+        [string]$Content
+    )
     if ([string]::IsNullOrWhiteSpace($CacheDir))
     {
         return
     }
-    $path = Get-CatCachePath -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
+    $path = Get-CatCachePath -Context $Context -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
     $dir = [System.IO.Path]::GetDirectoryName($path)
     if (-not [System.IO.Directory]::Exists($dir))
     {
@@ -2082,7 +2127,7 @@ function Get-CommentSyntaxProfileByPath
     [CmdletBinding()]
     [OutputType([object])]
     param(
-        [hashtable]$Context = $script:NarutoContext,
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [string]$FilePath
     )
     $pathKey = ConvertTo-PathKey -Path $FilePath
@@ -2487,7 +2532,7 @@ function Get-CachedOrFetchCatText
     [CmdletBinding()]
     [OutputType([string])]
     param(
-        [hashtable]$Context = $script:NarutoContext,
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [string]$Repo,
         [string]$FilePath,
         [int]$Revision,
@@ -2497,7 +2542,7 @@ function Get-CachedOrFetchCatText
     {
         return $null
     }
-    $catText = Read-CatCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
+    $catText = Read-CatCacheFile -Context $Context -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
     if ($null -ne $catText)
     {
         return $catText
@@ -2522,7 +2567,7 @@ function Get-CachedOrFetchCatText
     $catText = [string]$catFetchResult.Data
     if ($null -ne $catText)
     {
-        Write-CatCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath -Content $catText
+        Write-CatCacheFile -Context $Context -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath -Content $catText
     }
     return $catText
 }
@@ -2532,7 +2577,7 @@ function Resolve-PathByRenameMap
     .SYNOPSIS
         リネーム履歴をたどって最新側の論理パスへ解決する。
     #>
-    param( [hashtable]$Context = $script:NarutoContext, [string]$FilePath, [hashtable]$RenameMap)
+    param( [Parameter(Mandatory = $true)][hashtable]$Context, [string]$FilePath, [hashtable]$RenameMap)
     $resolved = ConvertTo-PathKey -Path $FilePath
     if ($null -eq $RenameMap -or -not $resolved)
     {
@@ -2572,7 +2617,7 @@ function Get-AllRepositoryFile
     [CmdletBinding()]
     [OutputType([object[]])]
     param(
-        [hashtable]$Context = $script:NarutoContext,
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [string]$TargetUrl,
         [int]$Revision,
         [string[]]$IncludeExtensions,
@@ -2772,7 +2817,7 @@ function Invoke-SvnCommand
     .SYNOPSIS
         SVN コマンドを実行して標準出力と失敗情報を統一処理する。
     #>
-    [CmdletBinding()]param( [hashtable]$Context = $script:NarutoContext, [string[]]$Arguments, [string]$ErrorContext = 'SVN command')
+    [CmdletBinding()]param( [Parameter(Mandatory = $true)][hashtable]$Context, [string[]]$Arguments, [string]$ErrorContext = 'SVN command')
     $all = New-Object 'System.Collections.Generic.List[string]'
     foreach ($a in $Arguments)
     {
@@ -2849,7 +2894,7 @@ function Invoke-SvnCommandAllowMissingTarget
     .SYNOPSIS
         対象不存在を Skipped として返す SVN コマンド実行。
     #>
-    [CmdletBinding()]param([hashtable]$Context = $script:NarutoContext, [string[]]$Arguments, [string]$ErrorContext = 'SVN command')
+    [CmdletBinding()]param([Parameter(Mandatory = $true)][hashtable]$Context, [string[]]$Arguments, [string]$ErrorContext = 'SVN command')
     try
     {
         $out = Invoke-SvnCommand -Context $Context -Arguments $Arguments -ErrorContext $ErrorContext
@@ -2931,7 +2976,7 @@ function Resolve-SvnTargetUrl
     .SYNOPSIS
         入力 URL を SVN 実行用の正規化ターゲットに確定する。
     #>
-    param([hashtable]$Context = $script:NarutoContext, [string]$Target)
+    param([Parameter(Mandatory = $true)][hashtable]$Context, [string]$Target)
     if (-not ($Target -match '^(https?|svn|file)://'))
     {
         Throw-NarutoError -Category 'INPUT' -ErrorCode 'INPUT_INVALID_REPO_URL' -Message ("RepoUrl は svn URL 形式で指定してください: '{0}'" -f $Target) -Context @{
@@ -2965,7 +3010,7 @@ function Get-SvnLogPathPrefix
     #>
     [CmdletBinding()]
     [OutputType([string])]
-    param([hashtable]$Context = $script:NarutoContext, [string]$TargetUrl)
+    param([Parameter(Mandatory = $true)][hashtable]$Context, [string]$TargetUrl)
     $xml = ConvertFrom-SvnXmlText -Text (Invoke-SvnCommand -Context $Context -Arguments @('info', '--xml', $TargetUrl) -ErrorContext 'svn info (prefix)') -ContextLabel 'svn info (prefix)'
     $url = [string]$xml.info.entry.url
     $rootNode = $xml.info.entry.SelectSingleNode('repository/root')
@@ -3176,7 +3221,7 @@ function ConvertTo-LineHash
     .DESCRIPTION
         空白を正規化したうえでファイルパスと結合し、Get-Sha1Hex でハッシュ化する。
     #>
-    param([hashtable]$Context = $script:NarutoContext, [string]$FilePath, [string]$Content)
+    param([Parameter(Mandatory = $true)][hashtable]$Context, [string]$FilePath, [string]$Content)
     $norm = $Content -replace '\s+', ' '
     $norm = $norm.Trim()
     $raw = $FilePath + [char]0 + $norm
@@ -3196,7 +3241,7 @@ function ConvertTo-ContextHash
     .PARAMETER K
         K の値を指定する。
     #>
-    param( [hashtable]$Context = $script:NarutoContext, [string]$FilePath, [string[]]$ContextLines, [int]$K = $Context.Constants.ContextHashNeighborK)
+    param( [Parameter(Mandatory = $true)][hashtable]$Context, [string]$FilePath, [string[]]$ContextLines, [int]$K = $Context.Constants.ContextHashNeighborK)
     $first = @()
     $last = @()
     if ($ContextLines -and $ContextLines.Count -gt 0)
@@ -3366,11 +3411,13 @@ function New-SvnUnifiedDiffParseState
     [CmdletBinding()]
     [OutputType([hashtable])]
     param(
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [int]$DetailLevel = 0,
         [switch]$ExcludeCommentOnlyLines,
         [hashtable]$LineMaskByPath = @{}
     )
     return @{
+        Context = $Context
         Result = @{}
         DetailLevel = $DetailLevel
         ExcludeCommentOnlyLines = [bool]$ExcludeCommentOnlyLines
@@ -3472,7 +3519,7 @@ function Complete-SvnUnifiedDiffCurrentHunk
     {
         $deletedHashes = @($ParseState.HunkDeletedHashes.ToArray())
     }
-    $ParseState.CurrentHunk.ContextHash = ConvertTo-ContextHash -FilePath $ParseState.CurrentFile -ContextLines $contextLines
+    $ParseState.CurrentHunk.ContextHash = ConvertTo-ContextHash -Context $ParseState.Context -FilePath $ParseState.CurrentFile -ContextLines $contextLines
     $ParseState.CurrentHunk.AddedLineHashes = $addedHashes
     $ParseState.CurrentHunk.DeletedLineHashes = $deletedHashes
 }
@@ -3643,7 +3690,7 @@ function Update-SvnUnifiedDiffLineStat
             if ($ParseState.DetailLevel -ge 1 -and $null -ne $ParseState.CurrentFile)
             {
                 $content = $Line.Substring(1)
-                $hashValue = ConvertTo-LineHash -FilePath $ParseState.CurrentFile -Content $content
+                $hashValue = ConvertTo-LineHash -Context $ParseState.Context -FilePath $ParseState.CurrentFile -Content $content
                 $ParseState.Current.AddedLineHashes.Add($hashValue)
                 if ($null -ne $ParseState.HunkAddedHashes)
                 {
@@ -3688,7 +3735,7 @@ function Update-SvnUnifiedDiffLineStat
             if ($ParseState.DetailLevel -ge 1 -and $null -ne $ParseState.CurrentFile)
             {
                 $content = $Line.Substring(1)
-                $hashValue = ConvertTo-LineHash -FilePath $ParseState.CurrentFile -Content $content
+                $hashValue = ConvertTo-LineHash -Context $ParseState.Context -FilePath $ParseState.CurrentFile -Content $content
                 $ParseState.Current.DeletedLineHashes.Add($hashValue)
                 if ($null -ne $ParseState.HunkDeletedHashes)
                 {
@@ -3771,6 +3818,7 @@ function ConvertFrom-SvnUnifiedDiff
     [CmdletBinding()]
     [OutputType([hashtable])]
     param(
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [string]$DiffText,
         [int]$DetailLevel = 0,
         [switch]$ExcludeCommentOnlyLines,
@@ -3780,7 +3828,7 @@ function ConvertFrom-SvnUnifiedDiff
     {
         return @{}
     }
-    $parseState = New-SvnUnifiedDiffParseState -DetailLevel $DetailLevel -ExcludeCommentOnlyLines:$ExcludeCommentOnlyLines -LineMaskByPath $LineMaskByPath
+    $parseState = New-SvnUnifiedDiffParseState -Context $Context -DetailLevel $DetailLevel -ExcludeCommentOnlyLines:$ExcludeCommentOnlyLines -LineMaskByPath $LineMaskByPath
     $lines = $DiffText -split "`r?`n"
     foreach ($line in $lines)
     {
@@ -4010,7 +4058,7 @@ function Get-SvnBlameSummary
     #>
     [CmdletBinding()]
     [OutputType([object])]
-    param( [hashtable]$Context = $script:NarutoContext, [string]$Repo, [string]$FilePath, [int]$ToRevision, [string]$CacheDir)
+    param( [Parameter(Mandatory = $true)][hashtable]$Context, [string]$Repo, [string]$FilePath, [int]$ToRevision, [string]$CacheDir)
     # インメモリキャッシュにヒットすればディスク読み込み・XML パースを完全に回避する。
     # 所有権分析フェーズでは同一ファイルに複数回アクセスされるため効果が大きい。
     if ($null -eq $Context.Caches.SvnBlameSummaryMemoryCache)
@@ -4034,7 +4082,7 @@ function Get-SvnBlameSummary
     }
 
     $url = $Repo.TrimEnd('/') + '/' + (ConvertTo-PathKey -Path $FilePath).TrimStart('/') + '@' + [string]$ToRevision
-    $text = Read-BlameCacheFile -CacheDir $CacheDir -Revision $ToRevision -FilePath $FilePath
+    $text = Read-BlameCacheFile -Context $Context -CacheDir $CacheDir -Revision $ToRevision -FilePath $FilePath
     $fetchResult = $null
     if ([string]::IsNullOrWhiteSpace($text))
     {
@@ -4051,7 +4099,7 @@ function Get-SvnBlameSummary
         }
         if (-not [string]::IsNullOrWhiteSpace($text))
         {
-            Write-BlameCacheFile -CacheDir $CacheDir -Revision $ToRevision -FilePath $FilePath -Content $text
+            Write-BlameCacheFile -Context $Context -CacheDir $CacheDir -Revision $ToRevision -FilePath $FilePath -Content $text
         }
     }
     else
@@ -4158,7 +4206,7 @@ function Get-SvnBlameLine
     #>
     [CmdletBinding()]
     [OutputType([object])]
-    param( [hashtable]$Context = $script:NarutoContext, [string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir)
+    param( [Parameter(Mandatory = $true)][hashtable]$Context, [string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir)
     # インメモリキャッシュにヒットすればディスク読み込み (blame XML + cat テキスト) と
     # XML パースを完全に回避する。同一コミット内で同じファイルが複数トランジションから
     # 参照されるケースで効果がある。コミット境界で Clear() されるため無制限には成長しない。
@@ -4176,7 +4224,7 @@ function Get-SvnBlameLine
     $path = (ConvertTo-PathKey -Path $FilePath).TrimStart('/')
     $url = $Repo.TrimEnd('/') + '/' + $path + '@' + [string]$Revision
 
-    $blameXml = Read-BlameCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
+    $blameXml = Read-BlameCacheFile -Context $Context -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
     $blameFetchResult = $null
     if ([string]::IsNullOrWhiteSpace($blameXml))
     {
@@ -4193,7 +4241,7 @@ function Get-SvnBlameLine
         }
         if (-not [string]::IsNullOrWhiteSpace($blameXml))
         {
-            Write-BlameCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath -Content $blameXml
+            Write-BlameCacheFile -Context $Context -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath -Content $blameXml
         }
     }
     else
@@ -4201,7 +4249,7 @@ function Get-SvnBlameLine
         $Context.Caches.StrictBlameCacheHits++
     }
 
-    $catText = Read-CatCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
+    $catText = Read-CatCacheFile -Context $Context -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
     $catFetchResult = $null
     if ($null -eq $catText)
     {
@@ -4217,7 +4265,7 @@ function Get-SvnBlameLine
         }
         if ($null -ne $catText)
         {
-            Write-CatCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath -Content $catText
+            Write-CatCacheFile -Context $Context -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath -Content $catText
         }
     }
     if ([string]::IsNullOrWhiteSpace($blameXml) -or $null -eq $catText)
@@ -4262,7 +4310,7 @@ function Initialize-SvnBlameLineCache
     #>
     [CmdletBinding()]
     [OutputType([object])]
-    param([hashtable]$Context = $script:NarutoContext, [string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir)
+    param([Parameter(Mandatory = $true)][hashtable]$Context, [string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir)
     if ($Revision -le 0 -or [string]::IsNullOrWhiteSpace($FilePath))
     {
         return (New-NarutoResultSkipped -Data ([pscustomobject]@{
@@ -4281,7 +4329,7 @@ function Initialize-SvnBlameLineCache
     $misses = 0
     $skipReason = $null
 
-    $blameXml = Read-BlameCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
+    $blameXml = Read-BlameCacheFile -Context $Context -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
     if ([string]::IsNullOrWhiteSpace($blameXml))
     {
         $misses++
@@ -4298,7 +4346,7 @@ function Initialize-SvnBlameLineCache
         }
         if (-not [string]::IsNullOrWhiteSpace($blameXml))
         {
-            Write-BlameCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath -Content $blameXml
+            Write-BlameCacheFile -Context $Context -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath -Content $blameXml
         }
     }
     else
@@ -4306,7 +4354,7 @@ function Initialize-SvnBlameLineCache
         $hits++
     }
 
-    $catText = Read-CatCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
+    $catText = Read-CatCacheFile -Context $Context -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
     if ($null -eq $catText)
     {
         $misses++
@@ -4326,7 +4374,7 @@ function Initialize-SvnBlameLineCache
         }
         if ($null -ne $catText)
         {
-            Write-CatCacheFile -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath -Content $catText
+            Write-CatCacheFile -Context $Context -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath -Content $catText
         }
     }
     else
@@ -5157,7 +5205,12 @@ function Get-StrictHunkEventsByFile
     #>
     [CmdletBinding()]
     [OutputType([hashtable])]
-    param([object[]]$Commits, [hashtable]$RevToAuthor, [hashtable]$RenameMap)
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Context,
+        [object[]]$Commits,
+        [hashtable]$RevToAuthor,
+        [hashtable]$RenameMap
+    )
     $offsetByFile = @{}
     $eventsByFile = @{}
     foreach ($commit in @($Commits | Sort-Object Revision))
@@ -5187,7 +5240,7 @@ function Get-StrictHunkEventsByFile
             {
                 continue
             }
-            $resolvedPath = Resolve-PathByRenameMap -FilePath $filePath -RenameMap $RenameMap
+            $resolvedPath = Resolve-PathByRenameMap -Context $Context -FilePath $filePath -RenameMap $RenameMap
             if ([string]::IsNullOrWhiteSpace($resolvedPath))
             {
                 continue
@@ -5356,8 +5409,13 @@ function Get-StrictHunkDetail
         RenameMap の値を指定する。
     #>
     [CmdletBinding()]
-    param([object[]]$Commits, [hashtable]$RevToAuthor, [hashtable]$RenameMap)
-    $eventsByFile = Get-StrictHunkEventsByFile -Commits $Commits -RevToAuthor $RevToAuthor -RenameMap $RenameMap
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Context,
+        [object[]]$Commits,
+        [hashtable]$RevToAuthor,
+        [hashtable]$RenameMap
+    )
+    $eventsByFile = Get-StrictHunkEventsByFile -Context $Context -Commits $Commits -RevToAuthor $RevToAuthor -RenameMap $RenameMap
     return (Get-StrictHunkOverlapSummary -EventsByFile $eventsByFile)
 }
 function Get-StrictBlamePrefetchTarget
@@ -5380,6 +5438,7 @@ function Get-StrictBlamePrefetchTarget
     [CmdletBinding()]
     [OutputType([object[]])]
     param(
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [object[]]$Commits,
         [int]$FromRevision,
         [int]$ToRevision,
@@ -5422,8 +5481,8 @@ function Get-StrictBlamePrefetchTarget
                 $key = [string]($rev - 1) + [char]31 + $beforePath
                 if ($seen.Add($key))
                 {
-                    $hasBlameCache = Test-BlameCacheFileExistence -CacheDir $CacheDir -Revision ($rev - 1) -FilePath $beforePath
-                    $hasCatCache = Test-CatCacheFileExistence -CacheDir $CacheDir -Revision ($rev - 1) -FilePath $beforePath
+                    $hasBlameCache = Test-BlameCacheFileExistence -Context $Context -CacheDir $CacheDir -Revision ($rev - 1) -FilePath $beforePath
+                    $hasCatCache = Test-CatCacheFileExistence -Context $Context -CacheDir $CacheDir -Revision ($rev - 1) -FilePath $beforePath
                     if ((-not $hasBlameCache) -or (-not $hasCatCache))
                     {
                         [void]$targets.Add([pscustomobject]@{
@@ -5439,8 +5498,8 @@ function Get-StrictBlamePrefetchTarget
                 $key = [string]$rev + [char]31 + $afterPath
                 if ($seen.Add($key))
                 {
-                    $hasBlameCache = Test-BlameCacheFileExistence -CacheDir $CacheDir -Revision $rev -FilePath $afterPath
-                    $hasCatCache = Test-CatCacheFileExistence -CacheDir $CacheDir -Revision $rev -FilePath $afterPath
+                    $hasBlameCache = Test-BlameCacheFileExistence -Context $Context -CacheDir $CacheDir -Revision $rev -FilePath $afterPath
+                    $hasCatCache = Test-CatCacheFileExistence -Context $Context -CacheDir $CacheDir -Revision $rev -FilePath $afterPath
                     if ((-not $hasBlameCache) -or (-not $hasCatCache))
                     {
                         [void]$targets.Add([pscustomobject]@{
@@ -5473,7 +5532,7 @@ function Invoke-StrictBlameCachePrefetch
         並列実行時の最大ワーカー数を指定する。
     #>
     [CmdletBinding()]
-    param( [hashtable]$Context = $script:NarutoContext,
+    param( [Parameter(Mandatory = $true)][hashtable]$Context,
         [object[]]$Targets,
         [string]$TargetUrl,
         [string]$CacheDir,
@@ -5537,7 +5596,7 @@ function Invoke-StrictBlameCachePrefetch
         [void]$Index # Required by Invoke-ParallelWork contract
         try
         {
-            $statsResult = Initialize-SvnBlameLineCache -Context $NarutoContext -Repo $Item.TargetUrl -FilePath ([string]$Item.FilePath) -Revision ([int]$Item.Revision) -CacheDir $Item.CacheDir
+            $statsResult = Initialize-SvnBlameLineCache -Context $Context -Repo $Item.TargetUrl -FilePath ([string]$Item.FilePath) -Revision ([int]$Item.Revision) -CacheDir $Item.CacheDir
             $statsResult = ConvertTo-NarutoResultAdapter -InputObject $statsResult -SuccessCode 'SVN_BLAME_CACHE_READY' -SkippedCode 'SVN_BLAME_CACHE_INVALID_ARGUMENT'
             $stats = $statsResult.Data
             if ($null -eq $stats)
@@ -5572,7 +5631,7 @@ function Invoke-StrictBlameCachePrefetch
                 'Initialize-SvnBlameLineCache'
             )
         ) -SessionVariables @{
-            NarutoContext = (Get-RunspaceNarutoContext -Context $Context)
+            Context = (Get-RunspaceNarutoContext -Context $Context)
             SvnExecutable = $Context.Runtime.SvnExecutable
             SvnGlobalArguments = @($Context.Runtime.SvnGlobalArguments)
         } -ErrorContext 'strict blame prefetch')
@@ -5622,6 +5681,7 @@ function Resolve-StrictTransitionContext
     [CmdletBinding()]
     [OutputType([object])]
     param(
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [object]$Commit,
         [object]$Transition,
         [hashtable]$RenameMap
@@ -5687,11 +5747,11 @@ function Resolve-StrictTransitionContext
 
     $metricFile = if ($afterPath)
     {
-        Resolve-PathByRenameMap -FilePath $afterPath -RenameMap $RenameMap
+        Resolve-PathByRenameMap -Context $Context -FilePath $afterPath -RenameMap $RenameMap
     }
     else
     {
-        Resolve-PathByRenameMap -FilePath $beforePath -RenameMap $RenameMap
+        Resolve-PathByRenameMap -Context $Context -FilePath $beforePath -RenameMap $RenameMap
     }
 
     return [pscustomobject]@{
@@ -5712,7 +5772,7 @@ function Get-StrictTransitionLineFilterResult
     [CmdletBinding()]
     [OutputType([object[]])]
     param(
-        [hashtable]$Context = $script:NarutoContext,
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [object[]]$Lines,
         [string]$TargetUrl,
         [string]$FilePath,
@@ -5750,7 +5810,7 @@ function Get-StrictTransitionComparison
     [CmdletBinding()]
     [OutputType([object])]
     param(
-        [hashtable]$Context = $script:NarutoContext,
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [object]$TransitionContext,
         [string]$TargetUrl,
         [int]$Revision,
@@ -5772,7 +5832,7 @@ function Get-StrictTransitionComparison
     # 現リビジョンの blame から当該リビジョンで born された行だけを抽出する。
     if ($hasTransitionStat -and $transitionAdded -gt 0 -and $transitionDeleted -eq 0 -and $afterPath)
     {
-        $currBlameResult = Get-SvnBlameLine -Repo $TargetUrl -FilePath $afterPath -Revision $Revision -CacheDir $CacheDir
+        $currBlameResult = Get-SvnBlameLine -Context $Context -Repo $TargetUrl -FilePath $afterPath -Revision $Revision -CacheDir $CacheDir
         $currBlameResult = ConvertTo-NarutoResultAdapter -InputObject $currBlameResult -SuccessCode 'SVN_BLAME_LINE_READY' -SkippedCode 'SVN_BLAME_LINE_EMPTY'
         if (-not (Test-NarutoResultSuccess -Result $currBlameResult))
         {
@@ -5819,7 +5879,7 @@ function Get-StrictTransitionComparison
     # 前リビジョンの全行を killed として扱う。afterPath が null であることが条件。
     if ($hasTransitionStat -and $transitionDeleted -gt 0 -and $transitionAdded -eq 0 -and $beforePath -and (-not $afterPath))
     {
-        $prevBlameResult = Get-SvnBlameLine -Repo $TargetUrl -FilePath $beforePath -Revision ($Revision - 1) -CacheDir $CacheDir
+        $prevBlameResult = Get-SvnBlameLine -Context $Context -Repo $TargetUrl -FilePath $beforePath -Revision ($Revision - 1) -CacheDir $CacheDir
         $prevBlameResult = ConvertTo-NarutoResultAdapter -InputObject $prevBlameResult -SuccessCode 'SVN_BLAME_LINE_READY' -SkippedCode 'SVN_BLAME_LINE_EMPTY'
         if (-not (Test-NarutoResultSuccess -Result $prevBlameResult))
         {
@@ -5852,7 +5912,7 @@ function Get-StrictTransitionComparison
     $prevLines = @()
     if ($beforePath)
     {
-        $prevBlameResult = Get-SvnBlameLine -Repo $TargetUrl -FilePath $beforePath -Revision ($Revision - 1) -CacheDir $CacheDir
+        $prevBlameResult = Get-SvnBlameLine -Context $Context -Repo $TargetUrl -FilePath $beforePath -Revision ($Revision - 1) -CacheDir $CacheDir
         $prevBlameResult = ConvertTo-NarutoResultAdapter -InputObject $prevBlameResult -SuccessCode 'SVN_BLAME_LINE_READY' -SkippedCode 'SVN_BLAME_LINE_EMPTY'
         if (-not (Test-NarutoResultSuccess -Result $prevBlameResult))
         {
@@ -5867,7 +5927,7 @@ function Get-StrictTransitionComparison
     $currLines = @()
     if ($afterPath)
     {
-        $currBlameResult = Get-SvnBlameLine -Repo $TargetUrl -FilePath $afterPath -Revision $Revision -CacheDir $CacheDir
+        $currBlameResult = Get-SvnBlameLine -Context $Context -Repo $TargetUrl -FilePath $afterPath -Revision $Revision -CacheDir $CacheDir
         $currBlameResult = ConvertTo-NarutoResultAdapter -InputObject $currBlameResult -SuccessCode 'SVN_BLAME_LINE_READY' -SkippedCode 'SVN_BLAME_LINE_EMPTY'
         if (-not (Test-NarutoResultSuccess -Result $currBlameResult))
         {
@@ -6046,7 +6106,7 @@ function Invoke-StrictCommitAttribution
     [CmdletBinding()]
     [OutputType([bool])]
     param(
-        [hashtable]$Context = $script:NarutoContext,
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [object]$Accumulator,
         [object]$Commit,
         [hashtable]$RevToAuthor,
@@ -6067,7 +6127,7 @@ function Invoke-StrictCommitAttribution
     {
         try
         {
-            $transitionContext = Resolve-StrictTransitionContext -Commit $Commit -Transition $transition -RenameMap $RenameMap
+            $transitionContext = Resolve-StrictTransitionContext -Context $Context -Commit $Commit -Transition $transition -RenameMap $RenameMap
             if ($null -eq $transitionContext)
             {
                 continue
@@ -6120,7 +6180,7 @@ function Get-ExactDeathAttribution
         並列実行時の最大ワーカー数を指定する。
     #>
     [CmdletBinding()]
-    param( [hashtable]$Context = $script:NarutoContext,
+    param( [Parameter(Mandatory = $true)][hashtable]$Context,
         [object[]]$Commits,
         [hashtable]$RevToAuthor,
         [string]$TargetUrl,
@@ -6131,8 +6191,8 @@ function Get-ExactDeathAttribution
         [int]$Parallel = 1
     )
     $accumulator = New-StrictAttributionAccumulator
-    $prefetchTargets = @(Get-StrictBlamePrefetchTarget -Commits $Commits -FromRevision $FromRevision -ToRevision $ToRevision -CacheDir $CacheDir)
-    Invoke-StrictBlameCachePrefetch -Targets $prefetchTargets -TargetUrl $TargetUrl -CacheDir $CacheDir -Parallel $Parallel
+    $prefetchTargets = @(Get-StrictBlamePrefetchTarget -Context $Context -Commits $Commits -FromRevision $FromRevision -ToRevision $ToRevision -CacheDir $CacheDir)
+    Invoke-StrictBlameCachePrefetch -Context $Context -Targets $prefetchTargets -TargetUrl $TargetUrl -CacheDir $CacheDir -Parallel $Parallel
     $sortedCommits = @($Commits | Sort-Object Revision)
     $deathTotal = $sortedCommits.Count
     $deathIdx = 0
@@ -6149,7 +6209,7 @@ function Get-ExactDeathAttribution
     Write-Progress -Id 3 -Activity '行単位の帰属解析' -Completed
     try
     {
-        $strictHunk = Get-StrictHunkDetail -Commits $Commits -RevToAuthor $RevToAuthor -RenameMap $RenameMap
+        $strictHunk = Get-StrictHunkDetail -Context $Context -Commits $Commits -RevToAuthor $RevToAuthor -RenameMap $RenameMap
     }
     catch
     {
@@ -6198,6 +6258,7 @@ function Update-CommitterMetricState
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     param(
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [hashtable]$States,
         [object]$Commit,
         [hashtable]$RenameMap = @{}
@@ -6231,7 +6292,7 @@ function Update-CommitterMetricState
 
     foreach ($filePath in @($Commit.FilesChanged))
     {
-        $resolvedFilePath = Resolve-PathByRenameMap -FilePath ([string]$filePath) -RenameMap $RenameMap
+        $resolvedFilePath = Resolve-PathByRenameMap -Context $Context -FilePath ([string]$filePath) -RenameMap $RenameMap
         [void]$state.Files.Add($resolvedFilePath)
         $idx = $resolvedFilePath.LastIndexOf('/')
         $dir = if ($idx -lt 0)
@@ -6292,7 +6353,7 @@ function ConvertTo-CommitterMetricRows
     [CmdletBinding()]
     [OutputType([object[]])]
     param(
-        [hashtable]$Context = $script:NarutoContext,
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [hashtable]$States,
         [hashtable]$FileAuthors
     )
@@ -6414,7 +6475,7 @@ function Get-CommitterMetric
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
-    param( [hashtable]$Context = $script:NarutoContext, [object[]]$Commits, [hashtable]$RenameMap = @{})
+    param( [Parameter(Mandatory = $true)][hashtable]$Context, [object[]]$Commits, [hashtable]$RenameMap = @{})
     $states = @{}
     $fileAuthors = @{}
     foreach ($commit in @($Commits))
@@ -6422,7 +6483,7 @@ function Get-CommitterMetric
         $author = [string]$commit.Author
         foreach ($filePath in @($commit.FilesChanged))
         {
-            $resolvedFilePath = Resolve-PathByRenameMap -FilePath ([string]$filePath) -RenameMap $RenameMap
+            $resolvedFilePath = Resolve-PathByRenameMap -Context $Context -FilePath ([string]$filePath) -RenameMap $RenameMap
             if (-not $fileAuthors.ContainsKey($resolvedFilePath))
             {
                 $fileAuthors[$resolvedFilePath] = New-Object 'System.Collections.Generic.HashSet[string]'
@@ -6433,7 +6494,7 @@ function Get-CommitterMetric
 
     foreach ($commit in @($Commits))
     {
-        Update-CommitterMetricState -States $states -Commit $commit -RenameMap $RenameMap
+        Update-CommitterMetricState -Context $Context -States $states -Commit $commit -RenameMap $RenameMap
     }
     $rows = ConvertTo-CommitterMetricRows -Context $Context -States $states -FileAuthors $fileAuthors
     return @($rows | Sort-Object -Property @{Expression = '総チャーン'
@@ -6472,6 +6533,7 @@ function Update-FileMetricState
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     param(
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [hashtable]$States,
         [object]$Commit,
         [hashtable]$RenameMap = @{}
@@ -6480,12 +6542,12 @@ function Update-FileMetricState
     $files = New-Object 'System.Collections.Generic.HashSet[string]'
     foreach ($filePath in @($Commit.FilesChanged))
     {
-        $resolved = Resolve-PathByRenameMap -FilePath ([string]$filePath) -RenameMap $RenameMap
+        $resolved = Resolve-PathByRenameMap -Context $Context -FilePath ([string]$filePath) -RenameMap $RenameMap
         [void]$files.Add($resolved)
     }
     foreach ($pathEntry in @($Commit.ChangedPathsFiltered))
     {
-        $resolved = Resolve-PathByRenameMap -FilePath ([string]$pathEntry.Path) -RenameMap $RenameMap
+        $resolved = Resolve-PathByRenameMap -Context $Context -FilePath ([string]$pathEntry.Path) -RenameMap $RenameMap
         [void]$files.Add($resolved)
     }
     foreach ($file in $files)
@@ -6505,7 +6567,7 @@ function Update-FileMetricState
 
     foreach ($filePath in @($Commit.FilesChanged))
     {
-        $resolvedFilePath = Resolve-PathByRenameMap -FilePath ([string]$filePath) -RenameMap $RenameMap
+        $resolvedFilePath = Resolve-PathByRenameMap -Context $Context -FilePath ([string]$filePath) -RenameMap $RenameMap
         $state = $States[$resolvedFilePath]
         $diffStat = $Commit.FileDiffStats[$filePath]
         $addedLines = [int]$diffStat.AddedLines
@@ -6524,7 +6586,7 @@ function Update-FileMetricState
     }
     foreach ($pathEntry in @($Commit.ChangedPathsFiltered))
     {
-        $resolvedPath = Resolve-PathByRenameMap -FilePath ([string]$pathEntry.Path) -RenameMap $RenameMap
+        $resolvedPath = Resolve-PathByRenameMap -Context $Context -FilePath ([string]$pathEntry.Path) -RenameMap $RenameMap
         $state = $States[$resolvedPath]
         switch (([string]$pathEntry.Action).ToUpperInvariant())
         {
@@ -6553,7 +6615,7 @@ function ConvertTo-FileMetricRows
     [CmdletBinding()]
     [OutputType([object[]])]
     param(
-        [hashtable]$Context = $script:NarutoContext,
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [hashtable]$States
     )
     $rows = New-Object 'System.Collections.Generic.List[object]'
@@ -6654,6 +6716,7 @@ function Get-CoChangeCounters
     [CmdletBinding()]
     [OutputType([object])]
     param(
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [object[]]$Commits,
         [hashtable]$RenameMap = @{}
     )
@@ -6665,7 +6728,7 @@ function Get-CoChangeCounters
         $files = New-Object 'System.Collections.Generic.HashSet[string]'
         foreach ($filePath in @($commit.FilesChanged))
         {
-            $resolved = Resolve-PathByRenameMap -FilePath ([string]$filePath) -RenameMap $RenameMap
+            $resolved = Resolve-PathByRenameMap -Context $Context -FilePath ([string]$filePath) -RenameMap $RenameMap
             [void]$files.Add($resolved)
         }
         if ($files.Count -eq 0)
@@ -6768,14 +6831,14 @@ function Get-FileMetric
     [CmdletBinding()]
     [OutputType([object[]])]
     param(
-        [hashtable]$Context = $script:NarutoContext,
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [object[]]$Commits,
         [hashtable]$RenameMap = @{}
     )
     $states = @{}
     foreach ($commit in @($Commits))
     {
-        Update-FileMetricState -States $states -Commit $commit -RenameMap $RenameMap
+        Update-FileMetricState -Context $Context -States $states -Commit $commit -RenameMap $RenameMap
     }
     return @(ConvertTo-FileMetricRows -Context $Context -States $states)
 }
@@ -6794,8 +6857,13 @@ function Get-CoChangeMetric
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
-    param([object[]]$Commits, [int]$TopNCount = 50, [hashtable]$RenameMap = @{})
-    $counters = Get-CoChangeCounters -Commits $Commits -RenameMap $RenameMap
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Context,
+        [object[]]$Commits,
+        [int]$TopNCount = 50,
+        [hashtable]$RenameMap = @{}
+    )
+    $counters = Get-CoChangeCounters -Context $Context -Commits $Commits -RenameMap $RenameMap
     $rows = ConvertTo-CoChangeRows -Pair $counters.Pair -FileCount $counters.FileCount -CommitTotal ([int]$counters.CommitTotal
     )
     $sorted = @($rows | Sort-Object -Property @{Expression = '共変更回数'
@@ -6823,7 +6891,7 @@ function New-NarutoVisualizationSkippedResult
     [CmdletBinding()]
     [OutputType([object])]
     param(
-        [hashtable]$Context = $script:NarutoContext,
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [ValidateSet('Warning', 'Verbose')]
         [string]$Level = 'Verbose',
         [string]$OutputName,
@@ -6843,7 +6911,7 @@ function Initialize-NarutoVisualizationOutputDirectory
     [CmdletBinding()]
     [OutputType([object])]
     param(
-        [hashtable]$Context = $script:NarutoContext,
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [string]$OutDirectory,
         [string]$CallerName,
         [string]$OutputName
@@ -6885,7 +6953,7 @@ function Write-PlantUmlFile
     #>
     [OutputType([object])]
     param(
-        [hashtable]$Context = $script:NarutoContext,
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [string]$OutDirectory,
         [object[]]$Committers,
         [object[]]$Files,
@@ -7111,7 +7179,7 @@ function Write-FileBubbleChart
     #>
     [CmdletBinding()]
     [OutputType([object])]
-    param( [hashtable]$Context = $script:NarutoContext,
+    param( [Parameter(Mandatory = $true)][hashtable]$Context,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$OutDirectory,
@@ -7365,12 +7433,12 @@ function Write-FileBubbleChart
             }
         }
         $labelY = [Math]::Round([Math]::Min($plotBottom - 4.0, [Math]::Max($plotTop + 12.0, $labelY)), 2)
-        $fittedLabel = Get-SvgFittedText -Text $label -MaxWidth $maxLabelWidth -FontSize $labelFontSize
+        $fittedLabel = Get-SvgFittedText -Context $Context -Text $label -MaxWidth $maxLabelWidth -FontSize $labelFontSize
         if (-not [string]::IsNullOrWhiteSpace($fittedLabel))
         {
             if ($labelAnchor -eq 'middle')
             {
-                $halfWidth = (Measure-SvgTextWidth -Text $fittedLabel -FontSize $labelFontSize) / 2.0
+                $halfWidth = (Measure-SvgTextWidth -Context $Context -Text $fittedLabel -FontSize $labelFontSize) / 2.0
                 $labelX = [Math]::Round([Math]::Min($svgWidth - 12.0 - $halfWidth, [Math]::Max(12.0 + $halfWidth, $labelX)), 2)
             }
             else
@@ -7417,7 +7485,7 @@ function Write-FileQualityScatterChart
     #>
     [CmdletBinding()]
     [OutputType([object])]
-    param( [hashtable]$Context = $script:NarutoContext,
+    param( [Parameter(Mandatory = $true)][hashtable]$Context,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$OutDirectory,
@@ -7641,7 +7709,7 @@ function Write-CommitTimelineChart
     #>
     [CmdletBinding()]
     [OutputType([object])]
-    param( [hashtable]$Context = $script:NarutoContext,
+    param( [Parameter(Mandatory = $true)][hashtable]$Context,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$OutDirectory,
@@ -7850,7 +7918,7 @@ function Write-CommitScatterChart
     #>
     [CmdletBinding()]
     [OutputType([object])]
-    param( [hashtable]$Context = $script:NarutoContext,
+    param( [Parameter(Mandatory = $true)][hashtable]$Context,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$OutDirectory,
@@ -8057,7 +8125,7 @@ function Get-SafeFileName
     #>
     [CmdletBinding()]
     [OutputType([string])]
-    param( [hashtable]$Context = $script:NarutoContext,
+    param( [Parameter(Mandatory = $true)][hashtable]$Context,
         [Parameter(Mandatory = $true)]
         [AllowEmptyString()]
         [string]$BaseName,
@@ -8264,7 +8332,7 @@ function Write-CommitterOutcomeChart
     #>
     [CmdletBinding()]
     [OutputType([object])]
-    param( [hashtable]$Context = $script:NarutoContext,
+    param( [Parameter(Mandatory = $true)][hashtable]$Context,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$OutDirectory,
@@ -8311,11 +8379,11 @@ function Write-CommitterOutcomeChart
     {
         $authorDisplay = [string]$row.Author
         $baseName = 'committer_outcome_' + $authorDisplay
-        $fileName = Get-SafeFileName -BaseName $baseName -Extension '.svg'
+        $fileName = Get-SafeFileName -Context $Context -BaseName $baseName -Extension '.svg'
         while (-not $usedNames.Add($fileName))
         {
             $baseName = $baseName + '_dup'
-            $fileName = Get-SafeFileName -BaseName $baseName -Extension '.svg'
+            $fileName = Get-SafeFileName -Context $Context -BaseName $baseName -Extension '.svg'
         }
 
         $barWidth = 500.0
@@ -8582,7 +8650,7 @@ function Write-CommitterScatterChart
     #>
     [CmdletBinding()]
     [OutputType([object])]
-    param( [hashtable]$Context = $script:NarutoContext,
+    param( [Parameter(Mandatory = $true)][hashtable]$Context,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$OutDirectory,
@@ -8660,11 +8728,11 @@ function Write-CommitterScatterChart
     {
         $authorDisplay = [string]$row.Author
         $baseName = 'committer_scatter_' + $authorDisplay
-        $fileName = Get-SafeFileName -BaseName $baseName -Extension '.svg'
+        $fileName = Get-SafeFileName -Context $Context -BaseName $baseName -Extension '.svg'
         while (-not $usedNames.Add($fileName))
         {
             $baseName = $baseName + '_dup'
-            $fileName = Get-SafeFileName -BaseName $baseName -Extension '.svg'
+            $fileName = Get-SafeFileName -Context $Context -BaseName $baseName -Extension '.svg'
         }
 
         $svgW = 600
@@ -8854,7 +8922,7 @@ function Write-SurvivedShareDonutChart
     #>
     [CmdletBinding()]
     [OutputType([object])]
-    param( [hashtable]$Context = $script:NarutoContext,
+    param( [Parameter(Mandatory = $true)][hashtable]$Context,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$OutDirectory,
@@ -9013,7 +9081,7 @@ function Write-TeamInteractionHeatMap
     #>
     [CmdletBinding()]
     [OutputType([object])]
-    param( [hashtable]$Context = $script:NarutoContext,
+    param( [Parameter(Mandatory = $true)][hashtable]$Context,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$OutDirectory,
@@ -9190,6 +9258,8 @@ function Get-TeamActivityProfileData
     [OutputType([object[]])]
     param(
         [Parameter(Mandatory = $true)]
+        [hashtable]$Context,
+        [Parameter(Mandatory = $true)]
         [AllowNull()]
         [AllowEmptyCollection()]
         [object[]]$Committers
@@ -9225,11 +9295,24 @@ function Get-TeamActivityProfileData
         {
             continue
         }
-        $interventionRate = $interventionLines / $totalChurn
+        $authorName = Get-NormalizedAuthorName -Author ([string]$c.'作者')
+        $rawInterventionRate = $interventionLines / $totalChurn
+        $interventionRate = $rawInterventionRate
+        if ($rawInterventionRate -gt 1.0)
+        {
+            $interventionRate = 1.0
+            Write-NarutoDiagnostic -Context $Context -Level 'Warning' -ErrorCode 'OUTPUT_TEAM_ACTIVITY_INTERVENTION_RATE_OVERFLOW' -Message ("Write-TeamActivityProfileChart: '{0}' の介入率が 100% を超過したため 100% に補正しました (raw={1:N4}, intervention={2:N0}, churn={3:N0})。" -f $authorName, $rawInterventionRate, $interventionLines, $totalChurn) -OutputName 'team_activity_profile.svg' -Data @{
+                Author = $authorName
+                RawInterventionRate = $rawInterventionRate
+                InterventionLines = $interventionLines
+                TotalChurn = $totalChurn
+            }
+        }
         $outcomeBalance = ($survivedOutcomeLines - $interventionLines) / $denominator
         [void]$rows.Add([pscustomobject][ordered]@{
-                Author = (Get-NormalizedAuthorName -Author ([string]$c.'作者'))
+                Author = $authorName
                 InterventionRate = $interventionRate
+                RawInterventionRate = $rawInterventionRate
                 OutcomeBalance = $outcomeBalance
                 InterventionLines = $interventionLines
                 SurvivedOutcomeLines = $survivedOutcomeLines
@@ -9266,7 +9349,7 @@ function Write-TeamActivityProfileChart
     #>
     [CmdletBinding()]
     [OutputType([object])]
-    param( [hashtable]$Context = $script:NarutoContext,
+    param( [Parameter(Mandatory = $true)][hashtable]$Context,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$OutDirectory,
@@ -9288,7 +9371,7 @@ function Write-TeamActivityProfileChart
         return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Verbose' -OutputName $outputName -ErrorCode 'OUTPUT_TEAM_ACTIVITY_NO_DATA' -Message 'Write-TeamActivityProfileChart: Committers が空です。')
     }
 
-    $profileData = @(Get-TeamActivityProfileData -Committers $Committers)
+    $profileData = @(Get-TeamActivityProfileData -Context $Context -Committers $Committers)
     if ($profileData.Count -eq 0)
     {
         return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Verbose' -OutputName $outputName -ErrorCode 'OUTPUT_TEAM_ACTIVITY_NO_PLOTTABLE_DATA' -Message 'Write-TeamActivityProfileChart: 描画対象データがありません。')
@@ -9304,11 +9387,6 @@ function Write-TeamActivityProfileChart
     $midX = $plotLeft + $plotWidth / 2.0
     $midY = $plotTop + $plotHeight / 2.0
 
-    $maxInterventionRate = ($profileData | Measure-Object -Property InterventionRate -Maximum).Maximum
-    if ($maxInterventionRate -le 0)
-    {
-        $maxInterventionRate = 1.0
-    }
     $maxChurn = ($profileData | Measure-Object -Property TotalChurn -Maximum).Maximum
     if ($maxChurn -le 0)
     {
@@ -9351,8 +9429,7 @@ function Write-TeamActivityProfileChart
     for ($tick = 0.0; $tick -le 1.01; $tick += $Context.Constants.SvgQuadrantTickStep)
     {
         $tx = $plotLeft + $tick * $plotWidth
-        $xValue = $maxInterventionRate * $tick
-        [void]$sb.AppendLine(('<text class="tick-label" x="{0:F0}" y="{1}" text-anchor="middle">{2:F1}%</text>' -f $tx, [int]($plotBottom + 16), ($xValue * 100)))
+        [void]$sb.AppendLine(('<text class="tick-label" x="{0:F0}" y="{1}" text-anchor="middle">{2:F0}%</text>' -f $tx, [int]($plotBottom + 16), ($tick * 100)))
     }
     # Y 軸目盛り（-100% ～ +100%）
     for ($tick = -1.0; $tick -le 1.01; $tick += 0.5)
@@ -9372,14 +9449,14 @@ function Write-TeamActivityProfileChart
     for ($ci = 0; $ci -lt $sortedByChurn.Count; $ci++)
     {
         $d = $sortedByChurn[$ci]
-        $bx = $plotLeft + (($d.InterventionRate / $maxInterventionRate) * $plotWidth)
+        $bx = $plotLeft + ($d.InterventionRate * $plotWidth)
         $outcomeBalanceNormalized = ($d.OutcomeBalance + 1.0) / 2.0
         $outcomeBalanceNormalized = [Math]::Max(0.0, [Math]::Min(1.0, $outcomeBalanceNormalized))
         $by = $plotBottom - $outcomeBalanceNormalized * $plotHeight
         $br = $minBubble + ($maxBubble - $minBubble) * [Math]::Sqrt($d.TotalChurn / $maxChurn)
         $cIdx = $ci % $colorPalette.Count
         $bColor = $colorPalette[$cIdx]
-        [void]$sb.AppendLine(('<circle cx="{0:F1}" cy="{1:F1}" r="{2:F1}" fill="{3}" fill-opacity="0.55" stroke="{3}" stroke-width="1.2"><title>{4} (介入率:{5:F1}%, 生死差分指数:{6:F1}%, 介入行数:{7}, 生存成果行数:{8}, チャーン:{9})</title></circle>' -f $bx, $by, $br, $bColor, (ConvertTo-SvgEscapedText -Text $d.Author), ($d.InterventionRate * 100), ($d.OutcomeBalance * 100), [int]$d.InterventionLines, [int]$d.SurvivedOutcomeLines, [int]$d.TotalChurn))
+        [void]$sb.AppendLine(('<circle cx="{0:F1}" cy="{1:F1}" r="{2:F1}" fill="{3}" fill-opacity="0.55" stroke="{3}" stroke-width="1.2"><title>{4} (介入率(raw):{5:F1}%, 介入率(描画):{6:F1}%, 生死差分指数:{7:F1}%, 介入行数:{8}, 生存成果行数:{9}, チャーン:{10})</title></circle>' -f $bx, $by, $br, $bColor, (ConvertTo-SvgEscapedText -Text $d.Author), ($d.RawInterventionRate * 100), ($d.InterventionRate * 100), ($d.OutcomeBalance * 100), [int]$d.InterventionLines, [int]$d.SurvivedOutcomeLines, [int]$d.TotalChurn))
         [void]$sb.AppendLine(('<text class="author-label" x="{0:F1}" y="{1:F1}">{2}</text>' -f $bx, ($by - $br - 4.0), (ConvertTo-SvgEscapedText -Text $d.Author)))
     }
 
@@ -9408,7 +9485,7 @@ function Write-ProjectCodeFateChart
     #>
     [CmdletBinding()]
     [OutputType([object])]
-    param( [hashtable]$Context = $script:NarutoContext,
+    param( [Parameter(Mandatory = $true)][hashtable]$Context,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$OutDirectory,
@@ -9450,7 +9527,7 @@ function Write-ProjectCodeFateChart
     {
         return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Verbose' -OutputName $outputName -ErrorCode 'OUTPUT_PROJECT_FATE_ZERO_ADDED' -Message 'Write-ProjectCodeFateChart: 追加行数が 0 のためスキップしました。')
     }
-    $totalOther = Get-MetricBreakdownResidualValue -MetricName 'CodeFate.OtherDead' -TotalValue $totalAdded -BreakdownValues @($totalSurvived, $totalSelfCancel, $totalRemovedByOthers) -BreakdownLabels @('survived', 'selfCancel', 'removedByOthers')
+    $totalOther = Get-MetricBreakdownResidualValue -Context $Context -MetricName 'CodeFate.OtherDead' -TotalValue $totalAdded -BreakdownValues @($totalSurvived, $totalSelfCancel, $totalRemovedByOthers) -BreakdownLabels @('survived', 'selfCancel', 'removedByOthers')
 
     $segments = @(
         [pscustomobject]@{ Label = '生存'; Value = $totalSurvived; Color = $Context.Constants.ColorSurvived }
@@ -9664,7 +9741,7 @@ function Write-ProjectEfficiencyQuadrantChart
     #>
     [CmdletBinding()]
     [OutputType([object])]
-    param( [hashtable]$Context = $script:NarutoContext,
+    param( [Parameter(Mandatory = $true)][hashtable]$Context,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$OutDirectory,
@@ -9772,7 +9849,7 @@ function Write-ProjectEfficiencyQuadrantChart
         }
         $tooltipText = ('{0} 生存率:{1:F0}% 効率:{2:F0}% チャーン:{3}' -f (ConvertTo-SvgEscapedText -Text $d.FilePath), ($d.SurvivalRate * 100), ($d.ChurnEfficiency * 100), [int]$d.TotalChurn)
         [void]$sb.AppendLine(('<circle cx="{0:F1}" cy="{1:F1}" r="{2:F1}" fill="{3}" fill-opacity="0.6" stroke="{3}" stroke-width="1"><title>{4}</title></circle>' -f $bx, $by, $r, $color, $tooltipText))
-        $labelText = Get-SvgFittedText -Text $shortName -MaxWidth ($r * 3.0) -FontSize 9.0
+        $labelText = Get-SvgFittedText -Context $Context -Text $shortName -MaxWidth ($r * 3.0) -FontSize 9.0
         if ($labelText)
         {
             [void]$sb.AppendLine(('<text class="file-label" x="{0:F1}" y="{1:F1}"><title>{2}</title>{3}</text>' -f $bx, ($by + $r + 12.0), $tooltipText, (ConvertTo-SvgEscapedText -Text $labelText)))
@@ -9815,7 +9892,7 @@ function Write-ProjectSummaryDashboard
     #>
     [CmdletBinding()]
     [OutputType([object])]
-    param( [hashtable]$Context = $script:NarutoContext,
+    param( [Parameter(Mandatory = $true)][hashtable]$Context,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$OutDirectory,
@@ -10011,186 +10088,6 @@ function Write-ProjectSummaryDashboard
     return (New-NarutoResultSuccess -Data (Join-Path $OutDirectory 'project_summary_dashboard.svg') -ErrorCode 'OUTPUT_PROJECT_DASHBOARD_WRITTEN')
 }
 
-function Write-ContributorBalanceChart
-{
-    <#
-    .SYNOPSIS
-        コミッター別の投入量と最終成果を左右対称バタフライチャートで描画する。
-    .DESCRIPTION
-        左側に総チャーン（投入量）、右側に生存行数（最終成果）を横棒で描画し、
-        中央に作者名を配置する。投入に対して成果が少ない作者は視覚的に非対称になり、
-        チームの貢献バランスを一目で把握できる。
-        開発完了後の「誰がどれだけ投入し、どれだけ成果として残ったか」を示す。
-    .PARAMETER OutDirectory
-        出力先ディレクトリを指定する。
-    .PARAMETER Committers
-        Get-CommitterMetric が返すコミッター行配列を指定する。
-    .PARAMETER TopNCount
-        総チャーン上位として表示する件数を指定する。0 で全件。
-    .PARAMETER EncodingName
-        出力時に使用する文字エンコーディングを指定する。
-    #>
-    [CmdletBinding()]
-    [OutputType([object])]
-    param( [hashtable]$Context = $script:NarutoContext,
-        [Parameter(Mandatory = $true)]
-        [ValidateNotNullOrEmpty()]
-        [string]$OutDirectory,
-        [Parameter(Mandatory = $true)]
-        [AllowNull()]
-        [AllowEmptyCollection()]
-        [object[]]$Committers,
-        [Parameter(Mandatory = $false)]
-        [int]$TopNCount = 0,
-        [Parameter(Mandatory = $false)]
-        [string]$EncodingName = 'UTF-8'
-    )
-    $outputName = 'contributor_balance.svg'
-    $directoryResult = Initialize-NarutoVisualizationOutputDirectory -Context $Context -OutDirectory $OutDirectory -CallerName 'Write-ContributorBalanceChart' -OutputName $outputName
-    if (-not (Test-NarutoResultSuccess -Result $directoryResult))
-    {
-        return $directoryResult
-    }
-    if (-not $Committers -or @($Committers).Count -eq 0)
-    {
-        return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Verbose' -OutputName $outputName -ErrorCode 'OUTPUT_CONTRIBUTOR_BALANCE_NO_DATA' -Message 'Write-ContributorBalanceChart: Committers が空です。')
-    }
-
-    # データ抽出
-    $data = New-Object 'System.Collections.Generic.List[object]'
-    foreach ($c in @($Committers))
-    {
-        if ($null -eq $c)
-        {
-            continue
-        }
-        $churn = 0.0
-        if ($null -ne $c.'総チャーン')
-        {
-            $churn = [double]$c.'総チャーン'
-        }
-        $survived = 0.0
-        if ($null -ne $c.'生存行数')
-        {
-            $survived = [double]$c.'生存行数'
-        }
-        if ($churn -le 0 -and $survived -le 0)
-        {
-            continue
-        }
-        [void]$data.Add([pscustomobject][ordered]@{
-                Author = (Get-NormalizedAuthorName -Author ([string]$c.'作者'))
-                TotalChurn = $churn
-                Survived = $survived
-            })
-    }
-    if ($data.Count -eq 0)
-    {
-        return (New-NarutoVisualizationSkippedResult -Context $Context -Level 'Verbose' -OutputName $outputName -ErrorCode 'OUTPUT_CONTRIBUTOR_BALANCE_NO_PLOTTABLE_DATA' -Message 'Write-ContributorBalanceChart: 描画対象データがありません。')
-    }
-    $sorted = @($data.ToArray() | Sort-Object -Property @{Expression = 'TotalChurn'; Descending = $true }, 'Author')
-    if ($TopNCount -gt 0 -and $sorted.Count -gt $TopNCount)
-    {
-        $sorted = @($sorted | Select-Object -First $TopNCount)
-    }
-    $n = $sorted.Count
-    $barHeight = 28
-    $barGap = 8
-    $centerX = 340.0
-    $barMaxW = 240.0
-    $marginTop = 80
-    $marginBottom = 40
-
-    $maxVal = 1.0
-    foreach ($d in $sorted)
-    {
-        if ($d.TotalChurn -gt $maxVal)
-        {
-            $maxVal = $d.TotalChurn
-        }
-        if ($d.Survived -gt $maxVal)
-        {
-            $maxVal = $d.Survived
-        }
-    }
-
-    $svgW = 720
-    $svgH = $marginTop + $n * ($barHeight + $barGap) + $marginBottom + 20
-
-    $sb = New-Object System.Text.StringBuilder
-    [void]$sb.AppendLine('<?xml version="1.0" encoding="UTF-8"?>')
-    [void]$sb.AppendLine(('<svg xmlns="http://www.w3.org/2000/svg" width="{0}" height="{1}" viewBox="0 0 {0} {1}">' -f $svgW, $svgH))
-    [void]$sb.Append((Get-SvgCommonStyle -AdditionalStyles @'
-  .author-label { font-size: 12px; fill: #333; text-anchor: middle; dominant-baseline: central; }
-  .bar-value { font-size: 10px; fill: #555; dominant-baseline: central; }
-  .header-label { font-size: 11px; fill: #666; font-weight: bold; text-anchor: middle; }
-  .legend-text { font-size: 11px; fill: #333; }
-'@))
-    [void]$sb.AppendLine('<rect width="100%" height="100%" fill="#fafafa"/>')
-    [void]$sb.AppendLine('<text class="title" x="20" y="28">投入量 vs 最終成果（コミッター別バランス）</text>')
-    [void]$sb.AppendLine('<text class="subtitle" x="20" y="46">左: 総チャーン（投入量） / 右: 生存行数（最終成果） / 非対称 = 歩留まり差</text>')
-
-    # ヘッダー
-    $headerY = $marginTop - 16
-    [void]$sb.AppendLine(('<text class="header-label" x="{0}" y="{1}">← 総チャーン（投入）</text>' -f [int]($centerX - $barMaxW / 2.0), [int]$headerY))
-    [void]$sb.AppendLine(('<text class="header-label" x="{0}" y="{1}">生存行数（成果）→</text>' -f [int]($centerX + $barMaxW / 2.0), [int]$headerY))
-
-    # 中央線
-    [void]$sb.AppendLine(('<line x1="{0}" y1="{1}" x2="{0}" y2="{2}" stroke="#bdbdbd" stroke-width="1" stroke-dasharray="4,3"/>' -f [int]$centerX, [int]($marginTop - 6), [int]($marginTop + $n * ($barHeight + $barGap))))
-
-    $churnColor = $Context.Constants.ColorChurn
-    $survivedColor = $Context.Constants.ColorSurvived
-
-    for ($i = 0; $i -lt $n; $i++)
-    {
-        $d = $sorted[$i]
-        $yBase = $marginTop + $i * ($barHeight + $barGap)
-        $yCtr = $yBase + $barHeight / 2.0
-
-        # 左バー (チャーン) — 右から左へ伸びる
-        $churnW = 0.0
-        if ($maxVal -gt 0)
-        {
-            $churnW = ($d.TotalChurn / $maxVal) * $barMaxW
-        }
-        $churnX = $centerX - 4 - $churnW
-        if ($churnW -gt 0)
-        {
-            $tooltip = ('総チャーン: {0:N0}' -f [int]$d.TotalChurn)
-            [void]$sb.AppendLine(('<rect x="{0:F1}" y="{1}" width="{2:F1}" height="{3}" rx="4" fill="{4}" fill-opacity="0.8"><title>{5}</title></rect>' -f $churnX, [int]$yBase, $churnW, $barHeight, $churnColor, (ConvertTo-SvgEscapedText -Text $tooltip)))
-            [void]$sb.AppendLine(('<text class="bar-value" x="{0:F1}" y="{1:F0}" text-anchor="end">{2:N0}</text>' -f ($churnX - 4), $yCtr, [int]$d.TotalChurn))
-        }
-
-        # 右バー (生存行数) — 左から右へ伸びる
-        $survW = 0.0
-        if ($maxVal -gt 0)
-        {
-            $survW = ($d.Survived / $maxVal) * $barMaxW
-        }
-        $survX = $centerX + 4
-        if ($survW -gt 0)
-        {
-            $tooltip = ('生存行数: {0:N0}' -f [int]$d.Survived)
-            [void]$sb.AppendLine(('<rect x="{0}" y="{1}" width="{2:F1}" height="{3}" rx="4" fill="{4}" fill-opacity="0.8"><title>{5}</title></rect>' -f [int]$survX, [int]$yBase, $survW, $barHeight, $survivedColor, (ConvertTo-SvgEscapedText -Text $tooltip)))
-            [void]$sb.AppendLine(('<text class="bar-value" x="{0:F1}" y="{1:F0}">{2:N0}</text>' -f ($survX + $survW + 4), $yCtr, [int]$d.Survived))
-        }
-
-        # 中央: 作者名
-        [void]$sb.AppendLine(('<text class="author-label" x="{0}" y="{1:F0}">{2}</text>' -f [int]$centerX, $yCtr, (ConvertTo-SvgEscapedText -Text $d.Author)))
-    }
-
-    # 凡例
-    $legendY = $marginTop + $n * ($barHeight + $barGap) + 16
-    [void]$sb.AppendLine(('<rect x="{0}" y="{1}" width="14" height="14" rx="3" fill="{2}"/>' -f [int]($centerX - 120), [int]$legendY, $churnColor))
-    [void]$sb.AppendLine(('<text class="legend-text" x="{0}" y="{1}">総チャーン（投入量）</text>' -f [int]($centerX - 102), [int]($legendY + 12)))
-    [void]$sb.AppendLine(('<rect x="{0}" y="{1}" width="14" height="14" rx="3" fill="{2}"/>' -f [int]($centerX + 30), [int]$legendY, $survivedColor))
-    [void]$sb.AppendLine(('<text class="legend-text" x="{0}" y="{1}">生存行数（最終成果）</text>' -f [int]($centerX + 48), [int]($legendY + 12)))
-
-    [void]$sb.AppendLine('</svg>')
-    Write-TextFile -FilePath (Join-Path $OutDirectory 'contributor_balance.svg') -Content $sb.ToString() -EncodingName $EncodingName
-    return (New-NarutoResultSuccess -Data (Join-Path $OutDirectory 'contributor_balance.svg') -ErrorCode 'OUTPUT_CONTRIBUTOR_BALANCE_WRITTEN')
-}
-
 # endregion PlantUML 出力
 # region SVG 出力
 function Get-SvgCommonStyle
@@ -10251,7 +10148,7 @@ function Get-SvgCharacterWidth
     #>
     [CmdletBinding()]
     [OutputType([double])]
-    param( [hashtable]$Context = $script:NarutoContext,
+    param( [Parameter(Mandatory = $true)][hashtable]$Context,
         [Parameter(Mandatory = $true)]
         [char]$Character,
         [Parameter(Mandatory = $false)]
@@ -10313,6 +10210,7 @@ function Measure-SvgTextWidth
     [CmdletBinding()]
     [OutputType([double])]
     param(
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [Parameter(Mandatory = $false)]
         [AllowNull()]
         [string]$Text,
@@ -10328,7 +10226,7 @@ function Measure-SvgTextWidth
     $width = 0.0
     foreach ($character in $Text.ToCharArray())
     {
-        $width += Get-SvgCharacterWidth -Character $character -FontSize $FontSize
+        $width += Get-SvgCharacterWidth -Context $Context -Character $character -FontSize $FontSize
     }
     return [Math]::Round($width, 2)
 }
@@ -10341,6 +10239,7 @@ function Get-SvgFittedText
     [CmdletBinding()]
     [OutputType([string])]
     param(
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [Parameter(Mandatory = $false)]
         [AllowNull()]
         [string]$Text,
@@ -10363,7 +10262,7 @@ function Get-SvgFittedText
         return ''
     }
 
-    if ((Measure-SvgTextWidth -Text $Text -FontSize $FontSize) -le $allowedWidth)
+    if ((Measure-SvgTextWidth -Context $Context -Text $Text -FontSize $FontSize) -le $allowedWidth)
     {
         return $Text
     }
@@ -10373,7 +10272,7 @@ function Get-SvgFittedText
     {
         $ellipsisText = '…'
     }
-    $ellipsisWidth = Measure-SvgTextWidth -Text $ellipsisText -FontSize $FontSize
+    $ellipsisWidth = Measure-SvgTextWidth -Context $Context -Text $ellipsisText -FontSize $FontSize
     if ($ellipsisWidth -ge $allowedWidth)
     {
         return $ellipsisText
@@ -10383,7 +10282,7 @@ function Get-SvgFittedText
     $currentWidth = 0.0
     foreach ($character in $Text.ToCharArray())
     {
-        $charWidth = Get-SvgCharacterWidth -Character $character -FontSize $FontSize
+        $charWidth = Get-SvgCharacterWidth -Context $Context -Character $character -FontSize $FontSize
         if (($currentWidth + $charWidth + $ellipsisWidth) -gt $allowedWidth)
         {
             break
@@ -10495,6 +10394,8 @@ function Get-MetricBreakdownResidualValue
     <#
     .SYNOPSIS
         合計値と内訳値から残余値を計算し不整合を診断する。
+    .PARAMETER Context
+        NarutoContext ハッシュテーブル。指定時は Write-NarutoDiagnostic で構造化診断を記録する。
     .PARAMETER MetricName
         診断メッセージに使用するメトリクス名。
     .PARAMETER TotalValue
@@ -10507,6 +10408,7 @@ function Get-MetricBreakdownResidualValue
     [CmdletBinding()]
     [OutputType([double])]
     param(
+        [Parameter(Mandatory = $false)][hashtable]$Context,
         [string]$MetricName,
         [double]$TotalValue,
         [double[]]$BreakdownValues,
@@ -10535,7 +10437,20 @@ function Get-MetricBreakdownResidualValue
             }
             [void]$detailParts.Add(("{0}={1}" -f $label, [double]$BreakdownValues[$i]))
         }
-        Write-Warning ("Metric breakdown exceeded total: metric={0}, total={1}, {2}" -f $MetricName, $TotalValue, ($detailParts.ToArray() -join ', '))
+        $diagMessage = "Metric breakdown exceeded total: metric={0}, total={1}, {2}" -f $MetricName, $TotalValue, ($detailParts.ToArray() -join ', ')
+        if ($null -ne $Context)
+        {
+            Write-NarutoDiagnostic -Context $Context -Level 'Warning' -ErrorCode 'OUTPUT_METRIC_BREAKDOWN_OVERFLOW' -Message $diagMessage -Data @{
+                MetricName = $MetricName
+                TotalValue = $TotalValue
+                SumBreakdown = $sumBreakdown
+                Residual = $residual
+            }
+        }
+        else
+        {
+            Write-Warning $diagMessage
+        }
         return 0.0
     }
     return $residual
@@ -10592,7 +10507,7 @@ function Get-SvnVersionSafe
     #>
     [CmdletBinding()]
     [OutputType([object])]
-    param([hashtable]$Context = $script:NarutoContext)
+    param([Parameter(Mandatory = $true)][hashtable]$Context)
     try
     {
         $versionText = (Invoke-SvnCommand -Context $Context -Arguments @('--version', '--quiet') -ErrorContext 'svn version').Split("`n")[0].Trim()
@@ -10647,7 +10562,7 @@ function Get-CachedOrFetchDiffText
     #>
     [CmdletBinding()]
     [OutputType([string])]
-    param([hashtable]$Context = $script:NarutoContext, [string]$CacheDir, [int]$Revision, [string]$TargetUrl, [string[]]$DiffArguments)
+    param([Parameter(Mandatory = $true)][hashtable]$Context, [string]$CacheDir, [int]$Revision, [string]$TargetUrl, [string[]]$DiffArguments)
     $cacheFile = Join-Path $CacheDir ("diff_r{0}.txt" -f $Revision)
     if ([System.IO.File]::Exists($cacheFile))
     {
@@ -10941,7 +10856,7 @@ function Get-RenamePairRealDiffStat
     [CmdletBinding()]
     [OutputType([object])]
     param(
-        [hashtable]$Context = $script:NarutoContext,
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [string]$TargetUrl,
         [string]$CacheDir = '',
         [string[]]$DiffArguments,
@@ -10992,7 +10907,7 @@ function Get-RenamePairRealDiffStat
             $lineMaskByPath[$NewPath] = $maskEntry
         }
     }
-    $realParsed = ConvertFrom-SvnUnifiedDiff -DiffText $realDiff -DetailLevel 2 -ExcludeCommentOnlyLines:$excludeCommentOnlyLines -LineMaskByPath $lineMaskByPath
+    $realParsed = ConvertFrom-SvnUnifiedDiff -Context $Context -DiffText $realDiff -DetailLevel 2 -ExcludeCommentOnlyLines:$excludeCommentOnlyLines -LineMaskByPath $lineMaskByPath
 
     $realStat = $null
     if ($realParsed.ContainsKey($NewPath))
@@ -11060,7 +10975,7 @@ function Update-RenamePairDiffStat
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
-    param([hashtable]$Context = $script:NarutoContext, [object]$Commit, [int]$Revision, [string]$TargetUrl, [string]$CacheDir = '', [string[]]$DiffArguments)
+    param([Parameter(Mandatory = $true)][hashtable]$Context, [object]$Commit, [int]$Revision, [string]$TargetUrl, [string]$CacheDir = '', [string[]]$DiffArguments)
     $candidates = @(Get-RenameCorrectionCandidates -Commit $Commit -Revision $Revision)
     foreach ($candidate in $candidates)
     {
@@ -11104,7 +11019,7 @@ function Get-CommitMessageSummary
     [CmdletBinding()]
     [OutputType([object])]
     param(
-        [hashtable]$Context = $script:NarutoContext,
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [string]$Message
     )
     $normalized = [string]$Message
@@ -11150,7 +11065,7 @@ function Set-CommitDerivedMetric
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
-    param( [hashtable]$Context = $script:NarutoContext, [object]$Commit)
+    param( [Parameter(Mandatory = $true)][hashtable]$Context, [object]$Commit)
     $churnValues = Get-CommitDerivedChurnValues -Commit $Commit
     Set-ObjectPropertyValue -InputObject $Commit -PropertyName 'AddedLines' -Value ([int]$churnValues.Added)
     Set-ObjectPropertyValue -InputObject $Commit -PropertyName 'DeletedLines' -Value ([int]$churnValues.Deleted)
@@ -11249,7 +11164,7 @@ function Invoke-CommitDiffPrefetch
     [CmdletBinding()]
     [OutputType([hashtable])]
     param(
-        [hashtable]$Context = $script:NarutoContext,
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [object[]]$PrefetchItems,
         [int]$Parallel = 1
     )
@@ -11259,8 +11174,8 @@ function Invoke-CommitDiffPrefetch
         $phaseAWorker = {
             param($Item, $Index)
             [void]$Index # Required by Invoke-ParallelWork contract
-            # $NarutoContext は Invoke-ParallelWork の SessionVariables 経由で注入される
-            $diffText = Get-CachedOrFetchDiffText -Context $NarutoContext -CacheDir $Item.CacheDir -Revision ([int]$Item.Revision) -TargetUrl $Item.TargetUrl -DiffArguments @($Item.DiffArguments)
+            # $Context は Invoke-ParallelWork の SessionVariables 経由で注入される
+            $diffText = Get-CachedOrFetchDiffText -Context $Context -CacheDir $Item.CacheDir -Revision ([int]$Item.Revision) -TargetUrl $Item.TargetUrl -DiffArguments @($Item.DiffArguments)
             $lineMaskByPath = @{}
             if ([bool]$Item.ExcludeCommentOnlyLines)
             {
@@ -11313,13 +11228,13 @@ function Invoke-CommitDiffPrefetch
                         return $commentMaskCache[$cacheKey]
                     }
 
-                    $commentProfile = Get-CommentSyntaxProfileByPath -Context $NarutoContext -FilePath $normalizedPath
+                    $commentProfile = Get-CommentSyntaxProfileByPath -Context $Context -FilePath $normalizedPath
                     if ($null -eq $commentProfile)
                     {
                         $commentMaskCache[$cacheKey] = $null
                         return $null
                     }
-                    $catText = Get-CachedOrFetchCatText -Context $NarutoContext -Repo $Item.TargetUrl -FilePath $normalizedPath -Revision $normalizedRevision -CacheDir $Item.CacheDir
+                    $catText = Get-CachedOrFetchCatText -Context $Context -Repo $Item.TargetUrl -FilePath $normalizedPath -Revision $normalizedRevision -CacheDir $Item.CacheDir
                     if ($null -eq $catText)
                     {
                         $commentMaskCache[$cacheKey] = $null
@@ -11462,7 +11377,7 @@ function Invoke-CommitDiffPrefetch
                     }
                 }
             }
-            $rawDiffByPath = ConvertFrom-SvnUnifiedDiff -DiffText $diffText -DetailLevel 2 -ExcludeCommentOnlyLines:$([bool]$Item.ExcludeCommentOnlyLines) -LineMaskByPath $lineMaskByPath
+            $rawDiffByPath = ConvertFrom-SvnUnifiedDiff -Context $Context -DiffText $diffText -DetailLevel 2 -ExcludeCommentOnlyLines:$([bool]$Item.ExcludeCommentOnlyLines) -LineMaskByPath $lineMaskByPath
             [pscustomobject]@{
                 Revision = [int]$Item.Revision
                 RawDiffByPath = $rawDiffByPath
@@ -11477,7 +11392,7 @@ function Invoke-CommitDiffPrefetch
                     'Get-CachedOrFetchDiffText'
                 )
             ) -SessionVariables @{
-                NarutoContext = (Get-RunspaceNarutoContext -Context $Context)
+                Context = (Get-RunspaceNarutoContext -Context $Context)
                 SvnExecutable = $Context.Runtime.SvnExecutable
                 SvnGlobalArguments = @($Context.Runtime.SvnGlobalArguments)
             } -ErrorContext 'commit diff prefetch')
@@ -11588,7 +11503,7 @@ function Complete-CommitDiffForCommit
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     param(
-        [hashtable]$Context = $script:NarutoContext,
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [object]$Commit,
         [int]$Revision,
         [string]$TargetUrl,
@@ -11596,7 +11511,7 @@ function Complete-CommitDiffForCommit
         [string[]]$DiffArguments
     )
     Update-RenamePairDiffStat -Context $Context -Commit $Commit -Revision $Revision -TargetUrl $TargetUrl -CacheDir $CacheDir -DiffArguments $DiffArguments
-    Set-CommitDerivedMetric -Commit $Commit
+    Set-CommitDerivedMetric -Context $Context -Commit $Commit
 }
 function Initialize-CommitDiffData
 {
@@ -11630,7 +11545,7 @@ function Initialize-CommitDiffData
     #>
     [CmdletBinding()]
     [OutputType([hashtable])]
-    param( [hashtable]$Context = $script:NarutoContext,
+    param( [Parameter(Mandatory = $true)][hashtable]$Context,
         [object[]]$Commits,
         [string]$CacheDir,
         [string]$TargetUrl,
@@ -11671,7 +11586,11 @@ function New-CommitRowFromCommit
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     [OutputType([object[]])]
-    param([object[]]$Commits)
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Context,
+        [object[]]$Commits
+    )
+    [void]$Context
     return @(
         $Commits | Sort-Object Revision | ForEach-Object {
             [pscustomobject][ordered]@{
@@ -11775,7 +11694,7 @@ function Get-StrictOwnershipAggregate
     #>
     [CmdletBinding()]
     [OutputType([object])]
-    param( [hashtable]$Context = $script:NarutoContext,
+    param( [Parameter(Mandatory = $true)][hashtable]$Context,
         [string]$TargetUrl,
         [int]$ToRevision,
         [string]$CacheDir,
@@ -11846,7 +11765,7 @@ function Get-StrictOwnershipAggregate
             [void]$Index # Required by Invoke-ParallelWork contract
             try
             {
-                $blameResult = Get-SvnBlameSummary -Context $NarutoContext -Repo $Item.TargetUrl -FilePath ([string]$Item.FilePath) -ToRevision ([int]$Item.ToRevision) -CacheDir $Item.CacheDir
+                $blameResult = Get-SvnBlameSummary -Context $Context -Repo $Item.TargetUrl -FilePath ([string]$Item.FilePath) -ToRevision ([int]$Item.ToRevision) -CacheDir $Item.CacheDir
                 $blameResult = ConvertTo-NarutoResultAdapter -InputObject $blameResult -SuccessCode 'SVN_BLAME_SUMMARY_READY' -SkippedCode 'SVN_BLAME_SUMMARY_EMPTY'
                 if (-not (Test-NarutoResultSuccess -Result $blameResult))
                 {
@@ -11880,7 +11799,7 @@ function Get-StrictOwnershipAggregate
                     'Get-SvnBlameSummary'
                 )
             ) -SessionVariables @{
-                NarutoContext = (Get-RunspaceNarutoContext -Context $Context)
+                Context = (Get-RunspaceNarutoContext -Context $Context)
                 SvnExecutable = $Context.Runtime.SvnExecutable
                 SvnGlobalArguments = @($Context.Runtime.SvnGlobalArguments)
             } -ErrorContext 'strict ownership blame')
@@ -11910,7 +11829,7 @@ function Get-StrictFileBlameWithFallback
     [CmdletBinding()]
     [OutputType([object])]
     param(
-        [hashtable]$Context = $script:NarutoContext,
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [string]$MetricKey,
         [string]$FilePath,
         [string]$ResolvedFilePath,
@@ -12051,7 +11970,7 @@ function Set-StrictFileRowMetricValues
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '')]
     [CmdletBinding()]
     param(
-        [hashtable]$Context = $script:NarutoContext,
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [object]$Row,
         [object]$Values
     )
@@ -12092,7 +12011,7 @@ function Update-FileRowWithStrictMetric
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
-    param( [hashtable]$Context = $script:NarutoContext,
+    param( [Parameter(Mandatory = $true)][hashtable]$Context,
         [object[]]$FileRows,
         [hashtable]$RenameMap,
         [object]$StrictDetail,
@@ -12105,7 +12024,7 @@ function Update-FileRowWithStrictMetric
     foreach ($row in @($FileRows))
     {
         $filePath = [string]$row.'ファイルパス'
-        $resolvedFilePath = Resolve-PathByRenameMap -FilePath $filePath -RenameMap $RenameMap
+        $resolvedFilePath = Resolve-PathByRenameMap -Context $Context -FilePath $filePath -RenameMap $RenameMap
         $isOldRenamePath = ($RenameMap.ContainsKey($filePath) -and ([string]$RenameMap[$filePath] -ne $filePath))
         $metricKey = if ($isOldRenamePath)
         {
@@ -12214,7 +12133,7 @@ function Set-StrictCommitterRowMetricValues
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '')]
     [CmdletBinding()]
     param(
-        [hashtable]$Context = $script:NarutoContext,
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [object]$Row,
         [object]$Values
     )
@@ -12255,7 +12174,7 @@ function Update-CommitterRowWithStrictMetric
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
-    param( [hashtable]$Context = $script:NarutoContext,
+    param( [Parameter(Mandatory = $true)][hashtable]$Context,
         [object[]]$CommitterRows,
         [hashtable]$AuthorSurvived,
         [hashtable]$AuthorOwned,
@@ -12320,7 +12239,7 @@ function Get-StrictDeathDetailOrThrow
     [CmdletBinding()]
     [OutputType([object])]
     param(
-        [hashtable]$Context = $script:NarutoContext,
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [object[]]$Commits,
         [hashtable]$RevToAuthor,
         [string]$TargetUrl,
@@ -12407,7 +12326,7 @@ function Get-StrictExecutionContext
     [CmdletBinding()]
     [OutputType([object])]
     param(
-        [hashtable]$Context = $script:NarutoContext,
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [object[]]$Commits,
         [hashtable]$RevToAuthor,
         [string]$TargetUrl,
@@ -12438,7 +12357,7 @@ function Update-StrictMetricsOnRows
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '')]
     [CmdletBinding()]
     param(
-        [hashtable]$Context = $script:NarutoContext,
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [object[]]$FileRows,
         [object[]]$CommitterRows,
         [object]$StrictExecutionContext,
@@ -12489,7 +12408,7 @@ function Update-StrictAttributionMetric
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     param(
-        [hashtable]$Context = $script:NarutoContext,
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [object[]]$Commits,
         [hashtable]$RevToAuthor,
         [string]$TargetUrl,
@@ -12526,7 +12445,7 @@ function Get-MetricColumnDefinitions
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '')]
     [CmdletBinding()]
     [OutputType([hashtable])]
-    param([hashtable]$Context = $script:NarutoContext)
+    param([Parameter(Mandatory = $true)][hashtable]$Context)
     return [ordered]@{
         Committer = @('作者', 'コミット数', '活動日数', '変更ファイル数', '変更ディレクトリ数', '追加行数', '削除行数', '純増行数', '総チャーン', 'コミットあたりチャーン', '削除対追加比', 'チャーン対純増比', 'リワーク率', 'バイナリ変更回数', '追加アクション数', '変更アクション数', '削除アクション数', '置換アクション数', '生存行数', $Context.Metrics.ColDeadAdded, '所有行数', '所有割合', '自己相殺行数', '他者差戻行数', '同一箇所反復編集数', 'ピンポン回数', '内部移動行数', '他者コード変更行数', '他者コード変更生存行数', '他者コード変更生存率', 'ピンポン率', '変更エントロピー', '平均共同作者数', '最大共同作者数', 'メッセージ総文字数', 'メッセージ平均文字数', '課題ID言及数', '修正キーワード数', '差戻キーワード数', 'マージキーワード数')
         File = @('ファイルパス', 'コミット数', '作者数', '追加行数', '削除行数', '純増行数', '総チャーン', 'バイナリ変更回数', '作成回数', '削除回数', '置換回数', '初回変更リビジョン', '最終変更リビジョン', '平均変更間隔日数', '活動期間日数', '生存行数 (範囲指定)', $Context.Metrics.ColDeadAdded, '最多作者チャーン占有率', '最多作者blame占有率', '自己相殺行数 (合計)', '他者差戻行数 (合計)', '同一箇所反復編集数 (合計)', 'ピンポン回数 (合計)', '内部移動行数 (合計)', 'ホットスポットスコア', 'ホットスポット順位')
@@ -12542,7 +12461,7 @@ function Get-MetricHeader
     #>
     [CmdletBinding()]
     [OutputType([object])]
-    param([hashtable]$Context = $script:NarutoContext)
+    param([Parameter(Mandatory = $true)][hashtable]$Context)
     $definitions = Get-MetricColumnDefinitions -Context $Context
     return [pscustomobject]@{
         Committer = @($definitions.Committer)
@@ -12602,7 +12521,7 @@ function New-RunMetaData
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     [OutputType([System.Collections.Specialized.OrderedDictionary])]
-    param( [hashtable]$Context = $script:NarutoContext,
+    param( [Parameter(Mandatory = $true)][hashtable]$Context,
         [datetime]$StartTime,
         [datetime]$EndTime,
         [string]$TargetUrl,
@@ -12872,7 +12791,7 @@ function Initialize-PipelineSvnRuntimeContext
     [CmdletBinding()]
     [OutputType([string])]
     param(
-        [hashtable]$Context = $script:NarutoContext,
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [string]$SvnExecutable,
         [string]$Username,
         [securestring]$Password,
@@ -12980,7 +12899,7 @@ function Resolve-PipelineExecutionState
     [CmdletBinding()]
     [OutputType([object])]
     param(
-        [hashtable]$Context = $script:NarutoContext,
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [string]$RepoUrl,
         [int]$FromRevision,
         [int]$ToRevision,
@@ -13032,7 +12951,7 @@ function Invoke-PipelineLogAndDiffStage
     [CmdletBinding()]
     [OutputType([object])]
     param(
-        [hashtable]$Context = $script:NarutoContext,
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [object]$ExecutionState,
         [switch]$IgnoreWhitespace,
         [int]$Parallel
@@ -13067,14 +12986,15 @@ function Invoke-PipelineAggregationStage
     [CmdletBinding()]
     [OutputType([object])]
     param(
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [object[]]$Commits,
         [hashtable]$RenameMap
     )
     Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 4/8: 基本メトリクス算出' -PercentComplete 35
-    $committerRows = @(Get-CommitterMetric -Commits $Commits -RenameMap $RenameMap)
-    $fileRows = @(Get-FileMetric -Commits $Commits -RenameMap $RenameMap)
-    $couplingRows = @(Get-CoChangeMetric -Commits $Commits -TopNCount 0 -RenameMap $RenameMap)
-    $commitRows = @(New-CommitRowFromCommit -Commits $Commits)
+    $committerRows = @(Get-CommitterMetric -Context $Context -Commits $Commits -RenameMap $RenameMap)
+    $fileRows = @(Get-FileMetric -Context $Context -Commits $Commits -RenameMap $RenameMap)
+    $couplingRows = @(Get-CoChangeMetric -Context $Context -Commits $Commits -TopNCount 0 -RenameMap $RenameMap)
+    $commitRows = @(New-CommitRowFromCommit -Context $Context -Commits $Commits)
 
     return [pscustomobject]@{
         CommitterRows = $committerRows
@@ -13097,7 +13017,7 @@ function Invoke-PipelineStrictStage
     [CmdletBinding()]
     [OutputType([object])]
     param(
-        [hashtable]$Context = $script:NarutoContext,
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [object]$ExecutionState,
         [object]$LogAndDiffStage,
         [object]$AggregationStage,
@@ -13115,6 +13035,7 @@ function Write-PipelineCsvArtifacts
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '')]
     [CmdletBinding()]
     param(
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [string]$OutDirectory,
         [object[]]$CommitterRows,
         [object[]]$FileRows,
@@ -13124,7 +13045,7 @@ function Write-PipelineCsvArtifacts
         [string]$Encoding
     )
     Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 6/8: CSV レポート出力' -PercentComplete 80
-    $headers = Get-MetricHeader
+    $headers = Get-MetricHeader -Context $Context
     Write-CsvFile -FilePath (Join-Path $OutDirectory 'committers.csv') -Rows $CommitterRows -Headers $headers.Committer -EncodingName $Encoding
     Write-CsvFile -FilePath (Join-Path $OutDirectory 'files.csv') -Rows $FileRows -Headers $headers.File -EncodingName $Encoding
     Write-CsvFile -FilePath (Join-Path $OutDirectory 'commits.csv') -Rows $CommitRows -Headers $headers.Commit -EncodingName $Encoding
@@ -13143,6 +13064,7 @@ function Write-PipelineVisualizationArtifacts
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '')]
     [CmdletBinding()]
     param(
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [string]$OutDirectory,
         [object[]]$CommitterRows,
         [object[]]$FileRows,
@@ -13184,7 +13106,7 @@ function Write-PipelineVisualizationArtifacts
     foreach ($viz in $visualizations)
     {
         $vizArgs = $viz.Args
-        $vizArgs['Context'] = $script:NarutoContext
+        $vizArgs['Context'] = $Context
         $vizArgs['OutDirectory'] = $OutDirectory
         $vizArgs['EncodingName'] = $Encoding
         $vizResult = & $viz.Fn @vizArgs
@@ -13201,7 +13123,7 @@ function Write-PipelineVisualizationArtifacts
     # Strict 結果がある場合のみヒートマップを出力する
     if ($null -ne $StrictResult)
     {
-        $heatMapResult = Write-TeamInteractionHeatMap -Context $script:NarutoContext -OutDirectory $OutDirectory -KillMatrix $StrictResult.KillMatrix -AuthorSelfDead $StrictResult.AuthorSelfDead -Committers $CommitterRows -EncodingName $Encoding
+        $heatMapResult = Write-TeamInteractionHeatMap -Context $Context -OutDirectory $OutDirectory -KillMatrix $StrictResult.KillMatrix -AuthorSelfDead $StrictResult.AuthorSelfDead -Committers $CommitterRows -EncodingName $Encoding
         $heatMapResult = ConvertTo-NarutoResultAdapter -InputObject $heatMapResult -SuccessCode 'OUTPUT_VISUALIZATION_WRITTEN' -SkippedCode 'OUTPUT_VISUALIZATION_SKIPPED'
         if ([string]$heatMapResult.Status -eq 'Failure')
         {
@@ -13222,7 +13144,7 @@ function Write-PipelineRunArtifacts
     [CmdletBinding()]
     [OutputType([object])]
     param(
-        [hashtable]$Context = $script:NarutoContext,
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [datetime]$StartedAt,
         [object]$ExecutionState,
         [int]$Parallel,
@@ -13286,7 +13208,7 @@ function Invoke-NarutoCodePipeline
     #>
     [CmdletBinding()]
     param(
-        [hashtable]$Context = $script:NarutoContext,
+        [Parameter(Mandatory = $true)][hashtable]$Context,
         [string]$RepoUrl,
         [int]$FromRevision,
         [int]$ToRevision,
@@ -13307,16 +13229,15 @@ function Invoke-NarutoCodePipeline
         [switch]$ExcludeCommentOnlyLines
     )
     $startedAt = Get-Date
-    Initialize-StrictModeContext -Context $Context
-    $Context = $script:NarutoContext
+    $Context = Initialize-StrictModeContext -Context $Context
     $Context.Runtime.ExcludeCommentOnlyLines = [bool]$ExcludeCommentOnlyLines
     $executionState = Resolve-PipelineExecutionState -Context $Context -RepoUrl $RepoUrl -FromRevision $FromRevision -ToRevision $ToRevision -OutDirectory $OutDirectory -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -SvnExecutable $SvnExecutable -Username $Username -Password $Password -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -ExcludeCommentOnlyLines:$ExcludeCommentOnlyLines
     $logAndDiffStage = Invoke-PipelineLogAndDiffStage -Context $Context -ExecutionState $executionState -IgnoreWhitespace:$IgnoreWhitespace -Parallel $Parallel
-    $aggregationStage = Invoke-PipelineAggregationStage -Commits $logAndDiffStage.Commits -RenameMap $logAndDiffStage.RenameMap
+    $aggregationStage = Invoke-PipelineAggregationStage -Context $Context -Commits $logAndDiffStage.Commits -RenameMap $logAndDiffStage.RenameMap
     $strictResult = Invoke-PipelineStrictStage -Context $Context -ExecutionState $executionState -LogAndDiffStage $logAndDiffStage -AggregationStage $aggregationStage -Parallel $Parallel
 
-    Write-PipelineCsvArtifacts -OutDirectory $executionState.OutDirectory -CommitterRows $aggregationStage.CommitterRows -FileRows $aggregationStage.FileRows -CommitRows $aggregationStage.CommitRows -CouplingRows $aggregationStage.CouplingRows -StrictResult $strictResult -Encoding $Encoding
-    Write-PipelineVisualizationArtifacts -OutDirectory $executionState.OutDirectory -CommitterRows $aggregationStage.CommitterRows -FileRows $aggregationStage.FileRows -CommitRows $aggregationStage.CommitRows -CouplingRows $aggregationStage.CouplingRows -StrictResult $strictResult -TopNCount $TopNCount -Encoding $Encoding
+    Write-PipelineCsvArtifacts -Context $Context -OutDirectory $executionState.OutDirectory -CommitterRows $aggregationStage.CommitterRows -FileRows $aggregationStage.FileRows -CommitRows $aggregationStage.CommitRows -CouplingRows $aggregationStage.CouplingRows -StrictResult $strictResult -Encoding $Encoding
+    Write-PipelineVisualizationArtifacts -Context $Context -OutDirectory $executionState.OutDirectory -CommitterRows $aggregationStage.CommitterRows -FileRows $aggregationStage.FileRows -CommitRows $aggregationStage.CommitRows -CouplingRows $aggregationStage.CouplingRows -StrictResult $strictResult -TopNCount $TopNCount -Encoding $Encoding
     $meta = Write-PipelineRunArtifacts -Context $Context -StartedAt $startedAt -ExecutionState $executionState -Parallel $Parallel -TopNCount $TopNCount -Encoding $Encoding -Commits $logAndDiffStage.Commits -FileRows $aggregationStage.FileRows -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -IgnoreWhitespace:$IgnoreWhitespace -ExcludeCommentOnlyLines:$ExcludeCommentOnlyLines
 
     return (New-PipelineResultObject -OutDirectory $executionState.OutDirectory -CommitterRows $aggregationStage.CommitterRows -FileRows $aggregationStage.FileRows -CommitRows $aggregationStage.CommitRows -CouplingRows $aggregationStage.CouplingRows -RunMeta $meta)
@@ -13324,13 +13245,14 @@ function Invoke-NarutoCodePipeline
 
 if ($MyInvocation.InvocationName -ne '.')
 {
+    $cliContext = New-NarutoContext -SvnExecutable $SvnExecutable
     try
     {
-        [void](Invoke-NarutoCodePipeline -Context $script:NarutoContext -RepoUrl $RepoUrl -FromRevision $FromRevision -ToRevision $ToRevision -SvnExecutable $SvnExecutable -OutDirectory $OutDirectory -Username $Username -Password $Password -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -Parallel $Parallel -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -TopNCount $TopNCount -Encoding $Encoding -IgnoreWhitespace:$IgnoreWhitespace -ExcludeCommentOnlyLines:$ExcludeCommentOnlyLines)
+        [void](Invoke-NarutoCodePipeline -Context $cliContext -RepoUrl $RepoUrl -FromRevision $FromRevision -ToRevision $ToRevision -SvnExecutable $SvnExecutable -OutDirectory $OutDirectory -Username $Username -Password $Password -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -Parallel $Parallel -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -TopNCount $TopNCount -Encoding $Encoding -IgnoreWhitespace:$IgnoreWhitespace -ExcludeCommentOnlyLines:$ExcludeCommentOnlyLines)
     }
     catch
     {
-        $errorInfo = Get-NarutoErrorInfo -ErrorInput $_
+        $errorInfo = Get-NarutoErrorInfo -Context $cliContext -ErrorInput $_
         $exitCode = Resolve-NarutoExitCode -Category ([string]$errorInfo.Category)
         Write-Host ("[{0}] {1}" -f [string]$errorInfo.ErrorCode, [string]$errorInfo.Message)
 
@@ -13342,9 +13264,10 @@ if ($MyInvocation.InvocationName -ne '.')
         $reportResult = Write-NarutoErrorReport -OutDirectory $reportOutDirectory -ErrorInfo $errorInfo -ExitCode $exitCode
         if (-not (Test-NarutoResultSuccess -Result $reportResult))
         {
-            Write-NarutoDiagnostic -Context $script:NarutoContext -Level 'Warning' -ErrorCode ([string]$reportResult.ErrorCode) -Message ([string]$reportResult.Message)
+            Write-NarutoDiagnostic -Context $cliContext -Level 'Warning' -ErrorCode ([string]$reportResult.ErrorCode) -Message ([string]$reportResult.Message)
         }
         exit $exitCode
     }
 }
+
 

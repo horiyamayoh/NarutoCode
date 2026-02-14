@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
 Pester tests for NarutoCode error handling contracts.
 #>
@@ -7,7 +7,9 @@ BeforeAll {
     $here = Split-Path -Parent $PSCommandPath
     $script:ScriptPath = Join-Path (Join-Path $here '..') 'NarutoCode.ps1'
     . $script:ScriptPath -RepoUrl 'https://example.invalid/repos/proj/trunk' -FromRevision 1 -ToRevision 1
-    Initialize-StrictModeContext
+    $script:TestContext = New-NarutoContext -SvnExecutable 'svn'
+    $script:TestContext = Initialize-StrictModeContext -Context $script:TestContext
+    $PSDefaultParameterValues['*:Context'] = $script:TestContext
 }
 
 Describe 'NarutoResult constructors' {
@@ -97,3 +99,9 @@ Describe 'Resolve-NarutoExitCode' {
         Resolve-NarutoExitCode -Category 'UNKNOWN' | Should -Be 70
     }
 }
+
+
+
+
+
+

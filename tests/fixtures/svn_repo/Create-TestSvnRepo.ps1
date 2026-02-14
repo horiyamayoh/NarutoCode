@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
 NarutoCode テスト用の SVN リポジトリを作成するスクリプト。
 C++ プロジェクト風の履歴を持つローカル SVN リポジトリを構築します。
@@ -1112,3 +1112,7 @@ Write-Host "  - バイナリ変更          (r7,r15: logo.png)" -ForegroundColor
 Write-Host "  - fix/hotfix キーワード (r9,r18)" -ForegroundColor White
 Write-Host "  - 高/低 churn           (r8: 高churn, r16: 集中編集)" -ForegroundColor White
 Write-Host "  - リネーム              (r13: utils→string_utils)" -ForegroundColor White
+
+
+
+
