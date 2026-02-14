@@ -780,6 +780,7 @@ Describe 'Invoke-NarutoCodePipeline run_meta write policy' {
                 [int]$FromRevision,
                 [int]$ToRevision,
                 [object[]]$Commits,
+                [int]$CommitCount,
                 [object[]]$FileRows,
                 [string]$OutDirectory
             )
@@ -787,6 +788,7 @@ Describe 'Invoke-NarutoCodePipeline run_meta write policy' {
             [void]$FromRevision
             [void]$ToRevision
             [void]$Commits
+            [void]$CommitCount
             [void]$FileRows
             [void]$OutDirectory
         }

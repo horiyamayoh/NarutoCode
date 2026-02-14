@@ -1,4 +1,4 @@
-# NarutoCode 並列ランタイム設計書
+﻿# NarutoCode 並列ランタイム設計書
 
 ## 1. 目的 / 非目的
 ### 1.1 目的
@@ -86,3 +86,38 @@
 | Step 6: CSV | Done | N/A | N/A | Done | 2026-02-14 | 成果物単位（committers/files/commits/couplings/kill_matrix）ノードへ分解 |
 | Step 7: Visualization | Done | N/A | N/A | Done | 2026-02-14 | 可視化関数単位ノードへ分解（入れ子並列なし） |
 | Step 8: run_meta | Done | Done | Done | Done | 2026-02-14 | DAG内はメタ生成のみ、ファイル書き込みは DAG 完了後 1 回のみ |
+
+## 12. Memory Governor (2026-02-14)
+- Added runtime memory governor state in `New-PipelineRuntime`.
+- Observation points:
+  - stage start/end in `Invoke-PipelineDag`
+  - every 64 resolved requests in `Wait-SvnRequest`
+- Low-cost sampling path:
+  - `[GC]::GetTotalMemory($false)`
+  - cached `System.Diagnostics.Process` memory values
+  - process refresh every 8 observations
+- CIM refresh path (`Win32_OperatingSystem`):
+  - initial snapshot at runtime start
+  - refreshed only when level is Soft/Hard and 15s elapsed
+- Pressure policy:
+  - `Normal`: keep throughput-oriented behavior
+  - `Soft`: halve effective parallelism (`ceil(P/2)`)
+  - `Hard`: halve again + cache purge (gateway + strict caches)
+  - `Hard streak >= 3 at P=1`: emergency purge + forced GC
+
+## 13. Streaming Resolve and Stage Cleanup (2026-02-14)
+- `Wait-SvnRequest` now supports:
+  - `-OnResolved [scriptblock]`
+  - `-ConsumeOnResolve [switch]`
+- `Invoke-ParallelWork` / `Invoke-ParallelExecutorBatch` now support:
+  - `-OnItemCompleted [scriptblock]`
+  - `-SuppressOutputCollection [switch]`
+- Added post-strict cleanup node:
+  - stores `CommitCount` into `Runtime.DerivedMeta`
+  - releases `StageResults['step3_diff']`
+  - clears strict memory caches and gateway command cache
+- `run_meta.json` now records:
+  - `PeakPrivateMemoryMB`, `PeakWorkingSetMB`
+  - `MemoryPressureSoftCount`, `MemoryPressureHardCount`
+  - `MemoryThrottleCount`, `LowestEffectiveParallel`
+  - `CachePurgeCount`

@@ -2141,6 +2141,13 @@ Describe 'Integration — test SVN repo output matches baseline' -Tag 'Integrati
         [double]$meta.DurationSeconds | Should -BeGreaterThan 0
         [bool]$meta.Parameters.ExcludeCommentOnlyLines | Should -BeFalse
         $meta.StageDurations.PSObject.Properties.Name | Should -Contain 'step8_meta'
+        [double]$meta.PeakPrivateMemoryMB | Should -BeGreaterThan 0
+        [double]$meta.PeakWorkingSetMB | Should -BeGreaterThan 0
+        [int]$meta.MemoryPressureSoftCount | Should -BeGreaterOrEqual 0
+        [int]$meta.MemoryPressureHardCount | Should -BeGreaterOrEqual 0
+        [int]$meta.MemoryThrottleCount | Should -BeGreaterOrEqual 0
+        [int]$meta.LowestEffectiveParallel | Should -BeGreaterThan 0
+        [int]$meta.CachePurgeCount | Should -BeGreaterOrEqual 0
         $meta.Outputs.SurvivedShareDonutSvg | Should -Be 'team_survived_share.svg'
         $meta.Outputs.PSObject.Properties.Name | Should -Not -Contain 'ContributorBalanceSvg'
     }
@@ -2233,6 +2240,33 @@ Describe 'Invoke-ParallelWork' {
         $errorText | Should -Not -BeNullOrEmpty
         $errorText | Should -Match '\[3\]'
         $errorText | Should -Match 'intentional detail failure'
+    }
+
+    It 'supports completion callback with suppressed output collection' {
+        $items = 1..8
+        $seenIndexes = New-Object 'System.Collections.Generic.List[int]'
+        $syncRoot = New-Object object
+        $actual = @(Invoke-ParallelWork -InputItems $items -WorkerScript {
+                param($Item, $Index)
+                Start-Sleep -Milliseconds (5 + (8 - [int]$Item))
+                return ([int]$Item * 10)
+            } -MaxParallel 4 -ErrorContext 'callback suppress test' -OnItemCompleted {
+                param($Item, $Index, $Output)
+                [void]$Item
+                [void]$Output
+                [System.Threading.Monitor]::Enter($syncRoot)
+                try
+                {
+                    [void]$seenIndexes.Add([int]$Index)
+                }
+                finally
+                {
+                    [System.Threading.Monitor]::Exit($syncRoot)
+                }
+            } -SuppressOutputCollection)
+
+        $actual.Count | Should -Be 0
+        @($seenIndexes.ToArray() | Sort-Object) | Should -Be @(0..7)
     }
 }
 

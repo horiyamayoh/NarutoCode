@@ -1,4 +1,4 @@
-# NarutoCode.ps1 設計書（SVN リビジョン範囲のコミット品質・傾向解析）
+﻿# NarutoCode.ps1 設計書（SVN リビジョン範囲のコミット品質・傾向解析）
 
 ## 1. 目的 / ゴール
 SVN のリモートリポジトリに対し、指定したリビジョン範囲 **rA〜rB** の履歴を取得し、
@@ -1316,3 +1316,10 @@ try {
 - run_meta は DAG 内でメタ生成のみ行い、`run_meta.json` の書き込みは DAG 完了後に 1 回のみ実行する。
 
 以降、並列設計と進捗管理は `docs/parallel_runtime_design.md` の進捗表を参照すること。
+
+## Parallel Runtime Memory Policy (2026-02-14)
+- Memory governor was added to runtime execution control.
+- Request resolution supports streaming consume mode.
+- Post-strict cleanup releases large stage payloads early (`step3_diff`).
+- `run_meta.json` now includes memory pressure and throttle telemetry.
+- Hard pressure mode can switch strict blame preload to commit-window execution.

@@ -20,9 +20,11 @@ Describe 'Pipeline runtime' {
         $runtime.ParallelExecutor | Should -Not -BeNullOrEmpty
         @($runtime.ParallelFunctionCatalog).Count | Should -BeGreaterThan 0
         $runtime.RequestBroker | Should -Not -BeNullOrEmpty
+        $runtime.MemoryGovernor | Should -Not -BeNullOrEmpty
         $runtime.StageResults.Count | Should -Be 0
         $runtime.StageDurations.Count | Should -Be 0
         $script:TestContext.Runtime.RequestBroker | Should -Be $runtime.RequestBroker
+        $script:TestContext.Runtime.MemoryGovernor | Should -Be $runtime.MemoryGovernor
     }
 }
 
@@ -54,6 +56,7 @@ Describe 'Pipeline runtime disposal' {
         $runtime.ParallelSemaphore | Should -BeNullOrEmpty
         $context.Runtime.PipelineRuntime | Should -BeNullOrEmpty
         $context.Runtime.RequestBroker | Should -BeNullOrEmpty
+        $context.Runtime.MemoryGovernor | Should -BeNullOrEmpty
         $context.Runtime.SvnGateway | Should -BeNullOrEmpty
     }
 }
@@ -380,5 +383,129 @@ Describe 'Pipeline DAG deterministic merge order' {
 
         @($orders | Select-Object -Unique).Count | Should -Be 1
         $orders[0] | Should -Be 'step_base,step6_csv,step7_visual'
+    }
+}
+
+Describe 'Request broker streaming resolve' {
+    It 'consumes results on resolve and invokes callback' {
+        $context = New-NarutoContext -SvnExecutable 'svn'
+        $context = Initialize-StrictModeContext -Context $context
+        $runtime = New-PipelineRuntime -Context $context -Parallel 4
+        $broker = $runtime.RequestBroker
+        $callbacks = New-Object 'System.Collections.Generic.List[string]'
+
+        $keyA = Register-SvnRequest -Broker $broker -Operation 'diff' -Path 'https://example.invalid/svn/repo/trunk' -Revision '' -RevisionRange '21' -Flags @('diff') -Resolver {
+            param($Context, $Request)
+            [void]$Context
+            [void]$Request
+            return 'A'
+        }
+        $keyB = Register-SvnRequest -Broker $broker -Operation 'diff' -Path 'https://example.invalid/svn/repo/trunk' -Revision '' -RevisionRange '22' -Flags @('diff') -Resolver {
+            param($Context, $Request)
+            [void]$Context
+            [void]$Request
+            return 'B'
+        }
+
+        [void](Wait-SvnRequest -Context $context -Broker $broker -RequestKeys @($keyA, $keyB) -ConsumeOnResolve -OnResolved {
+                param($Broker, $RequestKey, $Request, $Result, $ConsumedResult)
+                [void]$Broker
+                [void]$Request
+                [void]$Result
+                [void]$callbacks.Add(([string]$RequestKey + ':' + [string]$ConsumedResult.Payload))
+            })
+
+        $broker.Results.Count | Should -Be 0
+        $broker.Requests.Count | Should -Be 0
+        $broker.RegistrationOrder.Count | Should -Be 0
+        @($callbacks | Sort-Object) | Should -Be @(
+            ($keyA + ':A'),
+            ($keyB + ':B')
+        )
+    }
+
+    It 'wraps callback failure with INTERNAL_REQUEST_RESOLVE_CALLBACK_FAILED' {
+        $context = New-NarutoContext -SvnExecutable 'svn'
+        $context = Initialize-StrictModeContext -Context $context
+        $runtime = New-PipelineRuntime -Context $context -Parallel 2
+        $broker = $runtime.RequestBroker
+        $requestKey = Register-SvnRequest -Broker $broker -Operation 'diff' -Path 'https://example.invalid/svn/repo/trunk' -Revision '' -RevisionRange '31' -Flags @('diff') -Resolver {
+            param($Context, $Request)
+            [void]$Context
+            [void]$Request
+            return 'ok'
+        }
+
+        $caught = $null
+        try
+        {
+            [void](Wait-SvnRequest -Context $context -Broker $broker -RequestKeys @($requestKey) -ConsumeOnResolve -OnResolved {
+                    param($Broker, $RequestKey, $Request, $Result, $ConsumedResult)
+                    [void]$Broker
+                    [void]$RequestKey
+                    [void]$Request
+                    [void]$Result
+                    [void]$ConsumedResult
+                    throw 'callback failure'
+                })
+        }
+        catch
+        {
+            $caught = $_.Exception
+        }
+
+        $caught | Should -Not -BeNullOrEmpty
+        [string]$caught.Data['ErrorCode'] | Should -Be 'INTERNAL_REQUEST_RESOLVE_CALLBACK_FAILED'
+    }
+}
+
+Describe 'Pipeline post strict cleanup stage' {
+    It 'releases step3 result and strict caches while preserving commit count' {
+        $context = New-NarutoContext -SvnExecutable 'svn'
+        $context = Initialize-StrictModeContext -Context $context
+        $runtime = New-PipelineRuntime -Context $context -Parallel 4
+        $runtime.StageResults['step3_diff'] = [pscustomobject]@{
+            Commits = @(
+                [pscustomobject]@{ Revision = 1 },
+                [pscustomobject]@{ Revision = 2 },
+                [pscustomobject]@{ Revision = 3 }
+            )
+        }
+        $context.Caches.SvnBlameSummaryMemoryCache['k1'] = [pscustomobject]@{ X = 1 }
+        $context.Caches.SvnBlameLineMemoryCache['k2'] = [pscustomobject]@{ X = 1 }
+        $gateway = Get-ContextSvnGatewayState -Context $context
+        $gateway.CommandCache['cmd'] = 'payload'
+
+        $result = Invoke-PipelinePostStrictCleanupStage -Context $context -Runtime $runtime
+
+        [int]$result.CommitCount | Should -Be 3
+        [int]$runtime.DerivedMeta.CommitCount | Should -Be 3
+        $runtime.StageResults.ContainsKey('step3_diff') | Should -BeFalse
+        $context.Caches.SvnBlameSummaryMemoryCache.Count | Should -Be 0
+        $context.Caches.SvnBlameLineMemoryCache.Count | Should -Be 0
+        $gateway.CommandCache.Count | Should -Be 0
+    }
+}
+
+Describe 'Memory governor pressure streak' {
+    It 'triggers emergency purge after 3 consecutive hard observations at P=1' {
+        $context = New-NarutoContext -SvnExecutable 'svn'
+        $context = Initialize-StrictModeContext -Context $context
+        $runtime = New-PipelineRuntime -Context $context -Parallel 4
+        $governor = $runtime.MemoryGovernor
+        $governor.CurrentParallel = 1
+        $governor.LowestParallel = 1
+        $governor.SoftLimitBytes = 1L
+        $governor.HardLimitBytes = 1L
+        $baselinePurgeCount = [int]$governor.CachePurgeCount
+
+        [void](Observe-MemoryGovernor -Context $context -Reason 'hard-1')
+        [void](Observe-MemoryGovernor -Context $context -Reason 'hard-2')
+        [void](Observe-MemoryGovernor -Context $context -Reason 'hard-3')
+
+        [string]$governor.CurrentLevel | Should -Be 'Hard'
+        [int]$governor.HardStreak | Should -BeGreaterOrEqual 3
+        [int]$governor.CurrentParallel | Should -Be 1
+        [int]$governor.CachePurgeCount | Should -BeGreaterThan $baselinePurgeCount
     }
 }
