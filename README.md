@@ -91,7 +91,8 @@ SVN リポジトリの履歴を解析し、コミット品質・変更傾向の�
 
 `-TopN` は可視化ファイルの表示件数にのみ適用され、CSV は常に全件出力されます。
 
-詳細な指標の読み方は [docs/metrics_guide.md](docs/metrics_guide.md) を参照してください。
+詳細な指標の読み方は [docs/metrics_guide.md](docs/metrics_guide.md) を参照してください。  
+並列ランタイムの設計思想と進捗は [docs/parallel_runtime_design.md](docs/parallel_runtime_design.md) を参照してください。
 
 ## フォルダ構成
 

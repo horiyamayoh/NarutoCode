@@ -1299,3 +1299,13 @@ try {
 ### 成果物への反映
 - 失敗時: `error_report.json` を出力（`ErrorCode`, `Category`, `Message`, `Context`, `ExitCode`, `Timestamp`）。
 - 成功時: `run_meta.json.Diagnostics` に `WarningCount`, `WarningCodes`, `SkippedOutputs` を記録。
+## Parallel Runtime Update (2026-02-14)
+
+`docs/parallel_runtime_design.md` を正本とし、並列実行基盤を以下へ更新した。
+
+- 旧 RunspacePool 依存実装は廃止。
+- 新実装は `DAG実行 + RequestBroker + SvnGateway`。
+- Step 3/5 は request の登録・待機・還元の二相構成に移行。
+- run_meta に `StageDurations` を追加し、段階時間を記録。
+
+以降、並列設計と進捗管理は `docs/parallel_runtime_design.md` の進捗表を参照すること。
