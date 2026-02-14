@@ -97,6 +97,9 @@ param(
     [switch]$NoProgress
 )
 
+# Script-scope cache initialization (strict mode safe)
+$script:NarutoFunctionNameCatalogCache = $null
+
 # Suppress progress output when -NoProgress is specified
 if ($NoProgress)
 {
