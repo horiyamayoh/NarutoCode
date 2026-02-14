@@ -37,7 +37,7 @@ SVN のリモートリポジトリに対し、指定したリビジョン範囲 
 ### 3.1 代表的な使用例
 ```powershell
 # 例: r1000〜r1200 の履歴を解析して ./out に出力
-.\NarutoCode.ps1 -RepoUrl "https://svn.example.com/repos/project" -FromRev 1000 -ToRev 1200 -OutDir .\out
+.\NarutoCode.ps1 -RepoUrl "https://svn.example.com/repos/project" -FromRev 1000 -ToRev 1200 -OutDirectory .\out
 ```
 
 ### 3.2 パラメータ設計
@@ -52,16 +52,17 @@ SVN のリモートリポジトリに対し、指定したリビジョン範囲 
   - `-ToRev <int>`: 終了リビジョン（含む）
 - 任意（運用で効く）
   - `-SvnExecutable <string>`: svn コマンドのパス（既定: `svn`）
-  - `-OutDir <string>`: 出力先（既定: `./NarutoCode_out`・固定名でキャッシュ再利用）
+  - `-OutDirectory <string>`: 出力先（既定: `./NarutoCode_out`・固定名でキャッシュ再利用）
   - `-Username <string>` / `-Password <securestring>`: SVN 認証情報
   - `-NonInteractive`: `--non-interactive` を強制（CI 想定）
   - `-TrustServerCert`: `--trust-server-cert`（自己署名証明書対応）
   - `-Parallel <int>`: 最大並列数（既定: CPU コア数）
   - `-IncludePaths <string[]>` / `-ExcludePaths <string[]>`: 解析対象パスの絞り込み（ワイルドカード）
   - `-IncludeExtensions <string[]>` / `-ExcludeExtensions <string[]>`: 拡張子フィルタ
-  - `-TopN <int>`: 可視化の出力上限（既定: 50・CSV は全件出力）
+  - `-TopNCount <int>`: 可視化の出力上限（既定: 50・CSV は全件出力）
   - `-Encoding <string>`: 出力エンコーディング（既定: UTF-8）
   - `-IgnoreWhitespace`: diff 時に空白・改行コードの差異を無視
+  - `-ExcludeCommentOnlyLines`: コメント専用行を全メトリクスで除外
   - `-NoProgress`: 進捗バー表示を抑止
 
 ---
@@ -164,7 +165,7 @@ PowerShell 内で扱う主要構造（擬似定義）。
 - `svn diff -c` は revision 数回だが、
   - **並列**（RunspacePool、`-Parallel` で制御）
   - 取得結果を一時ファイルにキャッシュ（`$OutDir/cache/diff_r1234.txt`）
-  - 同一 `-OutDir` での再実行時にキャッシュを自動再利用
+  - 同一 `-OutDirectory` での再実行時にキャッシュを自動再利用
 - `svn blame` は **変更されたファイル集合**に限定
   - per-revision blame のキャッシュも `$OutDir/cache/blame/` に保存
 
@@ -346,7 +347,7 @@ PowerShell 内で扱う主要構造（擬似定義）。
 を組み合わせた「ホットスポット指数」を **ランキング用途の数値**として出す。
 
 例：
-- `ホットスポットスコア = コミット数 * (追加行数 + 削除行数)`
+- `ホットスポットスコア = コミット数² × 作者数 × 総チャーン ÷ max(活動期間日数, 1)`
 - 併せて `ホットスポット順位` を出力（相対比較用）
 
 > 閾値判定せず、単なるスコア・順位。
@@ -863,7 +864,7 @@ Index: trunk/src/Main.cs
 - `commit_scatter.svg`
 - `cache/`（`diff` / `blame` / `cat` キャッシュ）
 
-`-TopN` は可視化出力の表示件数だけを制御し、CSV は常に全件を出力する。
+`-TopNCount` は可視化出力の表示件数だけを制御し、CSV は常に全件を出力する。
 
 ---
 
@@ -915,11 +916,18 @@ Index: trunk/src/Main.cs
   - `-FromRevision` → `-FromRev`（既存エイリアス維持）
   - `-ToRevision` → `-ToRev`（既存エイリアス維持）
 - **新規パラメータの追加**
-  - `-OutDir`, `-Username`, `-Password`, `-NonInteractive`, `-TrustServerCert`
-  - `-NoBlame`, `-Parallel`, `-IncludePaths`, `-EmitPlantUml`, `-TopN`, `-Encoding`
+  - `-OutDirectory`, `-Username`, `-Password`, `-NonInteractive`, `-TrustServerCert`
+  - `-Parallel`, `-IncludePaths`, `-ExcludePaths`, `-IncludeExtensions`, `-ExcludeExtensions`
+  - `-TopNCount`, `-Encoding`, `-IgnoreWhitespace`, `-ExcludeCommentOnlyLines`, `-NoProgress`
+
+> **注:** 以下のパラメータは削除済み（機能は常時有効化）:
+> - `-NoBlame`（blame は常時実行）
+> - `-EmitPlantUml`（PlantUML / SVG は常時出力）
+> - `-StrictMode`（Strict モードは常時有効）
+> - `-DeadDetailLevel`（常に最大値 2）
 - **出力ディレクトリ・キャッシュ基盤**
-  - `$OutDir` のデフォルト値（`./NarutoCode_out_yyyyMMdd_HHmmss`）
-  - `$OutDir/cache/` ディレクトリの自動作成
+  - `$OutDirectory` のデフォルト値（`./NarutoCode_out`）
+  - `$OutDirectory/cache/` ディレクトリの自動作成
 - **`run_meta.json` の出力**
   - 実行条件（パラメータ値、svn バージョン、開始/終了時刻）を記録
 - **完了条件**: 新パラメータで起動でき、OutDir と run_meta.json が生成される
@@ -984,14 +992,14 @@ Index: trunk/src/Main.cs
 - **消滅量（§7.7b）**: 消滅追加行数 = max(0, 追加行数 − 生存行数)
 - **所有権（§7.9）**: 所有行数, 所有割合
 - **最多作者blame占有率（§8.2、blame 版）**
-- **`-NoBlame` 指定時のスキップ処理**
+- ~~**`-NoBlame` 指定時のスキップ処理**~~ 削除済み（blame は常時実行）
 - **blame の並列取得**（Step 1-4 の RunspacePool を再利用）
 - **完了条件**: モック blame XML に対するテスト通過。NoBlame 時に該当列が空
 
 #### Step 1-8: Co-change 解析
 - **ペア集計（§9.1）**: commit ごとの変更ファイルからペアを列挙（ファイル数によるフィルタリングなし）
 - **Jaccard / リフト値（§9.2）** の算出
-- **`-TopN` による出力上限**
+- **`-TopNCount` による出力上限**
 - **完了条件**: 3ファイル × 3コミットのモックデータで 共変更回数/Jaccard/リフト値 が正しい
 
 #### Step 1-9: 出力（CSV / PlantUML / run_meta.json）
@@ -1000,7 +1008,7 @@ Index: trunk/src/Main.cs
   - `files.csv`（Phase 1 列）
   - `commits.csv`
   - `couplings.csv`
-- **PlantUML 出力**（`-EmitPlantUml` 指定時）
+- **PlantUML / SVG 出力**（常時出力）
   - `contributors_summary.puml`
   - `hotspots.puml`
   - `cochange_network.puml`
