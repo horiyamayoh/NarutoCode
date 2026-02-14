@@ -320,6 +320,104 @@ Index: src/new.cs
         }
     }
 
+    Context 'Invoke-CommitDiffPrefetch fallback parallel contract' {
+        BeforeEach {
+            $script:origGetCachedOrFetchDiffTextParallel = (Get-Item function:Get-CachedOrFetchDiffText).ScriptBlock.ToString()
+            $script:origGetCommitDiffRawByPathParallel = (Get-Item function:Get-CommitDiffRawByPath).ScriptBlock.ToString()
+            $script:origInvokeParallelWorkCommitDiff = (Get-Item function:Invoke-ParallelWork).ScriptBlock.ToString()
+            $script:capturedCommitDiffParallel = 0
+        }
+
+        AfterEach {
+            Set-Item -Path function:Get-CachedOrFetchDiffText -Value $script:origGetCachedOrFetchDiffTextParallel
+            Set-Item -Path function:Get-CommitDiffRawByPath -Value $script:origGetCommitDiffRawByPathParallel
+            Set-Item -Path function:Invoke-ParallelWork -Value $script:origInvokeParallelWorkCommitDiff
+        }
+
+        It 'passes requested -Parallel to fallback Invoke-ParallelWork' {
+            Set-Item -Path function:Get-CachedOrFetchDiffText -Value {
+                param(
+                    [hashtable]$Context,
+                    [string]$CacheDir,
+                    [int]$Revision,
+                    [string]$TargetUrl,
+                    [string[]]$DiffArguments
+                )
+                [void]$Context
+                [void]$CacheDir
+                [void]$Revision
+                [void]$TargetUrl
+                [void]$DiffArguments
+                return ''
+            }
+            Set-Item -Path function:Get-CommitDiffRawByPath -Value {
+                param([hashtable]$Context, [object]$Item, [string]$DiffText)
+                [void]$Context
+                [void]$Item
+                [void]$DiffText
+                return @{}
+            }
+            Set-Item -Path function:Invoke-ParallelWork -Value {
+                param(
+                    [object[]]$InputItems,
+                    [scriptblock]$WorkerScript,
+                    [int]$MaxParallel = 1,
+                    [string[]]$RequiredFunctions = @(),
+                    [hashtable]$SessionVariables = @{},
+                    [string]$ErrorContext = 'parallel work',
+                    [System.Threading.SemaphoreSlim]$SharedSemaphore = $null,
+                    [hashtable]$Context = $null,
+                    [scriptblock]$OnItemCompleted = $null,
+                    [switch]$SuppressOutputCollection
+                )
+                [void]$RequiredFunctions
+                [void]$ErrorContext
+                [void]$SharedSemaphore
+                [void]$Context
+                foreach ($name in @($SessionVariables.Keys))
+                {
+                    Set-Variable -Scope Script -Name ([string]$name) -Value $SessionVariables[$name]
+                }
+                $script:capturedCommitDiffParallel = [int]$MaxParallel
+                $rows = New-Object 'System.Collections.Generic.List[object]'
+                for ($index = 0
+                    $index -lt @($InputItems).Count
+                    $index++)
+                {
+                    $output = (& $WorkerScript -Item $InputItems[$index] -Index $index)
+                    if ($null -ne $OnItemCompleted)
+                    {
+                        & $OnItemCompleted -Item $InputItems[$index] -Index $index -Output $output
+                    }
+                    if (-not $SuppressOutputCollection)
+                    {
+                        [void]$rows.Add($output)
+                    }
+                }
+                if ($SuppressOutputCollection)
+                {
+                    return @()
+                }
+                return @($rows.ToArray())
+            }
+
+            $prefetchItems = @(
+                [pscustomobject]@{
+                    Revision = 10
+                    CacheDir = '.cache'
+                    TargetUrl = 'https://example.invalid/svn/repo'
+                    DiffArguments = @('diff', '--internal-diff')
+                    ChangedPaths = @()
+                    ExcludeCommentOnlyLines = $false
+                }
+            )
+
+            [void](Invoke-CommitDiffPrefetch -Context $script:TestContext -PrefetchItems $prefetchItems -Parallel 4)
+
+            [int]$script:capturedCommitDiffParallel | Should -Be 4
+        }
+    }
+
     Context 'Set-CommitDerivedMetric' {
         It 'updates churn and message summary fields' {
             $longMessage = ('x' * 150) + "`r`nsecond line"
@@ -557,6 +655,246 @@ Index: src/new.cs
             $result.AuthorBorn['alice'] | Should -Be 3
             $script:lastStrictParallelStage | Should -Be 3
         }
+    }
+}
+
+Describe 'Invoke-NarutoCodePipeline run_meta write policy' {
+    BeforeEach {
+        $script:origResolvePipelineExecutionStateMeta = (Get-Item function:Resolve-PipelineExecutionState).ScriptBlock.ToString()
+        $script:origInvokePipelineLogStageMeta = (Get-Item function:Invoke-PipelineLogStage).ScriptBlock.ToString()
+        $script:origInvokePipelineDiffStageMeta = (Get-Item function:Invoke-PipelineDiffStage).ScriptBlock.ToString()
+        $script:origInvokePipelineAggregationCommitterStageMeta = (Get-Item function:Invoke-PipelineAggregationCommitterStage).ScriptBlock.ToString()
+        $script:origInvokePipelineAggregationFileStageMeta = (Get-Item function:Invoke-PipelineAggregationFileStage).ScriptBlock.ToString()
+        $script:origInvokePipelineAggregationCouplingStageMeta = (Get-Item function:Invoke-PipelineAggregationCouplingStage).ScriptBlock.ToString()
+        $script:origInvokePipelineAggregationCommitStageMeta = (Get-Item function:Invoke-PipelineAggregationCommitStage).ScriptBlock.ToString()
+        $script:origInvokePipelineStrictStageMeta = (Get-Item function:Invoke-PipelineStrictStage).ScriptBlock.ToString()
+        $script:origWritePipelineCsvArtifactsMeta = (Get-Item function:Write-PipelineCsvArtifacts).ScriptBlock.ToString()
+        $script:origWritePipelineVisualizationArtifactsMeta = (Get-Item function:Write-PipelineVisualizationArtifacts).ScriptBlock.ToString()
+        $script:origWriteJsonFileMeta = (Get-Item function:Write-JsonFile).ScriptBlock.ToString()
+        $script:origWriteRunSummaryMeta = (Get-Item function:Write-RunSummary).ScriptBlock.ToString()
+        $script:runMetaWriteCount = 0
+        $script:testOutDirMeta = Join-Path $env:TEMP ('narutocode_run_meta_policy_' + [guid]::NewGuid().ToString('N'))
+        New-Item -Path $script:testOutDirMeta -ItemType Directory -Force | Out-Null
+    }
+
+    AfterEach {
+        Set-Item -Path function:Resolve-PipelineExecutionState -Value $script:origResolvePipelineExecutionStateMeta
+        Set-Item -Path function:Invoke-PipelineLogStage -Value $script:origInvokePipelineLogStageMeta
+        Set-Item -Path function:Invoke-PipelineDiffStage -Value $script:origInvokePipelineDiffStageMeta
+        Set-Item -Path function:Invoke-PipelineAggregationCommitterStage -Value $script:origInvokePipelineAggregationCommitterStageMeta
+        Set-Item -Path function:Invoke-PipelineAggregationFileStage -Value $script:origInvokePipelineAggregationFileStageMeta
+        Set-Item -Path function:Invoke-PipelineAggregationCouplingStage -Value $script:origInvokePipelineAggregationCouplingStageMeta
+        Set-Item -Path function:Invoke-PipelineAggregationCommitStage -Value $script:origInvokePipelineAggregationCommitStageMeta
+        Set-Item -Path function:Invoke-PipelineStrictStage -Value $script:origInvokePipelineStrictStageMeta
+        Set-Item -Path function:Write-PipelineCsvArtifacts -Value $script:origWritePipelineCsvArtifactsMeta
+        Set-Item -Path function:Write-PipelineVisualizationArtifacts -Value $script:origWritePipelineVisualizationArtifactsMeta
+        Set-Item -Path function:Write-JsonFile -Value $script:origWriteJsonFileMeta
+        Set-Item -Path function:Write-RunSummary -Value $script:origWriteRunSummaryMeta
+        Remove-Item -Path $script:testOutDirMeta -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'writes run_meta.json exactly once in pipeline execution' {
+        Set-Item -Path function:Resolve-PipelineExecutionState -Value {
+            param(
+                [hashtable]$Context,
+                [string]$RepoUrl,
+                [int]$FromRevision,
+                [int]$ToRevision,
+                [string]$OutDirectory,
+                [string[]]$IncludePaths,
+                [string[]]$ExcludePaths,
+                [string[]]$IncludeExtensions,
+                [string[]]$ExcludeExtensions,
+                [string]$SvnExecutable,
+                [string]$Username,
+                [securestring]$Password,
+                [switch]$NonInteractive,
+                [switch]$TrustServerCert,
+                [switch]$ExcludeCommentOnlyLines
+            )
+            [void]$Context
+            [void]$RepoUrl
+            [void]$FromRevision
+            [void]$ToRevision
+            [void]$IncludePaths
+            [void]$ExcludePaths
+            [void]$IncludeExtensions
+            [void]$ExcludeExtensions
+            [void]$SvnExecutable
+            [void]$Username
+            [void]$Password
+            [void]$NonInteractive
+            [void]$TrustServerCert
+            [void]$ExcludeCommentOnlyLines
+            return [pscustomobject]@{
+                RepoUrl = 'https://example.invalid/svn/repo'
+                FromRevision = 1
+                ToRevision = 2
+                OutDirectory = $script:testOutDirMeta
+                CacheDir = (Join-Path $script:testOutDirMeta 'cache')
+                IncludePaths = @()
+                ExcludePaths = @()
+                IncludeExtensions = @()
+                ExcludeExtensions = @()
+                TargetUrl = 'https://example.invalid/svn/repo'
+                LogPathPrefix = ''
+                SvnVersion = '1.14.2'
+                ExcludeCommentOnlyLines = $false
+            }
+        }
+        Set-Item -Path function:Invoke-PipelineLogStage -Value {
+            param([hashtable]$Context, [object]$ExecutionState)
+            [void]$Context
+            [void]$ExecutionState
+            return [pscustomobject]@{
+                Commits = @([pscustomobject]@{
+                        Revision = 2
+                        Author = 'alice'
+                        FilesChanged = @('src/A.cs')
+                        ChangedPathsFiltered = @()
+                        FileDiffStats = @{}
+                    })
+            }
+        }
+        Set-Item -Path function:Invoke-PipelineDiffStage -Value {
+            param([hashtable]$Context, [object]$ExecutionState, [object[]]$Commits, [switch]$IgnoreWhitespace, [int]$Parallel)
+            [void]$Context
+            [void]$ExecutionState
+            [void]$IgnoreWhitespace
+            [void]$Parallel
+            return [pscustomobject]@{
+                Commits = @($Commits)
+                RevToAuthor = @{ 2 = 'alice' }
+                RenameMap = @{}
+            }
+        }
+        Set-Item -Path function:Invoke-PipelineAggregationCommitterStage -Value {
+            param([hashtable]$Context, [object[]]$Commits, [hashtable]$RenameMap)
+            [void]$Context
+            [void]$Commits
+            [void]$RenameMap
+            return @([pscustomobject]@{
+                    '作者' = 'alice'
+                })
+        }
+        Set-Item -Path function:Invoke-PipelineAggregationFileStage -Value {
+            param([hashtable]$Context, [object[]]$Commits, [hashtable]$RenameMap)
+            [void]$Context
+            [void]$Commits
+            [void]$RenameMap
+            return @([pscustomobject]@{
+                    'ファイルパス' = 'src/A.cs'
+                })
+        }
+        Set-Item -Path function:Invoke-PipelineAggregationCouplingStage -Value {
+            param([hashtable]$Context, [object[]]$Commits, [hashtable]$RenameMap)
+            [void]$Context
+            [void]$Commits
+            [void]$RenameMap
+            return @([pscustomobject]@{
+                    'ファイルA' = 'src/A.cs'
+                    'ファイルB' = 'src/B.cs'
+                })
+        }
+        Set-Item -Path function:Invoke-PipelineAggregationCommitStage -Value {
+            param([hashtable]$Context, [object[]]$Commits)
+            [void]$Context
+            return @([pscustomobject]@{
+                    'リビジョン' = 2
+                })
+        }
+        Set-Item -Path function:Invoke-PipelineStrictStage -Value {
+            param([hashtable]$Context, [object]$ExecutionState, [object]$LogAndDiffStage, [object]$AggregationStage, [int]$Parallel)
+            [void]$Context
+            [void]$ExecutionState
+            [void]$LogAndDiffStage
+            [void]$AggregationStage
+            [void]$Parallel
+            return [pscustomobject]@{
+                KillMatrix = @{ alice = @{ alice = 0 } }
+                AuthorSelfDead = @{ alice = 0 }
+                AuthorBorn = @{ alice = 1 }
+            }
+        }
+        Set-Item -Path function:Write-PipelineCsvArtifacts -Value {
+            param(
+                [hashtable]$Context,
+                [string]$OutDirectory,
+                [object[]]$CommitterRows,
+                [object[]]$FileRows,
+                [object[]]$CommitRows,
+                [object[]]$CouplingRows,
+                [object]$StrictResult,
+                [string]$Encoding,
+                [string[]]$ArtifactNames
+            )
+            [void]$Context
+            [void]$OutDirectory
+            [void]$CommitterRows
+            [void]$FileRows
+            [void]$CommitRows
+            [void]$CouplingRows
+            [void]$StrictResult
+            [void]$Encoding
+            return @($ArtifactNames)
+        }
+        Set-Item -Path function:Write-PipelineVisualizationArtifacts -Value {
+            param(
+                [hashtable]$Context,
+                [string]$OutDirectory,
+                [object[]]$CommitterRows,
+                [object[]]$FileRows,
+                [object[]]$CommitRows,
+                [object[]]$CouplingRows,
+                [object]$StrictResult,
+                [int]$TopNCount,
+                [string]$Encoding,
+                [string[]]$VisualizationFunctions
+            )
+            [void]$Context
+            [void]$OutDirectory
+            [void]$CommitterRows
+            [void]$FileRows
+            [void]$CommitRows
+            [void]$CouplingRows
+            [void]$StrictResult
+            [void]$TopNCount
+            [void]$Encoding
+            return @($VisualizationFunctions)
+        }
+        Set-Item -Path function:Write-JsonFile -Value {
+            param([object]$Data, [string]$FilePath, [int]$Depth, [string]$EncodingName)
+            [void]$Data
+            [void]$Depth
+            [void]$EncodingName
+            if ([string]$FilePath -like '*run_meta.json')
+            {
+                $script:runMetaWriteCount++
+            }
+        }
+        Set-Item -Path function:Write-RunSummary -Value {
+            param(
+                [string]$TargetUrl,
+                [int]$FromRevision,
+                [int]$ToRevision,
+                [object[]]$Commits,
+                [int]$CommitCount,
+                [object[]]$FileRows,
+                [string]$OutDirectory
+            )
+            [void]$TargetUrl
+            [void]$FromRevision
+            [void]$ToRevision
+            [void]$Commits
+            [void]$CommitCount
+            [void]$FileRows
+            [void]$OutDirectory
+        }
+
+        $context = New-NarutoContext -SvnExecutable 'svn'
+        [void](Invoke-NarutoCodePipeline -Context $context -RepoUrl 'https://example.invalid/svn/repo' -FromRevision 1 -ToRevision 2 -SvnExecutable 'svn' -OutDirectory $script:testOutDirMeta -Parallel 4 -TopNCount 10 -Encoding 'UTF8')
+
+        $script:runMetaWriteCount | Should -Be 1
     }
 }
 

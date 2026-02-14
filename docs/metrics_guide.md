@@ -44,13 +44,16 @@ NarutoCode が出力する CSV / JSON / PlantUML の各指標について、
 ├── team_activity_profile.svg  ← チーム活動プロファイル
 ├── commit_timeline.svg        ← 時系列コミット量
 ├── commit_scatter.svg         ← コミット粒度散布図
+├── project_code_fate.svg      ← コード運命チャート
+├── project_efficiency_quadrant.svg ← 効率性四象限図
+├── project_summary_dashboard.svg  ← サマリダッシュボード
 └── cache/
     ├── diff_r{N}.txt          ← svn diff の生出力キャッシュ
     ├── blame/r{N}/            ← svn blame XML のキャッシュ
     └── cat/r{N}/              ← svn cat テキストのキャッシュ
 ```
 
-`-TopN` は可視化ファイルの表示件数だけを制御し、CSV は常に全件を出力します。
+`-TopNCount` は可視化ファイルの表示件数だけを制御し、CSV は常に全件を出力します。
 
 ### 解析パイプラインと出力ファイルの関係
 
@@ -745,7 +748,7 @@ $$L(A, B) = \frac{P(A \cap B)}{P(A) \times P(B)}$$
 | `DurationSeconds` | 実行時間（秒） |
 | `RepoUrl` | 解析対象のリポジトリ URL |
 | `FromRev` / `ToRev` | リビジョン範囲 |
-| `StrictMode` | Strict モード（per-revision blame による厄密計算）の有無 |
+| `StrictMode` | Strict モード（per-revision blame による厳密計算）の有無（常に `true`） |
 | `CommitCount` / `FileCount` | 検出されたコミット数・ファイル数 |
 | `Parameters` | 使用したフィルタ・オプション一覧（IgnoreWhitespace / ExcludeCommentOnlyLines 等） |
 | `Outputs` | 出力されたファイル名の一覧 |
@@ -777,6 +780,9 @@ CSV の集計結果を元に、以下の PlantUML テキストと SVG 画像が�
 | `team_activity_profile.svg` | チーム活動プロファイル | SVG |
 | `commit_timeline.svg` | コミット量の時系列 | SVG |
 | `commit_scatter.svg` | コミット粒度の散布図 | SVG |
+| `project_code_fate.svg` | コード運命チャート | SVG |
+| `project_efficiency_quadrant.svg` | ファイル効率性四象限図 | SVG |
+| `project_summary_dashboard.svg` | プロジェクトサマリダッシュボード | SVG |
 
 ---
 

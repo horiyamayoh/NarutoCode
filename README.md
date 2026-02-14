@@ -27,7 +27,7 @@ SVN リポジトリの履歴を解析し、コミット品質・変更傾向の�
 
 # 出力先を明示し、Java ファイルのみ対象
 .\NarutoCode.ps1 -RepoUrl https://svn.example.com/repos/proj/trunk `
-    -FromRev 200 -ToRev 250 -OutDir .\out -IncludeExtensions cs,java
+    -FromRev 200 -ToRev 250 -OutDirectory .\out -IncludeExtensions cs,java
 
 # SVN 認証付き + 空白差分を無視 + CI 環境向け
 .\NarutoCode.ps1 -RepoUrl https://svn.example.com/repos/proj/trunk `
@@ -43,7 +43,7 @@ SVN リポジトリの履歴を解析し、コミット品質・変更傾向の�
 | `-FromRev` | ✅ | — | 解析範囲の開始リビジョン番号 |
 | `-ToRev` | ✅ | — | 解析範囲の終了リビジョン番号 |
 | `-SvnExecutable` | | `svn` | svn コマンドのパスまたは名前 |
-| `-OutDir` | | `NarutoCode_out` | 出力先ディレクトリ（キャッシュ含む） |
+| `-OutDirectory` | | `NarutoCode_out` | 出力先ディレクトリ（キャッシュ含む） |
 | `-Username` | | | SVN 認証用ユーザー名（`--username` に渡される） |
 | `-Password` | | | SVN 認証用パスワード（SecureString 型） |
 | `-NonInteractive` | | | svn の対話プロンプトを抑止（CI 向け） |
@@ -53,13 +53,13 @@ SVN リポジトリの履歴を解析し、コミット品質・変更傾向の�
 | `-ExcludePaths` | | | 解析除外パスのワイルドカードパターン配列 |
 | `-IncludeExtensions` | | | 解析対象の拡張子配列（例: `cs`, `java`） |
 | `-ExcludeExtensions` | | | 解析除外の拡張子配列（例: `dll`, `exe`） |
-| `-TopN` | | `50` | 可視化に表示する上位件数（CSV は全件出力） |
+| `-TopNCount` | | `50` | 可視化に表示する上位件数（CSV は全件出力） |
 | `-Encoding` | | `UTF8` | 出力ファイルのエンコーディング |
 | `-IgnoreWhitespace` | | | diff 時に空白・改行コードの差異を無視 |
 | `-ExcludeCommentOnlyLines` | | | コメント専用行（コードを含まない行）を全メトリクスで除外 |
 | `-NoProgress` | | | 進捗バー表示を抑止 |
 
-> 旧パラメータ名（`-Path`, `-FromRevision`, `-ToRevision` 等）はエイリアスとして引き続き使用可能です。
+> 旧パラメータ名（`-Path`, `-FromRevision`, `-ToRevision`, `-FromRev`, `-ToRev`, `-Pre`, `-Post`, `-Start`, `-End`, `-From`, `-To` 等）はエイリアスとして引き続き使用可能です。
 > `-ExcludeCommentOnlyLines` は拡張子ごとの組み込みプロファイル（`CStyle` / `CSharpStyle` / `JsTsStyle` / `PowerShellStyle` / `IniStyle`）を使い、コメント記法と文字列リテラル境界の両方を判定します。
 
 ## 出力ファイル
@@ -86,12 +86,26 @@ SVN リポジトリの履歴を解析し、コミット品質・変更傾向の�
 ├── team_activity_profile.svg  ← チーム活動プロファイル
 ├── commit_timeline.svg        ← 時系列コミット量
 ├── commit_scatter.svg         ← コミット粒度散布図
+├── project_code_fate.svg      ← コード運命チャート
+├── project_efficiency_quadrant.svg ← 効率性四象限図
+├── project_summary_dashboard.svg  ← サマリダッシュボード
 └── cache/                     ← diff / blame / cat のキャッシュ
 ```
 
-`-TopN` は可視化ファイルの表示件数にのみ適用され、CSV は常に全件出力されます。
+`-TopNCount` は可視化ファイルの表示件数にのみ適用され、CSV は常に全件出力されます。
 
-詳細な指標の読み方は [docs/metrics_guide.md](docs/metrics_guide.md) を参照してください。
+詳細な指標の読み方は [docs/metrics_guide.md](docs/metrics_guide.md) を参照してください。  
+並列ランタイムの設計思想と進捗は [docs/parallel_runtime_design.md](docs/parallel_runtime_design.md) を参照してください。
+
+## 並列性能の目安（SLO）
+
+- 基準環境: `tests/fixtures/svn_repo/repo`、`-FromRev 1 -ToRev 20`
+- 判定はウォームアップ 1 回の後、本計測 5 回の中央値で比較
+- 必須条件:
+  - `median(step3_diff + step5_strict, -Parallel 4) <= 0.80 * median(..., -Parallel 1)`
+  - `median(total wallclock, -Parallel 4) < median(total wallclock, -Parallel 1)`
+
+`run_meta.json` の `DurationSeconds` は実行全体の壁時計時間を表し、`StageDurations` は `step8_meta` を含む全ステージを出力します。
 
 ## フォルダ構成
 
