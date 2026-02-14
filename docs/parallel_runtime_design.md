@@ -35,6 +35,10 @@
   - `op`/`flags` は小文字化
   - `path` は `ConvertTo-PathKey` で正規化
   - `flags` はソート後に連結
+- Resolver 契約:
+  - `Register-SvnRequest` の `Resolver` は `param($Context, $Request)` を必須とする。
+  - free variable（外側スコープ変数のキャプチャ）は禁止する。
+  - request 固有値は `Metadata` 経由で受け渡す。
 
 ## 5. SvnGateway 融合規則
 - コマンドキーが一致した `svn` 呼び出しは 1 回のみ実行し、結果を共有する。
@@ -44,6 +48,7 @@
 ## 6. 決定性契約
 - DAG ノードは ID ソート順で実行し、依存解決順を安定化する。
 - RequestBroker は登録順を保持し、結果辞書はキーで再参照する。
+- Request 結果取得は `Get-SvnRequestResult -Consume` を使い、消費済みエントリを逐次解放する。
 - run_meta に `StageDurations` を記録するが、成果物内容と独立させる。
 
 ## 7. Step 移行手順
@@ -51,6 +56,7 @@
 2. `BuildRequests` 相当処理として `Register-SvnRequest` を行う。
 3. `Wait-SvnRequest` 後に `Reduce` 相当処理で既存集計へ反映。
 4. 既存 Step ロジックの厳密性を維持したまま、直接 SVN 呼び出しを縮小する。
+5. Step 6/7 は成果物単位ノードへ分解し、ノード内入れ子並列を導入しない。
 
 ## 8. 失敗時挙動
 - 未登録キー待機は `INTERNAL_REQUEST_KEY_NOT_FOUND` で失敗。
@@ -77,6 +83,6 @@
 | Step 2/3: Log+Diff | Done | Done | Done | Done | 2026-02-14 | Diff prefetch を登録/待機/還元に移行 |
 | Step 4: Aggregation | Done | N/A | N/A | Done | 2026-02-14 | 純計算フェーズのため SVN I/O なし。4 DAG ノード（committer/file/coupling/commit）に分割し並列実行 |
 | Step 5: Strict Attribution | Done | Done | Done | Done | 2026-02-14 | 遷移計画と preloaded blame の二相実行へ移行 |
-| Step 6: CSV | Done | N/A | N/A | Done | 2026-02-14 | DAG ノードとして統合。出力順序決定性テスト済み |
-| Step 7: Visualization | Done | N/A | N/A | Done | 2026-02-14 | DAG ノードとして統合。出力順序決定性テスト済み |
-| Step 8: run_meta | Done | Done | Done | Done | 2026-02-14 | StageDurations 全ステージ出力完了 |
+| Step 6: CSV | Done | N/A | N/A | Done | 2026-02-14 | 成果物単位（committers/files/commits/couplings/kill_matrix）ノードへ分解 |
+| Step 7: Visualization | Done | N/A | N/A | Done | 2026-02-14 | 可視化関数単位ノードへ分解（入れ子並列なし） |
+| Step 8: run_meta | Done | Done | Done | Done | 2026-02-14 | DAG内はメタ生成のみ、ファイル書き込みは DAG 完了後 1 回のみ |

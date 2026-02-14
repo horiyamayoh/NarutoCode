@@ -81,13 +81,12 @@ Describe 'Request broker dedup' {
         $context = Initialize-StrictModeContext -Context $context
         $runtime = New-PipelineRuntime -Context $context -Parallel 8
         $broker = $runtime.RequestBroker
-        $script:execCount = 0
+        $context.Runtime.DedupExecCount = 0
 
         $resolver = {
             param($Context, $Request)
-            [void]$Context
             [void]$Request
-            $script:execCount++
+            $Context.Runtime.DedupExecCount++
             return [pscustomobject]@{
                 Value = 42
             }
@@ -97,10 +96,108 @@ Describe 'Request broker dedup' {
         $second = Register-SvnRequest -Broker $broker -Operation 'diff' -Path 'https://example.invalid/svn/repo/trunk' -Revision '' -RevisionRange '20' -Flags @('--internal-diff', 'diff') -Resolver $resolver
         $results = Wait-SvnRequest -Context $context -Broker $broker -RequestKeys @($first, $second)
 
-        $script:execCount | Should -Be 1
+        [int]$context.Runtime.DedupExecCount | Should -Be 1
         $results.ContainsKey($first) | Should -BeTrue
         [bool]$results[$first].Success | Should -BeTrue
         [int]$results[$first].Payload.Value | Should -Be 42
+    }
+}
+
+Describe 'Request broker consume retrieval' {
+    It 'removes consumed request/result entries from broker' {
+        $context = New-NarutoContext -SvnExecutable 'svn'
+        $context = Initialize-StrictModeContext -Context $context
+        $runtime = New-PipelineRuntime -Context $context -Parallel 2
+        $broker = $runtime.RequestBroker
+
+        $requestKey = Register-SvnRequest -Broker $broker -Operation 'diff' -Path 'https://example.invalid/svn/repo/trunk' -Revision '' -RevisionRange '10' -Flags @('diff') -Resolver {
+            param($Context, $Request)
+            [void]$Context
+            [void]$Request
+            return 'ok'
+        }
+        [void](Wait-SvnRequest -Context $context -Broker $broker -RequestKeys @($requestKey))
+
+        $broker.Results.ContainsKey($requestKey) | Should -BeTrue
+        $broker.Requests.ContainsKey($requestKey) | Should -BeTrue
+        $broker.RegistrationOrder.Count | Should -Be 1
+
+        $consumed = Get-SvnRequestResult -Broker $broker -RequestKey $requestKey -Consume -ThrowIfMissing
+
+        [bool]$consumed.Success | Should -BeTrue
+        [string]$consumed.Payload | Should -Be 'ok'
+        $broker.Results.ContainsKey($requestKey) | Should -BeFalse
+        $broker.Requests.ContainsKey($requestKey) | Should -BeFalse
+        $broker.RegistrationOrder.Count | Should -Be 0
+    }
+
+    It 'purges unconsumed request/result entries by key set' {
+        $context = New-NarutoContext -SvnExecutable 'svn'
+        $context = Initialize-StrictModeContext -Context $context
+        $runtime = New-PipelineRuntime -Context $context -Parallel 2
+        $broker = $runtime.RequestBroker
+
+        $keepKey = Register-SvnRequest -Broker $broker -Operation 'diff' -Path 'https://example.invalid/svn/repo/trunk' -Revision '' -RevisionRange '11' -Flags @('diff') -Resolver {
+            param($Context, $Request)
+            [void]$Context
+            [void]$Request
+            return 'keep'
+        }
+        $purgeKey = Register-SvnRequest -Broker $broker -Operation 'diff' -Path 'https://example.invalid/svn/repo/trunk' -Revision '' -RevisionRange '12' -Flags @('diff') -Resolver {
+            param($Context, $Request)
+            [void]$Context
+            [void]$Request
+            return 'purge'
+        }
+        [void](Wait-SvnRequest -Context $context -Broker $broker -RequestKeys @($keepKey, $purgeKey))
+
+        Remove-SvnRequestEntry -Broker $broker -RequestKeys @($purgeKey)
+
+        $broker.Results.ContainsKey($purgeKey) | Should -BeFalse
+        $broker.Requests.ContainsKey($purgeKey) | Should -BeFalse
+        $broker.RegistrationOrder.Contains($purgeKey) | Should -BeFalse
+        $broker.Results.ContainsKey($keepKey) | Should -BeTrue
+        $broker.Requests.ContainsKey($keepKey) | Should -BeTrue
+        $broker.RegistrationOrder.Contains($keepKey) | Should -BeTrue
+    }
+}
+
+Describe 'Request resolver contract' {
+    It 'rejects resolver that captures free variables' {
+        $broker = New-RequestBroker
+        $captured = 42
+        $caught = $null
+        try
+        {
+            [void](Register-SvnRequest -Broker $broker -Operation 'diff' -Path 'https://example.invalid/svn/repo/trunk' -Revision '' -RevisionRange '10' -Flags @('diff') -Resolver {
+                    param($Context, $Request)
+                    [void]$Context
+                    [void]$Request
+                    return $captured
+                })
+        }
+        catch
+        {
+            $caught = $_.Exception
+        }
+
+        $caught | Should -Not -BeNullOrEmpty
+        [string]$caught.Data['ErrorCode'] | Should -Be 'INPUT_REQUEST_RESOLVER_FREE_VARIABLE_NOT_ALLOWED'
+    }
+
+    It 'accepts resolver that uses only declared locals and metadata' {
+        $broker = New-RequestBroker
+
+        $key = Register-SvnRequest -Broker $broker -Operation 'diff' -Path 'https://example.invalid/svn/repo/trunk' -Revision '' -RevisionRange '10' -Flags @('diff') -Resolver {
+            param($Context, $Request)
+            [void]$Context
+            $revision = [int]$Request.Metadata.Revision
+            return $revision
+        } -Metadata @{
+            Revision = 10
+        }
+
+        [string]$key | Should -Not -BeNullOrEmpty
     }
 }
 

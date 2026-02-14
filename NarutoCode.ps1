@@ -1319,6 +1319,192 @@ function Get-SvnRequestKey
     $flagToken = (@($normalizedFlags | Sort-Object) -join [char]30)
     return ($opToken + [char]31 + $revisionToken + [char]31 + $rangeToken + [char]31 + $pathToken + [char]31 + $pegToken + [char]31 + $flagToken)
 }
+function Get-SvnRequestResolverDeclaredVariableSet
+{
+    <#
+    .SYNOPSIS
+        Request Resolver 内で宣言されるローカル変数集合を返す。
+    #>
+    [CmdletBinding()]
+    [OutputType([System.Collections.Generic.HashSet[string]])]
+    param([scriptblock]$Resolver)
+    $declared = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    if ($null -eq $Resolver -or $null -eq $Resolver.Ast)
+    {
+        return $declared
+    }
+
+    if ($null -ne $Resolver.Ast.ParamBlock)
+    {
+        foreach ($parameter in @($Resolver.Ast.ParamBlock.Parameters))
+        {
+            if ($null -eq $parameter -or $null -eq $parameter.Name)
+            {
+                continue
+            }
+            $name = [string]$parameter.Name.VariablePath.UserPath
+            if ([string]::IsNullOrWhiteSpace($name))
+            {
+                continue
+            }
+            [void]$declared.Add($name)
+        }
+    }
+
+    $assignmentAsts = @($Resolver.Ast.FindAll({
+                param($Ast)
+                $Ast -is [System.Management.Automation.Language.AssignmentStatementAst]
+            }, $true))
+    foreach ($assignmentAst in $assignmentAsts)
+    {
+        if ($null -eq $assignmentAst.Left -or -not ($assignmentAst.Left -is [System.Management.Automation.Language.VariableExpressionAst]))
+        {
+            continue
+        }
+        $leftVariable = $assignmentAst.Left
+        $name = [string]$leftVariable.VariablePath.UserPath
+        if ([string]::IsNullOrWhiteSpace($name) -or $name.Contains(':'))
+        {
+            continue
+        }
+        [void]$declared.Add($name)
+    }
+
+    $foreachAsts = @($Resolver.Ast.FindAll({
+                param($Ast)
+                $Ast -is [System.Management.Automation.Language.ForEachStatementAst]
+            }, $true))
+    foreach ($foreachAst in $foreachAsts)
+    {
+        if ($null -eq $foreachAst.Variable)
+        {
+            continue
+        }
+        $name = [string]$foreachAst.Variable.VariablePath.UserPath
+        if ([string]::IsNullOrWhiteSpace($name) -or $name.Contains(':'))
+        {
+            continue
+        }
+        [void]$declared.Add($name)
+    }
+
+    $catchAsts = @($Resolver.Ast.FindAll({
+                param($Ast)
+                $Ast -is [System.Management.Automation.Language.CatchClauseAst]
+            }, $true))
+    foreach ($catchAst in $catchAsts)
+    {
+        if ($null -eq $catchAst.Variable)
+        {
+            continue
+        }
+        $name = [string]$catchAst.Variable.VariablePath.UserPath
+        if ([string]::IsNullOrWhiteSpace($name) -or $name.Contains(':'))
+        {
+            continue
+        }
+        [void]$declared.Add($name)
+    }
+
+    return $declared
+}
+function Get-SvnRequestResolverFreeVariableName
+{
+    <#
+    .SYNOPSIS
+        Request Resolver が参照する free variable 名を列挙する。
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param([scriptblock]$Resolver)
+    if ($null -eq $Resolver -or $null -eq $Resolver.Ast)
+    {
+        return [string[]]@()
+    }
+
+    $declared = Get-SvnRequestResolverDeclaredVariableSet -Resolver $Resolver
+    $allowedAutomatic = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($name in @('null', 'true', 'false', '_', 'PSItem', 'args', 'input'))
+    {
+        [void]$allowedAutomatic.Add($name)
+    }
+
+    $free = New-Object 'System.Collections.Generic.List[string]'
+    $freeSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $variableAsts = @($Resolver.Ast.FindAll({
+                param($Ast)
+                $Ast -is [System.Management.Automation.Language.VariableExpressionAst]
+            }, $true))
+    foreach ($variableAst in $variableAsts)
+    {
+        if ($null -eq $variableAst -or $variableAst.Parent -is [System.Management.Automation.Language.ParameterAst])
+        {
+            continue
+        }
+        $name = [string]$variableAst.VariablePath.UserPath
+        if ([string]::IsNullOrWhiteSpace($name))
+        {
+            continue
+        }
+        if ($allowedAutomatic.Contains($name))
+        {
+            continue
+        }
+        if ($declared.Contains($name))
+        {
+            continue
+        }
+        if (-not $freeSet.Add($name))
+        {
+            continue
+        }
+        [void]$free.Add($name)
+    }
+    return [string[]]@($free.ToArray() | Sort-Object)
+}
+function Assert-SvnRequestResolverContract
+{
+    <#
+    .SYNOPSIS
+        Request Resolver の契約（引数名と free variable 禁止）を検証する。
+    #>
+    [CmdletBinding()]
+    param(
+        [scriptblock]$Resolver,
+        [string]$Operation = '',
+        [string]$Path = '',
+        [string]$Revision = '',
+        [string]$RevisionRange = ''
+    )
+    if ($null -eq $Resolver)
+    {
+        return
+    }
+
+    $declared = Get-SvnRequestResolverDeclaredVariableSet -Resolver $Resolver
+    if (-not $declared.Contains('Context') -or -not $declared.Contains('Request'))
+    {
+        Throw-NarutoError -Category 'INPUT' -ErrorCode 'INPUT_REQUEST_RESOLVER_INVALID_SIGNATURE' -Message 'SVN request resolver must declare both $Context and $Request parameters.' -Context @{
+            Operation = [string]$Operation
+            Path = [string]$Path
+            Revision = [string]$Revision
+            RevisionRange = [string]$RevisionRange
+            Resolver = [string]$Resolver.ToString()
+        }
+    }
+
+    $free = @(Get-SvnRequestResolverFreeVariableName -Resolver $Resolver)
+    if ($free.Count -gt 0)
+    {
+        Throw-NarutoError -Category 'INPUT' -ErrorCode 'INPUT_REQUEST_RESOLVER_FREE_VARIABLE_NOT_ALLOWED' -Message ("SVN request resolver must not capture free variables: {0}" -f ($free -join ', ')) -Context @{
+            Operation = [string]$Operation
+            Path = [string]$Path
+            Revision = [string]$Revision
+            RevisionRange = [string]$RevisionRange
+            FreeVariables = @($free)
+        }
+    }
+}
 function New-RequestBroker
 {
     <#
@@ -1355,6 +1541,7 @@ function Register-SvnRequest
         [scriptblock]$Resolver,
         [hashtable]$Metadata = @{}
     )
+    Assert-SvnRequestResolverContract -Resolver $Resolver -Operation $Operation -Path $Path -Revision $Revision -RevisionRange $RevisionRange
     $requestKey = Get-SvnRequestKey -Operation $Operation -Path $Path -Revision $Revision -RevisionRange $RevisionRange -Flags $Flags -Peg $Peg
     if (-not $Broker.Requests.ContainsKey($requestKey))
     {
@@ -1379,6 +1566,93 @@ function Register-SvnRequest
         [void]$Broker.RegistrationOrder.Add($requestKey)
     }
     return $requestKey
+}
+function Get-SvnRequestResult
+{
+    <#
+    .SYNOPSIS
+        RequestBroker から要求結果を取得し、必要に応じて消費する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Broker,
+        [Parameter(Mandatory = $true)][string]$RequestKey,
+        [switch]$Consume,
+        [switch]$ThrowIfMissing
+    )
+    if ([string]::IsNullOrWhiteSpace($RequestKey))
+    {
+        return $null
+    }
+    if (-not $Broker.Results.ContainsKey($RequestKey))
+    {
+        if ($ThrowIfMissing)
+        {
+            Throw-NarutoError -Category 'INTERNAL' -ErrorCode 'INTERNAL_REQUEST_RESULT_NOT_FOUND' -Message ("Request result key '{0}' was not found." -f $RequestKey) -Context @{
+                RequestKey = [string]$RequestKey
+            }
+        }
+        return $null
+    }
+
+    $result = $Broker.Results[$RequestKey]
+    if ($Consume)
+    {
+        [void]$Broker.Results.Remove($RequestKey)
+        if ($Broker.Requests.ContainsKey($RequestKey))
+        {
+            [void]$Broker.Requests.Remove($RequestKey)
+        }
+        if ($null -ne $Broker.RegistrationOrder)
+        {
+            [void]$Broker.RegistrationOrder.Remove($RequestKey)
+        }
+    }
+    return $result
+}
+function Remove-SvnRequestEntry
+{
+    <#
+    .SYNOPSIS
+        RequestBroker から指定キーの request/result を明示的に破棄する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Broker,
+        [string[]]$RequestKeys = @()
+    )
+    if ($null -eq $Broker)
+    {
+        return
+    }
+    $keySet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($requestKey in @($RequestKeys))
+    {
+        $key = [string]$requestKey
+        if ([string]::IsNullOrWhiteSpace($key))
+        {
+            continue
+        }
+        if (-not $keySet.Add($key))
+        {
+            continue
+        }
+        if ($Broker.Results.ContainsKey($key))
+        {
+            [void]$Broker.Results.Remove($key)
+        }
+        if ($Broker.Requests.ContainsKey($key))
+        {
+            [void]$Broker.Requests.Remove($key)
+        }
+        if ($null -ne $Broker.RegistrationOrder)
+        {
+            [void]$Broker.RegistrationOrder.Remove($key)
+        }
+    }
 }
 function Complete-SvnRequest
 {
@@ -2295,20 +2569,6 @@ function Invoke-ParallelExecutorBatch
     $failures = [System.Collections.Generic.List[object]]::new()
     $activeJobs = [System.Collections.Generic.List[object]]::new()
     $nextIndex = 0
-    $lockTaken = $false
-    $syncRoot = if ($Executor.ContainsKey('SyncRoot'))
-    {
-        $Executor.SyncRoot
-    }
-    else
-    {
-        $null
-    }
-    if ($null -ne $syncRoot)
-    {
-        [System.Threading.Monitor]::Enter($syncRoot)
-        $lockTaken = $true
-    }
     try
     {
         while ($nextIndex -lt $items.Count -or $activeJobs.Count -gt 0)
@@ -2433,10 +2693,6 @@ function Invoke-ParallelExecutorBatch
                 }
                 $job.PowerShell.Dispose()
             }
-        }
-        if ($lockTaken -and $null -ne $syncRoot)
-        {
-            [System.Threading.Monitor]::Exit($syncRoot)
         }
     }
 }
@@ -6633,7 +6889,8 @@ function Invoke-StrictBlameCachePrefetch
         if ($null -ne $broker)
         {
             $requestKey = Get-SvnRequestKey -Operation 'blame_line_prefetch' -Path ([string]$item.FilePath) -Revision ([string]([int]$item.Revision)) -RevisionRange '' -Flags @() -Peg ''
-            $statsResult = $broker.Results[$requestKey].Payload
+            $requestResult = Get-SvnRequestResult -Broker $broker -RequestKey ([string]$requestKey) -Consume -ThrowIfMissing
+            $statsResult = $requestResult.Payload
         }
         else
         {
@@ -6652,6 +6909,10 @@ function Invoke-StrictBlameCachePrefetch
             $Context.Caches.StrictBlameCacheHits += [int]$stats.CacheHits
             $Context.Caches.StrictBlameCacheMisses += [int]$stats.CacheMisses
         }
+    }
+    if ($null -ne $broker)
+    {
+        Remove-SvnRequestEntry -Broker $broker -RequestKeys @($requestKeys.ToArray())
     }
 }
 function New-StrictAttributionAccumulator
@@ -7410,7 +7671,8 @@ function Get-ExactDeathAttribution
         foreach ($lookupKey in @($requestKeyByLookup.Keys))
         {
             $requestKey = [string]$requestKeyByLookup[$lookupKey]
-            $blameResult = ConvertTo-NarutoResultAdapter -InputObject $broker.Results[$requestKey].Payload -SuccessCode 'SVN_BLAME_LINE_READY' -SkippedCode 'SVN_BLAME_LINE_EMPTY'
+            $requestResult = Get-SvnRequestResult -Broker $broker -RequestKey $requestKey -Consume -ThrowIfMissing
+            $blameResult = ConvertTo-NarutoResultAdapter -InputObject $requestResult.Payload -SuccessCode 'SVN_BLAME_LINE_READY' -SkippedCode 'SVN_BLAME_LINE_EMPTY'
             if (-not (Test-NarutoResultSuccess -Result $blameResult))
             {
                 Throw-NarutoError -Category 'STRICT' -ErrorCode ([string]$blameResult.ErrorCode) -Message ("Strict blame preload failed: {0}" -f [string]$blameResult.Message) -Context @{
@@ -7437,6 +7699,10 @@ function Get-ExactDeathAttribution
             $lookupKey = Get-StrictBlameLineLookupKey -FilePath ([string]$target.FilePath) -Revision ([int]$target.Revision)
             $preloadedBlameByKey[$lookupKey] = $blameResult.Data
         }
+    }
+    if ($null -ne $broker)
+    {
+        Remove-SvnRequestEntry -Broker $broker -RequestKeys @($requestKeyByLookup.Values)
     }
 
     $sortedCommits = @($Commits | Sort-Object Revision)
@@ -12669,16 +12935,18 @@ function Invoke-CommitDiffPrefetch
         if ($null -ne $broker -and $requestKeyByRevision.ContainsKey($revision))
         {
             $requestKey = [string]$requestKeyByRevision[$revision]
-            if ($broker.Results.ContainsKey($requestKey))
-            {
-                $diffText = [string]$broker.Results[$requestKey].Payload
-            }
+            $requestResult = Get-SvnRequestResult -Broker $broker -RequestKey $requestKey -Consume -ThrowIfMissing
+            $diffText = [string]$requestResult.Payload
         }
         else
         {
             $diffText = Get-CachedOrFetchDiffText -Context $Context -CacheDir $item.CacheDir -Revision $revision -TargetUrl $item.TargetUrl -DiffArguments @($item.DiffArguments)
         }
         $rawDiffByRevision[$revision] = (Get-CommitDiffRawByPath -Context $Context -Item $item -DiffText $diffText)
+    }
+    if ($null -ne $broker)
+    {
+        Remove-SvnRequestEntry -Broker $broker -RequestKeys @($requestKeyByRevision.Values)
     }
     return $rawDiffByRevision
 }
@@ -13019,7 +13287,8 @@ function Get-StrictOwnershipAggregate
         if ($null -ne $broker -and $requestKeyByFile.ContainsKey([string]$file))
         {
             $requestKey = [string]$requestKeyByFile[[string]$file]
-            $rawBlameResult = $broker.Results[$requestKey].Payload
+            $requestResult = Get-SvnRequestResult -Broker $broker -RequestKey $requestKey -Consume -ThrowIfMissing
+            $rawBlameResult = $requestResult.Payload
         }
         else
         {
@@ -13035,6 +13304,10 @@ function Get-StrictOwnershipAggregate
             }
         }
         Add-StrictOwnershipBlameSummary -BlameByFile $blameByFile -AuthorOwned $authorOwned -OwnedTotal ([ref]$ownedTotal) -FilePath ([string]$file) -Blame $blameResult.Data
+    }
+    if ($null -ne $broker)
+    {
+        Remove-SvnRequestEntry -Broker $broker -RequestKeys @($requestKeyByFile.Values)
     }
 
     return [pscustomobject]@{
@@ -14445,6 +14718,7 @@ function Write-PipelineCsvArtifacts
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '')]
     [CmdletBinding()]
+    [OutputType([string[]])]
     param(
         [Parameter(Mandatory = $true)][hashtable]$Context,
         [string]$OutDirectory,
@@ -14453,12 +14727,13 @@ function Write-PipelineCsvArtifacts
         [object[]]$CommitRows,
         [object[]]$CouplingRows,
         [object]$StrictResult,
-        [string]$Encoding
+        [string]$Encoding,
+        [string[]]$ArtifactNames = @()
     )
     Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 6/8: CSV レポート出力' -PercentComplete 80
     $headers = Get-MetricHeader -Context $Context
-    $tasks = @(
-        [pscustomobject]@{
+    $tasks = New-Object 'System.Collections.Generic.List[object]'
+    [void]$tasks.Add([pscustomobject]@{
             Name = 'committers.csv'
             Fn = 'Write-CsvFile'
             Args = @{
@@ -14467,8 +14742,8 @@ function Write-PipelineCsvArtifacts
                 Headers = $headers.Committer
                 EncodingName = $Encoding
             }
-        },
-        [pscustomobject]@{
+        })
+    [void]$tasks.Add([pscustomobject]@{
             Name = 'files.csv'
             Fn = 'Write-CsvFile'
             Args = @{
@@ -14477,8 +14752,8 @@ function Write-PipelineCsvArtifacts
                 Headers = $headers.File
                 EncodingName = $Encoding
             }
-        },
-        [pscustomobject]@{
+        })
+    [void]$tasks.Add([pscustomobject]@{
             Name = 'commits.csv'
             Fn = 'Write-CsvFile'
             Args = @{
@@ -14487,8 +14762,8 @@ function Write-PipelineCsvArtifacts
                 Headers = $headers.Commit
                 EncodingName = $Encoding
             }
-        },
-        [pscustomobject]@{
+        })
+    [void]$tasks.Add([pscustomobject]@{
             Name = 'couplings.csv'
             Fn = 'Write-CsvFile'
             Args = @{
@@ -14497,36 +14772,44 @@ function Write-PipelineCsvArtifacts
                 Headers = $headers.Coupling
                 EncodingName = $Encoding
             }
-        }
-    )
+        })
     if ($null -ne $StrictResult)
     {
-        $tasks += [pscustomobject]@{
-            Name = 'kill_matrix.csv'
-            Fn = 'Write-KillMatrixCsv'
-            Args = @{
-                OutDirectory = $OutDirectory
-                KillMatrix = $StrictResult.KillMatrix
-                AuthorSelfDead = $StrictResult.AuthorSelfDead
-                Committers = $CommitterRows
-                EncodingName = $Encoding
-            }
-        }
+        [void]$tasks.Add([pscustomobject]@{
+                Name = 'kill_matrix.csv'
+                Fn = 'Write-KillMatrixCsv'
+                Args = @{
+                    OutDirectory = $OutDirectory
+                    KillMatrix = $StrictResult.KillMatrix
+                    AuthorSelfDead = $StrictResult.AuthorSelfDead
+                    Committers = $CommitterRows
+                    EncodingName = $Encoding
+                }
+            })
     }
-    $parallelLimit = Get-ContextParallelLimit -Context $Context -Default 1
-    # DAG ノード間は並列化するが、ワーカー内の入れ子並列は過剰並列化を避けるため抑止する。
-    if (Test-IsParallelWorkerRunspace)
+
+    $selectionSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($artifactName in @($ArtifactNames))
     {
-        $parallelLimit = 1
+        if ([string]::IsNullOrWhiteSpace([string]$artifactName))
+        {
+            continue
+        }
+        [void]$selectionSet.Add([string]$artifactName)
     }
-    $parallelSemaphore = Get-ContextParallelSemaphore -Context $Context
-    [void](Invoke-ParallelWork -InputItems $tasks -WorkerScript {
-            param($Item, $Index)
-            [void]$Index
-            $itemArgs = @{} + $Item.Args
-            [void](& $Item.Fn @itemArgs)
-            return [string]$Item.Name
-        } -MaxParallel $parallelLimit -ErrorContext 'csv artifact write' -SharedSemaphore $parallelSemaphore -Context $Context)
+
+    $writtenArtifacts = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($task in @($tasks.ToArray()))
+    {
+        if ($selectionSet.Count -gt 0 -and -not $selectionSet.Contains([string]$task.Name))
+        {
+            continue
+        }
+        $itemArgs = @{} + $task.Args
+        [void](& $task.Fn @itemArgs)
+        [void]$writtenArtifacts.Add([string]$task.Name)
+    }
+    return [string[]]@($writtenArtifacts.ToArray())
 }
 function Write-PipelineVisualizationArtifacts
 {
@@ -14536,6 +14819,7 @@ function Write-PipelineVisualizationArtifacts
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '')]
     [CmdletBinding()]
+    [OutputType([string[]])]
     param(
         [Parameter(Mandatory = $true)][hashtable]$Context,
         [string]$OutDirectory,
@@ -14545,7 +14829,8 @@ function Write-PipelineVisualizationArtifacts
         [object[]]$CouplingRows,
         [object]$StrictResult,
         [int]$TopNCount,
-        [string]$Encoding
+        [string]$Encoding,
+        [string[]]$VisualizationFunctions = @()
     )
     Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 7/8: 可視化出力' -PercentComplete 88
 
@@ -14592,37 +14877,40 @@ function Write-PipelineVisualizationArtifacts
                 Encoding = $Encoding
             })
     }
-    $parallelLimit = Get-ContextParallelLimit -Context $Context -Default 1
-    # DAG ノード間は並列化するが、ワーカー内の入れ子並列は過剰並列化を避けるため抑止する。
-    if (Test-IsParallelWorkerRunspace)
+
+    $selectionSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($functionName in @($VisualizationFunctions))
     {
-        $parallelLimit = 1
-    }
-    $parallelSemaphore = Get-ContextParallelSemaphore -Context $Context
-    $vizResults = @(Invoke-ParallelWork -InputItems @($visualizationItems.ToArray()) -WorkerScript {
-            param($Item, $Index)
-            [void]$Index
-            $vizArgs = @{} + $Item.Args
-            $vizArgs['Context'] = $Item.Context
-            $vizArgs['OutDirectory'] = $Item.OutDirectory
-            $vizArgs['EncodingName'] = $Item.Encoding
-            $rawResult = & $Item.Fn @vizArgs
-            $vizResult = ConvertTo-NarutoResultAdapter -InputObject $rawResult -SuccessCode 'OUTPUT_VISUALIZATION_WRITTEN' -SkippedCode 'OUTPUT_VISUALIZATION_SKIPPED'
-            return [pscustomobject]@{
-                Function = [string]$Item.Fn
-                Result = $vizResult
-            }
-        } -MaxParallel $parallelLimit -ErrorContext 'visualization artifact write' -SharedSemaphore $parallelSemaphore -Context $Context)
-    foreach ($vizResult in $vizResults)
-    {
-        if ([string]$vizResult.Result.Status -eq 'Failure')
+        if ([string]::IsNullOrWhiteSpace([string]$functionName))
         {
-            Throw-NarutoError -Category 'OUTPUT' -ErrorCode ([string]$vizResult.Result.ErrorCode) -Message ([string]$vizResult.Result.Message) -Context @{
-                Function = [string]$vizResult.Function
+            continue
+        }
+        [void]$selectionSet.Add([string]$functionName)
+    }
+
+    $writtenFunctions = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($item in @($visualizationItems.ToArray()))
+    {
+        if ($selectionSet.Count -gt 0 -and -not $selectionSet.Contains([string]$item.Fn))
+        {
+            continue
+        }
+        $vizArgs = @{} + $item.Args
+        $vizArgs['Context'] = $item.Context
+        $vizArgs['OutDirectory'] = $item.OutDirectory
+        $vizArgs['EncodingName'] = $item.Encoding
+        $rawResult = & $item.Fn @vizArgs
+        $vizResult = ConvertTo-NarutoResultAdapter -InputObject $rawResult -SuccessCode 'OUTPUT_VISUALIZATION_WRITTEN' -SkippedCode 'OUTPUT_VISUALIZATION_SKIPPED'
+        if ([string]$vizResult.Status -eq 'Failure')
+        {
+            Throw-NarutoError -Category 'OUTPUT' -ErrorCode ([string]$vizResult.ErrorCode) -Message ([string]$vizResult.Message) -Context @{
+                Function = [string]$item.Fn
                 OutDirectory = $OutDirectory
             }
         }
+        [void]$writtenFunctions.Add([string]$item.Fn)
     }
+    return [string[]]@($writtenFunctions.ToArray())
 }
 function Write-PipelineRunArtifacts
 {
@@ -14647,6 +14935,7 @@ function Write-PipelineRunArtifacts
         [switch]$TrustServerCert,
         [switch]$IgnoreWhitespace,
         [switch]$ExcludeCommentOnlyLines,
+        [switch]$SkipWriteFile,
         [switch]$SkipProgress,
         [switch]$SkipRunSummary
     )
@@ -14656,7 +14945,10 @@ function Write-PipelineRunArtifacts
     }
     $finishedAt = Get-Date
     $meta = New-RunMetaData -Context $Context -StartTime $StartedAt -EndTime $finishedAt -TargetUrl $ExecutionState.TargetUrl -FromRevision $ExecutionState.FromRevision -ToRevision $ExecutionState.ToRevision -SvnVersion $ExecutionState.SvnVersion -Parallel $Parallel -TopNCount $TopNCount -Encoding $Encoding -Commits $Commits -FileRows $FileRows -OutDirectory $ExecutionState.OutDirectory -IncludePaths $ExecutionState.IncludePaths -ExcludePaths $ExecutionState.ExcludePaths -IncludeExtensions $ExecutionState.IncludeExtensions -ExcludeExtensions $ExecutionState.ExcludeExtensions -StageDurations $StageDurations -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -IgnoreWhitespace:$IgnoreWhitespace -ExcludeCommentOnlyLines:$ExcludeCommentOnlyLines
-    Write-JsonFile -Data $meta -FilePath (Join-Path $ExecutionState.OutDirectory 'run_meta.json') -Depth 12 -EncodingName $Encoding
+    if (-not $SkipWriteFile)
+    {
+        Write-JsonFile -Data $meta -FilePath (Join-Path $ExecutionState.OutDirectory 'run_meta.json') -Depth 12 -EncodingName $Encoding
+    }
 
     if (-not $SkipProgress)
     {
@@ -14753,16 +15045,111 @@ function Invoke-NarutoCodePipeline
         ExcludeCommentOnlyLines = [bool]$ExcludeCommentOnlyLines
     }
 
-    $nodes = @(
+    $csvNodeDefinitions = @(
         [pscustomobject]@{
+            Id = 'step6_csv_committers'
+            DependsOn = @('step4_committer', 'step5_strict')
+            ArtifactNames = @('committers.csv')
+        },
+        [pscustomobject]@{
+            Id = 'step6_csv_files'
+            DependsOn = @('step4_file', 'step5_strict')
+            ArtifactNames = @('files.csv')
+        },
+        [pscustomobject]@{
+            Id = 'step6_csv_commits'
+            DependsOn = @('step4_commit')
+            ArtifactNames = @('commits.csv')
+        },
+        [pscustomobject]@{
+            Id = 'step6_csv_couplings'
+            DependsOn = @('step4_coupling')
+            ArtifactNames = @('couplings.csv')
+        },
+        [pscustomobject]@{
+            Id = 'step6_csv_kill_matrix'
+            DependsOn = @('step4_committer', 'step5_strict')
+            ArtifactNames = @('kill_matrix.csv')
+        }
+    )
+    $visualNodeDefinitions = @(
+        [pscustomobject]@{
+            Id = 'step7_visual_plantuml'
+            DependsOn = @('step4_committer', 'step4_file', 'step4_coupling', 'step5_strict')
+            VisualizationFunctions = @('Write-PlantUmlFile')
+        },
+        [pscustomobject]@{
+            Id = 'step7_visual_file_bubble'
+            DependsOn = @('step4_file', 'step5_strict')
+            VisualizationFunctions = @('Write-FileBubbleChart')
+        },
+        [pscustomobject]@{
+            Id = 'step7_visual_committer_outcome'
+            DependsOn = @('step4_committer', 'step5_strict')
+            VisualizationFunctions = @('Write-CommitterOutcomeChart')
+        },
+        [pscustomobject]@{
+            Id = 'step7_visual_committer_scatter'
+            DependsOn = @('step4_committer', 'step5_strict')
+            VisualizationFunctions = @('Write-CommitterScatterChart')
+        },
+        [pscustomobject]@{
+            Id = 'step7_visual_survived_share'
+            DependsOn = @('step4_committer', 'step5_strict')
+            VisualizationFunctions = @('Write-SurvivedShareDonutChart')
+        },
+        [pscustomobject]@{
+            Id = 'step7_visual_team_activity'
+            DependsOn = @('step4_committer', 'step5_strict')
+            VisualizationFunctions = @('Write-TeamActivityProfileChart')
+        },
+        [pscustomobject]@{
+            Id = 'step7_visual_file_quality'
+            DependsOn = @('step4_file', 'step5_strict')
+            VisualizationFunctions = @('Write-FileQualityScatterChart')
+        },
+        [pscustomobject]@{
+            Id = 'step7_visual_commit_timeline'
+            DependsOn = @('step4_commit')
+            VisualizationFunctions = @('Write-CommitTimelineChart')
+        },
+        [pscustomobject]@{
+            Id = 'step7_visual_commit_scatter'
+            DependsOn = @('step4_commit')
+            VisualizationFunctions = @('Write-CommitScatterChart')
+        },
+        [pscustomobject]@{
+            Id = 'step7_visual_code_fate'
+            DependsOn = @('step4_committer', 'step5_strict')
+            VisualizationFunctions = @('Write-ProjectCodeFateChart')
+        },
+        [pscustomobject]@{
+            Id = 'step7_visual_efficiency_quadrant'
+            DependsOn = @('step4_file', 'step5_strict')
+            VisualizationFunctions = @('Write-ProjectEfficiencyQuadrantChart')
+        },
+        [pscustomobject]@{
+            Id = 'step7_visual_summary_dashboard'
+            DependsOn = @('step4_committer', 'step4_file', 'step4_commit', 'step5_strict')
+            VisualizationFunctions = @('Write-ProjectSummaryDashboard')
+        },
+        [pscustomobject]@{
+            Id = 'step7_visual_team_interaction'
+            DependsOn = @('step4_committer', 'step5_strict')
+            VisualizationFunctions = @('Write-TeamInteractionHeatMap')
+        }
+    )
+
+    $nodes = New-Object 'System.Collections.Generic.List[object]'
+    [void]$nodes.Add([pscustomobject]@{
             Id = 'step2_log'
             DependsOn = @()
             AllowParallel = $false
             Action = {
                 Invoke-PipelineLogStage -Context $Context -ExecutionState $executionState
             }
-        },
-        [pscustomobject]@{
+        })
+    [void]$nodes.Add([pscustomobject]@{
             Id = 'step3_diff'
             DependsOn = @('step2_log')
             AllowParallel = $false
@@ -14770,8 +15157,8 @@ function Invoke-NarutoCodePipeline
                 $logStage = $pipelineRuntime.StageResults['step2_log']
                 Invoke-PipelineDiffStage -Context $Context -ExecutionState $executionState -Commits $logStage.Commits -IgnoreWhitespace:$IgnoreWhitespace -Parallel $Parallel
             }
-        },
-        [pscustomobject]@{
+        })
+    [void]$nodes.Add([pscustomobject]@{
             Id = 'step4_committer'
             DependsOn = @('step3_diff')
             AllowParallel = $true
@@ -14781,8 +15168,8 @@ function Invoke-NarutoCodePipeline
                 Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 4/8: 基本メトリクス算出 (committer)' -PercentComplete 30
                 Invoke-PipelineAggregationCommitterStage -Context $Context -Commits $logAndDiffStage.Commits -RenameMap $logAndDiffStage.RenameMap
             }
-        },
-        [pscustomobject]@{
+        })
+    [void]$nodes.Add([pscustomobject]@{
             Id = 'step4_file'
             DependsOn = @('step3_diff')
             AllowParallel = $true
@@ -14792,8 +15179,8 @@ function Invoke-NarutoCodePipeline
                 Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 4/8: 基本メトリクス算出 (file)' -PercentComplete 32
                 Invoke-PipelineAggregationFileStage -Context $Context -Commits $logAndDiffStage.Commits -RenameMap $logAndDiffStage.RenameMap
             }
-        },
-        [pscustomobject]@{
+        })
+    [void]$nodes.Add([pscustomobject]@{
             Id = 'step4_coupling'
             DependsOn = @('step3_diff')
             AllowParallel = $true
@@ -14803,8 +15190,8 @@ function Invoke-NarutoCodePipeline
                 Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 4/8: 基本メトリクス算出 (coupling)' -PercentComplete 34
                 Invoke-PipelineAggregationCouplingStage -Context $Context -Commits $logAndDiffStage.Commits -RenameMap $logAndDiffStage.RenameMap
             }
-        },
-        [pscustomobject]@{
+        })
+    [void]$nodes.Add([pscustomobject]@{
             Id = 'step4_commit'
             DependsOn = @('step3_diff')
             AllowParallel = $true
@@ -14814,12 +15201,11 @@ function Invoke-NarutoCodePipeline
                 Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 4/8: 基本メトリクス算出 (commit)' -PercentComplete 36
                 Invoke-PipelineAggregationCommitStage -Context $Context -Commits $logAndDiffStage.Commits
             }
-        },
-        [pscustomobject]@{
+        })
+    [void]$nodes.Add([pscustomobject]@{
             Id = 'step5_strict'
             DependsOn = @('step3_diff', 'step4_committer', 'step4_file')
-            AllowParallel = $true
-            SessionVariables = $dagSessionVariables
+            AllowParallel = $false
             Action = {
                 $aggregationForStrict = [pscustomobject]@{
                     FileRows = $pipelineRuntime.StageResults['step4_file']
@@ -14827,41 +15213,65 @@ function Invoke-NarutoCodePipeline
                 }
                 Invoke-PipelineStrictStage -Context $Context -ExecutionState $executionState -LogAndDiffStage $pipelineRuntime.StageResults['step3_diff'] -AggregationStage $aggregationForStrict -Parallel $Parallel
             }
-        },
-        [pscustomobject]@{
-            Id = 'step6_csv'
-            DependsOn = @('step4_committer', 'step4_file', 'step4_coupling', 'step4_commit', 'step5_strict')
-            AllowParallel = $true
-            SessionVariables = $dagSessionVariables
-            Action = {
-                Write-PipelineCsvArtifacts -Context $Context -OutDirectory $executionState.OutDirectory -CommitterRows $pipelineRuntime.StageResults['step4_committer'] -FileRows $pipelineRuntime.StageResults['step4_file'] -CommitRows $pipelineRuntime.StageResults['step4_commit'] -CouplingRows $pipelineRuntime.StageResults['step4_coupling'] -StrictResult $pipelineRuntime.StageResults['step5_strict'] -Encoding $encodingName
-                return $null
-            }
-        },
-        [pscustomobject]@{
-            Id = 'step7_visual'
-            DependsOn = @('step4_committer', 'step4_file', 'step4_coupling', 'step4_commit', 'step5_strict')
-            AllowParallel = $true
-            SessionVariables = $dagSessionVariables
-            Action = {
-                Write-PipelineVisualizationArtifacts -Context $Context -OutDirectory $executionState.OutDirectory -CommitterRows $pipelineRuntime.StageResults['step4_committer'] -FileRows $pipelineRuntime.StageResults['step4_file'] -CommitRows $pipelineRuntime.StageResults['step4_commit'] -CouplingRows $pipelineRuntime.StageResults['step4_coupling'] -StrictResult $pipelineRuntime.StageResults['step5_strict'] -TopNCount $topNCountValue -Encoding $encodingName
-                return $null
-            }
-        },
-        [pscustomobject]@{
+        })
+
+    foreach ($csvNodeDefinition in $csvNodeDefinitions)
+    {
+        $nodeSessionVariables = @{} + $dagSessionVariables
+        $nodeSessionVariables['CsvArtifactNames'] = @($csvNodeDefinition.ArtifactNames)
+        [void]$nodes.Add([pscustomobject]@{
+                Id = [string]$csvNodeDefinition.Id
+                DependsOn = @($csvNodeDefinition.DependsOn)
+                AllowParallel = $true
+                SessionVariables = $nodeSessionVariables
+                Action = {
+                    [void](Write-PipelineCsvArtifacts -Context $Context -OutDirectory $executionState.OutDirectory -CommitterRows $pipelineRuntime.StageResults['step4_committer'] -FileRows $pipelineRuntime.StageResults['step4_file'] -CommitRows $pipelineRuntime.StageResults['step4_commit'] -CouplingRows $pipelineRuntime.StageResults['step4_coupling'] -StrictResult $pipelineRuntime.StageResults['step5_strict'] -Encoding $encodingName -ArtifactNames @($CsvArtifactNames))
+                    return $null
+                }
+            })
+    }
+    foreach ($visualNodeDefinition in $visualNodeDefinitions)
+    {
+        $nodeSessionVariables = @{} + $dagSessionVariables
+        $nodeSessionVariables['VisualizationFunctionNames'] = @($visualNodeDefinition.VisualizationFunctions)
+        [void]$nodes.Add([pscustomobject]@{
+                Id = [string]$visualNodeDefinition.Id
+                DependsOn = @($visualNodeDefinition.DependsOn)
+                AllowParallel = $true
+                SessionVariables = $nodeSessionVariables
+                Action = {
+                    [void](Write-PipelineVisualizationArtifacts -Context $Context -OutDirectory $executionState.OutDirectory -CommitterRows $pipelineRuntime.StageResults['step4_committer'] -FileRows $pipelineRuntime.StageResults['step4_file'] -CommitRows $pipelineRuntime.StageResults['step4_commit'] -CouplingRows $pipelineRuntime.StageResults['step4_coupling'] -StrictResult $pipelineRuntime.StageResults['step5_strict'] -TopNCount $topNCountValue -Encoding $encodingName -VisualizationFunctions @($VisualizationFunctionNames))
+                    return $null
+                }
+            })
+    }
+
+    $step6NodeIds = @($csvNodeDefinitions | ForEach-Object { [string]$_.Id })
+    $step7NodeIds = @($visualNodeDefinitions | ForEach-Object { [string]$_.Id })
+    $step8Dependencies = New-Object 'System.Collections.Generic.List[string]'
+    [void]$step8Dependencies.Add('step3_diff')
+    [void]$step8Dependencies.Add('step4_file')
+    foreach ($nodeId in @($step6NodeIds + $step7NodeIds))
+    {
+        if ([string]::IsNullOrWhiteSpace([string]$nodeId))
+        {
+            continue
+        }
+        [void]$step8Dependencies.Add([string]$nodeId)
+    }
+    [void]$nodes.Add([pscustomobject]@{
             Id = 'step8_meta'
-            DependsOn = @('step3_diff', 'step4_file', 'step6_csv', 'step7_visual')
+            DependsOn = @($step8Dependencies.ToArray())
             AllowParallel = $false
             Action = {
-                Write-PipelineRunArtifacts -Context $Context -StartedAt $startedAt -ExecutionState $executionState -Parallel $Parallel -TopNCount $topNCountValue -Encoding $encodingName -Commits $pipelineRuntime.StageResults['step3_diff'].Commits -FileRows $pipelineRuntime.StageResults['step4_file'] -StageDurations $pipelineRuntime.StageDurations -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -IgnoreWhitespace:$ignoreWhitespaceSwitch -ExcludeCommentOnlyLines:$ExcludeCommentOnlyLines
+                Write-PipelineRunArtifacts -Context $Context -StartedAt $startedAt -ExecutionState $executionState -Parallel $Parallel -TopNCount $topNCountValue -Encoding $encodingName -Commits $pipelineRuntime.StageResults['step3_diff'].Commits -FileRows $pipelineRuntime.StageResults['step4_file'] -StageDurations $pipelineRuntime.StageDurations -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -IgnoreWhitespace:$ignoreWhitespaceSwitch -ExcludeCommentOnlyLines:$ExcludeCommentOnlyLines -SkipWriteFile -SkipRunSummary
             }
-        }
-    )
+        })
 
     try
     {
-        [void](Invoke-PipelineDag -Context $Context -Runtime $pipelineRuntime -Nodes $nodes)
-        $finalRunMeta = Write-PipelineRunArtifacts -Context $Context -StartedAt $startedAt -ExecutionState $executionState -Parallel $Parallel -TopNCount $topNCountValue -Encoding $encodingName -Commits $pipelineRuntime.StageResults['step3_diff'].Commits -FileRows $pipelineRuntime.StageResults['step4_file'] -StageDurations $pipelineRuntime.StageDurations -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -IgnoreWhitespace:$ignoreWhitespaceSwitch -ExcludeCommentOnlyLines:$ExcludeCommentOnlyLines -SkipProgress -SkipRunSummary
+        [void](Invoke-PipelineDag -Context $Context -Runtime $pipelineRuntime -Nodes @($nodes.ToArray()))
+        $finalRunMeta = Write-PipelineRunArtifacts -Context $Context -StartedAt $startedAt -ExecutionState $executionState -Parallel $Parallel -TopNCount $topNCountValue -Encoding $encodingName -Commits $pipelineRuntime.StageResults['step3_diff'].Commits -FileRows $pipelineRuntime.StageResults['step4_file'] -StageDurations $pipelineRuntime.StageDurations -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -IgnoreWhitespace:$ignoreWhitespaceSwitch -ExcludeCommentOnlyLines:$ExcludeCommentOnlyLines -SkipProgress
         $pipelineRuntime.StageResults['step8_meta'] = $finalRunMeta
         $Context.Runtime.PipelineRuntime = $pipelineRuntime
         return (New-PipelineResultObject -OutDirectory $executionState.OutDirectory -CommitterRows $pipelineRuntime.StageResults['step4_committer'] -FileRows $pipelineRuntime.StageResults['step4_file'] -CommitRows $pipelineRuntime.StageResults['step4_commit'] -CouplingRows $pipelineRuntime.StageResults['step4_coupling'] -RunMeta $finalRunMeta)

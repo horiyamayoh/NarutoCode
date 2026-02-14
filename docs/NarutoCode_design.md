@@ -1229,14 +1229,13 @@ This preserves the same classification categories (`KilledLines`, `BornLines`, `
 
 ### Runspace job lifecycle decomposition
 
-`Invoke-ParallelWorkRunspaceCore` now separates job lifecycle concerns:
+並列実行は `Invoke-ParallelWork` / `Invoke-ParallelExecutorBatch` を中心に、
+共有 executor（`New-ParallelExecutor`）で管理する構成へ整理した。
 
-- Failure DTO: `New-ParallelWorkerFailureResult`
-- Submission: `Add-RunspaceParallelJob`
-- Completion scan: `Get-CompletedRunspaceParallelJobIndex`
-- Result receive: `Receive-RunspaceParallelJobResult`
-- Disposal: `Clear-RunspaceParallelJob`
-- Order reconstruction: `ConvertTo-OrderedRunspaceWrappedResult`
+- Executor 作成: `New-ParallelExecutor`
+- バッチ実行: `Invoke-ParallelExecutorBatch`
+- 互換 API: `Invoke-ParallelWork`
+- 後始末: `Dispose-ParallelExecutor`
 
 Behavioral guarantees are unchanged:
 - input order preserved
@@ -1311,9 +1310,9 @@ try {
 
 `docs/parallel_runtime_design.md` を正本とし、並列実行基盤を以下へ更新した。
 
-- 旧 RunspacePool 依存実装は廃止。
-- 新実装は `DAG実行 + RequestBroker + SvnGateway`。
+- 旧 Step 固有の並列実装は廃止し、`DAG実行 + RequestBroker + SvnGateway + 共有RunspacePool executor` に統一。
 - Step 3/5 は request の登録・待機・還元の二相構成に移行。
-- run_meta に `StageDurations` を追加し、段階時間を記録。
+- Step 6/7 は成果物単位ノードへ分解し、ノード内入れ子並列を持たない設計へ移行。
+- run_meta は DAG 内でメタ生成のみ行い、`run_meta.json` の書き込みは DAG 完了後に 1 回のみ実行する。
 
 以降、並列設計と進捗管理は `docs/parallel_runtime_design.md` の進捗表を参照すること。
