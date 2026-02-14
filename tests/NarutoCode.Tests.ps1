@@ -2138,7 +2138,9 @@ Describe 'Integration — test SVN repo output matches baseline' -Tag 'Integrati
         $meta.FileCount     | Should -Be 17
         $meta.StrictMode    | Should -BeTrue
         $meta.Encoding      | Should -Be 'UTF8'
+        [double]$meta.DurationSeconds | Should -BeGreaterThan 0
         [bool]$meta.Parameters.ExcludeCommentOnlyLines | Should -BeFalse
+        $meta.StageDurations.PSObject.Properties.Name | Should -Contain 'step8_meta'
         $meta.Outputs.SurvivedShareDonutSvg | Should -Be 'team_survived_share.svg'
         $meta.Outputs.PSObject.Properties.Name | Should -Not -Contain 'ContributorBalanceSvg'
     }

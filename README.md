@@ -94,6 +94,16 @@ SVN リポジトリの履歴を解析し、コミット品質・変更傾向の�
 詳細な指標の読み方は [docs/metrics_guide.md](docs/metrics_guide.md) を参照してください。  
 並列ランタイムの設計思想と進捗は [docs/parallel_runtime_design.md](docs/parallel_runtime_design.md) を参照してください。
 
+## 並列性能の目安（SLO）
+
+- 基準環境: `tests/fixtures/svn_repo/repo`、`-FromRev 1 -ToRev 20`
+- 判定はウォームアップ 1 回の後、本計測 5 回の中央値で比較
+- 必須条件:
+  - `median(step3_diff + step5_strict, -Parallel 4) <= 0.80 * median(..., -Parallel 1)`
+  - `median(total wallclock, -Parallel 4) < median(total wallclock, -Parallel 1)`
+
+`run_meta.json` の `DurationSeconds` は実行全体の壁時計時間を表し、`StageDurations` は `step8_meta` を含む全ステージを出力します。
+
 ## フォルダ構成
 
 ```

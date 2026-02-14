@@ -1406,15 +1406,37 @@ function Get-ContextSvnGatewayState
         if ($null -eq $Context.Runtime.SvnGateway)
         {
             $Context.Runtime.SvnGateway = @{
-                CommandCache = @{}
-                InFlightCommands = @{}
+                CommandCache = (New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::Ordinal))
+                InFlightCommands = (New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::Ordinal))
                 SyncRoot = (Get-ContextSyncRoot -Context $Context -Kind 'Gateway')
                 SourceCommandCount = 0
             }
         }
-        if (-not $Context.Runtime.SvnGateway.ContainsKey('InFlightCommands'))
+        if (-not $Context.Runtime.SvnGateway.ContainsKey('CommandCache') -or $null -eq $Context.Runtime.SvnGateway.CommandCache)
         {
-            $Context.Runtime.SvnGateway.InFlightCommands = @{}
+            $Context.Runtime.SvnGateway.CommandCache = (New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::Ordinal))
+        }
+        elseif ($Context.Runtime.SvnGateway.CommandCache -is [hashtable])
+        {
+            $ordinalCommandCache = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::Ordinal)
+            foreach ($entry in $Context.Runtime.SvnGateway.CommandCache.GetEnumerator())
+            {
+                $ordinalCommandCache[[string]$entry.Key] = $entry.Value
+            }
+            $Context.Runtime.SvnGateway.CommandCache = $ordinalCommandCache
+        }
+        if (-not $Context.Runtime.SvnGateway.ContainsKey('InFlightCommands') -or $null -eq $Context.Runtime.SvnGateway.InFlightCommands)
+        {
+            $Context.Runtime.SvnGateway.InFlightCommands = (New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::Ordinal))
+        }
+        elseif ($Context.Runtime.SvnGateway.InFlightCommands -is [hashtable])
+        {
+            $ordinalInFlight = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::Ordinal)
+            foreach ($entry in $Context.Runtime.SvnGateway.InFlightCommands.GetEnumerator())
+            {
+                $ordinalInFlight[[string]$entry.Key] = $entry.Value
+            }
+            $Context.Runtime.SvnGateway.InFlightCommands = $ordinalInFlight
         }
         if (-not $Context.Runtime.SvnGateway.ContainsKey('SyncRoot') -or $null -eq $Context.Runtime.SvnGateway.SyncRoot)
         {
@@ -1578,7 +1600,7 @@ function Wait-SvnRequest
             }
         } -MaxParallel $maxParallel -SessionVariables @{
             NarutoParallelWorker = $true
-        } -ErrorContext 'wait svn request' -SharedSemaphore $parallelSemaphore)
+        } -ErrorContext 'wait svn request' -SharedSemaphore $parallelSemaphore -Context $Context)
 
     $firstFailure = $null
     foreach ($resolved in $resolvedResults)
@@ -1657,9 +1679,13 @@ function New-PipelineRuntime
         [int]$Parallel
     )
     $parallelLimit = [Math]::Max(1, [int]$Parallel)
+    $functionCatalog = @(Get-NarutoFunctionNameCatalog)
+    $parallelExecutor = New-ParallelExecutor -MaxParallel $parallelLimit -FunctionCatalog $functionCatalog
     $runtime = @{
         Parallel = $parallelLimit
         ParallelSemaphore = (New-Object System.Threading.SemaphoreSlim($parallelLimit, $parallelLimit))
+        ParallelExecutor = $parallelExecutor
+        ParallelFunctionCatalog = @($functionCatalog)
         RequestBroker = (New-RequestBroker)
         StageResults = @{}
         StageDurations = [ordered]@{}
@@ -1687,6 +1713,105 @@ function Set-PipelineStageDuration
         return
     }
     $Runtime.StageDurations[$StageId] = (Format-MetricValue -Value ([double]$Seconds))
+}
+function Dispose-PipelineRuntime
+{
+    <#
+    .SYNOPSIS
+        パイプライン実行で確保した共有リソースを一括解放する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseApprovedVerbs', '')]
+    [CmdletBinding()]
+    param(
+        [hashtable]$Context,
+        [hashtable]$Runtime
+    )
+    $activeRuntime = $Runtime
+    if ($null -eq $activeRuntime -and $null -ne $Context -and $null -ne $Context.Runtime -and $null -ne $Context.Runtime.PipelineRuntime)
+    {
+        $activeRuntime = $Context.Runtime.PipelineRuntime
+    }
+    if ($null -eq $activeRuntime)
+    {
+        return
+    }
+
+    if ($activeRuntime.ContainsKey('ParallelExecutor') -and $null -ne $activeRuntime.ParallelExecutor)
+    {
+        Dispose-ParallelExecutor -Executor $activeRuntime.ParallelExecutor
+        $activeRuntime.ParallelExecutor = $null
+    }
+    if ($activeRuntime.ContainsKey('ParallelSemaphore') -and $null -ne $activeRuntime.ParallelSemaphore)
+    {
+        try
+        {
+            $activeRuntime.ParallelSemaphore.Dispose()
+        }
+        catch
+        {
+            Write-Verbose ("ParallelSemaphore dispose skipped: {0}" -f $_.Exception.Message)
+        }
+        $activeRuntime.ParallelSemaphore = $null
+    }
+    if ($activeRuntime.ContainsKey('RequestBroker') -and $null -ne $activeRuntime.RequestBroker)
+    {
+        if ($activeRuntime.RequestBroker.ContainsKey('Requests') -and $null -ne $activeRuntime.RequestBroker.Requests)
+        {
+            $activeRuntime.RequestBroker.Requests.Clear()
+        }
+        if ($activeRuntime.RequestBroker.ContainsKey('Results') -and $null -ne $activeRuntime.RequestBroker.Results)
+        {
+            $activeRuntime.RequestBroker.Results.Clear()
+        }
+        if ($activeRuntime.RequestBroker.ContainsKey('RegistrationOrder') -and $null -ne $activeRuntime.RequestBroker.RegistrationOrder)
+        {
+            $activeRuntime.RequestBroker.RegistrationOrder.Clear()
+        }
+    }
+
+    if ($null -ne $Context -and $null -ne $Context.Runtime)
+    {
+        if ($null -ne $Context.Runtime.SvnGateway)
+        {
+            Invoke-WithContextLock -Context $Context -Kind 'Gateway' -Action {
+                if ($Context.Runtime.SvnGateway.ContainsKey('InFlightCommands') -and $null -ne $Context.Runtime.SvnGateway.InFlightCommands)
+                {
+                    foreach ($inFlight in @($Context.Runtime.SvnGateway.InFlightCommands.Values))
+                    {
+                        if ($null -eq $inFlight -or $null -eq $inFlight.Event)
+                        {
+                            continue
+                        }
+                        try
+                        {
+                            [void]$inFlight.Event.Set()
+                        }
+                        catch
+                        {
+                            Write-Verbose ("InFlight event set skipped: {0}" -f $_.Exception.Message)
+                        }
+                        try
+                        {
+                            $inFlight.Event.Dispose()
+                        }
+                        catch
+                        {
+                            Write-Verbose ("InFlight event dispose skipped: {0}" -f $_.Exception.Message)
+                        }
+                    }
+                    $Context.Runtime.SvnGateway.InFlightCommands.Clear()
+                }
+                if ($Context.Runtime.SvnGateway.ContainsKey('CommandCache') -and $null -ne $Context.Runtime.SvnGateway.CommandCache)
+                {
+                    $Context.Runtime.SvnGateway.CommandCache.Clear()
+                }
+            }
+            $Context.Runtime.SvnGateway = $null
+        }
+        $Context.Runtime.RequestBroker = $null
+        $Context.Runtime.PipelineRuntime = $null
+    }
 }
 function Get-ContextParallelLimit
 {
@@ -1733,6 +1858,29 @@ function Get-ContextParallelSemaphore
         return $null
     }
     return $Context.Runtime.PipelineRuntime.ParallelSemaphore
+}
+function Get-ContextParallelExecutor
+{
+    <#
+    .SYNOPSIS
+        Context から共有並列 executor を取得する。
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param([hashtable]$Context)
+    if ($null -eq $Context -or $null -eq $Context.Runtime)
+    {
+        return $null
+    }
+    if ($null -eq $Context.Runtime.PipelineRuntime)
+    {
+        return $null
+    }
+    if ($null -eq $Context.Runtime.PipelineRuntime.ParallelExecutor)
+    {
+        return $null
+    }
+    return $Context.Runtime.PipelineRuntime.ParallelExecutor
 }
 function Test-IsParallelWorkerRunspace
 {
@@ -1835,12 +1983,12 @@ function Invoke-PipelineDag
         foreach ($node in @($serialNodes.ToArray() | Sort-Object Id))
         {
             $nodeId = [string]$node.Id
-            $startedAt = Get-Date
+            $stageStartedAt = Get-Date
             $result = & $node.Action
-            $endedAt = Get-Date
+            $stageEndedAt = Get-Date
             $Runtime.StageResults[$nodeId] = $result
             [void]$Runtime.CompletedNodeIds.Add($nodeId)
-            Set-PipelineStageDuration -Runtime $Runtime -StageId $nodeId -Seconds ((New-TimeSpan -Start $startedAt -End $endedAt).TotalSeconds)
+            Set-PipelineStageDuration -Runtime $Runtime -StageId $nodeId -Seconds ((New-TimeSpan -Start $stageStartedAt -End $stageEndedAt).TotalSeconds)
         }
 
         $parallelBatch = @($parallelNodes.ToArray() | Sort-Object Id)
@@ -1877,15 +2025,15 @@ function Invoke-PipelineDag
                     }
                     $action = [scriptblock]::Create([string]$Item.ActionText)
                     $nodeId = [string]$Item.NodeId
-                    $startedAt = Get-Date
+                    $nodeStartedAt = Get-Date
                     $result = & $action
-                    $endedAt = Get-Date
+                    $nodeEndedAt = Get-Date
                     return [pscustomobject]@{
                         NodeId = $nodeId
                         Result = $result
-                        Seconds = (New-TimeSpan -Start $startedAt -End $endedAt).TotalSeconds
+                        Seconds = (New-TimeSpan -Start $nodeStartedAt -End $nodeEndedAt).TotalSeconds
                     }
-                } -MaxParallel $parallelLimit -ErrorContext 'pipeline dag node execution')
+                } -MaxParallel $parallelLimit -ErrorContext 'pipeline dag node execution' -Context $Context)
 
             foreach ($dagResult in $dagResults)
             {
@@ -1898,37 +2046,66 @@ function Invoke-PipelineDag
     }
     return $Runtime.StageResults
 }
-function Get-ParallelFunctionDefinitionMap
+function Get-NarutoFunctionNameCatalog
 {
     <#
     .SYNOPSIS
-        並列ワーカーへ注入する関数定義マップを作成する。
+        NarutoCode.ps1 由来の関数名カタログを返す。
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param(
+        [switch]$Refresh
+    )
+    if (-not $Refresh -and $null -ne $script:NarutoFunctionNameCatalogCache -and @($script:NarutoFunctionNameCatalogCache).Count -gt 0)
+    {
+        return [string[]]@($script:NarutoFunctionNameCatalogCache)
+    }
+
+    $scriptPath = ''
+    $functionItem = Get-Item function:Get-NarutoFunctionNameCatalog -ErrorAction SilentlyContinue
+    if ($null -ne $functionItem -and $null -ne $functionItem.ScriptBlock -and -not [string]::IsNullOrWhiteSpace([string]$functionItem.ScriptBlock.File))
+    {
+        $scriptPath = [string]$functionItem.ScriptBlock.File
+    }
+    if ([string]::IsNullOrWhiteSpace($scriptPath) -or -not (Test-Path -LiteralPath $scriptPath))
+    {
+        return [string[]]@()
+    }
+
+    $nameSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($line in @(Get-Content -LiteralPath $scriptPath -Encoding UTF8))
+    {
+        if ([string]::IsNullOrWhiteSpace([string]$line))
+        {
+            continue
+        }
+        if ($line -match '^\s*function\s+([A-Za-z_][A-Za-z0-9\-_]*)')
+        {
+            [void]$nameSet.Add([string]$matches[1])
+        }
+    }
+    $catalog = @($nameSet | Sort-Object)
+    $script:NarutoFunctionNameCatalogCache = [string[]]@($catalog)
+    return [string[]]@($catalog)
+}
+function Get-NarutoFunctionDefinitionMapFromCatalog
+{
+    <#
+    .SYNOPSIS
+        関数名カタログから並列ワーカー注入用の定義マップを作成する。
     #>
     [CmdletBinding()]
     [OutputType([hashtable])]
-    param([string[]]$FunctionNames = @())
+    param(
+        [string[]]$CatalogNames = @(),
+        [string[]]$RequiredFunctions = @()
+    )
     $map = @{}
-    $requestedNames = @($FunctionNames | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Select-Object -Unique)
+    $requestedNames = @($RequiredFunctions | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Select-Object -Unique)
     if ($requestedNames.Count -eq 0)
     {
-        $nameSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-        foreach ($name in @(Get-ChildItem function: | Select-Object -ExpandProperty Name))
-        {
-            if ([string]::IsNullOrWhiteSpace([string]$name))
-            {
-                continue
-            }
-            [void]$nameSet.Add([string]$name)
-        }
-        foreach ($command in @(Get-Command -CommandType Function -ErrorAction SilentlyContinue))
-        {
-            if ($null -eq $command -or [string]::IsNullOrWhiteSpace([string]$command.Name))
-            {
-                continue
-            }
-            [void]$nameSet.Add([string]$command.Name)
-        }
-        $requestedNames = @($nameSet | Sort-Object)
+        $requestedNames = @($CatalogNames | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Select-Object -Unique)
     }
     foreach ($name in $requestedNames)
     {
@@ -1957,6 +2134,18 @@ function Get-ParallelFunctionDefinitionMap
         $map[[string]$name] = [string]$definition
     }
     return $map
+}
+function Get-ParallelFunctionDefinitionMap
+{
+    <#
+    .SYNOPSIS
+        並列ワーカーへ注入する関数定義マップを作成する。
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param([string[]]$FunctionNames = @())
+    $catalog = @(Get-NarutoFunctionNameCatalog)
+    return (Get-NarutoFunctionDefinitionMapFromCatalog -CatalogNames $catalog -RequiredFunctions $FunctionNames)
 }
 function New-ParallelInitialSessionState
 {
@@ -1993,6 +2182,325 @@ function New-ParallelInitialSessionState
     }
     return $sessionState
 }
+function New-ParallelExecutor
+{
+    <#
+    .SYNOPSIS
+        共有 RunspacePool ベースの並列 executor を作成する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [ValidateRange(1, 128)][int]$MaxParallel = 1,
+        [string[]]$FunctionCatalog = @(),
+        [string[]]$RequiredFunctions = @()
+    )
+    $parallelLimit = [Math]::Max(1, [int]$MaxParallel)
+    $catalog = @($FunctionCatalog)
+    if ($catalog.Count -eq 0)
+    {
+        $catalog = @(Get-NarutoFunctionNameCatalog)
+    }
+    $functionMap = Get-NarutoFunctionDefinitionMapFromCatalog -CatalogNames $catalog -RequiredFunctions $RequiredFunctions
+    $sessionState = New-ParallelInitialSessionState -FunctionDefinitionMap $functionMap
+    $runspacePool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $parallelLimit, $sessionState, $Host)
+    $runspacePool.Open()
+    $functionNameSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($name in @($functionMap.Keys))
+    {
+        [void]$functionNameSet.Add([string]$name)
+    }
+    return @{
+        MaxParallel = $parallelLimit
+        RunspacePool = $runspacePool
+        FunctionCatalog = @($catalog)
+        FunctionNameSet = $functionNameSet
+        SyncRoot = (New-Object object)
+        Disposed = $false
+    }
+}
+function Test-ParallelExecutorSupportsFunctionSet
+{
+    <#
+    .SYNOPSIS
+        executor が指定関数群を実行可能か判定する。
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [hashtable]$Executor,
+        [string[]]$RequiredFunctions = @()
+    )
+    if ($null -eq $Executor)
+    {
+        return $false
+    }
+    if ($null -eq $RequiredFunctions -or @($RequiredFunctions).Count -eq 0)
+    {
+        return $true
+    }
+    if (-not $Executor.ContainsKey('FunctionNameSet') -or $null -eq $Executor.FunctionNameSet)
+    {
+        return $false
+    }
+    foreach ($name in @($RequiredFunctions))
+    {
+        if ([string]::IsNullOrWhiteSpace([string]$name))
+        {
+            continue
+        }
+        if (-not $Executor.FunctionNameSet.Contains([string]$name))
+        {
+            return $false
+        }
+    }
+    return $true
+}
+function Invoke-ParallelExecutorBatch
+{
+    <#
+    .SYNOPSIS
+        共有 executor を使って入力配列を決定的順序で処理する。
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Executor,
+        [object[]]$InputItems,
+        [Parameter(Mandatory = $true)][scriptblock]$WorkerScript,
+        [ValidateRange(1, 128)][int]$MaxParallel = 1,
+        [hashtable]$SessionVariables = @{},
+        [string]$ErrorContext = 'parallel work',
+        [System.Threading.SemaphoreSlim]$SharedSemaphore = $null
+    )
+    if ($null -eq $Executor.RunspacePool -or ($Executor.ContainsKey('Disposed') -and [bool]$Executor.Disposed))
+    {
+        Throw-NarutoError -Category 'INTERNAL' -ErrorCode 'INTERNAL_PARALLEL_EXECUTOR_DISPOSED' -Message ("Parallel executor is not available for {0}." -f $ErrorContext) -Context @{
+            ErrorContext = $ErrorContext
+        }
+    }
+
+    $items = @($InputItems)
+    if ($items.Count -eq 0)
+    {
+        return @()
+    }
+    $effectiveParallel = [Math]::Max(1, [Math]::Min([Math]::Min([int]$MaxParallel, [int]$Executor.MaxParallel), [int]$items.Count))
+    $workerScriptText = [string]$WorkerScript.ToString()
+    $orderedResults = [object[]]::new($items.Count)
+    $failures = [System.Collections.Generic.List[object]]::new()
+    $activeJobs = [System.Collections.Generic.List[object]]::new()
+    $nextIndex = 0
+    $lockTaken = $false
+    $syncRoot = if ($Executor.ContainsKey('SyncRoot'))
+    {
+        $Executor.SyncRoot
+    }
+    else
+    {
+        $null
+    }
+    if ($null -ne $syncRoot)
+    {
+        [System.Threading.Monitor]::Enter($syncRoot)
+        $lockTaken = $true
+    }
+    try
+    {
+        while ($nextIndex -lt $items.Count -or $activeJobs.Count -gt 0)
+        {
+            while ($nextIndex -lt $items.Count -and $activeJobs.Count -lt $effectiveParallel)
+            {
+                $ps = [System.Management.Automation.PowerShell]::Create()
+                $ps.RunspacePool = $Executor.RunspacePool
+                [void]$ps.AddScript({
+                        param(
+                            $Item,
+                            [int]$Index,
+                            [string]$WorkerScriptText,
+                            [hashtable]$SessionVariables,
+                            [System.Threading.SemaphoreSlim]$SharedSemaphore
+                        )
+                        $script:NarutoParallelWorker = $true
+                        foreach ($name in @($SessionVariables.Keys))
+                        {
+                            Set-Variable -Scope Script -Name ([string]$name) -Value $SessionVariables[$name]
+                        }
+                        $workerScript = [scriptblock]::Create($WorkerScriptText)
+                        if ($null -ne $SharedSemaphore)
+                        {
+                            [void]$SharedSemaphore.Wait()
+                            try
+                            {
+                                return (& $workerScript -Item $Item -Index $Index)
+                            }
+                            finally
+                            {
+                                [void]$SharedSemaphore.Release()
+                            }
+                        }
+                        return (& $workerScript -Item $Item -Index $Index)
+                    }).AddArgument($items[$nextIndex]).AddArgument($nextIndex).AddArgument($workerScriptText).AddArgument($SessionVariables).AddArgument($SharedSemaphore)
+                $asyncResult = $ps.BeginInvoke()
+                [void]$activeJobs.Add([pscustomobject]@{
+                        Index = [int]$nextIndex
+                        PowerShell = $ps
+                        AsyncResult = $asyncResult
+                    })
+                $nextIndex++
+            }
+
+            $completedJob = $null
+            while ($null -eq $completedJob)
+            {
+                foreach ($job in @($activeJobs.ToArray()))
+                {
+                    if ($job.AsyncResult.IsCompleted)
+                    {
+                        $completedJob = $job
+                        break
+                    }
+                }
+                if ($null -eq $completedJob)
+                {
+                    Start-Sleep -Milliseconds 1
+                }
+            }
+
+            try
+            {
+                $output = @($completedJob.PowerShell.EndInvoke($completedJob.AsyncResult))
+                if ($output.Count -eq 0)
+                {
+                    $orderedResults[$completedJob.Index] = $null
+                }
+                elseif ($output.Count -eq 1)
+                {
+                    $orderedResults[$completedJob.Index] = $output[0]
+                }
+                else
+                {
+                    $orderedResults[$completedJob.Index] = @($output)
+                }
+            }
+            catch
+            {
+                [void]$failures.Add([pscustomobject]@{
+                        ItemIndex = [int]$completedJob.Index
+                        Message = [string]$_.Exception.Message
+                        Exception = $_.Exception
+                    })
+            }
+            finally
+            {
+                if ($null -ne $completedJob.PowerShell)
+                {
+                    $completedJob.PowerShell.Dispose()
+                }
+                [void]$activeJobs.Remove($completedJob)
+            }
+        }
+
+        if ($failures.Count -gt 0)
+        {
+            $sortedFailures = @($failures.ToArray() | Sort-Object ItemIndex)
+            $firstFailure = $sortedFailures[0]
+            Throw-NarutoError -Category 'INTERNAL' -ErrorCode 'INTERNAL_PARALLEL_WORK_FAILED' -Message ("{0} failed for {1} item(s).`n[{2}] {3}" -f $ErrorContext, $sortedFailures.Count, [int]$firstFailure.ItemIndex, [string]$firstFailure.Message) -Context @{
+                ErrorContext = $ErrorContext
+                FailedCount = [int]$sortedFailures.Count
+                ItemIndex = [int]$firstFailure.ItemIndex
+            } -InnerException $firstFailure.Exception
+        }
+        return @($orderedResults)
+    }
+    finally
+    {
+        foreach ($job in @($activeJobs.ToArray()))
+        {
+            if ($null -ne $job.PowerShell)
+            {
+                try
+                {
+                    [void]$job.PowerShell.Stop()
+                }
+                catch
+                {
+                    Write-Verbose ("PowerShell stop skipped: {0}" -f $_.Exception.Message)
+                }
+                $job.PowerShell.Dispose()
+            }
+        }
+        if ($lockTaken -and $null -ne $syncRoot)
+        {
+            [System.Threading.Monitor]::Exit($syncRoot)
+        }
+    }
+}
+function Dispose-ParallelExecutor
+{
+    <#
+    .SYNOPSIS
+        並列 executor と RunspacePool を解放する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseApprovedVerbs', '')]
+    [CmdletBinding()]
+    param([hashtable]$Executor)
+    if ($null -eq $Executor)
+    {
+        return
+    }
+    if ($Executor.ContainsKey('Disposed') -and [bool]$Executor.Disposed)
+    {
+        return
+    }
+    if ($Executor.ContainsKey('RunspacePool') -and $null -ne $Executor.RunspacePool)
+    {
+        try
+        {
+            $Executor.RunspacePool.Close()
+        }
+        catch
+        {
+            Write-Verbose ("RunspacePool close skipped: {0}" -f $_.Exception.Message)
+        }
+        $Executor.RunspacePool.Dispose()
+        $Executor.RunspacePool = $null
+    }
+    if ($Executor.ContainsKey('Disposed'))
+    {
+        $Executor.Disposed = $true
+    }
+}
+function Resolve-ParallelExecutionContext
+{
+    <#
+    .SYNOPSIS
+        Invoke-ParallelWork の実行コンテキストを解決する。
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [hashtable]$Context,
+        [object[]]$InputItems,
+        [hashtable]$SessionVariables
+    )
+    if ($null -ne $Context)
+    {
+        return $Context
+    }
+    if ($null -ne $SessionVariables -and $SessionVariables.ContainsKey('Context') -and $SessionVariables['Context'] -is [hashtable])
+    {
+        return $SessionVariables['Context']
+    }
+    $items = @($InputItems)
+    if ($items.Count -gt 0 -and $null -ne $items[0] -and $items[0].PSObject.Properties.Match('Context').Count -gt 0 -and $items[0].Context -is [hashtable])
+    {
+        return $items[0].Context
+    }
+    return $null
+}
 function Invoke-ParallelWork
 {
     <#
@@ -2010,7 +2518,8 @@ function Invoke-ParallelWork
         [string[]]$RequiredFunctions = @(),
         [hashtable]$SessionVariables = @{},
         [string]$ErrorContext = 'parallel work',
-        [System.Threading.SemaphoreSlim]$SharedSemaphore = $null
+        [System.Threading.SemaphoreSlim]$SharedSemaphore = $null,
+        [hashtable]$Context = $null
     )
 
     $items = @($InputItems)
@@ -2048,112 +2557,28 @@ function Invoke-ParallelWork
         return @($results.ToArray())
     }
 
-    $workerScriptText = $WorkerScript.ToString()
-    $parallelFunctionMap = Get-ParallelFunctionDefinitionMap -FunctionNames $RequiredFunctions
-    $sessionState = New-ParallelInitialSessionState -FunctionDefinitionMap $parallelFunctionMap
-    $runspacePool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $effectiveParallel, $sessionState, $Host)
-    $runspacePool.Open()
-
-    $parallelJobs = [System.Collections.Generic.List[object]]::new()
+    $resolvedContext = Resolve-ParallelExecutionContext -Context $Context -InputItems $items -SessionVariables $SessionVariables
+    $executor = Get-ContextParallelExecutor -Context $resolvedContext
+    if ($null -ne $executor -and -not (Test-ParallelExecutorSupportsFunctionSet -Executor $executor -RequiredFunctions $RequiredFunctions))
+    {
+        $executor = $null
+    }
+    $ownsExecutor = $false
+    if ($null -eq $executor)
+    {
+        $catalog = @(Get-NarutoFunctionNameCatalog)
+        $executor = New-ParallelExecutor -MaxParallel $effectiveParallel -FunctionCatalog $catalog -RequiredFunctions $RequiredFunctions
+        $ownsExecutor = $true
+    }
     try
     {
-        for ($index = 0
-            $index -lt $items.Count
-            $index++)
-        {
-            $ps = [System.Management.Automation.PowerShell]::Create()
-            $ps.RunspacePool = $runspacePool
-            [void]$ps.AddScript({
-                    param(
-                        $Item,
-                        [int]$Index,
-                        [string]$WorkerScriptText,
-                        [hashtable]$SessionVariables,
-                        [System.Threading.SemaphoreSlim]$SharedSemaphore
-                    )
-                    $script:NarutoParallelWorker = $true
-                    foreach ($name in @($SessionVariables.Keys))
-                    {
-                        Set-Variable -Scope Script -Name ([string]$name) -Value $SessionVariables[$name]
-                    }
-                    $workerScript = [scriptblock]::Create($WorkerScriptText)
-                    if ($null -ne $SharedSemaphore)
-                    {
-                        [void]$SharedSemaphore.Wait()
-                        try
-                        {
-                            return (& $workerScript -Item $Item -Index $Index)
-                        }
-                        finally
-                        {
-                            [void]$SharedSemaphore.Release()
-                        }
-                    }
-                    return (& $workerScript -Item $Item -Index $Index)
-                }).AddArgument($items[$index]).AddArgument($index).AddArgument($workerScriptText).AddArgument($SessionVariables).AddArgument($SharedSemaphore)
-            $asyncResult = $ps.BeginInvoke()
-            [void]$parallelJobs.Add([pscustomobject]@{
-                    Index = [int]$index
-                    PowerShell = $ps
-                    AsyncResult = $asyncResult
-                })
-        }
-
-        $orderedResults = [object[]]::new($items.Count)
-        $failures = [System.Collections.Generic.List[object]]::new()
-        foreach ($job in $parallelJobs.ToArray())
-        {
-            try
-            {
-                $output = @($job.PowerShell.EndInvoke($job.AsyncResult))
-                if ($output.Count -eq 0)
-                {
-                    $orderedResults[$job.Index] = $null
-                }
-                elseif ($output.Count -eq 1)
-                {
-                    $orderedResults[$job.Index] = $output[0]
-                }
-                else
-                {
-                    $orderedResults[$job.Index] = @($output)
-                }
-            }
-            catch
-            {
-                [void]$failures.Add([pscustomobject]@{
-                        ItemIndex = [int]$job.Index
-                        Message = [string]$_.Exception.Message
-                        Exception = $_.Exception
-                    })
-            }
-        }
-
-        if ($failures.Count -gt 0)
-        {
-            $sortedFailures = @($failures.ToArray() | Sort-Object ItemIndex)
-            $firstFailure = $sortedFailures[0]
-            Throw-NarutoError -Category 'INTERNAL' -ErrorCode 'INTERNAL_PARALLEL_WORK_FAILED' -Message ("{0} failed for {1} item(s).`n[{2}] {3}" -f $ErrorContext, $sortedFailures.Count, [int]$firstFailure.ItemIndex, [string]$firstFailure.Message) -Context @{
-                ErrorContext = $ErrorContext
-                FailedCount = [int]$sortedFailures.Count
-                ItemIndex = [int]$firstFailure.ItemIndex
-            } -InnerException $firstFailure.Exception
-        }
-        return @($orderedResults)
+        return @(Invoke-ParallelExecutorBatch -Executor $executor -InputItems $items -WorkerScript $WorkerScript -MaxParallel $effectiveParallel -SessionVariables $SessionVariables -ErrorContext $ErrorContext -SharedSemaphore $SharedSemaphore)
     }
     finally
     {
-        foreach ($job in $parallelJobs.ToArray())
+        if ($ownsExecutor)
         {
-            if ($null -ne $job.PowerShell)
-            {
-                $job.PowerShell.Dispose()
-            }
-        }
-        if ($null -ne $runspacePool)
-        {
-            $runspacePool.Close()
-            $runspacePool.Dispose()
+            Dispose-ParallelExecutor -Executor $executor
         }
     }
 }
@@ -3230,69 +3655,54 @@ function Get-SvnGatewayCommandKey
     $argumentList = @($Arguments)
     if ($argumentList.Count -eq 0)
     {
-        return (Get-SvnRequestKey -Operation '' -Path '' -Revision '' -RevisionRange '' -Flags @() -Peg '')
+        return ('gateway' + [char]31)
     }
-    $operation = ([string]$argumentList[0]).ToLowerInvariant()
-    $path = ''
-    $revision = ''
-    $revisionRange = ''
-    $peg = ''
-    $flags = New-Object 'System.Collections.Generic.List[string]'
-    $recognizedSwitchIndex = New-Object 'System.Collections.Generic.HashSet[int]'
-
-    for ($i = 0
-        $i -lt $argumentList.Count
-        $i++)
+    $normalizedTokens = New-Object 'System.Collections.Generic.List[string]'
+    $positionArguments = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($tokenValue in $argumentList)
     {
-        $token = [string]$argumentList[$i]
-        if ($token -eq '-r' -and ($i + 1) -lt $argumentList.Count)
+        $token = [string]$tokenValue
+        $normalizedToken = $token
+        if ($token.StartsWith('--'))
         {
-            $revision = [string]$argumentList[$i + 1]
-            [void]$recognizedSwitchIndex.Add($i)
-            [void]$recognizedSwitchIndex.Add($i + 1)
-            continue
-        }
-        if ($token -eq '-c' -and ($i + 1) -lt $argumentList.Count)
-        {
-            $revisionRange = [string]$argumentList[$i + 1]
-            [void]$recognizedSwitchIndex.Add($i)
-            [void]$recognizedSwitchIndex.Add($i + 1)
-            continue
-        }
-    }
-
-    if ($argumentList.Count -gt 1)
-    {
-        $path = [string]$argumentList[$argumentList.Count - 1]
-    }
-    if (-not [string]::IsNullOrWhiteSpace($path))
-    {
-        $atIndex = $path.LastIndexOf('@')
-        if ($atIndex -gt 0 -and $atIndex -lt ($path.Length - 1))
-        {
-            $pathPeg = $path.Substring($atIndex + 1)
-            if ($pathPeg -match '^\d+$')
+            $equalsIndex = $token.IndexOf('=')
+            if ($equalsIndex -ge 0)
             {
-                $peg = $pathPeg
-                $path = $path.Substring(0, $atIndex)
+                $optionName = $token.Substring(0, $equalsIndex).ToLowerInvariant()
+                $optionValue = $token.Substring($equalsIndex + 1)
+                $normalizedToken = $optionName + '=' + $optionValue
+            }
+            else
+            {
+                $normalizedToken = $token.ToLowerInvariant()
             }
         }
+        elseif ($token.StartsWith('-') -and $token -ne '-')
+        {
+            if ($token.Length -gt 2)
+            {
+                $normalizedToken = $token.Substring(0, 2).ToLowerInvariant() + $token.Substring(2)
+            }
+            else
+            {
+                $normalizedToken = $token.ToLowerInvariant()
+            }
+        }
+        else
+        {
+            [void]$positionArguments.Add($token)
+        }
+        $lengthPrefixedToken = [string]$normalizedToken.Length + ':' + $normalizedToken
+        [void]$normalizedTokens.Add($lengthPrefixedToken)
     }
-    for ($i = 1
-        $i -lt $argumentList.Count
-        $i++)
+    $positionTokens = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($positionArgument in $positionArguments)
     {
-        if ($recognizedSwitchIndex.Contains($i))
-        {
-            continue
-        }
-        if ($i -eq ($argumentList.Count - 1))
-        {
-            continue
-        }
-        [void]$flags.Add([string]$argumentList[$i])
+        [void]$positionTokens.Add(([string]$positionArgument.Length + ':' + [string]$positionArgument))
     }
-    return (Get-SvnRequestKey -Operation $operation -Path $path -Revision $revision -RevisionRange $revisionRange -Flags @($flags.ToArray()) -Peg $peg)
+    $positionToken = 'pos[' + [string]$positionArguments.Count + ']:' + ($positionTokens.ToArray() -join [char]30)
+    [void]$normalizedTokens.Add(([string]$positionToken.Length + ':' + $positionToken))
+    return ('gateway' + [char]31 + ($normalizedTokens.ToArray() -join [char]30))
 }
 function Invoke-SvnCommandCore
 {
@@ -13988,7 +14398,7 @@ function Invoke-PipelineAggregationStage
                 Key = [string]$Item.Key
                 Value = (& $Item.Action)
             }
-        } -MaxParallel $parallelLimit -SharedSemaphore $parallelSemaphore -ErrorContext 'aggregation stage')
+        } -MaxParallel $parallelLimit -SharedSemaphore $parallelSemaphore -ErrorContext 'aggregation stage' -Context $Context)
     $resultMap = @{}
     foreach ($item in $results)
     {
@@ -14101,6 +14511,7 @@ function Write-PipelineCsvArtifacts
         }
     }
     $parallelLimit = Get-ContextParallelLimit -Context $Context -Default 1
+    # DAG ノード間は並列化するが、ワーカー内の入れ子並列は過剰並列化を避けるため抑止する。
     if (Test-IsParallelWorkerRunspace)
     {
         $parallelLimit = 1
@@ -14112,7 +14523,7 @@ function Write-PipelineCsvArtifacts
             $itemArgs = @{} + $Item.Args
             [void](& $Item.Fn @itemArgs)
             return [string]$Item.Name
-        } -MaxParallel $parallelLimit -ErrorContext 'csv artifact write' -SharedSemaphore $parallelSemaphore)
+        } -MaxParallel $parallelLimit -ErrorContext 'csv artifact write' -SharedSemaphore $parallelSemaphore -Context $Context)
 }
 function Write-PipelineVisualizationArtifacts
 {
@@ -14179,6 +14590,7 @@ function Write-PipelineVisualizationArtifacts
             })
     }
     $parallelLimit = Get-ContextParallelLimit -Context $Context -Default 1
+    # DAG ノード間は並列化するが、ワーカー内の入れ子並列は過剰並列化を避けるため抑止する。
     if (Test-IsParallelWorkerRunspace)
     {
         $parallelLimit = 1
@@ -14197,7 +14609,7 @@ function Write-PipelineVisualizationArtifacts
                 Function = [string]$Item.Fn
                 Result = $vizResult
             }
-        } -MaxParallel $parallelLimit -ErrorContext 'visualization artifact write' -SharedSemaphore $parallelSemaphore)
+        } -MaxParallel $parallelLimit -ErrorContext 'visualization artifact write' -SharedSemaphore $parallelSemaphore -Context $Context)
     foreach ($vizResult in $vizResults)
     {
         if ([string]$vizResult.Result.Status -eq 'Failure')
@@ -14231,15 +14643,26 @@ function Write-PipelineRunArtifacts
         [switch]$NonInteractive,
         [switch]$TrustServerCert,
         [switch]$IgnoreWhitespace,
-        [switch]$ExcludeCommentOnlyLines
+        [switch]$ExcludeCommentOnlyLines,
+        [switch]$SkipProgress,
+        [switch]$SkipRunSummary
     )
-    Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 8/8: メタデータ出力' -PercentComplete 95
+    if (-not $SkipProgress)
+    {
+        Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 8/8: メタデータ出力' -PercentComplete 95
+    }
     $finishedAt = Get-Date
     $meta = New-RunMetaData -Context $Context -StartTime $StartedAt -EndTime $finishedAt -TargetUrl $ExecutionState.TargetUrl -FromRevision $ExecutionState.FromRevision -ToRevision $ExecutionState.ToRevision -SvnVersion $ExecutionState.SvnVersion -Parallel $Parallel -TopNCount $TopNCount -Encoding $Encoding -Commits $Commits -FileRows $FileRows -OutDirectory $ExecutionState.OutDirectory -IncludePaths $ExecutionState.IncludePaths -ExcludePaths $ExecutionState.ExcludePaths -IncludeExtensions $ExecutionState.IncludeExtensions -ExcludeExtensions $ExecutionState.ExcludeExtensions -StageDurations $StageDurations -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -IgnoreWhitespace:$IgnoreWhitespace -ExcludeCommentOnlyLines:$ExcludeCommentOnlyLines
     Write-JsonFile -Data $meta -FilePath (Join-Path $ExecutionState.OutDirectory 'run_meta.json') -Depth 12 -EncodingName $Encoding
 
-    Write-Progress -Id 0 -Activity 'NarutoCode' -Completed
-    Write-RunSummary -TargetUrl $ExecutionState.TargetUrl -FromRevision $ExecutionState.FromRevision -ToRevision $ExecutionState.ToRevision -Commits $Commits -FileRows $FileRows -OutDirectory $ExecutionState.OutDirectory
+    if (-not $SkipProgress)
+    {
+        Write-Progress -Id 0 -Activity 'NarutoCode' -Completed
+    }
+    if (-not $SkipRunSummary)
+    {
+        Write-RunSummary -TargetUrl $ExecutionState.TargetUrl -FromRevision $ExecutionState.FromRevision -ToRevision $ExecutionState.ToRevision -Commits $Commits -FileRows $FileRows -OutDirectory $ExecutionState.OutDirectory
+    }
     return [pscustomobject]$meta
 }
 function New-PipelineResultObject
@@ -14432,9 +14855,18 @@ function Invoke-NarutoCodePipeline
         }
     )
 
-    [void](Invoke-PipelineDag -Context $Context -Runtime $pipelineRuntime -Nodes $nodes)
-    $Context.Runtime.PipelineRuntime = $pipelineRuntime
-    return (New-PipelineResultObject -OutDirectory $executionState.OutDirectory -CommitterRows $pipelineRuntime.StageResults['step4_committer'] -FileRows $pipelineRuntime.StageResults['step4_file'] -CommitRows $pipelineRuntime.StageResults['step4_commit'] -CouplingRows $pipelineRuntime.StageResults['step4_coupling'] -RunMeta $pipelineRuntime.StageResults['step8_meta'])
+    try
+    {
+        [void](Invoke-PipelineDag -Context $Context -Runtime $pipelineRuntime -Nodes $nodes)
+        $finalRunMeta = Write-PipelineRunArtifacts -Context $Context -StartedAt $startedAt -ExecutionState $executionState -Parallel $Parallel -TopNCount $topNCountValue -Encoding $encodingName -Commits $pipelineRuntime.StageResults['step3_diff'].Commits -FileRows $pipelineRuntime.StageResults['step4_file'] -StageDurations $pipelineRuntime.StageDurations -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -IgnoreWhitespace:$ignoreWhitespaceSwitch -ExcludeCommentOnlyLines:$ExcludeCommentOnlyLines -SkipProgress -SkipRunSummary
+        $pipelineRuntime.StageResults['step8_meta'] = $finalRunMeta
+        $Context.Runtime.PipelineRuntime = $pipelineRuntime
+        return (New-PipelineResultObject -OutDirectory $executionState.OutDirectory -CommitterRows $pipelineRuntime.StageResults['step4_committer'] -FileRows $pipelineRuntime.StageResults['step4_file'] -CommitRows $pipelineRuntime.StageResults['step4_commit'] -CouplingRows $pipelineRuntime.StageResults['step4_coupling'] -RunMeta $finalRunMeta)
+    }
+    finally
+    {
+        Dispose-PipelineRuntime -Context $Context -Runtime $pipelineRuntime
+    }
 }
 
 if ($MyInvocation.InvocationName -ne '.')
