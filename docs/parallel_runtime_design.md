@@ -55,6 +55,8 @@
 ## 8. 失敗時挙動
 - 未登録キー待機は `INTERNAL_REQUEST_KEY_NOT_FOUND` で失敗。
 - Resolver 失敗は `SVN_REQUEST_FAILED` として共通化。
+- DAG の循環依存検出時は `INTERNAL_DAG_CYCLE_DETECTED` で失敗。
+- DAG ノード ID 未指定時は `INPUT_DAG_NODE_ID_REQUIRED` で失敗。
 - Strict 内では既存の `STRICT_*` 例外コードを維持する。
 
 ## 9. テスト戦略
@@ -73,8 +75,8 @@
 | Step | 状態 | Broker化 | Gateway融合対応 | 決定性テスト | 性能計測日 | 備考 |
 |---|---|---|---|---|---|---|
 | Step 2/3: Log+Diff | Done | Done | Done | Done | 2026-02-14 | Diff prefetch を登録/待機/還元に移行 |
-| Step 4: Aggregation | Not started | Not started | N/A | Not started | - | 純計算フェーズのため SVN I/O なし |
+| Step 4: Aggregation | Done | N/A | N/A | Done | 2026-02-14 | 純計算フェーズのため SVN I/O なし。4 DAG ノード（committer/file/coupling/commit）に分割し並列実行 |
 | Step 5: Strict Attribution | Done | Done | Done | Done | 2026-02-14 | 遷移計画と preloaded blame の二相実行へ移行 |
-| Step 6: CSV | Not started | N/A | N/A | Not started | - | 出力順序決定性テストのみ今後追加 |
-| Step 7: Visualization | Not started | N/A | N/A | Not started | - | 出力順序決定性テストのみ今後追加 |
-| Step 8: run_meta | In progress | Done | Done | Done | 2026-02-14 | StageDurations 出力を追加済み、項目拡充は継続 |
+| Step 6: CSV | Done | N/A | N/A | Done | 2026-02-14 | DAG ノードとして統合。出力順序決定性テスト済み |
+| Step 7: Visualization | Done | N/A | N/A | Done | 2026-02-14 | DAG ノードとして統合。出力順序決定性テスト済み |
+| Step 8: run_meta | Done | Done | Done | Done | 2026-02-14 | StageDurations 全ステージ出力完了 |
