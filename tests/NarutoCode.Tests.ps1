@@ -680,10 +680,25 @@ Describe 'Join-CommandArgument' {
         $result | Should -Match '"--ignore-all-space --ignore-eol-style"'
     }
 
+    It 'quotes empty argument as double quotes' {
+        Join-CommandArgument -Arguments @('cmd', '') | Should -Be 'cmd ""'
+    }
+
+    It 'escapes embedded double quote' {
+        Join-CommandArgument -Arguments @('cmd', 'a"b') | Should -Be 'cmd "a\"b"'
+    }
+
+    It 'escapes trailing backslash in quoted argument' {
+        Join-CommandArgument -Arguments @('cmd', 'C:\Program Files\') | Should -Be 'cmd "C:\Program Files\\"'
+    }
+
+    It 'escapes backslashes before embedded quote' {
+        Join-CommandArgument -Arguments @('cmd', 'a\\"b') | Should -Be 'cmd "a\\\\\"b"'
+    }
+
     It 'handles null arguments' {
-        # null is converted to empty string by PowerShell, so result has extra space
         $result = Join-CommandArgument -Arguments @('a', $null, 'b')
-        $result | Should -Match '^a\s+b$'
+        $result | Should -Be 'a b'
     }
 }
 
@@ -2865,7 +2880,8 @@ Describe 'Update-StrictAttributionMetric parallel consistency' {
             @('src/a.cs', 'src/b.cs', 'src/c.cs')
         }
         Set-Item -Path function:Get-SvnBlameSummary -Value {
-            param([string]$Repo, [string]$FilePath, [int]$ToRevision, [string]$CacheDir)
+            param([hashtable]$Context, [string]$Repo, [string]$FilePath, [int]$ToRevision, [string]$CacheDir)
+            [void]$Context
             if ($FilePath -eq 'src/a.cs') {
                 return [pscustomobject]@{
                     LineCountTotal = 3
@@ -2959,6 +2975,7 @@ Describe 'Get-StrictOwnershipAggregate' {
         $script:origGetAllRepositoryFileOwnership = (Get-Item function:Get-AllRepositoryFile).ScriptBlock.ToString()
         $script:origGetSvnBlameSummaryOwnership = (Get-Item function:Get-SvnBlameSummary).ScriptBlock.ToString()
         $script:origInvokeParallelWorkOwnership = (Get-Item function:Invoke-ParallelWork).ScriptBlock.ToString()
+        $script:lastOwnershipMaxParallel = 0
 
         Set-Item -Path function:Get-AllRepositoryFile -Value {
             param([hashtable]$Context, [string]$TargetUrl, [int]$Revision, [string[]]$IncludeExtensions, [string[]]$ExcludeExtensions, [string[]]$IncludePathPatterns, [string[]]$ExcludePathPatterns)
@@ -2966,7 +2983,8 @@ Describe 'Get-StrictOwnershipAggregate' {
             @('src/a.cs', 'src/b.cs')
         }
         Set-Item -Path function:Get-SvnBlameSummary -Value {
-            param([string]$Repo, [string]$FilePath, [int]$ToRevision, [string]$CacheDir)
+            param([hashtable]$Context, [string]$Repo, [string]$FilePath, [int]$ToRevision, [string]$CacheDir)
+            [void]$Context
             if ($FilePath -eq 'src/a.cs') {
                 return [pscustomobject]@{
                     LineCountTotal = 3
@@ -2989,16 +3007,37 @@ Describe 'Get-StrictOwnershipAggregate' {
                 [int]$MaxParallel = 1,
                 [string[]]$RequiredFunctions = @(),
                 [hashtable]$SessionVariables = @{},
-                [string]$ErrorContext = 'parallel work'
+                [string]$ErrorContext = 'parallel work',
+                [System.Threading.SemaphoreSlim]$SharedSemaphore = $null,
+                [hashtable]$Context = $null,
+                [scriptblock]$OnItemCompleted = $null,
+                [switch]$SuppressOutputCollection
             )
+            [void]$MaxParallel
+            [void]$RequiredFunctions
+            [void]$SessionVariables
+            [void]$ErrorContext
+            [void]$SharedSemaphore
+            [void]$Context
+            $script:lastOwnershipMaxParallel = [int]$MaxParallel
             $rows = New-Object 'System.Collections.Generic.List[object]'
+            $index = 0
             foreach ($item in @($InputItems))
             {
-                $blame = Get-SvnBlameSummary -Repo $item.TargetUrl -FilePath ([string]$item.FilePath) -ToRevision ([int]$item.ToRevision) -CacheDir $item.CacheDir
-                [void]$rows.Add([pscustomobject]@{
-                        FilePath = [string]$item.FilePath
-                        Blame = $blame
-                    })
+                $output = (& $WorkerScript -Item $item -Index $index)
+                if ($null -ne $OnItemCompleted)
+                {
+                    & $OnItemCompleted -Item $item -Index $index -Output $output
+                }
+                if (-not $SuppressOutputCollection)
+                {
+                    [void]$rows.Add($output)
+                }
+                $index++
+            }
+            if ($SuppressOutputCollection)
+            {
+                return @()
             }
             return @($rows.ToArray())
         }
@@ -3020,6 +3059,7 @@ Describe 'Get-StrictOwnershipAggregate' {
         (Get-HashtableIntValue -Table $seq.AuthorOwned -Key 'charlie') | Should -Be (Get-HashtableIntValue -Table $par.AuthorOwned -Key 'charlie')
         @($seq.ExistingFileSet | Sort-Object) | Should -Be @($par.ExistingFileSet | Sort-Object)
         @($seq.BlameByFile.Keys | Sort-Object) | Should -Be @($par.BlameByFile.Keys | Sort-Object)
+        [int]$script:lastOwnershipMaxParallel | Should -Be 4
     }
 }
 
@@ -3035,7 +3075,8 @@ Describe 'Get-StrictFileBlameWithFallback' {
     It 'tries metricKey then filePath in order and returns first successful blame' {
         $script:blameLookupCalls = New-Object 'System.Collections.Generic.List[string]'
         Set-Item -Path function:Get-SvnBlameSummary -Value {
-            param([string]$Repo, [string]$FilePath, [int]$ToRevision, [string]$CacheDir)
+            param([hashtable]$Context, [string]$Repo, [string]$FilePath, [int]$ToRevision, [string]$CacheDir)
+            [void]$Context
             [void]$script:blameLookupCalls.Add([string]$FilePath)
             if ($FilePath -eq 'src/canonical.cs')
             {
@@ -3070,7 +3111,8 @@ Describe 'Invoke-StrictBlameCachePrefetch parallel consistency' {
     BeforeAll {
         $script:origInitializeSvnBlameLineCache = (Get-Item function:Initialize-SvnBlameLineCache).ScriptBlock.ToString()
         Set-Item -Path function:Initialize-SvnBlameLineCache -Value {
-            param([string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir)
+            param([hashtable]$Context, [string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir)
+            [void]$Context
             if ($FilePath -like '*miss*') {
                 return [pscustomobject]@{ CacheHits = 0; CacheMisses = 1 }
             }
@@ -3105,6 +3147,71 @@ Describe 'Invoke-StrictBlameCachePrefetch parallel consistency' {
         $seqMisses | Should -Be $parMisses
         $parHits | Should -Be 2
         $parMisses | Should -Be 1
+    }
+
+    It 'uses requested -Parallel for fallback worker execution when broker is absent' {
+        $targets = @(
+            [pscustomobject]@{ FilePath = 'src/hit-a.cs'; Revision = 10 },
+            [pscustomobject]@{ FilePath = 'src/miss-b.cs'; Revision = 10 }
+        )
+        $script:capturedPrefetchParallel = 0
+        $script:origInvokeParallelWorkPrefetch = (Get-Item function:Invoke-ParallelWork).ScriptBlock.ToString()
+        try
+        {
+            Set-Item -Path function:Invoke-ParallelWork -Value {
+                param(
+                    [object[]]$InputItems,
+                    [scriptblock]$WorkerScript,
+                    [int]$MaxParallel = 1,
+                    [string[]]$RequiredFunctions = @(),
+                    [hashtable]$SessionVariables = @{},
+                    [string]$ErrorContext = 'parallel work',
+                    [System.Threading.SemaphoreSlim]$SharedSemaphore = $null,
+                    [hashtable]$Context = $null,
+                    [scriptblock]$OnItemCompleted = $null,
+                    [switch]$SuppressOutputCollection
+                )
+                [void]$RequiredFunctions
+                [void]$ErrorContext
+                [void]$SharedSemaphore
+                [void]$Context
+                foreach ($name in @($SessionVariables.Keys))
+                {
+                    Set-Variable -Scope Script -Name ([string]$name) -Value $SessionVariables[$name]
+                }
+                $script:capturedPrefetchParallel = [int]$MaxParallel
+                $rows = New-Object 'System.Collections.Generic.List[object]'
+                for ($index = 0
+                    $index -lt @($InputItems).Count
+                    $index++)
+                {
+                    $output = (& $WorkerScript -Item $InputItems[$index] -Index $index)
+                    if ($null -ne $OnItemCompleted)
+                    {
+                        & $OnItemCompleted -Item $InputItems[$index] -Index $index -Output $output
+                    }
+                    if (-not $SuppressOutputCollection)
+                    {
+                        [void]$rows.Add($output)
+                    }
+                }
+                if ($SuppressOutputCollection)
+                {
+                    return @()
+                }
+                return @($rows.ToArray())
+            }
+
+            $script:TestContext = Initialize-StrictModeContext -Context $script:TestContext
+            $PSDefaultParameterValues['*:Context'] = $script:TestContext
+            Invoke-StrictBlameCachePrefetch -Targets $targets -TargetUrl 'https://example.invalid/svn/repo' -CacheDir 'dummy' -Parallel 4
+        }
+        finally
+        {
+            Set-Item -Path function:Invoke-ParallelWork -Value $script:origInvokeParallelWorkPrefetch
+        }
+
+        [int]$script:capturedPrefetchParallel | Should -Be 4
     }
 }
 

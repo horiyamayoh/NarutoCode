@@ -320,6 +320,104 @@ Index: src/new.cs
         }
     }
 
+    Context 'Invoke-CommitDiffPrefetch fallback parallel contract' {
+        BeforeEach {
+            $script:origGetCachedOrFetchDiffTextParallel = (Get-Item function:Get-CachedOrFetchDiffText).ScriptBlock.ToString()
+            $script:origGetCommitDiffRawByPathParallel = (Get-Item function:Get-CommitDiffRawByPath).ScriptBlock.ToString()
+            $script:origInvokeParallelWorkCommitDiff = (Get-Item function:Invoke-ParallelWork).ScriptBlock.ToString()
+            $script:capturedCommitDiffParallel = 0
+        }
+
+        AfterEach {
+            Set-Item -Path function:Get-CachedOrFetchDiffText -Value $script:origGetCachedOrFetchDiffTextParallel
+            Set-Item -Path function:Get-CommitDiffRawByPath -Value $script:origGetCommitDiffRawByPathParallel
+            Set-Item -Path function:Invoke-ParallelWork -Value $script:origInvokeParallelWorkCommitDiff
+        }
+
+        It 'passes requested -Parallel to fallback Invoke-ParallelWork' {
+            Set-Item -Path function:Get-CachedOrFetchDiffText -Value {
+                param(
+                    [hashtable]$Context,
+                    [string]$CacheDir,
+                    [int]$Revision,
+                    [string]$TargetUrl,
+                    [string[]]$DiffArguments
+                )
+                [void]$Context
+                [void]$CacheDir
+                [void]$Revision
+                [void]$TargetUrl
+                [void]$DiffArguments
+                return ''
+            }
+            Set-Item -Path function:Get-CommitDiffRawByPath -Value {
+                param([hashtable]$Context, [object]$Item, [string]$DiffText)
+                [void]$Context
+                [void]$Item
+                [void]$DiffText
+                return @{}
+            }
+            Set-Item -Path function:Invoke-ParallelWork -Value {
+                param(
+                    [object[]]$InputItems,
+                    [scriptblock]$WorkerScript,
+                    [int]$MaxParallel = 1,
+                    [string[]]$RequiredFunctions = @(),
+                    [hashtable]$SessionVariables = @{},
+                    [string]$ErrorContext = 'parallel work',
+                    [System.Threading.SemaphoreSlim]$SharedSemaphore = $null,
+                    [hashtable]$Context = $null,
+                    [scriptblock]$OnItemCompleted = $null,
+                    [switch]$SuppressOutputCollection
+                )
+                [void]$RequiredFunctions
+                [void]$ErrorContext
+                [void]$SharedSemaphore
+                [void]$Context
+                foreach ($name in @($SessionVariables.Keys))
+                {
+                    Set-Variable -Scope Script -Name ([string]$name) -Value $SessionVariables[$name]
+                }
+                $script:capturedCommitDiffParallel = [int]$MaxParallel
+                $rows = New-Object 'System.Collections.Generic.List[object]'
+                for ($index = 0
+                    $index -lt @($InputItems).Count
+                    $index++)
+                {
+                    $output = (& $WorkerScript -Item $InputItems[$index] -Index $index)
+                    if ($null -ne $OnItemCompleted)
+                    {
+                        & $OnItemCompleted -Item $InputItems[$index] -Index $index -Output $output
+                    }
+                    if (-not $SuppressOutputCollection)
+                    {
+                        [void]$rows.Add($output)
+                    }
+                }
+                if ($SuppressOutputCollection)
+                {
+                    return @()
+                }
+                return @($rows.ToArray())
+            }
+
+            $prefetchItems = @(
+                [pscustomobject]@{
+                    Revision = 10
+                    CacheDir = '.cache'
+                    TargetUrl = 'https://example.invalid/svn/repo'
+                    DiffArguments = @('diff', '--internal-diff')
+                    ChangedPaths = @()
+                    ExcludeCommentOnlyLines = $false
+                }
+            )
+
+            [void](Invoke-CommitDiffPrefetch -Context $script:TestContext -PrefetchItems $prefetchItems -Parallel 4)
+
+            [int]$script:capturedCommitDiffParallel | Should -Be 4
+        }
+    }
+
     Context 'Set-CommitDerivedMetric' {
         It 'updates churn and message summary fields' {
             $longMessage = ('x' * 150) + "`r`nsecond line"

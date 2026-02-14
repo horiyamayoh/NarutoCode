@@ -515,6 +515,72 @@ Describe 'Request broker streaming resolve' {
         $caught | Should -Not -BeNullOrEmpty
         [string]$caught.Data['ErrorCode'] | Should -Be 'INTERNAL_REQUEST_RESOLVE_CALLBACK_FAILED'
     }
+
+    It 'uses RequestedParallel when runtime parallel context is absent' {
+        $context = New-NarutoContext -SvnExecutable 'svn'
+        $context = Initialize-StrictModeContext -Context $context
+        $broker = New-RequestBroker
+        $requestKey = Register-SvnRequest -Broker $broker -Operation 'diff' -Path 'https://example.invalid/svn/repo/trunk' -Revision '' -RevisionRange '41' -Flags @('diff') -Resolver {
+            param($Context, $Request)
+            [void]$Context
+            [void]$Request
+            return 'ok'
+        }
+
+        $script:capturedRequestedMaxParallel = 0
+        $originalInvokeParallelWork = (Get-Item function:Invoke-ParallelWork).ScriptBlock.ToString()
+        try
+        {
+            Set-Item -Path function:Invoke-ParallelWork -Value {
+                param(
+                    [object[]]$InputItems,
+                    [scriptblock]$WorkerScript,
+                    [int]$MaxParallel = 1,
+                    [string[]]$RequiredFunctions = @(),
+                    [hashtable]$SessionVariables = @{},
+                    [string]$ErrorContext = 'parallel work',
+                    [System.Threading.SemaphoreSlim]$SharedSemaphore = $null,
+                    [hashtable]$Context = $null,
+                    [scriptblock]$OnItemCompleted = $null,
+                    [switch]$SuppressOutputCollection
+                )
+                [void]$RequiredFunctions
+                [void]$SessionVariables
+                [void]$ErrorContext
+                [void]$SharedSemaphore
+                [void]$Context
+                $script:capturedRequestedMaxParallel = [int]$MaxParallel
+                $rows = New-Object 'System.Collections.Generic.List[object]'
+                for ($index = 0
+                    $index -lt @($InputItems).Count
+                    $index++)
+                {
+                    $output = (& $WorkerScript -Item $InputItems[$index] -Index $index)
+                    if ($null -ne $OnItemCompleted)
+                    {
+                        & $OnItemCompleted -Item $InputItems[$index] -Index $index -Output $output
+                    }
+                    if (-not $SuppressOutputCollection)
+                    {
+                        [void]$rows.Add($output)
+                    }
+                }
+                if ($SuppressOutputCollection)
+                {
+                    return @()
+                }
+                return @($rows.ToArray())
+            }
+
+            [void](Wait-SvnRequest -Context $context -Broker $broker -RequestKeys @($requestKey) -RequestedParallel 3)
+        }
+        finally
+        {
+            Set-Item -Path function:Invoke-ParallelWork -Value $originalInvokeParallelWork
+        }
+
+        [int]$script:capturedRequestedMaxParallel | Should -Be 3
+    }
 }
 
 Describe 'Pipeline post strict cleanup stage' {

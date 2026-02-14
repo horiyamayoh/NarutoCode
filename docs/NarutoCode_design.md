@@ -168,6 +168,10 @@ PowerShell 内で扱う主要構造（擬似定義）。
   - 同一 `-OutDirectory` での再実行時にキャッシュを自動再利用
 - `svn blame` は **変更されたファイル集合**に限定
   - per-revision blame のキャッシュも `$OutDir/cache/blame/` に保存
+- 並列契約の一貫性
+  - `-Parallel` を公開/内部シグネチャに持つ関数は、実装でも必ず実効並列度として使用する
+  - 実効並列度は `Get-ContextParallelLimit -Default $Parallel` で解決し、メモリガバナ制御を常に適用する
+  - RequestBroker 経路は `Wait-SvnRequest -RequestedParallel ... -ConsumeOnResolve -OnResolved` を標準とする
 
 ---
 

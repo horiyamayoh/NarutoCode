@@ -109,9 +109,19 @@
 - `Wait-SvnRequest` now supports:
   - `-OnResolved [scriptblock]`
   - `-ConsumeOnResolve [switch]`
+  - `-RequestedParallel [int]`（既定 `1`、実効値は `Get-ContextParallelLimit` で解決）
+- Streaming resolve 適用範囲:
+  - `Invoke-StrictBlameCachePrefetch`
+  - `Get-ExactDeathAttribution` preload（非 window モード）
+  - `Invoke-CommitDiffPrefetch`
+  - `Get-StrictOwnershipAggregate`
 - `Invoke-ParallelWork` / `Invoke-ParallelExecutorBatch` now support:
   - `-OnItemCompleted [scriptblock]`
   - `-SuppressOutputCollection [switch]`
+- `-Parallel` 契約の統一:
+  - 上記関数は `effectiveParallel = Get-ContextParallelLimit -Default $Parallel` を使用
+  - Broker 経路は `Wait-SvnRequest -RequestedParallel $effectiveParallel` で解決
+  - Broker 非存在時も `Invoke-ParallelWork -MaxParallel $effectiveParallel` を使用
 - Added post-strict cleanup node:
   - stores `CommitCount` into `Runtime.DerivedMeta`
   - releases `StageResults['step3_diff']`
