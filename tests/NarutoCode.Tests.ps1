@@ -2155,7 +2155,11 @@ Describe 'Integration — test SVN repo output matches baseline' -Tag 'Integrati
         $meta.Encoding      | Should -Be 'UTF8'
         [double]$meta.DurationSeconds | Should -BeGreaterThan 0
         [bool]$meta.Parameters.ExcludeCommentOnlyLines | Should -BeFalse
+        $meta.StageDurations.PSObject.Properties.Name | Should -Contain 'step6_csv'
+        $meta.StageDurations.PSObject.Properties.Name | Should -Contain 'step7_visual'
         $meta.StageDurations.PSObject.Properties.Name | Should -Contain 'step8_meta'
+        $meta.StageDurations.PSObject.Properties.Name | Should -Not -Contain 'step6_csv_committers'
+        $meta.StageDurations.PSObject.Properties.Name | Should -Not -Contain 'step7_visual_plantuml'
         [double]$meta.PeakPrivateMemoryMB | Should -BeGreaterThan 0
         [double]$meta.PeakWorkingSetMB | Should -BeGreaterThan 0
         [int]$meta.MemoryPressureSoftCount | Should -BeGreaterOrEqual 0
@@ -2633,6 +2637,99 @@ Describe 'Blame memory cache' {
         $second.Data.LineCountTotal | Should -Be 1
         Assert-MockCalled Invoke-SvnCommandAllowMissingTarget -Times 2 -Exactly
     }
+
+    It 'recovers from corrupted blame line cache once and succeeds' {
+        $script:blameCacheReadCount = 0
+        Mock Read-BlameCacheFile {
+            $script:blameCacheReadCount++
+            if ($script:blameCacheReadCount -eq 1)
+            {
+                return '<broken-xml'
+            }
+            return @"
+<blame>
+  <target path="trunk/src/B.cs">
+    <entry line-number="1"><commit revision="20"><author>bob</author></commit></entry>
+  </target>
+</blame>
+"@
+        }
+        Mock Read-CatCacheFile {
+            return "line1`n"
+        }
+        Mock Remove-BlameCacheEntry {
+            param([string]$CacheDir, [int]$Revision, [string]$FilePath)
+            [void]$CacheDir
+            [void]$Revision
+            [void]$FilePath
+        }
+        Mock Initialize-SvnBlameLineCache {
+            param([string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir)
+            [void]$Repo
+            [void]$FilePath
+            [void]$Revision
+            [void]$CacheDir
+            return (New-NarutoResultSuccess -Data ([pscustomobject]@{
+                        CacheHits = 0
+                        CacheMisses = 2
+                    }) -ErrorCode 'SVN_BLAME_CACHE_READY')
+        }
+        Mock Invoke-SvnCommandAllowMissingTarget {
+            throw 'svn command should not be called in corrupted cache recovery test'
+        }
+
+        $result = Get-SvnBlameLine -Repo 'https://example.invalid/svn/repo' -FilePath 'trunk/src/B.cs' -Revision 20 -CacheDir 'dummy'
+
+        [string]$result.Status | Should -Be 'Success'
+        $result.Data.LineCountTotal | Should -Be 1
+        Assert-MockCalled Remove-BlameCacheEntry -Times 1 -Exactly
+        Assert-MockCalled Initialize-SvnBlameLineCache -Times 1 -Exactly
+    }
+
+    It 'recovers from corrupted blame summary cache once and succeeds' {
+        $script:summaryCacheReadCount = 0
+        Mock Read-BlameCacheFile {
+            $script:summaryCacheReadCount++
+            if ($script:summaryCacheReadCount -eq 1)
+            {
+                return '<broken-xml'
+            }
+            return @"
+<blame>
+  <target path="trunk/src/A.cs">
+    <entry line-number="1"><commit revision="10"><author>alice</author></commit></entry>
+  </target>
+</blame>
+"@
+        }
+        Mock Remove-BlameCacheEntry {
+            param([string]$CacheDir, [int]$Revision, [string]$FilePath)
+            [void]$CacheDir
+            [void]$Revision
+            [void]$FilePath
+        }
+        Mock Initialize-SvnBlameLineCache {
+            param([string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir)
+            [void]$Repo
+            [void]$FilePath
+            [void]$Revision
+            [void]$CacheDir
+            return (New-NarutoResultSuccess -Data ([pscustomobject]@{
+                        CacheHits = 0
+                        CacheMisses = 2
+                    }) -ErrorCode 'SVN_BLAME_CACHE_READY')
+        }
+        Mock Invoke-SvnCommandAllowMissingTarget {
+            throw 'svn command should not be called in corrupted summary cache recovery test'
+        }
+
+        $result = Get-SvnBlameSummary -Repo 'https://example.invalid/svn/repo' -FilePath 'trunk/src/A.cs' -ToRevision 10 -CacheDir 'dummy'
+
+        [string]$result.Status | Should -Be 'Success'
+        $result.Data.LineCountTotal | Should -Be 1
+        Assert-MockCalled Remove-BlameCacheEntry -Times 1 -Exactly
+        Assert-MockCalled Initialize-SvnBlameLineCache -Times 1 -Exactly
+    }
 }
 
 Describe 'Get-StrictTransitionComparison fast path' {
@@ -2834,6 +2931,93 @@ Describe 'Get-ExactDeathAttribution fast path' {
 
         $result | Should -Not -BeNullOrEmpty
         Assert-MockCalled Get-SvnBlameLine -Times 2 -Exactly
+    }
+
+    It 'uses on-demand blame lookup in non-window mode without extra preload calls' {
+        Set-Item -Path function:Get-CommitFileTransition -Value {
+            param([object]$Commit)
+            return @([pscustomobject]@{
+                    BeforePath = 'src/a.cs'
+                    AfterPath = 'src/a.cs'
+                })
+        }
+        Set-Item -Path function:Compare-BlameOutput -Value {
+            param([object[]]$PreviousLines, [object[]]$CurrentLines)
+            return [pscustomobject]@{
+                BornLines = @()
+                KilledLines = @()
+                MatchedPairs = @()
+                MovedPairs = @()
+                ReattributedPairs = @()
+            }
+        }
+        Set-Item -Path function:Get-StrictHunkDetail -Value {
+            param([object[]]$Commits, [hashtable]$RevToAuthor, [hashtable]$RenameMap)
+            [pscustomobject]@{
+                AuthorRepeatedHunk = @{}
+                AuthorPingPong = @{}
+                FileRepeatedHunk = @{}
+                FilePingPong = @{}
+            }
+        }
+
+        $commits = @(
+            [pscustomobject]@{
+                Revision = 10
+                Author = 'alice'
+                FileDiffStats = @{
+                    'src/a.cs' = [pscustomobject]@{
+                        AddedLines = 1
+                        DeletedLines = 1
+                        Hunks = @()
+                        IsBinary = $false
+                    }
+                }
+                FilesChanged = @('src/a.cs')
+                ChangedPathsFiltered = @()
+            },
+            [pscustomobject]@{
+                Revision = 11
+                Author = 'bob'
+                FileDiffStats = @{
+                    'src/a.cs' = [pscustomobject]@{
+                        AddedLines = 1
+                        DeletedLines = 1
+                        Hunks = @()
+                        IsBinary = $false
+                    }
+                }
+                FilesChanged = @('src/a.cs')
+                ChangedPathsFiltered = @()
+            }
+        )
+        $revToAuthor = @{
+            10 = 'alice'
+            11 = 'bob'
+        }
+
+        Mock Get-SvnBlameLine {
+            param([string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir)
+            return [pscustomobject]@{
+                LineCountTotal = 1
+                LineCountByRevision = @{}
+                LineCountByAuthor = @{}
+                Lines = @(
+                    [pscustomobject]@{
+                        LineNumber = 1
+                        Content = ('code-' + [string]$Revision)
+                        Revision = [int]$Revision
+                        Author = 'alice'
+                    }
+                )
+            }
+        }
+
+        $result = Get-ExactDeathAttribution -Commits $commits -RevToAuthor $revToAuthor -TargetUrl 'https://example.invalid/svn/repo' -FromRevision 10 -ToRevision 11 -CacheDir 'dummy' -RenameMap @{} -Parallel 1
+
+        $result | Should -Not -BeNullOrEmpty
+        # r10 の比較で r9/r10、r11 の比較で r10/r11 を参照するため計4回。
+        Assert-MockCalled Get-SvnBlameLine -Times 4 -Exactly
     }
 }
 
@@ -3149,7 +3333,7 @@ Describe 'Invoke-StrictBlameCachePrefetch parallel consistency' {
         $parMisses | Should -Be 1
     }
 
-    It 'uses requested -Parallel for fallback worker execution when broker is absent' {
+    It 'uses requested -Parallel for direct worker execution' {
         $targets = @(
             [pscustomobject]@{ FilePath = 'src/hit-a.cs'; Revision = 10 },
             [pscustomobject]@{ FilePath = 'src/miss-b.cs'; Revision = 10 }
@@ -4324,6 +4508,45 @@ Describe 'Resolve-PathByRenameMap - 連鎖解決' {
     It '空のマップでもエラーにならない' {
         $result = Resolve-PathByRenameMap -FilePath 'src/a.cpp' -RenameMap @{}
         $result | Should -Be 'src/a.cpp'
+    }
+}
+
+Describe 'Get-StrictMissingBlameTargets' {
+    It 'returns only targets with missing blame/cat cache pair' {
+        $context = New-NarutoContext -SvnExecutable 'svn'
+        $context = Initialize-StrictModeContext -Context $context
+        $cacheDir = Join-Path $env:TEMP ('narutocode_missing_targets_' + [guid]::NewGuid().ToString('N'))
+        New-Item -Path $cacheDir -ItemType Directory -Force | Out-Null
+        try
+        {
+            Write-BlameCacheFile -Context $context -CacheDir $cacheDir -Revision 10 -FilePath 'src/a.cs' -Content '<blame/>'
+            Write-CatCacheFile -Context $context -CacheDir $cacheDir -Revision 10 -FilePath 'src/a.cs' -Content "a`n"
+            Write-BlameCacheFile -Context $context -CacheDir $cacheDir -Revision 10 -FilePath 'src/b.cs' -Content '<blame/>'
+
+            $targets = @(
+                [pscustomobject]@{
+                    FilePath = 'src/a.cs'
+                    Revision = 10
+                },
+                [pscustomobject]@{
+                    FilePath = 'src/b.cs'
+                    Revision = 10
+                },
+                [pscustomobject]@{
+                    FilePath = 'src/b.cs'
+                    Revision = 10
+                }
+            )
+
+            $missing = @(Get-StrictMissingBlameTargets -Context $context -Targets $targets -CacheDir $cacheDir)
+            $missing.Count | Should -Be 1
+            [string]$missing[0].FilePath | Should -Be 'src/b.cs'
+            [int]$missing[0].Revision | Should -Be 10
+        }
+        finally
+        {
+            Remove-Item -Path $cacheDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 

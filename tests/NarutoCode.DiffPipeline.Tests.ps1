@@ -320,7 +320,7 @@ Index: src/new.cs
         }
     }
 
-    Context 'Invoke-CommitDiffPrefetch fallback parallel contract' {
+    Context 'Invoke-CommitDiffPrefetch direct parallel contract' {
         BeforeEach {
             $script:origGetCachedOrFetchDiffTextParallel = (Get-Item function:Get-CachedOrFetchDiffText).ScriptBlock.ToString()
             $script:origGetCommitDiffRawByPathParallel = (Get-Item function:Get-CommitDiffRawByPath).ScriptBlock.ToString()
@@ -334,7 +334,7 @@ Index: src/new.cs
             Set-Item -Path function:Invoke-ParallelWork -Value $script:origInvokeParallelWorkCommitDiff
         }
 
-        It 'passes requested -Parallel to fallback Invoke-ParallelWork' {
+        It 'passes requested -Parallel to Invoke-ParallelWork' {
             Set-Item -Path function:Get-CachedOrFetchDiffText -Value {
                 param(
                     [hashtable]$Context,
@@ -415,6 +415,87 @@ Index: src/new.cs
             [void](Invoke-CommitDiffPrefetch -Context $script:TestContext -PrefetchItems $prefetchItems -Parallel 4)
 
             [int]$script:capturedCommitDiffParallel | Should -Be 4
+        }
+    }
+
+    Context 'Invoke-CommitDiffPrefetch resolver failure propagation' {
+        BeforeEach {
+            $script:origGetCachedOrFetchDiffTextResolverFail = (Get-Item function:Get-CachedOrFetchDiffText).ScriptBlock.ToString()
+            $script:origGetCommitDiffRawByPathResolverFail = (Get-Item function:Get-CommitDiffRawByPath).ScriptBlock.ToString()
+        }
+
+        AfterEach {
+            Set-Item -Path function:Get-CachedOrFetchDiffText -Value $script:origGetCachedOrFetchDiffTextResolverFail
+            Set-Item -Path function:Get-CommitDiffRawByPath -Value $script:origGetCommitDiffRawByPathResolverFail
+        }
+
+        It 'propagates parser failure from resolver payload as first failure' {
+            Set-Item -Path function:Get-CachedOrFetchDiffText -Value {
+                param(
+                    [hashtable]$Context,
+                    [string]$CacheDir,
+                    [int]$Revision,
+                    [string]$TargetUrl,
+                    [string[]]$DiffArguments
+                )
+                [void]$Context
+                [void]$CacheDir
+                [void]$Revision
+                [void]$TargetUrl
+                [void]$DiffArguments
+                return 'Index: src/a.cs'
+            }
+            Set-Item -Path function:Get-CommitDiffRawByPath -Value {
+                param(
+                    [hashtable]$Context,
+                    [object]$Item,
+                    [string]$DiffText
+                )
+                [void]$Context
+                [void]$Item
+                [void]$DiffText
+                Throw-NarutoError -Category 'PARSE' -ErrorCode 'PARSE_XML_FAILED' -Message 'diff parse failed in test'
+            }
+
+            $context = New-NarutoContext -SvnExecutable 'svn'
+            $context = Initialize-StrictModeContext -Context $context
+            $runtime = New-PipelineRuntime -Context $context -Parallel 2
+            try
+            {
+                $prefetchItems = @(
+                    [pscustomobject]@{
+                        Revision = 10
+                        CacheDir = '.cache'
+                        TargetUrl = 'https://example.invalid/svn/repo'
+                        DiffArguments = @('diff', '--internal-diff')
+                        ChangedPaths = @(
+                            [pscustomobject]@{
+                                Path = 'src/a.cs'
+                                Action = 'M'
+                            }
+                        )
+                        ExcludeCommentOnlyLines = $false
+                    }
+                )
+
+                $caught = $null
+                try
+                {
+                    [void](Invoke-CommitDiffPrefetch -Context $context -PrefetchItems $prefetchItems -Parallel 2)
+                }
+                catch
+                {
+                    $caught = $_.Exception
+                }
+
+                $caught | Should -Not -BeNullOrEmpty
+                [string]$caught.Data['ErrorCode'] | Should -Be 'PARSE_XML_FAILED'
+                [string]$caught.Data['Category'] | Should -Be 'PARSE'
+            }
+            finally
+            {
+                Dispose-PipelineRuntime -Context $context -Runtime $runtime
+            }
         }
     }
 
@@ -673,6 +754,9 @@ Describe 'Invoke-NarutoCodePipeline run_meta write policy' {
         $script:origWriteJsonFileMeta = (Get-Item function:Write-JsonFile).ScriptBlock.ToString()
         $script:origWriteRunSummaryMeta = (Get-Item function:Write-RunSummary).ScriptBlock.ToString()
         $script:runMetaWriteCount = 0
+        $script:runMetaWriteData = $null
+        $script:csvFilterArgumentPassed = $false
+        $script:visualFilterArgumentPassed = $false
         $script:testOutDirMeta = Join-Path $env:TEMP ('narutocode_run_meta_policy_' + [guid]::NewGuid().ToString('N'))
         New-Item -Path $script:testOutDirMeta -ItemType Directory -Force | Out-Null
     }
@@ -836,7 +920,11 @@ Describe 'Invoke-NarutoCodePipeline run_meta write policy' {
             [void]$CouplingRows
             [void]$StrictResult
             [void]$Encoding
-            return @($ArtifactNames)
+            if ($PSBoundParameters.ContainsKey('ArtifactNames'))
+            {
+                $script:csvFilterArgumentPassed = $true
+            }
+            return @()
         }
         Set-Item -Path function:Write-PipelineVisualizationArtifacts -Value {
             param(
@@ -860,7 +948,11 @@ Describe 'Invoke-NarutoCodePipeline run_meta write policy' {
             [void]$StrictResult
             [void]$TopNCount
             [void]$Encoding
-            return @($VisualizationFunctions)
+            if ($PSBoundParameters.ContainsKey('VisualizationFunctions'))
+            {
+                $script:visualFilterArgumentPassed = $true
+            }
+            return @()
         }
         Set-Item -Path function:Write-JsonFile -Value {
             param([object]$Data, [string]$FilePath, [int]$Depth, [string]$EncodingName)
@@ -870,6 +962,7 @@ Describe 'Invoke-NarutoCodePipeline run_meta write policy' {
             if ([string]$FilePath -like '*run_meta.json')
             {
                 $script:runMetaWriteCount++
+                $script:runMetaWriteData = $Data
             }
         }
         Set-Item -Path function:Write-RunSummary -Value {
@@ -895,6 +988,167 @@ Describe 'Invoke-NarutoCodePipeline run_meta write policy' {
         [void](Invoke-NarutoCodePipeline -Context $context -RepoUrl 'https://example.invalid/svn/repo' -FromRevision 1 -ToRevision 2 -SvnExecutable 'svn' -OutDirectory $script:testOutDirMeta -Parallel 4 -TopNCount 10 -Encoding 'UTF8')
 
         $script:runMetaWriteCount | Should -Be 1
+        $script:csvFilterArgumentPassed | Should -BeFalse
+        $script:visualFilterArgumentPassed | Should -BeFalse
+        @($script:runMetaWriteData.StageDurations.Keys) | Should -Contain 'step6_csv'
+        @($script:runMetaWriteData.StageDurations.Keys) | Should -Contain 'step7_visual'
+        @($script:runMetaWriteData.StageDurations.Keys) | Should -Not -Contain 'step6_csv_committers'
+        @($script:runMetaWriteData.StageDurations.Keys) | Should -Not -Contain 'step7_visual_plantuml'
+    }
+}
+
+Describe 'Invoke-NarutoCodePipeline DAG node layout' {
+    BeforeEach {
+        $script:origResolvePipelineExecutionStateDagLayout = (Get-Item function:Resolve-PipelineExecutionState).ScriptBlock.ToString()
+        $script:origInvokePipelineDagDagLayout = (Get-Item function:Invoke-PipelineDag).ScriptBlock.ToString()
+        $script:origWritePipelineRunArtifactsDagLayout = (Get-Item function:Write-PipelineRunArtifacts).ScriptBlock.ToString()
+        $script:capturedPipelineNodes = @()
+    }
+
+    AfterEach {
+        Set-Item -Path function:Resolve-PipelineExecutionState -Value $script:origResolvePipelineExecutionStateDagLayout
+        Set-Item -Path function:Invoke-PipelineDag -Value $script:origInvokePipelineDagDagLayout
+        Set-Item -Path function:Write-PipelineRunArtifacts -Value $script:origWritePipelineRunArtifactsDagLayout
+    }
+
+    It 'registers coarse step6/step7 nodes with explicit step5_cleanup dependency' {
+        Set-Item -Path function:Resolve-PipelineExecutionState -Value {
+            param(
+                [hashtable]$Context,
+                [string]$RepoUrl,
+                [int]$FromRevision,
+                [int]$ToRevision,
+                [string]$OutDirectory,
+                [string[]]$IncludePaths,
+                [string[]]$ExcludePaths,
+                [string[]]$IncludeExtensions,
+                [string[]]$ExcludeExtensions,
+                [string]$SvnExecutable,
+                [string]$Username,
+                [securestring]$Password,
+                [switch]$NonInteractive,
+                [switch]$TrustServerCert,
+                [switch]$ExcludeCommentOnlyLines
+            )
+            [void]$Context
+            [void]$RepoUrl
+            [void]$FromRevision
+            [void]$ToRevision
+            [void]$IncludePaths
+            [void]$ExcludePaths
+            [void]$IncludeExtensions
+            [void]$ExcludeExtensions
+            [void]$SvnExecutable
+            [void]$Username
+            [void]$Password
+            [void]$NonInteractive
+            [void]$TrustServerCert
+            [void]$ExcludeCommentOnlyLines
+            return [pscustomobject]@{
+                RepoUrl = 'https://example.invalid/svn/repo'
+                FromRevision = 1
+                ToRevision = 2
+                OutDirectory = $OutDirectory
+                CacheDir = (Join-Path $OutDirectory 'cache')
+                IncludePaths = @()
+                ExcludePaths = @()
+                IncludeExtensions = @()
+                ExcludeExtensions = @()
+                TargetUrl = 'https://example.invalid/svn/repo'
+                LogPathPrefix = ''
+                SvnVersion = '1.14.2'
+                ExcludeCommentOnlyLines = $false
+            }
+        }
+        Set-Item -Path function:Invoke-PipelineDag -Value {
+            param(
+                [hashtable]$Context,
+                [hashtable]$Runtime,
+                [object[]]$Nodes
+            )
+            [void]$Context
+            $script:capturedPipelineNodes = @($Nodes)
+            $Runtime.StageResults['step4_committer'] = @()
+            $Runtime.StageResults['step4_file'] = @()
+            $Runtime.StageResults['step4_commit'] = @()
+            $Runtime.StageResults['step4_coupling'] = @()
+            $Runtime.StageResults['step5_strict'] = $null
+            $Runtime.DerivedMeta['CommitCount'] = 0
+            $Runtime.StageDurations = [ordered]@{
+                step2_log = 0.0
+                step3_diff = 0.0
+                step4_committer = 0.0
+                step4_file = 0.0
+                step4_coupling = 0.0
+                step4_commit = 0.0
+                step5_strict = 0.0
+                step5_cleanup = 0.0
+                step6_csv = 0.0
+                step7_visual = 0.0
+                step8_meta = 0.0
+            }
+            return $Runtime.StageResults
+        }
+        Set-Item -Path function:Write-PipelineRunArtifacts -Value {
+            param(
+                [hashtable]$Context,
+                [datetime]$StartedAt,
+                [object]$ExecutionState,
+                [int]$Parallel,
+                [int]$TopNCount,
+                [string]$Encoding,
+                [object[]]$Commits,
+                [int]$CommitCount,
+                [object[]]$FileRows,
+                [hashtable]$StageDurations,
+                [switch]$NonInteractive,
+                [switch]$TrustServerCert,
+                [switch]$IgnoreWhitespace,
+                [switch]$ExcludeCommentOnlyLines,
+                [switch]$SkipWriteFile,
+                [switch]$SkipProgress,
+                [switch]$SkipRunSummary
+            )
+            [void]$Context
+            [void]$StartedAt
+            [void]$ExecutionState
+            [void]$Parallel
+            [void]$TopNCount
+            [void]$Encoding
+            [void]$Commits
+            [void]$CommitCount
+            [void]$FileRows
+            [void]$StageDurations
+            [void]$NonInteractive
+            [void]$TrustServerCert
+            [void]$IgnoreWhitespace
+            [void]$ExcludeCommentOnlyLines
+            [void]$SkipWriteFile
+            [void]$SkipProgress
+            [void]$SkipRunSummary
+            return [pscustomobject]@{
+                StageDurations = [ordered]@{}
+            }
+        }
+
+        $context = New-NarutoContext -SvnExecutable 'svn'
+        [void](Invoke-NarutoCodePipeline -Context $context -RepoUrl 'https://example.invalid/svn/repo' -FromRevision 1 -ToRevision 2 -SvnExecutable 'svn' -OutDirectory $env:TEMP -Parallel 4 -TopNCount 10 -Encoding 'UTF8')
+
+        $step6Node = @($script:capturedPipelineNodes | Where-Object { [string]$_.Id -eq 'step6_csv' })[0]
+        $step7Node = @($script:capturedPipelineNodes | Where-Object { [string]$_.Id -eq 'step7_visual' })[0]
+        $step8Node = @($script:capturedPipelineNodes | Where-Object { [string]$_.Id -eq 'step8_meta' })[0]
+
+        $step6Node | Should -Not -BeNullOrEmpty
+        $step7Node | Should -Not -BeNullOrEmpty
+        $step8Node | Should -Not -BeNullOrEmpty
+
+        @($step6Node.DependsOn) | Should -Contain 'step5_cleanup'
+        @($step7Node.DependsOn) | Should -Contain 'step5_cleanup'
+        @($step8Node.DependsOn) | Should -Contain 'step5_cleanup'
+        @($step8Node.DependsOn) | Should -Contain 'step6_csv'
+        @($step8Node.DependsOn) | Should -Contain 'step7_visual'
+        @($script:capturedPipelineNodes | ForEach-Object { [string]$_.Id }) | Should -Not -Contain 'step6_csv_committers'
+        @($script:capturedPipelineNodes | ForEach-Object { [string]$_.Id }) | Should -Not -Contain 'step7_visual_plantuml'
     }
 }
 

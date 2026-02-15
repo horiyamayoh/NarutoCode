@@ -171,7 +171,7 @@ PowerShell 内で扱う主要構造（擬似定義）。
 - 並列契約の一貫性
   - `-Parallel` を公開/内部シグネチャに持つ関数は、実装でも必ず実効並列度として使用する
   - 実効並列度は `Get-ContextParallelLimit -Default $Parallel` で解決し、メモリガバナ制御を常に適用する
-  - RequestBroker 経路は `Wait-SvnRequest -RequestedParallel ... -ConsumeOnResolve -OnResolved` を標準とする
+  - HotPath は `Invoke-ParallelWork -MaxParallel $effectiveParallel` へ統一する
 
 ---
 
@@ -1314,8 +1314,8 @@ try {
 
 `docs/parallel_runtime_design.md` を正本とし、並列実行基盤を以下へ更新した。
 
-- 旧 Step 固有の並列実装は廃止し、`DAG実行 + RequestBroker + SvnGateway + 共有RunspacePool executor` に統一。
-- Step 3/5 は request の登録・待機・還元の二相構成に移行。
+- 旧 Step 固有の並列実装は廃止し、`DAG実行 + SvnGateway + 共有RunspacePool executor` に統一。
+- Step 3/5 は direct parallel worker で fetch/parse/reduce を実行する構成に移行。
 - Step 6/7 は成果物単位ノードへ分解し、ノード内入れ子並列を持たない設計へ移行。
 - run_meta は DAG 内でメタ生成のみ行い、`run_meta.json` の書き込みは DAG 完了後に 1 回のみ実行する。
 
@@ -1323,7 +1323,7 @@ try {
 
 ## Parallel Runtime Memory Policy (2026-02-14)
 - Memory governor was added to runtime execution control.
-- Request resolution supports streaming consume mode.
+- Direct parallel hot paths use `OnItemCompleted` + first-failure-only.
 - Post-strict cleanup releases large stage payloads early (`step3_diff`).
 - `run_meta.json` now includes memory pressure and throttle telemetry.
 - Hard pressure mode can switch strict blame preload to commit-window execution.

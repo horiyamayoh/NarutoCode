@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-Pipeline runtime / request broker 検証。
+Pipeline runtime / gateway 検証。
 #>
 
 BeforeAll {
@@ -12,28 +12,40 @@ BeforeAll {
 }
 
 Describe 'Pipeline runtime' {
-    It 'creates runtime with request broker and stage registries' {
+    It 'creates runtime with shared parallel executor and memory governor' {
         $runtime = New-PipelineRuntime -Context $script:TestContext -Parallel 4
 
         $runtime | Should -Not -BeNullOrEmpty
         $runtime.Parallel | Should -Be 4
         $runtime.ParallelExecutor | Should -Not -BeNullOrEmpty
         @($runtime.ParallelFunctionCatalog).Count | Should -BeGreaterThan 0
-        $runtime.RequestBroker | Should -Not -BeNullOrEmpty
         $runtime.MemoryGovernor | Should -Not -BeNullOrEmpty
         $runtime.StageResults.Count | Should -Be 0
         $runtime.StageDurations.Count | Should -Be 0
-        $script:TestContext.Runtime.RequestBroker | Should -Be $runtime.RequestBroker
         $script:TestContext.Runtime.MemoryGovernor | Should -Be $runtime.MemoryGovernor
+
+        $result = @(Invoke-ParallelWork -InputItems @(1, 2) -WorkerScript {
+                param($Item, $Index)
+                [void]$Index
+                return ([int]$Item * 2)
+            } -MaxParallel 2 -Context $script:TestContext -ErrorContext 'runtime lazy executor test')
+
+        $result | Should -Be @(2, 4)
+        $runtime.ParallelExecutor | Should -Not -BeNullOrEmpty
+        @($runtime.ParallelFunctionCatalog).Count | Should -BeGreaterThan 0
     }
 }
 
 Describe 'Pipeline runtime disposal' {
-    It 'disposes executor and clears runtime references' {
+    It 'clears runtime references without shared executor state' {
         $context = New-NarutoContext -SvnExecutable 'svn'
         $context = Initialize-StrictModeContext -Context $context
         $runtime = New-PipelineRuntime -Context $context -Parallel 3
-        $executor = $runtime.ParallelExecutor
+        [void](Invoke-ParallelWork -InputItems @(1, 2, 3) -WorkerScript {
+                param($Item, $Index)
+                [void]$Index
+                return [int]$Item
+            } -MaxParallel 2 -Context $context -ErrorContext 'runtime dispose test')
         $gateway = Get-ContextSvnGatewayState -Context $context
         $event = New-Object System.Threading.ManualResetEventSlim($false)
         $gateway.InFlightCommands['test'] = [pscustomobject]@{
@@ -42,165 +54,14 @@ Describe 'Pipeline runtime disposal' {
             Error = $null
         }
         $gateway.CommandCache['k'] = 'v'
-        $runtime.RequestBroker.Requests['rk'] = [pscustomobject]@{
-            Key = 'rk'
-        }
-        $runtime.RequestBroker.Results['rk'] = [pscustomobject]@{
-            Success = $true
-        }
-        [void]$runtime.RequestBroker.RegistrationOrder.Add('rk')
 
         Dispose-PipelineRuntime -Context $context -Runtime $runtime
 
-        [bool]$executor.Disposed | Should -BeTrue
+        $runtime.ParallelExecutor | Should -BeNullOrEmpty
         $runtime.ParallelSemaphore | Should -BeNullOrEmpty
         $context.Runtime.PipelineRuntime | Should -BeNullOrEmpty
-        $context.Runtime.RequestBroker | Should -BeNullOrEmpty
         $context.Runtime.MemoryGovernor | Should -BeNullOrEmpty
         $context.Runtime.SvnGateway | Should -BeNullOrEmpty
-    }
-}
-
-Describe 'Request broker dedup' {
-    It 'returns same key for duplicate (op, rev, path) registration' {
-        $broker = New-RequestBroker
-        $resolver = {
-            param($Context, $Request)
-            [void]$Context
-            [void]$Request
-            return 'ok'
-        }
-
-        $keyA = Register-SvnRequest -Broker $broker -Operation 'blame_line' -Path 'trunk/src/a.cs' -Revision '10' -RevisionRange '' -Flags @('--xml') -Resolver $resolver
-        $keyB = Register-SvnRequest -Broker $broker -Operation 'blame_line' -Path 'trunk/src/a.cs' -Revision '10' -RevisionRange '' -Flags @('--xml') -Resolver $resolver
-
-        $keyA | Should -Be $keyB
-        $broker.Requests.Count | Should -Be 1
-        $broker.RegistrationOrder.Count | Should -Be 1
-    }
-
-    It 'executes deduplicated request once and shares result' {
-        $context = New-NarutoContext -SvnExecutable 'svn'
-        $context = Initialize-StrictModeContext -Context $context
-        $runtime = New-PipelineRuntime -Context $context -Parallel 8
-        $broker = $runtime.RequestBroker
-        $context.Runtime.DedupExecCount = 0
-
-        $resolver = {
-            param($Context, $Request)
-            [void]$Request
-            $Context.Runtime.DedupExecCount++
-            return [pscustomobject]@{
-                Value = 42
-            }
-        }
-
-        $first = Register-SvnRequest -Broker $broker -Operation 'diff' -Path 'https://example.invalid/svn/repo/trunk' -Revision '' -RevisionRange '20' -Flags @('diff', '--internal-diff') -Resolver $resolver
-        $second = Register-SvnRequest -Broker $broker -Operation 'diff' -Path 'https://example.invalid/svn/repo/trunk' -Revision '' -RevisionRange '20' -Flags @('--internal-diff', 'diff') -Resolver $resolver
-        $results = Wait-SvnRequest -Context $context -Broker $broker -RequestKeys @($first, $second)
-
-        [int]$context.Runtime.DedupExecCount | Should -Be 1
-        $results.ContainsKey($first) | Should -BeTrue
-        [bool]$results[$first].Success | Should -BeTrue
-        [int]$results[$first].Payload.Value | Should -Be 42
-    }
-}
-
-Describe 'Request broker consume retrieval' {
-    It 'removes consumed request/result entries from broker' {
-        $context = New-NarutoContext -SvnExecutable 'svn'
-        $context = Initialize-StrictModeContext -Context $context
-        $runtime = New-PipelineRuntime -Context $context -Parallel 2
-        $broker = $runtime.RequestBroker
-
-        $requestKey = Register-SvnRequest -Broker $broker -Operation 'diff' -Path 'https://example.invalid/svn/repo/trunk' -Revision '' -RevisionRange '10' -Flags @('diff') -Resolver {
-            param($Context, $Request)
-            [void]$Context
-            [void]$Request
-            return 'ok'
-        }
-        [void](Wait-SvnRequest -Context $context -Broker $broker -RequestKeys @($requestKey))
-
-        $broker.Results.ContainsKey($requestKey) | Should -BeTrue
-        $broker.Requests.ContainsKey($requestKey) | Should -BeTrue
-        $broker.RegistrationOrder.Count | Should -Be 1
-
-        $consumed = Get-SvnRequestResult -Broker $broker -RequestKey $requestKey -Consume -ThrowIfMissing
-
-        [bool]$consumed.Success | Should -BeTrue
-        [string]$consumed.Payload | Should -Be 'ok'
-        $broker.Results.ContainsKey($requestKey) | Should -BeFalse
-        $broker.Requests.ContainsKey($requestKey) | Should -BeFalse
-        $broker.RegistrationOrder.Count | Should -Be 0
-    }
-
-    It 'purges unconsumed request/result entries by key set' {
-        $context = New-NarutoContext -SvnExecutable 'svn'
-        $context = Initialize-StrictModeContext -Context $context
-        $runtime = New-PipelineRuntime -Context $context -Parallel 2
-        $broker = $runtime.RequestBroker
-
-        $keepKey = Register-SvnRequest -Broker $broker -Operation 'diff' -Path 'https://example.invalid/svn/repo/trunk' -Revision '' -RevisionRange '11' -Flags @('diff') -Resolver {
-            param($Context, $Request)
-            [void]$Context
-            [void]$Request
-            return 'keep'
-        }
-        $purgeKey = Register-SvnRequest -Broker $broker -Operation 'diff' -Path 'https://example.invalid/svn/repo/trunk' -Revision '' -RevisionRange '12' -Flags @('diff') -Resolver {
-            param($Context, $Request)
-            [void]$Context
-            [void]$Request
-            return 'purge'
-        }
-        [void](Wait-SvnRequest -Context $context -Broker $broker -RequestKeys @($keepKey, $purgeKey))
-
-        Remove-SvnRequestEntry -Broker $broker -RequestKeys @($purgeKey)
-
-        $broker.Results.ContainsKey($purgeKey) | Should -BeFalse
-        $broker.Requests.ContainsKey($purgeKey) | Should -BeFalse
-        $broker.RegistrationOrder.Contains($purgeKey) | Should -BeFalse
-        $broker.Results.ContainsKey($keepKey) | Should -BeTrue
-        $broker.Requests.ContainsKey($keepKey) | Should -BeTrue
-        $broker.RegistrationOrder.Contains($keepKey) | Should -BeTrue
-    }
-}
-
-Describe 'Request resolver contract' {
-    It 'rejects resolver that captures free variables' {
-        $broker = New-RequestBroker
-        $captured = 42
-        $caught = $null
-        try
-        {
-            [void](Register-SvnRequest -Broker $broker -Operation 'diff' -Path 'https://example.invalid/svn/repo/trunk' -Revision '' -RevisionRange '10' -Flags @('diff') -Resolver {
-                    param($Context, $Request)
-                    [void]$Context
-                    [void]$Request
-                    return $captured
-                })
-        }
-        catch
-        {
-            $caught = $_.Exception
-        }
-
-        $caught | Should -Not -BeNullOrEmpty
-        [string]$caught.Data['ErrorCode'] | Should -Be 'INPUT_REQUEST_RESOLVER_FREE_VARIABLE_NOT_ALLOWED'
-    }
-
-    It 'accepts resolver that uses only declared locals and metadata' {
-        $broker = New-RequestBroker
-
-        $key = Register-SvnRequest -Broker $broker -Operation 'diff' -Path 'https://example.invalid/svn/repo/trunk' -Revision '' -RevisionRange '10' -Flags @('diff') -Resolver {
-            param($Context, $Request)
-            [void]$Context
-            $revision = [int]$Request.Metadata.Revision
-            return $revision
-        } -Metadata @{
-            Revision = 10
-        }
-
-        [string]$key | Should -Not -BeNullOrEmpty
     }
 }
 
@@ -393,6 +254,50 @@ Describe 'Pipeline DAG guard' {
         $caught | Should -Not -BeNullOrEmpty
         [string]$caught.Data['ErrorCode'] | Should -Be 'INTERNAL_DAG_CYCLE_DETECTED'
     }
+
+    It 'accepts coarse step6/step7 graph with step5_cleanup dependency' {
+        $context = New-NarutoContext -SvnExecutable 'svn'
+        $context = Initialize-StrictModeContext -Context $context
+        $runtime = New-PipelineRuntime -Context $context -Parallel 4
+        $nodes = @(
+            [pscustomobject]@{
+                Id = 'step4_file'
+                DependsOn = @()
+                AllowParallel = $false
+                Action = { return @() }
+            },
+            [pscustomobject]@{
+                Id = 'step5_cleanup'
+                DependsOn = @('step4_file')
+                AllowParallel = $false
+                Action = { return $null }
+            },
+            [pscustomobject]@{
+                Id = 'step6_csv'
+                DependsOn = @('step4_file', 'step5_cleanup')
+                AllowParallel = $true
+                Action = { return 'csv' }
+            },
+            [pscustomobject]@{
+                Id = 'step7_visual'
+                DependsOn = @('step4_file', 'step5_cleanup')
+                AllowParallel = $true
+                Action = { return 'visual' }
+            },
+            [pscustomobject]@{
+                Id = 'step8_meta'
+                DependsOn = @('step4_file', 'step5_cleanup', 'step6_csv', 'step7_visual')
+                AllowParallel = $false
+                Action = { return 'meta' }
+            }
+        )
+
+        $result = Invoke-PipelineDag -Context $context -Runtime $runtime -Nodes $nodes
+
+        $result['step6_csv'] | Should -Be 'csv'
+        $result['step7_visual'] | Should -Be 'visual'
+        $result['step8_meta'] | Should -Be 'meta'
+    }
 }
 
 Describe 'Pipeline DAG deterministic merge order' {
@@ -441,145 +346,6 @@ Describe 'Pipeline DAG deterministic merge order' {
 
         @($orders | Select-Object -Unique).Count | Should -Be 1
         $orders[0] | Should -Be 'step_base,step6_csv,step7_visual'
-    }
-}
-
-Describe 'Request broker streaming resolve' {
-    It 'consumes results on resolve and invokes callback' {
-        $context = New-NarutoContext -SvnExecutable 'svn'
-        $context = Initialize-StrictModeContext -Context $context
-        $runtime = New-PipelineRuntime -Context $context -Parallel 4
-        $broker = $runtime.RequestBroker
-        $callbacks = New-Object 'System.Collections.Generic.List[string]'
-
-        $keyA = Register-SvnRequest -Broker $broker -Operation 'diff' -Path 'https://example.invalid/svn/repo/trunk' -Revision '' -RevisionRange '21' -Flags @('diff') -Resolver {
-            param($Context, $Request)
-            [void]$Context
-            [void]$Request
-            return 'A'
-        }
-        $keyB = Register-SvnRequest -Broker $broker -Operation 'diff' -Path 'https://example.invalid/svn/repo/trunk' -Revision '' -RevisionRange '22' -Flags @('diff') -Resolver {
-            param($Context, $Request)
-            [void]$Context
-            [void]$Request
-            return 'B'
-        }
-
-        [void](Wait-SvnRequest -Context $context -Broker $broker -RequestKeys @($keyA, $keyB) -ConsumeOnResolve -OnResolved {
-                param($Broker, $RequestKey, $Request, $Result, $ConsumedResult)
-                [void]$Broker
-                [void]$Request
-                [void]$Result
-                [void]$callbacks.Add(([string]$RequestKey + ':' + [string]$ConsumedResult.Payload))
-            })
-
-        $broker.Results.Count | Should -Be 0
-        $broker.Requests.Count | Should -Be 0
-        $broker.RegistrationOrder.Count | Should -Be 0
-        @($callbacks | Sort-Object) | Should -Be @(
-            ($keyA + ':A'),
-            ($keyB + ':B')
-        )
-    }
-
-    It 'wraps callback failure with INTERNAL_REQUEST_RESOLVE_CALLBACK_FAILED' {
-        $context = New-NarutoContext -SvnExecutable 'svn'
-        $context = Initialize-StrictModeContext -Context $context
-        $runtime = New-PipelineRuntime -Context $context -Parallel 2
-        $broker = $runtime.RequestBroker
-        $requestKey = Register-SvnRequest -Broker $broker -Operation 'diff' -Path 'https://example.invalid/svn/repo/trunk' -Revision '' -RevisionRange '31' -Flags @('diff') -Resolver {
-            param($Context, $Request)
-            [void]$Context
-            [void]$Request
-            return 'ok'
-        }
-
-        $caught = $null
-        try
-        {
-            [void](Wait-SvnRequest -Context $context -Broker $broker -RequestKeys @($requestKey) -ConsumeOnResolve -OnResolved {
-                    param($Broker, $RequestKey, $Request, $Result, $ConsumedResult)
-                    [void]$Broker
-                    [void]$RequestKey
-                    [void]$Request
-                    [void]$Result
-                    [void]$ConsumedResult
-                    throw 'callback failure'
-                })
-        }
-        catch
-        {
-            $caught = $_.Exception
-        }
-
-        $caught | Should -Not -BeNullOrEmpty
-        [string]$caught.Data['ErrorCode'] | Should -Be 'INTERNAL_REQUEST_RESOLVE_CALLBACK_FAILED'
-    }
-
-    It 'uses RequestedParallel when runtime parallel context is absent' {
-        $context = New-NarutoContext -SvnExecutable 'svn'
-        $context = Initialize-StrictModeContext -Context $context
-        $broker = New-RequestBroker
-        $requestKey = Register-SvnRequest -Broker $broker -Operation 'diff' -Path 'https://example.invalid/svn/repo/trunk' -Revision '' -RevisionRange '41' -Flags @('diff') -Resolver {
-            param($Context, $Request)
-            [void]$Context
-            [void]$Request
-            return 'ok'
-        }
-
-        $script:capturedRequestedMaxParallel = 0
-        $originalInvokeParallelWork = (Get-Item function:Invoke-ParallelWork).ScriptBlock.ToString()
-        try
-        {
-            Set-Item -Path function:Invoke-ParallelWork -Value {
-                param(
-                    [object[]]$InputItems,
-                    [scriptblock]$WorkerScript,
-                    [int]$MaxParallel = 1,
-                    [string[]]$RequiredFunctions = @(),
-                    [hashtable]$SessionVariables = @{},
-                    [string]$ErrorContext = 'parallel work',
-                    [System.Threading.SemaphoreSlim]$SharedSemaphore = $null,
-                    [hashtable]$Context = $null,
-                    [scriptblock]$OnItemCompleted = $null,
-                    [switch]$SuppressOutputCollection
-                )
-                [void]$RequiredFunctions
-                [void]$SessionVariables
-                [void]$ErrorContext
-                [void]$SharedSemaphore
-                [void]$Context
-                $script:capturedRequestedMaxParallel = [int]$MaxParallel
-                $rows = New-Object 'System.Collections.Generic.List[object]'
-                for ($index = 0
-                    $index -lt @($InputItems).Count
-                    $index++)
-                {
-                    $output = (& $WorkerScript -Item $InputItems[$index] -Index $index)
-                    if ($null -ne $OnItemCompleted)
-                    {
-                        & $OnItemCompleted -Item $InputItems[$index] -Index $index -Output $output
-                    }
-                    if (-not $SuppressOutputCollection)
-                    {
-                        [void]$rows.Add($output)
-                    }
-                }
-                if ($SuppressOutputCollection)
-                {
-                    return @()
-                }
-                return @($rows.ToArray())
-            }
-
-            [void](Wait-SvnRequest -Context $context -Broker $broker -RequestKeys @($requestKey) -RequestedParallel 3)
-        }
-        finally
-        {
-            Set-Item -Path function:Invoke-ParallelWork -Value $originalInvokeParallelWork
-        }
-
-        [int]$script:capturedRequestedMaxParallel | Should -Be 3
     }
 }
 
