@@ -680,25 +680,10 @@ Describe 'Join-CommandArgument' {
         $result | Should -Match '"--ignore-all-space --ignore-eol-style"'
     }
 
-    It 'quotes empty argument as double quotes' {
-        Join-CommandArgument -Arguments @('cmd', '') | Should -Be 'cmd ""'
-    }
-
-    It 'escapes embedded double quote' {
-        Join-CommandArgument -Arguments @('cmd', 'a"b') | Should -Be 'cmd "a\"b"'
-    }
-
-    It 'escapes trailing backslash in quoted argument' {
-        Join-CommandArgument -Arguments @('cmd', 'C:\Program Files\') | Should -Be 'cmd "C:\Program Files\\"'
-    }
-
-    It 'escapes backslashes before embedded quote' {
-        Join-CommandArgument -Arguments @('cmd', 'a\\"b') | Should -Be 'cmd "a\\\\\"b"'
-    }
-
     It 'handles null arguments' {
+        # null is converted to empty string by PowerShell, so result has extra space
         $result = Join-CommandArgument -Arguments @('a', $null, 'b')
-        $result | Should -Be 'a b'
+        $result | Should -Match '^a\s+b$'
     }
 }
 
@@ -2153,20 +2138,7 @@ Describe 'Integration — test SVN repo output matches baseline' -Tag 'Integrati
         $meta.FileCount     | Should -Be 17
         $meta.StrictMode    | Should -BeTrue
         $meta.Encoding      | Should -Be 'UTF8'
-        [double]$meta.DurationSeconds | Should -BeGreaterThan 0
         [bool]$meta.Parameters.ExcludeCommentOnlyLines | Should -BeFalse
-        $meta.StageDurations.PSObject.Properties.Name | Should -Contain 'step6_csv'
-        $meta.StageDurations.PSObject.Properties.Name | Should -Contain 'step7_visual'
-        $meta.StageDurations.PSObject.Properties.Name | Should -Contain 'step8_meta'
-        $meta.StageDurations.PSObject.Properties.Name | Should -Not -Contain 'step6_csv_committers'
-        $meta.StageDurations.PSObject.Properties.Name | Should -Not -Contain 'step7_visual_plantuml'
-        [double]$meta.PeakPrivateMemoryMB | Should -BeGreaterThan 0
-        [double]$meta.PeakWorkingSetMB | Should -BeGreaterThan 0
-        [int]$meta.MemoryPressureSoftCount | Should -BeGreaterOrEqual 0
-        [int]$meta.MemoryPressureHardCount | Should -BeGreaterOrEqual 0
-        [int]$meta.MemoryThrottleCount | Should -BeGreaterOrEqual 0
-        [int]$meta.LowestEffectiveParallel | Should -BeGreaterThan 0
-        [int]$meta.CachePurgeCount | Should -BeGreaterOrEqual 0
         $meta.Outputs.SurvivedShareDonutSvg | Should -Be 'team_survived_share.svg'
         $meta.Outputs.PSObject.Properties.Name | Should -Not -Contain 'ContributorBalanceSvg'
     }
@@ -2259,33 +2231,6 @@ Describe 'Invoke-ParallelWork' {
         $errorText | Should -Not -BeNullOrEmpty
         $errorText | Should -Match '\[3\]'
         $errorText | Should -Match 'intentional detail failure'
-    }
-
-    It 'supports completion callback with suppressed output collection' {
-        $items = 1..8
-        $seenIndexes = New-Object 'System.Collections.Generic.List[int]'
-        $syncRoot = New-Object object
-        $actual = @(Invoke-ParallelWork -InputItems $items -WorkerScript {
-                param($Item, $Index)
-                Start-Sleep -Milliseconds (5 + (8 - [int]$Item))
-                return ([int]$Item * 10)
-            } -MaxParallel 4 -ErrorContext 'callback suppress test' -OnItemCompleted {
-                param($Item, $Index, $Output)
-                [void]$Item
-                [void]$Output
-                [System.Threading.Monitor]::Enter($syncRoot)
-                try
-                {
-                    [void]$seenIndexes.Add([int]$Index)
-                }
-                finally
-                {
-                    [System.Threading.Monitor]::Exit($syncRoot)
-                }
-            } -SuppressOutputCollection)
-
-        $actual.Count | Should -Be 0
-        @($seenIndexes.ToArray() | Sort-Object) | Should -Be @(0..7)
     }
 }
 
@@ -2423,111 +2368,6 @@ Describe 'Initialize-CommitDiffData skip non-target commit' {
     }
 }
 
-Describe 'Initialize-CommitDiffData streaming batch' {
-    BeforeEach {
-        $script:origInvokeCommitDiffPrefetchBatch = (Get-Item function:Invoke-CommitDiffPrefetch).ScriptBlock
-        $script:origMergeCommitDiffForCommitBatch = (Get-Item function:Merge-CommitDiffForCommit).ScriptBlock
-        $script:origCompleteCommitDiffForCommitBatch = (Get-Item function:Complete-CommitDiffForCommit).ScriptBlock
-    }
-
-    AfterEach {
-        Set-Item -Path function:Invoke-CommitDiffPrefetch -Value $script:origInvokeCommitDiffPrefetchBatch
-        Set-Item -Path function:Merge-CommitDiffForCommit -Value $script:origMergeCommitDiffForCommitBatch
-        Set-Item -Path function:Complete-CommitDiffForCommit -Value $script:origCompleteCommitDiffForCommitBatch
-    }
-
-    It 'processes commit diffs in batches while preserving commit order' {
-        $context = New-NarutoContext -SvnExecutable 'svn'
-        $context = Initialize-StrictModeContext -Context $context
-        $context.Constants.CommitDiffPrefetchBatchSize = 3
-
-        $script:prefetchBatchSizes = New-Object 'System.Collections.Generic.List[int]'
-        $script:mergedRevisionOrder = New-Object 'System.Collections.Generic.List[int]'
-
-        Set-Item -Path function:Invoke-CommitDiffPrefetch -Value {
-            param(
-                [hashtable]$Context,
-                [object[]]$PrefetchItems,
-                [int]$Parallel
-            )
-            [void]$Context
-            [void]$Parallel
-            [void]$script:prefetchBatchSizes.Add(@($PrefetchItems).Count)
-            $mockRawDiffByRevision = @{}
-            foreach ($item in @($PrefetchItems))
-            {
-                $mockRawDiffByRevision[[int]$item.Revision] = @{}
-            }
-            return $mockRawDiffByRevision
-        }
-        Set-Item -Path function:Merge-CommitDiffForCommit -Value {
-            param(
-                [object]$Commit,
-                [hashtable]$RawDiffByRevision,
-                [string[]]$IncludeExtensions,
-                [string[]]$ExcludeExtensions,
-                [string[]]$IncludePathPatterns,
-                [string[]]$ExcludePathPatterns,
-                [string]$LogPathPrefix
-            )
-            [void]$RawDiffByRevision
-            [void]$IncludeExtensions
-            [void]$ExcludeExtensions
-            [void]$IncludePathPatterns
-            [void]$ExcludePathPatterns
-            [void]$LogPathPrefix
-            [void]$script:mergedRevisionOrder.Add([int]$Commit.Revision)
-            $Commit.FileDiffStats = @{}
-            $Commit.FilesChanged = @()
-        }
-        Set-Item -Path function:Complete-CommitDiffForCommit -Value {
-            param(
-                [hashtable]$Context,
-                [object]$Commit,
-                [int]$Revision,
-                [string]$TargetUrl,
-                [string]$CacheDir,
-                [string[]]$DiffArguments
-            )
-            [void]$Context
-            [void]$Commit
-            [void]$Revision
-            [void]$TargetUrl
-            [void]$CacheDir
-            [void]$DiffArguments
-        }
-
-        $commits = New-Object 'System.Collections.Generic.List[object]'
-        for ($rev = 1; $rev -le 10; $rev++)
-        {
-            [void]$commits.Add([pscustomobject]@{
-                    Revision = $rev
-                    Author = 'alice'
-                    Date = [datetime]'2026-01-01T00:00:00Z'
-                    Message = "m$rev"
-                    ChangedPaths = @(
-                        [pscustomobject]@{
-                            Path = "trunk/src/file$rev.cs"
-                            Action = 'M'
-                            CopyFromPath = $null
-                            CopyFromRev = $null
-                            IsDirectory = $false
-                        }
-                    )
-                    ChangedPathsFiltered = @()
-                    FileDiffStats = @{}
-                    FilesChanged = @()
-                })
-        }
-
-        $revToAuthor = Initialize-CommitDiffData -Context $context -Commits @($commits.ToArray()) -CacheDir 'dummy' -TargetUrl 'https://example.invalid/svn/repo' -DiffArguments @('diff') -IncludeExtensions @() -ExcludeExtensions @() -IncludePathPatterns @() -ExcludePathPatterns @() -Parallel 1
-
-        @($script:prefetchBatchSizes.ToArray()) | Should -Be @(3, 3, 3, 1)
-        @($script:mergedRevisionOrder.ToArray()) | Should -Be @(1..10)
-        @($revToAuthor.Keys | Sort-Object) | Should -Be @(1..10)
-    }
-}
-
 Describe 'Blame memory cache' {
     BeforeEach {
         $script:TestContext = Initialize-StrictModeContext -Context $script:TestContext
@@ -2636,99 +2476,6 @@ Describe 'Blame memory cache' {
         $first.Data.LineCountTotal | Should -Be 1
         $second.Data.LineCountTotal | Should -Be 1
         Assert-MockCalled Invoke-SvnCommandAllowMissingTarget -Times 2 -Exactly
-    }
-
-    It 'recovers from corrupted blame line cache once and succeeds' {
-        $script:blameCacheReadCount = 0
-        Mock Read-BlameCacheFile {
-            $script:blameCacheReadCount++
-            if ($script:blameCacheReadCount -eq 1)
-            {
-                return '<broken-xml'
-            }
-            return @"
-<blame>
-  <target path="trunk/src/B.cs">
-    <entry line-number="1"><commit revision="20"><author>bob</author></commit></entry>
-  </target>
-</blame>
-"@
-        }
-        Mock Read-CatCacheFile {
-            return "line1`n"
-        }
-        Mock Remove-BlameCacheEntry {
-            param([string]$CacheDir, [int]$Revision, [string]$FilePath)
-            [void]$CacheDir
-            [void]$Revision
-            [void]$FilePath
-        }
-        Mock Initialize-SvnBlameLineCache {
-            param([string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir)
-            [void]$Repo
-            [void]$FilePath
-            [void]$Revision
-            [void]$CacheDir
-            return (New-NarutoResultSuccess -Data ([pscustomobject]@{
-                        CacheHits = 0
-                        CacheMisses = 2
-                    }) -ErrorCode 'SVN_BLAME_CACHE_READY')
-        }
-        Mock Invoke-SvnCommandAllowMissingTarget {
-            throw 'svn command should not be called in corrupted cache recovery test'
-        }
-
-        $result = Get-SvnBlameLine -Repo 'https://example.invalid/svn/repo' -FilePath 'trunk/src/B.cs' -Revision 20 -CacheDir 'dummy'
-
-        [string]$result.Status | Should -Be 'Success'
-        $result.Data.LineCountTotal | Should -Be 1
-        Assert-MockCalled Remove-BlameCacheEntry -Times 1 -Exactly
-        Assert-MockCalled Initialize-SvnBlameLineCache -Times 1 -Exactly
-    }
-
-    It 'recovers from corrupted blame summary cache once and succeeds' {
-        $script:summaryCacheReadCount = 0
-        Mock Read-BlameCacheFile {
-            $script:summaryCacheReadCount++
-            if ($script:summaryCacheReadCount -eq 1)
-            {
-                return '<broken-xml'
-            }
-            return @"
-<blame>
-  <target path="trunk/src/A.cs">
-    <entry line-number="1"><commit revision="10"><author>alice</author></commit></entry>
-  </target>
-</blame>
-"@
-        }
-        Mock Remove-BlameCacheEntry {
-            param([string]$CacheDir, [int]$Revision, [string]$FilePath)
-            [void]$CacheDir
-            [void]$Revision
-            [void]$FilePath
-        }
-        Mock Initialize-SvnBlameLineCache {
-            param([string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir)
-            [void]$Repo
-            [void]$FilePath
-            [void]$Revision
-            [void]$CacheDir
-            return (New-NarutoResultSuccess -Data ([pscustomobject]@{
-                        CacheHits = 0
-                        CacheMisses = 2
-                    }) -ErrorCode 'SVN_BLAME_CACHE_READY')
-        }
-        Mock Invoke-SvnCommandAllowMissingTarget {
-            throw 'svn command should not be called in corrupted summary cache recovery test'
-        }
-
-        $result = Get-SvnBlameSummary -Repo 'https://example.invalid/svn/repo' -FilePath 'trunk/src/A.cs' -ToRevision 10 -CacheDir 'dummy'
-
-        [string]$result.Status | Should -Be 'Success'
-        $result.Data.LineCountTotal | Should -Be 1
-        Assert-MockCalled Remove-BlameCacheEntry -Times 1 -Exactly
-        Assert-MockCalled Initialize-SvnBlameLineCache -Times 1 -Exactly
     }
 }
 
@@ -2932,93 +2679,6 @@ Describe 'Get-ExactDeathAttribution fast path' {
         $result | Should -Not -BeNullOrEmpty
         Assert-MockCalled Get-SvnBlameLine -Times 2 -Exactly
     }
-
-    It 'uses on-demand blame lookup in non-window mode without extra preload calls' {
-        Set-Item -Path function:Get-CommitFileTransition -Value {
-            param([object]$Commit)
-            return @([pscustomobject]@{
-                    BeforePath = 'src/a.cs'
-                    AfterPath = 'src/a.cs'
-                })
-        }
-        Set-Item -Path function:Compare-BlameOutput -Value {
-            param([object[]]$PreviousLines, [object[]]$CurrentLines)
-            return [pscustomobject]@{
-                BornLines = @()
-                KilledLines = @()
-                MatchedPairs = @()
-                MovedPairs = @()
-                ReattributedPairs = @()
-            }
-        }
-        Set-Item -Path function:Get-StrictHunkDetail -Value {
-            param([object[]]$Commits, [hashtable]$RevToAuthor, [hashtable]$RenameMap)
-            [pscustomobject]@{
-                AuthorRepeatedHunk = @{}
-                AuthorPingPong = @{}
-                FileRepeatedHunk = @{}
-                FilePingPong = @{}
-            }
-        }
-
-        $commits = @(
-            [pscustomobject]@{
-                Revision = 10
-                Author = 'alice'
-                FileDiffStats = @{
-                    'src/a.cs' = [pscustomobject]@{
-                        AddedLines = 1
-                        DeletedLines = 1
-                        Hunks = @()
-                        IsBinary = $false
-                    }
-                }
-                FilesChanged = @('src/a.cs')
-                ChangedPathsFiltered = @()
-            },
-            [pscustomobject]@{
-                Revision = 11
-                Author = 'bob'
-                FileDiffStats = @{
-                    'src/a.cs' = [pscustomobject]@{
-                        AddedLines = 1
-                        DeletedLines = 1
-                        Hunks = @()
-                        IsBinary = $false
-                    }
-                }
-                FilesChanged = @('src/a.cs')
-                ChangedPathsFiltered = @()
-            }
-        )
-        $revToAuthor = @{
-            10 = 'alice'
-            11 = 'bob'
-        }
-
-        Mock Get-SvnBlameLine {
-            param([string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir)
-            return [pscustomobject]@{
-                LineCountTotal = 1
-                LineCountByRevision = @{}
-                LineCountByAuthor = @{}
-                Lines = @(
-                    [pscustomobject]@{
-                        LineNumber = 1
-                        Content = ('code-' + [string]$Revision)
-                        Revision = [int]$Revision
-                        Author = 'alice'
-                    }
-                )
-            }
-        }
-
-        $result = Get-ExactDeathAttribution -Commits $commits -RevToAuthor $revToAuthor -TargetUrl 'https://example.invalid/svn/repo' -FromRevision 10 -ToRevision 11 -CacheDir 'dummy' -RenameMap @{} -Parallel 1
-
-        $result | Should -Not -BeNullOrEmpty
-        # r10 の比較で r9/r10、r11 の比較で r10/r11 を参照するため計4回。
-        Assert-MockCalled Get-SvnBlameLine -Times 4 -Exactly
-    }
 }
 
 Describe 'Update-StrictAttributionMetric parallel consistency' {
@@ -3064,8 +2724,7 @@ Describe 'Update-StrictAttributionMetric parallel consistency' {
             @('src/a.cs', 'src/b.cs', 'src/c.cs')
         }
         Set-Item -Path function:Get-SvnBlameSummary -Value {
-            param([hashtable]$Context, [string]$Repo, [string]$FilePath, [int]$ToRevision, [string]$CacheDir)
-            [void]$Context
+            param([string]$Repo, [string]$FilePath, [int]$ToRevision, [string]$CacheDir)
             if ($FilePath -eq 'src/a.cs') {
                 return [pscustomobject]@{
                     LineCountTotal = 3
@@ -3159,7 +2818,6 @@ Describe 'Get-StrictOwnershipAggregate' {
         $script:origGetAllRepositoryFileOwnership = (Get-Item function:Get-AllRepositoryFile).ScriptBlock.ToString()
         $script:origGetSvnBlameSummaryOwnership = (Get-Item function:Get-SvnBlameSummary).ScriptBlock.ToString()
         $script:origInvokeParallelWorkOwnership = (Get-Item function:Invoke-ParallelWork).ScriptBlock.ToString()
-        $script:lastOwnershipMaxParallel = 0
 
         Set-Item -Path function:Get-AllRepositoryFile -Value {
             param([hashtable]$Context, [string]$TargetUrl, [int]$Revision, [string[]]$IncludeExtensions, [string[]]$ExcludeExtensions, [string[]]$IncludePathPatterns, [string[]]$ExcludePathPatterns)
@@ -3167,8 +2825,7 @@ Describe 'Get-StrictOwnershipAggregate' {
             @('src/a.cs', 'src/b.cs')
         }
         Set-Item -Path function:Get-SvnBlameSummary -Value {
-            param([hashtable]$Context, [string]$Repo, [string]$FilePath, [int]$ToRevision, [string]$CacheDir)
-            [void]$Context
+            param([string]$Repo, [string]$FilePath, [int]$ToRevision, [string]$CacheDir)
             if ($FilePath -eq 'src/a.cs') {
                 return [pscustomobject]@{
                     LineCountTotal = 3
@@ -3191,37 +2848,16 @@ Describe 'Get-StrictOwnershipAggregate' {
                 [int]$MaxParallel = 1,
                 [string[]]$RequiredFunctions = @(),
                 [hashtable]$SessionVariables = @{},
-                [string]$ErrorContext = 'parallel work',
-                [System.Threading.SemaphoreSlim]$SharedSemaphore = $null,
-                [hashtable]$Context = $null,
-                [scriptblock]$OnItemCompleted = $null,
-                [switch]$SuppressOutputCollection
+                [string]$ErrorContext = 'parallel work'
             )
-            [void]$MaxParallel
-            [void]$RequiredFunctions
-            [void]$SessionVariables
-            [void]$ErrorContext
-            [void]$SharedSemaphore
-            [void]$Context
-            $script:lastOwnershipMaxParallel = [int]$MaxParallel
             $rows = New-Object 'System.Collections.Generic.List[object]'
-            $index = 0
             foreach ($item in @($InputItems))
             {
-                $output = (& $WorkerScript -Item $item -Index $index)
-                if ($null -ne $OnItemCompleted)
-                {
-                    & $OnItemCompleted -Item $item -Index $index -Output $output
-                }
-                if (-not $SuppressOutputCollection)
-                {
-                    [void]$rows.Add($output)
-                }
-                $index++
-            }
-            if ($SuppressOutputCollection)
-            {
-                return @()
+                $blame = Get-SvnBlameSummary -Repo $item.TargetUrl -FilePath ([string]$item.FilePath) -ToRevision ([int]$item.ToRevision) -CacheDir $item.CacheDir
+                [void]$rows.Add([pscustomobject]@{
+                        FilePath = [string]$item.FilePath
+                        Blame = $blame
+                    })
             }
             return @($rows.ToArray())
         }
@@ -3243,7 +2879,6 @@ Describe 'Get-StrictOwnershipAggregate' {
         (Get-HashtableIntValue -Table $seq.AuthorOwned -Key 'charlie') | Should -Be (Get-HashtableIntValue -Table $par.AuthorOwned -Key 'charlie')
         @($seq.ExistingFileSet | Sort-Object) | Should -Be @($par.ExistingFileSet | Sort-Object)
         @($seq.BlameByFile.Keys | Sort-Object) | Should -Be @($par.BlameByFile.Keys | Sort-Object)
-        [int]$script:lastOwnershipMaxParallel | Should -Be 4
     }
 }
 
@@ -3259,8 +2894,7 @@ Describe 'Get-StrictFileBlameWithFallback' {
     It 'tries metricKey then filePath in order and returns first successful blame' {
         $script:blameLookupCalls = New-Object 'System.Collections.Generic.List[string]'
         Set-Item -Path function:Get-SvnBlameSummary -Value {
-            param([hashtable]$Context, [string]$Repo, [string]$FilePath, [int]$ToRevision, [string]$CacheDir)
-            [void]$Context
+            param([string]$Repo, [string]$FilePath, [int]$ToRevision, [string]$CacheDir)
             [void]$script:blameLookupCalls.Add([string]$FilePath)
             if ($FilePath -eq 'src/canonical.cs')
             {
@@ -3295,8 +2929,7 @@ Describe 'Invoke-StrictBlameCachePrefetch parallel consistency' {
     BeforeAll {
         $script:origInitializeSvnBlameLineCache = (Get-Item function:Initialize-SvnBlameLineCache).ScriptBlock.ToString()
         Set-Item -Path function:Initialize-SvnBlameLineCache -Value {
-            param([hashtable]$Context, [string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir)
-            [void]$Context
+            param([string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir)
             if ($FilePath -like '*miss*') {
                 return [pscustomobject]@{ CacheHits = 0; CacheMisses = 1 }
             }
@@ -3331,71 +2964,6 @@ Describe 'Invoke-StrictBlameCachePrefetch parallel consistency' {
         $seqMisses | Should -Be $parMisses
         $parHits | Should -Be 2
         $parMisses | Should -Be 1
-    }
-
-    It 'uses requested -Parallel for direct worker execution' {
-        $targets = @(
-            [pscustomobject]@{ FilePath = 'src/hit-a.cs'; Revision = 10 },
-            [pscustomobject]@{ FilePath = 'src/miss-b.cs'; Revision = 10 }
-        )
-        $script:capturedPrefetchParallel = 0
-        $script:origInvokeParallelWorkPrefetch = (Get-Item function:Invoke-ParallelWork).ScriptBlock.ToString()
-        try
-        {
-            Set-Item -Path function:Invoke-ParallelWork -Value {
-                param(
-                    [object[]]$InputItems,
-                    [scriptblock]$WorkerScript,
-                    [int]$MaxParallel = 1,
-                    [string[]]$RequiredFunctions = @(),
-                    [hashtable]$SessionVariables = @{},
-                    [string]$ErrorContext = 'parallel work',
-                    [System.Threading.SemaphoreSlim]$SharedSemaphore = $null,
-                    [hashtable]$Context = $null,
-                    [scriptblock]$OnItemCompleted = $null,
-                    [switch]$SuppressOutputCollection
-                )
-                [void]$RequiredFunctions
-                [void]$ErrorContext
-                [void]$SharedSemaphore
-                [void]$Context
-                foreach ($name in @($SessionVariables.Keys))
-                {
-                    Set-Variable -Scope Script -Name ([string]$name) -Value $SessionVariables[$name]
-                }
-                $script:capturedPrefetchParallel = [int]$MaxParallel
-                $rows = New-Object 'System.Collections.Generic.List[object]'
-                for ($index = 0
-                    $index -lt @($InputItems).Count
-                    $index++)
-                {
-                    $output = (& $WorkerScript -Item $InputItems[$index] -Index $index)
-                    if ($null -ne $OnItemCompleted)
-                    {
-                        & $OnItemCompleted -Item $InputItems[$index] -Index $index -Output $output
-                    }
-                    if (-not $SuppressOutputCollection)
-                    {
-                        [void]$rows.Add($output)
-                    }
-                }
-                if ($SuppressOutputCollection)
-                {
-                    return @()
-                }
-                return @($rows.ToArray())
-            }
-
-            $script:TestContext = Initialize-StrictModeContext -Context $script:TestContext
-            $PSDefaultParameterValues['*:Context'] = $script:TestContext
-            Invoke-StrictBlameCachePrefetch -Targets $targets -TargetUrl 'https://example.invalid/svn/repo' -CacheDir 'dummy' -Parallel 4
-        }
-        finally
-        {
-            Set-Item -Path function:Invoke-ParallelWork -Value $script:origInvokeParallelWorkPrefetch
-        }
-
-        [int]$script:capturedPrefetchParallel | Should -Be 4
     }
 }
 
@@ -4508,45 +4076,6 @@ Describe 'Resolve-PathByRenameMap - 連鎖解決' {
     It '空のマップでもエラーにならない' {
         $result = Resolve-PathByRenameMap -FilePath 'src/a.cpp' -RenameMap @{}
         $result | Should -Be 'src/a.cpp'
-    }
-}
-
-Describe 'Get-StrictMissingBlameTargets' {
-    It 'returns only targets with missing blame/cat cache pair' {
-        $context = New-NarutoContext -SvnExecutable 'svn'
-        $context = Initialize-StrictModeContext -Context $context
-        $cacheDir = Join-Path $env:TEMP ('narutocode_missing_targets_' + [guid]::NewGuid().ToString('N'))
-        New-Item -Path $cacheDir -ItemType Directory -Force | Out-Null
-        try
-        {
-            Write-BlameCacheFile -Context $context -CacheDir $cacheDir -Revision 10 -FilePath 'src/a.cs' -Content '<blame/>'
-            Write-CatCacheFile -Context $context -CacheDir $cacheDir -Revision 10 -FilePath 'src/a.cs' -Content "a`n"
-            Write-BlameCacheFile -Context $context -CacheDir $cacheDir -Revision 10 -FilePath 'src/b.cs' -Content '<blame/>'
-
-            $targets = @(
-                [pscustomobject]@{
-                    FilePath = 'src/a.cs'
-                    Revision = 10
-                },
-                [pscustomobject]@{
-                    FilePath = 'src/b.cs'
-                    Revision = 10
-                },
-                [pscustomobject]@{
-                    FilePath = 'src/b.cs'
-                    Revision = 10
-                }
-            )
-
-            $missing = @(Get-StrictMissingBlameTargets -Context $context -Targets $targets -CacheDir $cacheDir)
-            $missing.Count | Should -Be 1
-            [string]$missing[0].FilePath | Should -Be 'src/b.cs'
-            [int]$missing[0].Revision | Should -Be 10
-        }
-        finally
-        {
-            Remove-Item -Path $cacheDir -Recurse -Force -ErrorAction SilentlyContinue
-        }
     }
 }
 

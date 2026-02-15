@@ -14,35 +14,6 @@ BeforeAll {
 }
 
 Describe 'Strict aggregation refactor' {
-    It 'enables strict commit window mode when memory governor is in hard level' {
-        $context = New-NarutoContext -SvnExecutable 'svn'
-        $context = Initialize-StrictModeContext -Context $context
-        $runtime = New-PipelineRuntime -Context $context -Parallel 4
-        $runtime.MemoryGovernor.CurrentLevel = 'Hard'
-
-        (Test-UseStrictCommitWindowMode -Context $context) | Should -BeTrue
-    }
-
-    It 'throws INTERNAL_STRICT_WINDOW_PRELOAD_INCOMPLETE when required preload is missing' {
-        $caught = $null
-        try
-        {
-            Assert-StrictPreloadCoverage -RequiredTargets @(
-                [pscustomobject]@{
-                    FilePath = 'src/A.cs'
-                    Revision = 10
-                }
-            ) -PreloadedBlameByKey @{} -Revision 10
-        }
-        catch
-        {
-            $caught = $_.Exception
-        }
-
-        $caught | Should -Not -BeNullOrEmpty
-        [string]$caught.Data['ErrorCode'] | Should -Be 'INTERNAL_STRICT_WINDOW_PRELOAD_INCOMPLETE'
-    }
-
     It 'builds commit transitions for rename add and delete combinations' {
         $commit = [pscustomobject]@{
             FilesChanged = @('src/New.cs', 'src/Added.cs')

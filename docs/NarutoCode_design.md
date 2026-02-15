@@ -1,4 +1,4 @@
-﻿# NarutoCode.ps1 設計書（SVN リビジョン範囲のコミット品質・傾向解析）
+# NarutoCode.ps1 設計書（SVN リビジョン範囲のコミット品質・傾向解析）
 
 ## 1. 目的 / ゴール
 SVN のリモートリポジトリに対し、指定したリビジョン範囲 **rA〜rB** の履歴を取得し、
@@ -37,7 +37,7 @@ SVN のリモートリポジトリに対し、指定したリビジョン範囲 
 ### 3.1 代表的な使用例
 ```powershell
 # 例: r1000〜r1200 の履歴を解析して ./out に出力
-.\NarutoCode.ps1 -RepoUrl "https://svn.example.com/repos/project" -FromRev 1000 -ToRev 1200 -OutDirectory .\out
+.\NarutoCode.ps1 -RepoUrl "https://svn.example.com/repos/project" -FromRev 1000 -ToRev 1200 -OutDir .\out
 ```
 
 ### 3.2 パラメータ設計
@@ -52,17 +52,16 @@ SVN のリモートリポジトリに対し、指定したリビジョン範囲 
   - `-ToRev <int>`: 終了リビジョン（含む）
 - 任意（運用で効く）
   - `-SvnExecutable <string>`: svn コマンドのパス（既定: `svn`）
-  - `-OutDirectory <string>`: 出力先（既定: `./NarutoCode_out`・固定名でキャッシュ再利用）
+  - `-OutDir <string>`: 出力先（既定: `./NarutoCode_out`・固定名でキャッシュ再利用）
   - `-Username <string>` / `-Password <securestring>`: SVN 認証情報
   - `-NonInteractive`: `--non-interactive` を強制（CI 想定）
   - `-TrustServerCert`: `--trust-server-cert`（自己署名証明書対応）
   - `-Parallel <int>`: 最大並列数（既定: CPU コア数）
   - `-IncludePaths <string[]>` / `-ExcludePaths <string[]>`: 解析対象パスの絞り込み（ワイルドカード）
   - `-IncludeExtensions <string[]>` / `-ExcludeExtensions <string[]>`: 拡張子フィルタ
-  - `-TopNCount <int>`: 可視化の出力上限（既定: 50・CSV は全件出力）
+  - `-TopN <int>`: 可視化の出力上限（既定: 50・CSV は全件出力）
   - `-Encoding <string>`: 出力エンコーディング（既定: UTF-8）
   - `-IgnoreWhitespace`: diff 時に空白・改行コードの差異を無視
-  - `-ExcludeCommentOnlyLines`: コメント専用行を全メトリクスで除外
   - `-NoProgress`: 進捗バー表示を抑止
 
 ---
@@ -165,13 +164,9 @@ PowerShell 内で扱う主要構造（擬似定義）。
 - `svn diff -c` は revision 数回だが、
   - **並列**（RunspacePool、`-Parallel` で制御）
   - 取得結果を一時ファイルにキャッシュ（`$OutDir/cache/diff_r1234.txt`）
-  - 同一 `-OutDirectory` での再実行時にキャッシュを自動再利用
+  - 同一 `-OutDir` での再実行時にキャッシュを自動再利用
 - `svn blame` は **変更されたファイル集合**に限定
   - per-revision blame のキャッシュも `$OutDir/cache/blame/` に保存
-- 並列契約の一貫性
-  - `-Parallel` を公開/内部シグネチャに持つ関数は、実装でも必ず実効並列度として使用する
-  - 実効並列度は `Get-ContextParallelLimit -Default $Parallel` で解決し、メモリガバナ制御を常に適用する
-  - HotPath は `Invoke-ParallelWork -MaxParallel $effectiveParallel` へ統一する
 
 ---
 
@@ -351,7 +346,7 @@ PowerShell 内で扱う主要構造（擬似定義）。
 を組み合わせた「ホットスポット指数」を **ランキング用途の数値**として出す。
 
 例：
-- `ホットスポットスコア = コミット数² × 作者数 × 総チャーン ÷ max(活動期間日数, 1)`
+- `ホットスポットスコア = コミット数 * (追加行数 + 削除行数)`
 - 併せて `ホットスポット順位` を出力（相対比較用）
 
 > 閾値判定せず、単なるスコア・順位。
@@ -868,7 +863,7 @@ Index: trunk/src/Main.cs
 - `commit_scatter.svg`
 - `cache/`（`diff` / `blame` / `cat` キャッシュ）
 
-`-TopNCount` は可視化出力の表示件数だけを制御し、CSV は常に全件を出力する。
+`-TopN` は可視化出力の表示件数だけを制御し、CSV は常に全件を出力する。
 
 ---
 
@@ -920,18 +915,11 @@ Index: trunk/src/Main.cs
   - `-FromRevision` → `-FromRev`（既存エイリアス維持）
   - `-ToRevision` → `-ToRev`（既存エイリアス維持）
 - **新規パラメータの追加**
-  - `-OutDirectory`, `-Username`, `-Password`, `-NonInteractive`, `-TrustServerCert`
-  - `-Parallel`, `-IncludePaths`, `-ExcludePaths`, `-IncludeExtensions`, `-ExcludeExtensions`
-  - `-TopNCount`, `-Encoding`, `-IgnoreWhitespace`, `-ExcludeCommentOnlyLines`, `-NoProgress`
-
-> **注:** 以下のパラメータは削除済み（機能は常時有効化）:
-> - `-NoBlame`（blame は常時実行）
-> - `-EmitPlantUml`（PlantUML / SVG は常時出力）
-> - `-StrictMode`（Strict モードは常時有効）
-> - `-DeadDetailLevel`（常に最大値 2）
+  - `-OutDir`, `-Username`, `-Password`, `-NonInteractive`, `-TrustServerCert`
+  - `-NoBlame`, `-Parallel`, `-IncludePaths`, `-EmitPlantUml`, `-TopN`, `-Encoding`
 - **出力ディレクトリ・キャッシュ基盤**
-  - `$OutDirectory` のデフォルト値（`./NarutoCode_out`）
-  - `$OutDirectory/cache/` ディレクトリの自動作成
+  - `$OutDir` のデフォルト値（`./NarutoCode_out_yyyyMMdd_HHmmss`）
+  - `$OutDir/cache/` ディレクトリの自動作成
 - **`run_meta.json` の出力**
   - 実行条件（パラメータ値、svn バージョン、開始/終了時刻）を記録
 - **完了条件**: 新パラメータで起動でき、OutDir と run_meta.json が生成される
@@ -996,14 +984,14 @@ Index: trunk/src/Main.cs
 - **消滅量（§7.7b）**: 消滅追加行数 = max(0, 追加行数 − 生存行数)
 - **所有権（§7.9）**: 所有行数, 所有割合
 - **最多作者blame占有率（§8.2、blame 版）**
-- ~~**`-NoBlame` 指定時のスキップ処理**~~ 削除済み（blame は常時実行）
+- **`-NoBlame` 指定時のスキップ処理**
 - **blame の並列取得**（Step 1-4 の RunspacePool を再利用）
 - **完了条件**: モック blame XML に対するテスト通過。NoBlame 時に該当列が空
 
 #### Step 1-8: Co-change 解析
 - **ペア集計（§9.1）**: commit ごとの変更ファイルからペアを列挙（ファイル数によるフィルタリングなし）
 - **Jaccard / リフト値（§9.2）** の算出
-- **`-TopNCount` による出力上限**
+- **`-TopN` による出力上限**
 - **完了条件**: 3ファイル × 3コミットのモックデータで 共変更回数/Jaccard/リフト値 が正しい
 
 #### Step 1-9: 出力（CSV / PlantUML / run_meta.json）
@@ -1012,7 +1000,7 @@ Index: trunk/src/Main.cs
   - `files.csv`（Phase 1 列）
   - `commits.csv`
   - `couplings.csv`
-- **PlantUML / SVG 出力**（常時出力）
+- **PlantUML 出力**（`-EmitPlantUml` 指定時）
   - `contributors_summary.puml`
   - `hotspots.puml`
   - `cochange_network.puml`
@@ -1118,7 +1106,7 @@ This phase keeps the single-file constraint (`NarutoCode.ps1`) and reorganizes a
 ### Diff processing pipeline
 
 - `New-CommitDiffPrefetchPlan`: build filtered path targets and prefetch candidates.
-- `Invoke-CommitDiffPrefetch`: fetch/collect raw diff inputs per streaming batch.
+- `Invoke-CommitDiffPrefetch`: fetch/collect raw diff inputs (sequential or parallel).
 - `Merge-CommitDiffForCommit`: merge raw diff result with log path metadata.
 - `Complete-CommitDiffForCommit`: apply rename correction and finalize derived commit-level metrics.
 
@@ -1233,13 +1221,14 @@ This preserves the same classification categories (`KilledLines`, `BornLines`, `
 
 ### Runspace job lifecycle decomposition
 
-並列実行は `Invoke-ParallelWork` / `Invoke-ParallelExecutorBatch` を中心に、
-共有 executor（`New-ParallelExecutor`）で管理する構成へ整理した。
+`Invoke-ParallelWorkRunspaceCore` now separates job lifecycle concerns:
 
-- Executor 作成: `New-ParallelExecutor`
-- バッチ実行: `Invoke-ParallelExecutorBatch`
-- 互換 API: `Invoke-ParallelWork`
-- 後始末: `Dispose-ParallelExecutor`
+- Failure DTO: `New-ParallelWorkerFailureResult`
+- Submission: `Add-RunspaceParallelJob`
+- Completion scan: `Get-CompletedRunspaceParallelJobIndex`
+- Result receive: `Receive-RunspaceParallelJobResult`
+- Disposal: `Clear-RunspaceParallelJob`
+- Order reconstruction: `ConvertTo-OrderedRunspaceWrappedResult`
 
 Behavioral guarantees are unchanged:
 - input order preserved
@@ -1310,23 +1299,3 @@ try {
 ### 成果物への反映
 - 失敗時: `error_report.json` を出力（`ErrorCode`, `Category`, `Message`, `Context`, `ExitCode`, `Timestamp`）。
 - 成功時: `run_meta.json.Diagnostics` に `WarningCount`, `WarningCodes`, `SkippedOutputs` を記録。
-## Parallel Runtime Update (2026-02-14)
-
-`docs/parallel_runtime_design.md` を正本とし、並列実行基盤を以下へ更新した。
-
-- 旧 Step 固有の並列実装は廃止し、`DAG実行 + SvnGateway + 共有RunspacePool executor` に統一。
-- Step 3/5 は direct parallel worker で fetch/parse/reduce を実行する構成に移行。
-- Step 6/7 は成果物単位ノードへ分解し、ノード内入れ子並列を持たない設計へ移行。
-- run_meta は DAG 内でメタ生成のみ行い、`run_meta.json` の書き込みは DAG 完了後に 1 回のみ実行する。
-
-以降、並列設計と進捗管理は `docs/parallel_runtime_design.md` の進捗表を参照すること。
-
-## Parallel Runtime Memory Policy (2026-02-14)
-- Memory governor was added to runtime execution control.
-- Direct parallel hot paths use `OnItemCompleted` + first-failure-only.
-- Post-strict cleanup releases large stage payloads early (`step3_diff`).
-- `run_meta.json` now includes memory pressure and throttle telemetry.
-- Hard pressure mode can switch strict blame preload to commit-window execution.
-- Step3 diff integration now uses commit-order batch streaming to avoid full `rawDiffByRevision` retention.
-- SvnGateway `CommandCache` now enforces max-entry budget and stops insertion during hard pressure.
-- Memory sampling entry point is `Watch-MemoryGovernor` (approved verb).
