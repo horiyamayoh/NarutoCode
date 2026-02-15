@@ -3956,9 +3956,9 @@ SOFTWARE.
 '@
 Commit-As -Author 'alice' -Message 'Add MIT LICENSE file' -Date '2025-07-13T09:00:00.000000Z'
 
-# ---------- Phase 2: 反復的な修正コミット (r41 〜 r220) ----------
+# ---------- Phase 2: 反復的な修正コミット (r41 〜 r440) ----------
 # 複数著者が既存ファイルを繰り返し修正し、blame/LCS の負荷を最大化する
-Write-Host "  [Phase 2] 反復修正コミット生成 (r41 〜 r220)..." -ForegroundColor Yellow
+Write-Host "  [Phase 2] 反復修正コミット生成 (r41 〜 r440)..." -ForegroundColor Yellow
 
 # 修正対象となるソースファイル一覧 (ヘッダーと実装のペア)
 $sourceFiles = @(
@@ -4066,7 +4066,7 @@ $commentPatterns = @(
 # 基準日時
 $baseDate = [datetime]'2025-07-14T08:00:00Z'
 
-for ($i = 0; $i -lt 180; $i++)
+for ($i = 0; $i -lt 400; $i++)
 {
     $revNum = $i + 41
     $authorIdx = $i % $authors.Count
@@ -4190,7 +4190,7 @@ for ($i = 0; $i -lt 180; $i++)
     # 進捗表示 (20 コミットごと)
     if (($i + 1) % 20 -eq 0)
     {
-        Write-Host "    r$revNum 完了 ($($i + 1)/180)" -ForegroundColor DarkGray
+        Write-Host "    r$revNum 完了 ($($i + 1)/400)" -ForegroundColor DarkGray
     }
 }
 
