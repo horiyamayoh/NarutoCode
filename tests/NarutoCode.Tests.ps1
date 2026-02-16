@@ -1921,6 +1921,30 @@ Describe 'Compare-BlameOutput' {
     }
 }
 
+Describe 'Test-BlameHasUnmatchedSharedKey' {
+    It 'returns true when unmatched shared content exists' {
+        $previousKeys = @('a', 'shared', 'z')
+        $currentKeys = @('x', 'shared', 'y')
+        $previousMatched = @($true, $false, $true)
+        $currentMatched = @($true, $false, $true)
+
+        $actual = Test-BlameHasUnmatchedSharedKey -PreviousKeys $previousKeys -CurrentKeys $currentKeys -PreviousMatched $previousMatched -CurrentMatched $currentMatched
+
+        $actual | Should -BeTrue
+    }
+
+    It 'returns false when unmatched shared content does not exist' {
+        $previousKeys = @('a', 'b')
+        $currentKeys = @('x', 'y')
+        $previousMatched = @($false, $false)
+        $currentMatched = @($false, $false)
+
+        $actual = Test-BlameHasUnmatchedSharedKey -PreviousKeys $previousKeys -CurrentKeys $currentKeys -PreviousMatched $previousMatched -CurrentMatched $currentMatched
+
+        $actual | Should -BeFalse
+    }
+}
+
 Describe 'Resolve-PipelineExecutionState' {
     BeforeAll {
         $script:origResolveSvnTargetUrlForExecutionState = (Get-Item function:Resolve-SvnTargetUrl).ScriptBlock.ToString()
@@ -2495,7 +2519,7 @@ Describe 'Get-StrictTransitionComparison fast path' {
 
     It 'uses add-only fast path without calling Compare-BlameOutput' {
         Set-Item -Path function:Get-SvnBlameLine -Value {
-            param([string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir)
+            param([string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir, [bool]$NeedContent = $true, [bool]$NeedLines = $true)
             [pscustomobject]@{
                 LineCountTotal = 3
                 LineCountByRevision = @{}
@@ -2521,7 +2545,16 @@ Describe 'Get-StrictTransitionComparison fast path' {
         }
         $cmp = Get-StrictTransitionComparison -TransitionContext $context -TargetUrl 'https://example.invalid/svn/repo' -Revision 10 -CacheDir 'dummy'
         @($cmp.KilledLines).Count | Should -Be 0
-        @($cmp.BornLines).Count | Should -Be 2
+        $bornCount = @($cmp.BornLines).Count
+        if ($cmp.PSObject.Properties.Match('BornCountCurrentRevision').Count -gt 0)
+        {
+            $bornCount = [int]$cmp.BornCountCurrentRevision
+        }
+        elseif ($cmp.PSObject.Properties.Match('BornCountByAuthor').Count -gt 0 -and $null -ne $cmp.BornCountByAuthor)
+        {
+            $bornCount = (($cmp.BornCountByAuthor.Values | Measure-Object -Sum).Sum)
+        }
+        $bornCount | Should -Be 2
         @($cmp.MovedPairs).Count | Should -Be 0
     }
 
@@ -2531,7 +2564,7 @@ Describe 'Get-StrictTransitionComparison fast path' {
         $script:TestContext.Runtime.ExcludeCommentOnlyLines = $true
 
         Set-Item -Path function:Get-SvnBlameLine -Value {
-            param([string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir)
+            param([string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir, [bool]$NeedContent = $true, [bool]$NeedLines = $true)
             [pscustomobject]@{
                 LineCountTotal = 2
                 LineCountByRevision = @{ 10 = 2 }
@@ -2650,7 +2683,7 @@ Describe 'Get-ExactDeathAttribution fast path' {
         $revToAuthor = @{ 1 = 'alice'; 2 = 'alice'; 3 = 'charlie' }
 
         Mock Get-SvnBlameLine {
-            param([string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir)
+            param([string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir, [bool]$NeedContent = $true, [bool]$NeedLines = $true)
             if ($FilePath -eq 'src/addonly.cs') {
                 return [pscustomobject]@{
                     LineCountTotal = 3
@@ -2677,7 +2710,7 @@ Describe 'Get-ExactDeathAttribution fast path' {
         $result = Get-ExactDeathAttribution -Commits $commits -RevToAuthor $revToAuthor -TargetUrl 'https://example.invalid/svn/repo' -FromRevision 1 -ToRevision 3 -CacheDir 'dummy' -RenameMap @{} -Parallel 1
 
         $result | Should -Not -BeNullOrEmpty
-        Assert-MockCalled Get-SvnBlameLine -Times 2 -Exactly
+        Assert-MockCalled Get-SvnBlameLine -Times 1 -Exactly
     }
 }
 
@@ -2929,7 +2962,7 @@ Describe 'Invoke-StrictBlameCachePrefetch parallel consistency' {
     BeforeAll {
         $script:origInitializeSvnBlameLineCache = (Get-Item function:Initialize-SvnBlameLineCache).ScriptBlock.ToString()
         Set-Item -Path function:Initialize-SvnBlameLineCache -Value {
-            param([string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir)
+            param([string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir, [bool]$NeedContent = $true)
             if ($FilePath -like '*miss*') {
                 return [pscustomobject]@{ CacheHits = 0; CacheMisses = 1 }
             }
@@ -3772,7 +3805,7 @@ Describe 'Write-ProjectSummaryDashboard' {
     }
 }
 
-Describe 'SvnBlameLineMemoryCache eviction at commit boundary' {
+Describe 'SvnBlameLineMemoryCache revision window eviction' {
     BeforeAll {
         $script:origGetStrictBlamePrefetchTargetEvict = (Get-Item function:Get-StrictBlamePrefetchTarget).ScriptBlock.ToString()
         $script:origInvokeStrictBlameCachePrefetchEvict = (Get-Item function:Invoke-StrictBlameCachePrefetch).ScriptBlock.ToString()
@@ -3787,7 +3820,7 @@ Describe 'SvnBlameLineMemoryCache eviction at commit boundary' {
         Set-Item -Path function:Get-StrictHunkDetail -Value $script:origGetStrictHunkDetailEvict
     }
 
-    It 'clears line memory cache after each commit so earlier entries do not persist' {
+    It 'evicts only older revisions and keeps current revision entries for next commit reuse' {
         $script:TestContext = Initialize-StrictModeContext -Context $script:TestContext
     $PSDefaultParameterValues['*:Context'] = $script:TestContext
         Set-Item -Path function:Get-StrictBlamePrefetchTarget -Value {
@@ -3818,8 +3851,17 @@ Describe 'SvnBlameLineMemoryCache eviction at commit boundary' {
 
         $blameCallLog = New-Object 'System.Collections.Generic.List[string]'
         Mock Get-SvnBlameLine {
-            param([string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir)
+            param([string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir, [bool]$NeedContent = $true, [bool]$NeedLines = $true)
             $blameCallLog.Add("$FilePath@$Revision")
+            $cacheVariant = if ($NeedContent) {
+                'line.withcontent.1'
+            } else {
+                'line.withcontent.0'
+            }
+            $cacheKey = Get-BlameMemoryCacheKey -Revision $Revision -FilePath $FilePath -Variant $cacheVariant
+            $script:TestContext.Caches.SvnBlameLineMemoryCache[$cacheKey] = [pscustomobject]@{
+                Mocked = $true
+            }
             return [pscustomobject]@{
                 LineCountTotal = 1
                 LineCountByRevision = @{}
@@ -3854,16 +3896,16 @@ Describe 'SvnBlameLineMemoryCache eviction at commit boundary' {
 
         $null = Get-ExactDeathAttribution -Commits $commits -RevToAuthor $revToAuthor -TargetUrl 'https://example.invalid/svn/repo' -FromRevision 10 -ToRevision 20 -CacheDir 'dummy' -RenameMap @{} -Parallel 1
 
-        # コミット1 (rev10) のキャッシュキーがエビクション済みであること
-        $key10 = Get-BlameMemoryCacheKey -Revision 10 -FilePath 'src/file1.cs'
-        $key9  = Get-BlameMemoryCacheKey -Revision 9  -FilePath 'src/file1.cs'
+        # rev10 と rev9 は最終コミット(rev20)処理後に不要なためエビクションされる
+        $key10 = Get-BlameMemoryCacheKey -Revision 10 -FilePath 'src/file1.cs' -Variant 'line.withcontent.1'
+        $key9  = Get-BlameMemoryCacheKey -Revision 9  -FilePath 'src/file1.cs' -Variant 'line.withcontent.1'
         $script:TestContext.Caches.SvnBlameLineMemoryCache.ContainsKey($key10) | Should -BeFalse
         $script:TestContext.Caches.SvnBlameLineMemoryCache.ContainsKey($key9)  | Should -BeFalse
 
-        # コミット2 (rev20) のキャッシュも最終コミット処理後にクリアされている
-        $key20 = Get-BlameMemoryCacheKey -Revision 20 -FilePath 'src/file2.cs'
-        $key19 = Get-BlameMemoryCacheKey -Revision 19 -FilePath 'src/file2.cs'
-        $script:TestContext.Caches.SvnBlameLineMemoryCache.ContainsKey($key20) | Should -BeFalse
+        # 最終コミット revision のキャッシュは次コミット再利用のため保持される
+        $key20 = Get-BlameMemoryCacheKey -Revision 20 -FilePath 'src/file2.cs' -Variant 'line.withcontent.1'
+        $key19 = Get-BlameMemoryCacheKey -Revision 19 -FilePath 'src/file2.cs' -Variant 'line.withcontent.1'
+        $script:TestContext.Caches.SvnBlameLineMemoryCache.ContainsKey($key20) | Should -BeTrue
         $script:TestContext.Caches.SvnBlameLineMemoryCache.ContainsKey($key19) | Should -BeFalse
 
         # blame 呼び出し自体は行われていることを確認(キャッシュではなく実際に呼ばれた)
