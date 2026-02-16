@@ -2780,10 +2780,8 @@ Describe 'Get-StrictTransitionComparison sparse comparison path' {
         $cmp = Get-StrictTransitionComparison -Context $script:TestContext -TransitionContext $transitionContext -TargetUrl 'https://example.invalid/svn/repo' -Revision 10 -CacheDir 'dummy'
 
         Assert-MockCalled Get-SvnBlameSparseLineByNumber -Times 2 -Exactly
-        @($cmp.KilledLines).Count | Should -Be 1
-        @($cmp.BornLines).Count | Should -Be 1
-        [string]$cmp.KilledLines[0].Line.Author | Should -Be 'alice'
-        [string]$cmp.BornLines[0].Line.Author | Should -Be 'bob'
+        [int]$cmp.BornCountCurrentRevision | Should -Be 1
+        [int]$cmp.KilledCountByRevisionAuthor['5']['alice'] | Should -Be 1
     }
 
     It 'skips current sparse blame lookup when CurrentRevisionAuthor is provided' {
@@ -2825,11 +2823,8 @@ Describe 'Get-StrictTransitionComparison sparse comparison path' {
         $cmp = Get-StrictTransitionComparison -Context $script:TestContext -TransitionContext $transitionContext -TargetUrl 'https://example.invalid/svn/repo' -Revision 10 -CacheDir 'dummy' -CurrentRevisionAuthor 'bob'
 
         Assert-MockCalled Get-SvnBlameSparseLineByNumber -Times 1 -Exactly
-        @($cmp.KilledLines).Count | Should -Be 1
-        @($cmp.BornLines).Count | Should -Be 1
-        [string]$cmp.KilledLines[0].Line.Author | Should -Be 'alice'
-        [string]$cmp.BornLines[0].Line.Author | Should -Be 'bob'
-        [int]$cmp.BornLines[0].Line.Revision | Should -Be 10
+        [int]$cmp.BornCountCurrentRevision | Should -Be 1
+        [int]$cmp.KilledCountByRevisionAuthor['5']['alice'] | Should -Be 1
     }
 
     It 'falls back to full-content blame comparison when diff line entries are missing' {
@@ -4499,6 +4494,418 @@ Describe 'Resolve-PathByRenameMap - 連鎖解決' {
     It '空のマップでもエラーにならない' {
         $result = Resolve-PathByRenameMap -FilePath 'src/a.cpp' -RenameMap @{}
         $result | Should -Be 'src/a.cpp'
+    }
+}
+
+Describe 'Resolve-AutoParallelWorkerCount' {
+    It 'uses high range rule for >=300 commits' {
+        (Resolve-AutoParallelWorkerCount -CommitCount 300 -CpuCount 32) | Should -Be 24
+        (Resolve-AutoParallelWorkerCount -CommitCount 300 -CpuCount 16) | Should -Be 24
+        (Resolve-AutoParallelWorkerCount -CommitCount 500 -CpuCount 4) | Should -Be 8
+    }
+
+    It 'uses medium range rule for 100-299 commits' {
+        (Resolve-AutoParallelWorkerCount -CommitCount 120 -CpuCount 16) | Should -Be 10
+        (Resolve-AutoParallelWorkerCount -CommitCount 250 -CpuCount 6) | Should -Be 4
+    }
+
+    It 'uses small range rule for <100 commits' {
+        (Resolve-AutoParallelWorkerCount -CommitCount 99 -CpuCount 8) | Should -Be 4
+        (Resolve-AutoParallelWorkerCount -CommitCount 10 -CpuCount 2) | Should -Be 2
+    }
+}
+
+Describe 'Invoke-PipelineLogAndDiffStage parallel decision' {
+    BeforeEach {
+        $script:autoParallelObserved = -1
+        $script:logCommitsForAutoParallel = @(
+            [pscustomobject]@{ Revision = 1; Author = 'alice'; ChangedPaths = @(); ChangedPathsFiltered = @(); FileDiffStats = @{}; FilesChanged = @() }
+        )
+        Mock Invoke-SvnCommand { '<log></log>' }
+        Mock ConvertFrom-SvnLogXml { @($script:logCommitsForAutoParallel) }
+        Mock Initialize-CommitDiffData {
+            param(
+                [hashtable]$Context,
+                [object[]]$Commits,
+                [string]$CacheDir,
+                [string]$TargetUrl,
+                [string[]]$DiffArguments,
+                [string[]]$IncludeExtensions,
+                [string[]]$ExcludeExtensions,
+                [string[]]$IncludePathPatterns,
+                [string[]]$ExcludePathPatterns,
+                [string]$LogPathPrefix,
+                [switch]$ExcludeCommentOnlyLines,
+                [int]$Parallel
+            )
+            [void]$Context
+            [void]$Commits
+            [void]$CacheDir
+            [void]$TargetUrl
+            [void]$DiffArguments
+            [void]$IncludeExtensions
+            [void]$ExcludeExtensions
+            [void]$IncludePathPatterns
+            [void]$ExcludePathPatterns
+            [void]$LogPathPrefix
+            [void]$ExcludeCommentOnlyLines
+            $script:autoParallelObserved = [int]$Parallel
+            return @{}
+        }
+        Mock Get-RenameMap { @{} }
+    }
+
+    It 'auto-selects effective parallel when not explicitly specified' {
+        $script:logCommitsForAutoParallel = @(
+            1..320 | ForEach-Object {
+                [pscustomobject]@{
+                    Revision = $_
+                    Author = 'alice'
+                    ChangedPaths = @()
+                    ChangedPathsFiltered = @()
+                    FileDiffStats = @{}
+                    FilesChanged = @()
+                }
+            }
+        )
+        $executionState = [pscustomobject]@{
+            FromRevision = 1
+            ToRevision = 320
+            TargetUrl = 'https://example.invalid/svn/repo'
+            CacheDir = 'dummy'
+            IncludeExtensions = @()
+            ExcludeExtensions = @()
+            IncludePaths = @()
+            ExcludePaths = @()
+            LogPathPrefix = ''
+            ExcludeCommentOnlyLines = $false
+        }
+        $context = Initialize-StrictModeContext -Context (New-NarutoContext -SvnExecutable 'svn')
+        $stage = Invoke-PipelineLogAndDiffStage -Context $context -ExecutionState $executionState -Parallel 32
+        $expected = Resolve-AutoParallelWorkerCount -CommitCount 320 -CpuCount $([Environment]::ProcessorCount)
+
+        [int]$stage.EffectiveParallel | Should -Be $expected
+        [int]$script:autoParallelObserved | Should -Be $expected
+    }
+
+    It 'honors explicit -Parallel value without auto adjustment' {
+        $script:logCommitsForAutoParallel = @(
+            1..320 | ForEach-Object {
+                [pscustomobject]@{
+                    Revision = $_
+                    Author = 'alice'
+                    ChangedPaths = @()
+                    ChangedPathsFiltered = @()
+                    FileDiffStats = @{}
+                    FilesChanged = @()
+                }
+            }
+        )
+        $executionState = [pscustomobject]@{
+            FromRevision = 1
+            ToRevision = 320
+            TargetUrl = 'https://example.invalid/svn/repo'
+            CacheDir = 'dummy'
+            IncludeExtensions = @()
+            ExcludeExtensions = @()
+            IncludePaths = @()
+            ExcludePaths = @()
+            LogPathPrefix = ''
+            ExcludeCommentOnlyLines = $false
+        }
+        $context = Initialize-StrictModeContext -Context (New-NarutoContext -SvnExecutable 'svn')
+        $stage = Invoke-PipelineLogAndDiffStage -Context $context -ExecutionState $executionState -Parallel 7 -ParallelExplicit
+
+        [int]$stage.EffectiveParallel | Should -Be 7
+        [int]$script:autoParallelObserved | Should -Be 7
+    }
+}
+
+Describe 'Compare-StrictSparseTransitionCountOnly' {
+    It 'matches Compare-BlameOutput -MinimalOutput derived counts' {
+        $previous = @(
+            [pscustomobject]@{ LineNumber = 1; Content = 'x'; Revision = 1; Author = 'alice' },
+            [pscustomobject]@{ LineNumber = 2; Content = 'y'; Revision = 2; Author = 'bob' },
+            [pscustomobject]@{ LineNumber = 3; Content = 'x'; Revision = 1; Author = 'alice' },
+            [pscustomobject]@{ LineNumber = 4; Content = 'z'; Revision = 4; Author = 'dave' }
+        )
+        $current = @(
+            [pscustomobject]@{ LineNumber = 1; Content = 'y'; Revision = 2; Author = 'bob' },
+            [pscustomobject]@{ LineNumber = 2; Content = 'x'; Revision = 1; Author = 'alice' },
+            [pscustomobject]@{ LineNumber = 3; Content = 'new'; Revision = 10; Author = 'carol' },
+            [pscustomobject]@{ LineNumber = 4; Content = 'x'; Revision = 1; Author = 'alice' }
+        )
+
+        $baseline = Compare-BlameOutput -PreviousLines $previous -CurrentLines $current -MinimalOutput
+        $expectedBornCurrentRevision = 0
+        foreach ($born in @($baseline.BornLines))
+        {
+            $bornRev = $null
+            try
+            {
+                $bornRev = [int]$born.Line.Revision
+            }
+            catch
+            {
+                $bornRev = $null
+            }
+            if ($bornRev -eq 10)
+            {
+                $expectedBornCurrentRevision++
+            }
+        }
+        $expectedKilled = @{}
+        foreach ($killed in @($baseline.KilledLines))
+        {
+            $bornRev = $null
+            try
+            {
+                $bornRev = [int]$killed.Line.Revision
+            }
+            catch
+            {
+                $bornRev = $null
+            }
+            if ($null -eq $bornRev)
+            {
+                continue
+            }
+            $bornRevKey = [string]$bornRev
+            if (-not $expectedKilled.ContainsKey($bornRevKey))
+            {
+                $expectedKilled[$bornRevKey] = @{}
+            }
+            $author = Get-NormalizedAuthorName -Author ([string]$killed.Line.Author)
+            if (-not $expectedKilled[$bornRevKey].ContainsKey($author))
+            {
+                $expectedKilled[$bornRevKey][$author] = 0
+            }
+            $expectedKilled[$bornRevKey][$author]++
+        }
+
+        $actual = Compare-StrictSparseTransitionCountOnly -PreviousLines $previous -CurrentLines $current -CurrentRevision 10
+
+        [int]$actual.BornCountCurrentRevision | Should -Be $expectedBornCurrentRevision
+        [int]$actual.MovedPairCount | Should -Be @($baseline.MovedPairs).Count
+
+        $expectedPairs = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($revKey in @($expectedKilled.Keys | Sort-Object))
+        {
+            foreach ($authorKey in @($expectedKilled[$revKey].Keys | Sort-Object))
+            {
+                [void]$expectedPairs.Add(('{0}|{1}|{2}' -f [string]$revKey, [string]$authorKey, [int]$expectedKilled[$revKey][$authorKey]))
+            }
+        }
+        $actualPairs = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($revKey in @($actual.KilledCountByRevisionAuthor.Keys | Sort-Object))
+        {
+            foreach ($authorKey in @($actual.KilledCountByRevisionAuthor[$revKey].Keys | Sort-Object))
+            {
+                [void]$actualPairs.Add(('{0}|{1}|{2}' -f [string]$revKey, [string]$authorKey, [int]$actual.KilledCountByRevisionAuthor[$revKey][$authorKey]))
+            }
+        }
+        @($actualPairs.ToArray()) | Should -Be @($expectedPairs.ToArray())
+    }
+}
+
+Describe 'Get-StrictExecutionContext parallel consistency' {
+    It 'returns identical strict execution context between sequential and parallel modes' {
+        $origDeath = (Get-Item function:Get-StrictDeathDetailOrThrow).ScriptBlock.ToString()
+        $origOwnership = (Get-Item function:Get-StrictOwnershipAggregate).ScriptBlock.ToString()
+        $origModifiedOthers = (Get-Item function:Get-AuthorModifiedOthersSurvivedCount).ScriptBlock.ToString()
+        try
+        {
+            Set-Item -Path function:Get-StrictDeathDetailOrThrow -Value {
+                param(
+                    [hashtable]$Context,
+                    [object[]]$Commits,
+                    [hashtable]$RevToAuthor,
+                    [string]$TargetUrl,
+                    [int]$FromRevision,
+                    [int]$ToRevision,
+                    [string]$CacheDir,
+                    [hashtable]$RenameMap,
+                    [int]$Parallel = 1
+                )
+                [void]$Context
+                [void]$Commits
+                [void]$RevToAuthor
+                [void]$TargetUrl
+                [void]$FromRevision
+                [void]$ToRevision
+                [void]$CacheDir
+                [void]$RenameMap
+                [void]$Parallel
+                $killedOthers = New-Object 'System.Collections.Generic.HashSet[string]'
+                [void]$killedOthers.Add(('10' + [char]31 + 'alice'))
+                [pscustomobject]@{
+                    AuthorSurvived = @{ 'alice' = 10 }
+                    RevsWhereKilledOthers = $killedOthers
+                    KillMatrix = @{}
+                    AuthorSelfDead = @{}
+                    AuthorBorn = @{}
+                }
+            }
+            Set-Item -Path function:Get-StrictOwnershipAggregate -Value {
+                param(
+                    [hashtable]$Context,
+                    [string]$TargetUrl,
+                    [int]$ToRevision,
+                    [string]$CacheDir,
+                    [string[]]$IncludeExtensions,
+                    [string[]]$ExcludeExtensions,
+                    [string[]]$IncludePaths,
+                    [string[]]$ExcludePaths,
+                    [int]$Parallel = 1
+                )
+                [void]$Context
+                [void]$TargetUrl
+                [void]$ToRevision
+                [void]$CacheDir
+                [void]$IncludeExtensions
+                [void]$ExcludeExtensions
+                [void]$IncludePaths
+                [void]$ExcludePaths
+                [void]$Parallel
+                $existingSet = New-Object 'System.Collections.Generic.HashSet[string]'
+                [void]$existingSet.Add('src/a.cs')
+                [pscustomobject]@{
+                    OwnershipTargets = @('src/a.cs')
+                    ExistingFileSet = $existingSet
+                    BlameByFile = @{
+                        'src/a.cs' = [pscustomobject]@{
+                            LineCountTotal = 2
+                            LineCountByAuthor = @{ 'alice' = 2 }
+                            Lines = @()
+                        }
+                    }
+                    AuthorOwned = @{ 'alice' = 2 }
+                    OwnedTotal = 2
+                }
+            }
+            Set-Item -Path function:Get-AuthorModifiedOthersSurvivedCount -Value {
+                param([hashtable]$BlameByFile, [System.Collections.Generic.HashSet[string]]$RevsWhereKilledOthers, [int]$FromRevision, [int]$ToRevision)
+                [void]$BlameByFile
+                [void]$RevsWhereKilledOthers
+                [void]$FromRevision
+                [void]$ToRevision
+                @{ 'alice' = 1 }
+            }
+
+            $commits = @(
+                [pscustomobject]@{
+                    Revision = 10
+                    Author = 'alice'
+                    ChangedPaths = @()
+                    ChangedPathsFiltered = @()
+                    FileDiffStats = @{}
+                    FilesChanged = @()
+                }
+            )
+            $contextSeq = Initialize-StrictModeContext -Context (New-NarutoContext -SvnExecutable 'svn')
+            $contextPar = Initialize-StrictModeContext -Context (New-NarutoContext -SvnExecutable 'svn')
+            $revToAuthor = @{ 10 = 'alice' }
+
+            $seq = Get-StrictExecutionContext -Context $contextSeq -Commits $commits -RevToAuthor $revToAuthor -TargetUrl 'https://example.invalid/svn/repo' -FromRevision 1 -ToRevision 10 -CacheDir 'dummy' -IncludeExtensions @() -ExcludeExtensions @() -IncludePaths @() -ExcludePaths @() -Parallel 1 -RenameMap @{}
+            $par = Get-StrictExecutionContext -Context $contextPar -Commits $commits -RevToAuthor $revToAuthor -TargetUrl 'https://example.invalid/svn/repo' -FromRevision 1 -ToRevision 10 -CacheDir 'dummy' -IncludeExtensions @() -ExcludeExtensions @() -IncludePaths @() -ExcludePaths @() -Parallel 8 -RenameMap @{}
+
+            ($seq | ConvertTo-Json -Depth 20 -Compress) | Should -Be ($par | ConvertTo-Json -Depth 20 -Compress)
+        }
+        finally
+        {
+            Set-Item -Path function:Get-StrictDeathDetailOrThrow -Value $origDeath
+            Set-Item -Path function:Get-StrictOwnershipAggregate -Value $origOwnership
+            Set-Item -Path function:Get-AuthorModifiedOthersSurvivedCount -Value $origModifiedOthers
+        }
+    }
+}
+
+Describe 'Get-StrictHunkOverlapSummary consistency' {
+    It 'matches brute-force reference aggregation' {
+        $events = New-Object 'System.Collections.Generic.List[object]'
+        [void]$events.Add([pscustomobject]@{ Revision = 1; Author = 'alice'; Start = 1; End = 3 })
+        [void]$events.Add([pscustomobject]@{ Revision = 2; Author = 'bob'; Start = 2; End = 4 })
+        [void]$events.Add([pscustomobject]@{ Revision = 3; Author = 'alice'; Start = 3; End = 5 })
+        [void]$events.Add([pscustomobject]@{ Revision = 4; Author = 'charlie'; Start = 1; End = 2 })
+        [void]$events.Add([pscustomobject]@{ Revision = 5; Author = 'alice'; Start = 4; End = 6 })
+        $eventsByFile = @{ 'src/a.cs' = $events }
+
+        $reference = & {
+            param([hashtable]$EventsByFile)
+            $authorRepeated = @{}
+            $fileRepeated = @{}
+            $authorPingPong = @{}
+            $filePingPong = @{}
+            foreach ($file in $EventsByFile.Keys)
+            {
+                $fileEvents = @($EventsByFile[$file].ToArray() | Sort-Object Revision)
+                for ($i = 0; $i -lt $fileEvents.Count; $i++)
+                {
+                    for ($j = $i + 1; $j -lt $fileEvents.Count; $j++)
+                    {
+                        if ([string]$fileEvents[$i].Author -ne [string]$fileEvents[$j].Author)
+                        {
+                            continue
+                        }
+                        if ([int]$fileEvents[$i].Start -le [int]$fileEvents[$j].End -and [int]$fileEvents[$j].Start -le [int]$fileEvents[$i].End)
+                        {
+                            Add-Count -Table $authorRepeated -Key ([string]$fileEvents[$i].Author)
+                            Add-Count -Table $fileRepeated -Key $file
+                        }
+                    }
+                }
+                for ($i = 0; $i -lt ($fileEvents.Count - 2); $i++)
+                {
+                    for ($j = $i + 1; $j -lt ($fileEvents.Count - 1); $j++)
+                    {
+                        if ([string]$fileEvents[$i].Author -eq [string]$fileEvents[$j].Author)
+                        {
+                            continue
+                        }
+                        if (-not ([int]$fileEvents[$i].Start -le [int]$fileEvents[$j].End -and [int]$fileEvents[$j].Start -le [int]$fileEvents[$i].End))
+                        {
+                            continue
+                        }
+                        $abStart = [Math]::Max([int]$fileEvents[$i].Start, [int]$fileEvents[$j].Start)
+                        $abEnd = [Math]::Min([int]$fileEvents[$i].End, [int]$fileEvents[$j].End)
+                        for ($k = $j + 1; $k -lt $fileEvents.Count; $k++)
+                        {
+                            if ([string]$fileEvents[$k].Author -ne [string]$fileEvents[$i].Author)
+                            {
+                                continue
+                            }
+                            if ($abStart -le [int]$fileEvents[$k].End -and [int]$fileEvents[$k].Start -le $abEnd)
+                            {
+                                Add-Count -Table $authorPingPong -Key ([string]$fileEvents[$i].Author)
+                                Add-Count -Table $filePingPong -Key $file
+                            }
+                        }
+                    }
+                }
+            }
+            [pscustomobject]@{
+                AuthorRepeatedHunk = $authorRepeated
+                AuthorPingPong = $authorPingPong
+                FileRepeatedHunk = $fileRepeated
+                FilePingPong = $filePingPong
+            }
+        } $eventsByFile
+
+        $actual = Get-StrictHunkOverlapSummary -EventsByFile $eventsByFile
+        $toPairs = {
+            param([hashtable]$Table)
+            $pairs = New-Object 'System.Collections.Generic.List[string]'
+            foreach ($key in @($Table.Keys | Sort-Object))
+            {
+                [void]$pairs.Add(('{0}={1}' -f [string]$key, [int]$Table[$key]))
+            }
+            @($pairs.ToArray())
+        }
+
+        @(& $toPairs $actual.AuthorRepeatedHunk) | Should -Be @(& $toPairs $reference.AuthorRepeatedHunk)
+        @(& $toPairs $actual.AuthorPingPong) | Should -Be @(& $toPairs $reference.AuthorPingPong)
+        @(& $toPairs $actual.FileRepeatedHunk) | Should -Be @(& $toPairs $reference.FileRepeatedHunk)
+        @(& $toPairs $actual.FilePingPong) | Should -Be @(& $toPairs $reference.FilePingPong)
     }
 }
 

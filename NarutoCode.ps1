@@ -40,7 +40,7 @@
     svn コマンドに --trust-server-cert を付与し、SSL 証明書の検証をスキップする。
     自己署名証明書の SVN サーバーに接続する場合に使用する。
 .PARAMETER Parallel
-    並列実行するワーカー数の上限。デフォルトは CPU コア数（最大32）。
+    並列実行するワーカー数の上限。未指定時はコミット件数と CPU コア数から内部で自動決定する。
     svn diff / blame の取得を並列化して高速化する。1 を指定すると逐次実行になる。
 .PARAMETER IncludePaths
     解析対象に含めるパスパターンの配列（ワイルドカード対応）。
@@ -1422,6 +1422,54 @@ function Add-Count
 }
 # endregion 数値と書式
 # region 並列実行
+function Write-NarutoProgress
+{
+    <#
+    .SYNOPSIS
+        高頻度ループ向けに Write-Progress の更新頻度を制御する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    param(
+        [int]$Id,
+        [string]$Activity,
+        [string]$Status = '',
+        [int]$PercentComplete = 0,
+        [switch]$Completed,
+        [ValidateRange(1, 100)][int]$PercentStep = 2
+    )
+    $progressStateVar = Get-Variable -Scope Script -Name NarutoProgressState -ErrorAction SilentlyContinue
+    if ($null -eq $progressStateVar -or $null -eq $progressStateVar.Value -or $progressStateVar.Value -isnot [hashtable])
+    {
+        $script:NarutoProgressState = @{}
+    }
+    $progressState = $script:NarutoProgressState
+    $stateKey = ([string]$Id + [char]31 + [string]$Activity)
+    if ($Completed)
+    {
+        Write-Progress -Id $Id -Activity $Activity -Completed
+        if ($progressState.ContainsKey($stateKey))
+        {
+            [void]$progressState.Remove($stateKey)
+        }
+        return
+    }
+
+    $percent = [Math]::Min(100, [Math]::Max(0, [int]$PercentComplete))
+    $shouldUpdate = $true
+    if ($progressState.ContainsKey($stateKey))
+    {
+        $lastPercent = [int]$progressState[$stateKey]
+        $shouldUpdate = (($percent - $lastPercent) -ge $PercentStep -or $percent -eq 100 -or $percent -eq 0)
+    }
+    if (-not $shouldUpdate)
+    {
+        return
+    }
+
+    Write-Progress -Id $Id -Activity $Activity -Status $Status -PercentComplete $percent
+    $progressState[$stateKey] = $percent
+}
 function Invoke-ParallelWorkSequentialCore
 {
     <#
@@ -1442,7 +1490,7 @@ function Invoke-ParallelWorkSequentialCore
         $i++)
     {
         $pct = [Math]::Min(100, [int](($i / $Items.Count) * 100))
-        Write-Progress -Id $ProgressId -Activity $ErrorContext -Status ('{0}/{1}' -f ($i + 1), $Items.Count) -PercentComplete $pct
+        Write-NarutoProgress -Id $ProgressId -Activity $ErrorContext -Status ('{0}/{1}' -f ($i + 1), $Items.Count) -PercentComplete $pct
         try
         {
             [void]$sequentialResults.Add((& $WorkerScript -Item $Items[$i] -Index $i))
@@ -1455,7 +1503,7 @@ function Invoke-ParallelWorkSequentialCore
             } -InnerException $_.Exception
         }
     }
-    Write-Progress -Id $ProgressId -Activity $ErrorContext -Completed
+    Write-NarutoProgress -Id $ProgressId -Activity $ErrorContext -Completed
     return @($sequentialResults.ToArray())
 }
 function Invoke-ParallelWorkRunspaceCore
@@ -1500,7 +1548,7 @@ function Invoke-ParallelWorkRunspaceCore
             }
 
             $pct = [Math]::Min(100, [int](($jobDone / [Math]::Max(1, $jobTotal)) * 100))
-            Write-Progress -Id $ProgressId -Activity $ErrorContext -Status ('{0}/{1}' -f ($jobDone + 1), $jobTotal) -PercentComplete $pct
+            Write-NarutoProgress -Id $ProgressId -Activity $ErrorContext -Status ('{0}/{1}' -f ($jobDone + 1), $jobTotal) -PercentComplete $pct
             if ($jobs.Count -eq 0)
             {
                 continue
@@ -1522,7 +1570,7 @@ function Invoke-ParallelWorkRunspaceCore
             }
             $jobDone++
         }
-        Write-Progress -Id $ProgressId -Activity $ErrorContext -Completed
+        Write-NarutoProgress -Id $ProgressId -Activity $ErrorContext -Completed
     }
     catch
     {
@@ -1905,7 +1953,18 @@ function ConvertTo-PathKey
     {
         return ''
     }
-    $x = $Path.Trim() -replace '\\', '/'
+    $pathKeyCacheVar = Get-Variable -Scope Script -Name NarutoPathKeyCache -ErrorAction SilentlyContinue
+    if ($null -eq $pathKeyCacheVar -or $null -eq $pathKeyCacheVar.Value -or $pathKeyCacheVar.Value -isnot [hashtable])
+    {
+        $script:NarutoPathKeyCache = @{}
+    }
+    $pathKeyCache = $script:NarutoPathKeyCache
+    $cacheKey = [string]$Path
+    if ($pathKeyCache.ContainsKey($cacheKey))
+    {
+        return [string]$pathKeyCache[$cacheKey]
+    }
+    $x = $cacheKey.Trim() -replace '\\', '/'
     if ($x -match '^[a-zA-Z]+://')
     {
         $x = ([Uri]$x).AbsolutePath
@@ -1915,7 +1974,12 @@ function ConvertTo-PathKey
     {
         $x = $x.Substring(2)
     }
-    return $x
+    if ($pathKeyCache.Count -ge 131072)
+    {
+        $pathKeyCache.Clear()
+    }
+    $pathKeyCache[$cacheKey] = [string]$x
+    return [string]$x
 }
 function Get-Sha1Hex
 {
@@ -1969,7 +2033,24 @@ function Get-PathCacheHash
         パス文字列からキャッシュファイル名用ハッシュを生成する。
     #>
     param([Parameter(Mandatory = $true)][hashtable]$Context, [string]$FilePath)
-    return Get-Sha1Hex -Context $Context -Text (ConvertTo-PathKey -Path $FilePath)
+    $normalizedPath = ConvertTo-PathKey -Path $FilePath
+    $pathHashCacheVar = Get-Variable -Scope Script -Name NarutoPathHashCache -ErrorAction SilentlyContinue
+    if ($null -eq $pathHashCacheVar -or $null -eq $pathHashCacheVar.Value -or $pathHashCacheVar.Value -isnot [hashtable])
+    {
+        $script:NarutoPathHashCache = @{}
+    }
+    $pathHashCache = $script:NarutoPathHashCache
+    if ($pathHashCache.ContainsKey($normalizedPath))
+    {
+        return [string]$pathHashCache[$normalizedPath]
+    }
+    $pathHash = Get-Sha1Hex -Context $Context -Text $normalizedPath
+    if ($pathHashCache.Count -ge 131072)
+    {
+        $pathHashCache.Clear()
+    }
+    $pathHashCache[$normalizedPath] = [string]$pathHash
+    return [string]$pathHash
 }
 function Get-BlameCachePath
 {
@@ -3464,54 +3545,61 @@ function Get-SvnUnifiedDiffHeaderSectionList
 
     $sections = [System.Collections.Generic.List[object]]::new()
     $currentSection = $null
-    $lines = $DiffText -split "`r?`n"
-    foreach ($line in $lines)
+    $reader = New-Object System.IO.StringReader($DiffText)
+    try
     {
-        if ($line -like 'Index: *')
+        while ($null -ne ($line = $reader.ReadLine()))
         {
-            if ($null -ne $currentSection)
+            if ($line -like 'Index: *')
             {
-                [void]$sections.Add($currentSection)
-            }
-            $indexPath = ConvertTo-PathKey -Path $line.Substring(7).Trim()
-            if ([string]::IsNullOrWhiteSpace($indexPath))
-            {
-                $currentSection = $null
+                if ($null -ne $currentSection)
+                {
+                    [void]$sections.Add($currentSection)
+                }
+                $indexPath = ConvertTo-PathKey -Path $line.Substring(7).Trim()
+                if ([string]::IsNullOrWhiteSpace($indexPath))
+                {
+                    $currentSection = $null
+                    continue
+                }
+                $currentSection = [pscustomobject]@{
+                    IndexPath = $indexPath
+                    OldPath = $null
+                    OldRevision = $null
+                    NewPath = $null
+                    NewRevision = $null
+                }
                 continue
             }
-            $currentSection = [pscustomobject]@{
-                IndexPath = $indexPath
-                OldPath = $null
-                OldRevision = $null
-                NewPath = $null
-                NewRevision = $null
-            }
-            continue
-        }
-        if ($null -eq $currentSection)
-        {
-            continue
-        }
-        if ($line -like '--- *')
-        {
-            $oldHeader = ConvertFrom-SvnUnifiedDiffPathHeader -Line $line
-            if ($null -ne $oldHeader)
+            if ($null -eq $currentSection)
             {
-                $currentSection.OldPath = $oldHeader.Path
-                $currentSection.OldRevision = $oldHeader.Revision
+                continue
             }
-            continue
-        }
-        if ($line -like '+++ *')
-        {
-            $newHeader = ConvertFrom-SvnUnifiedDiffPathHeader -Line $line
-            if ($null -ne $newHeader)
+            if ($line -like '--- *')
             {
-                $currentSection.NewPath = $newHeader.Path
-                $currentSection.NewRevision = $newHeader.Revision
+                $oldHeader = ConvertFrom-SvnUnifiedDiffPathHeader -Line $line
+                if ($null -ne $oldHeader)
+                {
+                    $currentSection.OldPath = $oldHeader.Path
+                    $currentSection.OldRevision = $oldHeader.Revision
+                }
+                continue
             }
-            continue
+            if ($line -like '+++ *')
+            {
+                $newHeader = ConvertFrom-SvnUnifiedDiffPathHeader -Line $line
+                if ($null -ne $newHeader)
+                {
+                    $currentSection.NewPath = $newHeader.Path
+                    $currentSection.NewRevision = $newHeader.Revision
+                }
+                continue
+            }
         }
+    }
+    finally
+    {
+        $reader.Dispose()
     }
     if ($null -ne $currentSection)
     {
@@ -3579,14 +3667,25 @@ function New-SvnUnifiedDiffFileStat
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
     [CmdletBinding()]
     [OutputType([object])]
-    param()
+    param(
+        [int]$DetailLevel = 0,
+        [switch]$SkipHashComputation
+    )
+    $addedLineHashes = @()
+    $deletedLineHashes = @()
+    if ($DetailLevel -ge 1 -and -not [bool]$SkipHashComputation)
+    {
+        $addedLineHashes = New-Object 'System.Collections.Generic.List[string]'
+        $deletedLineHashes = New-Object 'System.Collections.Generic.List[string]'
+    }
     return [pscustomobject]@{
         AddedLines = 0
         DeletedLines = 0
         Hunks = (New-Object 'System.Collections.Generic.List[object]')
         IsBinary = $false
-        AddedLineHashes = (New-Object 'System.Collections.Generic.List[string]')
-        DeletedLineHashes = (New-Object 'System.Collections.Generic.List[string]')
+        HasDiffLineEntry = $false
+        AddedLineHashes = $addedLineHashes
+        DeletedLineHashes = $deletedLineHashes
     }
 }
 function Complete-SvnUnifiedDiffCurrentHunk
@@ -3664,6 +3763,10 @@ function Complete-SvnUnifiedDiffCurrentHunk
     }
     $ParseState.CurrentHunk.AddedLineEntries = $addedLineEntries
     $ParseState.CurrentHunk.DeletedLineEntries = $deletedLineEntries
+    if ($null -ne $ParseState.Current -and @($addedLineEntries).Count -gt 0 -and @($deletedLineEntries).Count -gt 0)
+    {
+        $ParseState.Current.HasDiffLineEntry = $true
+    }
 }
 function Reset-SvnUnifiedDiffCurrentHunkState
 {
@@ -3700,7 +3803,7 @@ function Start-SvnUnifiedDiffFileSection
     {
         if (-not $ParseState.Result.ContainsKey($file))
         {
-            $ParseState.Result[$file] = New-SvnUnifiedDiffFileStat
+            $ParseState.Result[$file] = New-SvnUnifiedDiffFileStat -DetailLevel ([int]$ParseState.DetailLevel) -SkipHashComputation:$([bool]$ParseState.SkipHashComputation)
         }
         $ParseState.Current = $ParseState.Result[$file]
         $ParseState.CurrentFile = $file
@@ -3792,8 +3895,16 @@ function Start-SvnUnifiedDiffHunkSection
             $ParseState.HunkAddedHashes = New-Object 'System.Collections.Generic.List[string]'
             $ParseState.HunkDeletedHashes = New-Object 'System.Collections.Generic.List[string]'
         }
-        $ParseState.HunkAddedLineEntries = New-Object 'System.Collections.Generic.List[string]'
-        $ParseState.HunkDeletedLineEntries = New-Object 'System.Collections.Generic.List[string]'
+        if ($ParseState.CurrentCaptureLineEntries)
+        {
+            $ParseState.HunkAddedLineEntries = New-Object 'System.Collections.Generic.List[string]'
+            $ParseState.HunkDeletedLineEntries = New-Object 'System.Collections.Generic.List[string]'
+        }
+        else
+        {
+            $ParseState.HunkAddedLineEntries = $null
+            $ParseState.HunkDeletedLineEntries = $null
+        }
     }
     else
     {
@@ -3813,7 +3924,19 @@ function Test-SvnUnifiedDiffBinaryMarker
     [CmdletBinding()]
     [OutputType([bool])]
     param([string]$Line)
-    if ($Line -match '^Cannot display: file marked as a binary type\.' -or $Line -match '^Binary files .* differ' -or $Line -match '(?i)mime-type\s*=\s*application/octet-stream')
+    if ([string]::IsNullOrEmpty($Line))
+    {
+        return $false
+    }
+    if ($Line.StartsWith('Cannot display: file marked as a binary type.'))
+    {
+        return $true
+    }
+    if ($Line.StartsWith('Binary files ') -and $Line.EndsWith(' differ'))
+    {
+        return $true
+    }
+    if ($Line.IndexOf('mime-type', [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -and $Line.IndexOf('application/octet-stream', [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
     {
         return $true
     }
@@ -3866,20 +3989,25 @@ function Update-SvnUnifiedDiffLineStat
             $ParseState.Current.AddedLines++
             if ($ParseState.DetailLevel -ge 1 -and $null -ne $ParseState.CurrentFile)
             {
-                $content = $Line.Substring(1)
-                if (-not [bool]$ParseState.SkipHashComputation)
+                $needHash = (-not [bool]$ParseState.SkipHashComputation)
+                $needLineEntry = ($ParseState.CurrentCaptureLineEntries -and $null -ne $ParseState.HunkAddedLineEntries)
+                if ($needHash -or $needLineEntry)
                 {
-                    $hashValue = ConvertTo-LineHash -Context $ParseState.Context -FilePath $ParseState.CurrentFile -Content $content
-                    $ParseState.Current.AddedLineHashes.Add($hashValue)
-                    if ($null -ne $ParseState.HunkAddedHashes)
+                    $content = $Line.Substring(1)
+                    if ($needHash)
                     {
-                        $ParseState.HunkAddedHashes.Add($hashValue)
+                        $hashValue = ConvertTo-LineHash -Context $ParseState.Context -FilePath $ParseState.CurrentFile -Content $content
+                        $ParseState.Current.AddedLineHashes.Add($hashValue)
+                        if ($null -ne $ParseState.HunkAddedHashes)
+                        {
+                            $ParseState.HunkAddedHashes.Add($hashValue)
+                        }
                     }
-                }
-                if ($ParseState.CurrentCaptureLineEntries -and $null -ne $ParseState.HunkAddedLineEntries)
-                {
-                    $entryToken = ([string][int]$ParseState.CurrentNewCursor) + [string][char]31 + [string]$content
-                    [void]$ParseState.HunkAddedLineEntries.Add($entryToken)
+                    if ($needLineEntry)
+                    {
+                        $entryToken = ([string][int]$ParseState.CurrentNewCursor) + [string][char]31 + [string]$content
+                        [void]$ParseState.HunkAddedLineEntries.Add($entryToken)
+                    }
                 }
             }
             if ([bool]$ParseState.ExcludeCommentOnlyLines)
@@ -3923,20 +4051,25 @@ function Update-SvnUnifiedDiffLineStat
             $ParseState.Current.DeletedLines++
             if ($ParseState.DetailLevel -ge 1 -and $null -ne $ParseState.CurrentFile)
             {
-                $content = $Line.Substring(1)
-                if (-not [bool]$ParseState.SkipHashComputation)
+                $needHash = (-not [bool]$ParseState.SkipHashComputation)
+                $needLineEntry = ($ParseState.CurrentCaptureLineEntries -and $null -ne $ParseState.HunkDeletedLineEntries)
+                if ($needHash -or $needLineEntry)
                 {
-                    $hashValue = ConvertTo-LineHash -Context $ParseState.Context -FilePath $ParseState.CurrentFile -Content $content
-                    $ParseState.Current.DeletedLineHashes.Add($hashValue)
-                    if ($null -ne $ParseState.HunkDeletedHashes)
+                    $content = $Line.Substring(1)
+                    if ($needHash)
                     {
-                        $ParseState.HunkDeletedHashes.Add($hashValue)
+                        $hashValue = ConvertTo-LineHash -Context $ParseState.Context -FilePath $ParseState.CurrentFile -Content $content
+                        $ParseState.Current.DeletedLineHashes.Add($hashValue)
+                        if ($null -ne $ParseState.HunkDeletedHashes)
+                        {
+                            $ParseState.HunkDeletedHashes.Add($hashValue)
+                        }
                     }
-                }
-                if ($ParseState.CurrentCaptureLineEntries -and $null -ne $ParseState.HunkDeletedLineEntries)
-                {
-                    $entryToken = ([string][int]$ParseState.CurrentOldCursor) + [string][char]31 + [string]$content
-                    [void]$ParseState.HunkDeletedLineEntries.Add($entryToken)
+                    if ($needLineEntry)
+                    {
+                        $entryToken = ([string][int]$ParseState.CurrentOldCursor) + [string][char]31 + [string]$content
+                        [void]$ParseState.HunkDeletedLineEntries.Add($entryToken)
+                    }
                 }
             }
             if ([bool]$ParseState.ExcludeCommentOnlyLines)
@@ -4036,48 +4169,55 @@ function ConvertFrom-SvnUnifiedDiff
         return @{}
     }
     $parseState = New-SvnUnifiedDiffParseState -Context $Context -DetailLevel $DetailLevel -ExcludeCommentOnlyLines:$ExcludeCommentOnlyLines -LineMaskByPath $LineMaskByPath -SkipHashComputation:$SkipHashComputation -LineEntryPathSet $LineEntryPathSet
-    $lines = $DiffText -split "`r?`n"
-    foreach ($line in $lines)
+    $reader = New-Object System.IO.StringReader($DiffText)
+    try
     {
-        # ファイル境界を先に確定し、前hunkの確定漏れを防ぐ。
-        if ($line -like 'Index: *')
+        while ($null -ne ($line = $reader.ReadLine()))
         {
-            Start-SvnUnifiedDiffFileSection -ParseState $parseState -Line $line
-            continue
-        }
-        if ($null -eq $parseState.Current)
-        {
-            continue
-        }
-        # hunk単位で位置情報を持ち、後段の行追跡精度を担保する。
-        if ($line -match '^@@\s*-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s*@@')
-        {
-            $oldCount = if ($Matches[2])
+            # ファイル境界を先に確定し、前hunkの確定漏れを防ぐ。
+            if ($line -like 'Index: *')
             {
-                [int]$Matches[2]
+                Start-SvnUnifiedDiffFileSection -ParseState $parseState -Line $line
+                continue
             }
-            else
+            if ($null -eq $parseState.Current)
             {
-                1
+                continue
             }
-            $newCount = if ($Matches[4])
+            # hunk 行以外へ正規表現を適用しない。
+            if ($line.Length -ge 2 -and $line[0] -eq '@' -and $line[1] -eq '@' -and $line -match '^@@\s*-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s*@@')
             {
-                [int]$Matches[4]
+                $oldCount = if ($Matches[2])
+                {
+                    [int]$Matches[2]
+                }
+                else
+                {
+                    1
+                }
+                $newCount = if ($Matches[4])
+                {
+                    [int]$Matches[4]
+                }
+                else
+                {
+                    1
+                }
+                Start-SvnUnifiedDiffHunkSection -ParseState $parseState -OldStart ([int]$Matches[1]) -OldCount $oldCount -NewStart ([int]$Matches[3]) -NewCount $newCount
+                continue
             }
-            else
+            # バイナリは行追跡不能なため早期にテキスト解析対象から外す。
+            if (Test-SvnUnifiedDiffBinaryMarker -Line $line)
             {
-                1
+                $parseState.Current.IsBinary = $true
+                continue
             }
-            Start-SvnUnifiedDiffHunkSection -ParseState $parseState -OldStart ([int]$Matches[1]) -OldCount $oldCount -NewStart ([int]$Matches[3]) -NewCount $newCount
-            continue
+            Update-SvnUnifiedDiffLineStat -ParseState $parseState -Line $line
         }
-        # バイナリは行追跡不能なため早期にテキスト解析対象から外す。
-        if (Test-SvnUnifiedDiffBinaryMarker -Line $line)
-        {
-            $parseState.Current.IsBinary = $true
-            continue
-        }
-        Update-SvnUnifiedDiffLineStat -ParseState $parseState -Line $line
+    }
+    finally
+    {
+        $reader.Dispose()
     }
     Complete-SvnUnifiedDiffCurrentHunk -ParseState $parseState
     return $parseState.Result
@@ -5684,6 +5824,68 @@ function Get-BlameMovedPairList
     }
     return @($movedPairs.ToArray())
 }
+function Get-BlameMovedPairCount
+{
+    <#
+    .SYNOPSIS
+        identity キー一致の移動行数のみを算出する。
+    .PARAMETER State
+        New-BlameCompareState で生成した共有状態 DTO。
+    .PARAMETER PreviousIdentity
+        Previous 側の identity キー配列。
+    .PARAMETER CurrentIdentity
+        Current 側の identity キー配列。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    [OutputType([int])]
+    param(
+        [hashtable]$State,
+        [string[]]$PreviousIdentity,
+        [string[]]$CurrentIdentity
+    )
+    $unmatchedPrevByKey = @{}
+    for ($pi = 0
+        $pi -lt $PreviousIdentity.Count
+        $pi++)
+    {
+        if ($State.PreviousMatched[$pi])
+        {
+            continue
+        }
+        $key = $PreviousIdentity[$pi]
+        if (-not $unmatchedPrevByKey.ContainsKey($key))
+        {
+            $unmatchedPrevByKey[$key] = New-Object 'System.Collections.Generic.Queue[int]'
+        }
+        [void]$unmatchedPrevByKey[$key].Enqueue($pi)
+    }
+
+    $movedCount = 0
+    for ($ci = 0
+        $ci -lt $CurrentIdentity.Count
+        $ci++)
+    {
+        if ($State.CurrentMatched[$ci])
+        {
+            continue
+        }
+        $key = $CurrentIdentity[$ci]
+        if (-not $unmatchedPrevByKey.ContainsKey($key))
+        {
+            continue
+        }
+        $queue = $unmatchedPrevByKey[$key]
+        if ($queue.Count -le 0)
+        {
+            continue
+        }
+        $prevIdx = [int]$queue.Dequeue()
+        Add-BlameMatchedPair -State $State -PrevIndex $prevIdx -CurrIndex $ci -MatchType 'Move'
+        $movedCount++
+    }
+    return [int]$movedCount
+}
 function Get-BlameUnmatchedLineList
 {
     <#
@@ -6053,6 +6255,7 @@ function Get-StrictHunkEventsByFile
     )
     $offsetByFile = @{}
     $eventsByFile = @{}
+    $resolvedPathBySourcePath = @{}
     foreach ($commit in @($Commits | Sort-Object Revision))
     {
         $revision = [int]$commit.Revision
@@ -6080,7 +6283,16 @@ function Get-StrictHunkEventsByFile
             {
                 continue
             }
-            $resolvedPath = Resolve-PathByRenameMap -Context $Context -FilePath $filePath -RenameMap $RenameMap
+            $sourcePathKey = [string]$filePath
+            if ($resolvedPathBySourcePath.ContainsKey($sourcePathKey))
+            {
+                $resolvedPath = [string]$resolvedPathBySourcePath[$sourcePathKey]
+            }
+            else
+            {
+                $resolvedPath = Resolve-PathByRenameMap -Context $Context -FilePath $sourcePathKey -RenameMap $RenameMap
+                $resolvedPathBySourcePath[$sourcePathKey] = [string]$resolvedPath
+            }
             if ([string]::IsNullOrWhiteSpace($resolvedPath))
             {
                 continue
@@ -6118,6 +6330,38 @@ function Test-StrictHunkRangeOverlap
     )
     return ($StartA -le $EndB -and $StartB -le $EndA)
 }
+function Get-FirstIntIndexGreaterThan
+{
+    <#
+    .SYNOPSIS
+        昇順 int 配列から指定値を超える最初のインデックスを返す。
+    #>
+    [CmdletBinding()]
+    [OutputType([int])]
+    param(
+        [int[]]$SortedValues,
+        [int]$Value
+    )
+    if ($null -eq $SortedValues -or $SortedValues.Length -le 0)
+    {
+        return 0
+    }
+    $low = 0
+    $high = $SortedValues.Length
+    while ($low -lt $high)
+    {
+        $mid = $low + [int](($high - $low) / 2)
+        if ([int]$SortedValues[$mid] -le $Value)
+        {
+            $low = $mid + 1
+        }
+        else
+        {
+            $high = $mid
+        }
+    }
+    return [int]$low
+}
 function Get-StrictHunkOverlapSummary
 {
     <#
@@ -6135,10 +6379,16 @@ function Get-StrictHunkOverlapSummary
     {
         $events = @($EventsByFile[$file].ToArray() | Sort-Object Revision)
         $evtCount = $events.Count
+        if ($evtCount -le 1)
+        {
+            continue
+        }
+
         # 属性を配列にバラしてプロパティアクセスを減らす。
         $evtAuthor = New-Object 'string[]' $evtCount
         $evtStart = New-Object 'int[]' $evtCount
         $evtEnd = New-Object 'int[]' $evtCount
+        $indicesByAuthor = @{}
         for ($x = 0
             $x -lt $evtCount
             $x++)
@@ -6146,84 +6396,118 @@ function Get-StrictHunkOverlapSummary
             $evtAuthor[$x] = [string]$events[$x].Author
             $evtStart[$x] = [int]$events[$x].Start
             $evtEnd[$x] = [int]$events[$x].End
-        }
-        # 同一作者の重なりを数え、反復編集の密度を可視化するため。
-        for ($i = 0
-            $i -lt $evtCount
-            $i++)
-        {
-            $a1 = $evtAuthor[$i]
-            $s1 = $evtStart[$i]
-            $e1 = $evtEnd[$i]
-            for ($j = $i + 1
-                $j -lt $evtCount
-                $j++)
+            if (-not $indicesByAuthor.ContainsKey($evtAuthor[$x]))
             {
-                if ($a1 -ne $evtAuthor[$j])
+                $indicesByAuthor[$evtAuthor[$x]] = New-Object 'System.Collections.Generic.List[int]'
+            }
+            [void]$indicesByAuthor[$evtAuthor[$x]].Add($x)
+        }
+
+        # 同一作者の重なりは作者ごとの開始点ソートで数える。
+        $fileRepeatedCount = 0
+        $authorIndexArrayByAuthor = @{}
+        foreach ($authorKey in @($indicesByAuthor.Keys))
+        {
+            $authorIndexes = @($indicesByAuthor[$authorKey].ToArray())
+            $authorIndexArrayByAuthor[$authorKey] = [int[]]$authorIndexes
+            if ($authorIndexes.Count -le 1)
+            {
+                continue
+            }
+            $sortedAuthorIndexes = @(
+                $authorIndexes |
+                    Sort-Object @{ Expression = { [int]$evtStart[$_] } }, @{ Expression = { [int]$evtEnd[$_] } }
+            )
+            $authorRepeatedCount = 0
+            for ($i = 0
+                $i -lt $sortedAuthorIndexes.Count
+                $i++)
+            {
+                $eventIndexI = [int]$sortedAuthorIndexes[$i]
+                $s1 = [int]$evtStart[$eventIndexI]
+                $e1 = [int]$evtEnd[$eventIndexI]
+                for ($j = $i + 1
+                    $j -lt $sortedAuthorIndexes.Count
+                    $j++)
                 {
-                    continue
-                }
-                if ($s1 -le $evtEnd[$j] -and $evtStart[$j] -le $e1)
-                {
-                    Add-Count -Table $authorRepeated -Key $a1
-                    Add-Count -Table $fileRepeated -Key $file
+                    $eventIndexJ = [int]$sortedAuthorIndexes[$j]
+                    $s2 = [int]$evtStart[$eventIndexJ]
+                    if ($s2 -gt $e1)
+                    {
+                        break
+                    }
+                    if ([int]$evtEnd[$eventIndexJ] -ge $s1)
+                    {
+                        $authorRepeatedCount++
+                    }
                 }
             }
+            if ($authorRepeatedCount -gt 0)
+            {
+                Add-Count -Table $authorRepeated -Key ([string]$authorKey) -Delta $authorRepeatedCount
+                $fileRepeatedCount += $authorRepeatedCount
+            }
         }
-        # A→B→A の往復を重なり範囲で絞り、偶然一致を減らすため。
+        if ($fileRepeatedCount -gt 0)
+        {
+            Add-Count -Table $fileRepeated -Key $file -Delta $fileRepeatedCount
+        }
+
+        # A→B→A は同一作者インデックスへ二分探索で絞って数える。
+        $filePingPongCount = 0
         for ($i = 0
             $i -lt ($evtCount - 2)
             $i++)
         {
-            $a1 = $evtAuthor[$i]
-            $s1 = $evtStart[$i]
-            $e1 = $evtEnd[$i]
+            $a1 = [string]$evtAuthor[$i]
+            if (-not $authorIndexArrayByAuthor.ContainsKey($a1))
+            {
+                continue
+            }
+            $authorIndexes = [int[]]$authorIndexArrayByAuthor[$a1]
+            if ($authorIndexes.Count -le 1)
+            {
+                continue
+            }
+            $s1 = [int]$evtStart[$i]
+            $e1 = [int]$evtEnd[$i]
             for ($j = $i + 1
                 $j -lt ($evtCount - 1)
                 $j++)
             {
-                if ($a1 -eq $evtAuthor[$j])
+                if ($a1 -eq [string]$evtAuthor[$j])
                 {
                     continue
                 }
-                $sj = $evtStart[$j]
-                $ej = $evtEnd[$j]
-                if (-not ($s1 -le $ej -and $sj -le $e1))
+                $sj = [int]$evtStart[$j]
+                $ej = [int]$evtEnd[$j]
+                if (-not (Test-StrictHunkRangeOverlap -StartA $s1 -EndA $e1 -StartB $sj -EndB $ej))
                 {
                     continue
                 }
-                # i-j の重複区間 [abMax, abMin] を求め、k との3者重複を判定する
-                $abMax = if ($s1 -gt $sj)
+                $intersectionStart = [Math]::Max($s1, $sj)
+                $intersectionEnd = [Math]::Min($e1, $ej)
+                $kStartOffset = Get-FirstIntIndexGreaterThan -SortedValues $authorIndexes -Value $j
+                if ($kStartOffset -ge $authorIndexes.Count)
                 {
-                    $s1
+                    continue
                 }
-                else
+                for ($kOffset = $kStartOffset
+                    $kOffset -lt $authorIndexes.Count
+                    $kOffset++)
                 {
-                    $sj
-                }
-                $abMin = if ($e1 -lt $ej)
-                {
-                    $e1
-                }
-                else
-                {
-                    $ej
-                }
-                for ($k = $j + 1
-                    $k -lt $evtCount
-                    $k++)
-                {
-                    if ($evtAuthor[$k] -ne $a1)
-                    {
-                        continue
-                    }
-                    if ($abMax -le $evtEnd[$k] -and $evtStart[$k] -le $abMin)
+                    $k = [int]$authorIndexes[$kOffset]
+                    if (Test-StrictHunkRangeOverlap -StartA $intersectionStart -EndA $intersectionEnd -StartB ([int]$evtStart[$k]) -EndB ([int]$evtEnd[$k]))
                     {
                         Add-Count -Table $authorPingPong -Key $a1
-                        Add-Count -Table $filePingPong -Key $file
+                        $filePingPongCount++
                     }
                 }
             }
+        }
+        if ($filePingPongCount -gt 0)
+        {
+            Add-Count -Table $filePingPong -Key $file -Delta $filePingPongCount
         }
     }
 
@@ -6649,40 +6933,72 @@ function Invoke-StrictBlameOnlyBatchPrefetch
     else
     {
         $workItems = New-Object 'System.Collections.Generic.List[object]'
-        foreach ($chunk in @($chunks))
+        $maxParallel = [Math]::Max(1, [int]$Parallel)
+        $targetWorkItemCount = [Math]::Min($chunks.Count, ($maxParallel * 4))
+        if ($targetWorkItemCount -lt $maxParallel)
         {
+            $targetWorkItemCount = $maxParallel
+        }
+        $bundleSize = [int][Math]::Ceiling($chunks.Count / [double][Math]::Max(1, $targetWorkItemCount))
+        $bundleSize = [Math]::Max(1, $bundleSize)
+        for ($chunkIndex = 0
+            $chunkIndex -lt $chunks.Count
+            $chunkIndex += $bundleSize)
+        {
+            $chunkBundle = New-Object 'System.Collections.Generic.List[object]'
+            $bundleEnd = [Math]::Min($chunks.Count, ($chunkIndex + $bundleSize))
+            for ($cursor = $chunkIndex
+                $cursor -lt $bundleEnd
+                $cursor++)
+            {
+                $chunk = $chunks[$cursor]
+                [void]$chunkBundle.Add([pscustomobject]@{
+                        Revision = [int]$chunk.Revision
+                        FilePaths = @([string[]]$chunk.FilePaths)
+                    })
+            }
             [void]$workItems.Add([pscustomobject]@{
                     TargetUrl = $TargetUrl
                     CacheDir = $CacheDir
-                    Revision = [int]$chunk.Revision
-                    FilePaths = @([string[]]$chunk.FilePaths)
+                    Chunks = @($chunkBundle.ToArray())
                 })
         }
         $worker = {
             param($Item, $Index)
             [void]$Index # Required by Invoke-ParallelWork contract
-            $result = Initialize-StrictBlameOnlyBatchChunk -Context $Context -TargetUrl $Item.TargetUrl -CacheDir $Item.CacheDir -Revision ([int]$Item.Revision) -FilePaths @([string[]]$Item.FilePaths)
-            $result = ConvertTo-NarutoResultAdapter -InputObject $result -SuccessCode 'SVN_BLAME_BATCH_READY' -SkippedCode 'SVN_BLAME_BATCH_INVALID_ARGUMENT'
-            $stats = $result.Data
-            if ($null -eq $stats)
+            $totalCacheHits = 0
+            $totalCacheMisses = 0
+            $totalBatchTargets = 0
+            $totalFallbackTargets = 0
+            foreach ($chunk in @($Item.Chunks))
             {
-                $stats = [pscustomobject]@{
-                    CacheHits = 0
-                    CacheMisses = 0
-                    BatchTargets = 0
-                    FallbackTargets = 0
+                $result = Initialize-StrictBlameOnlyBatchChunk -Context $Context -TargetUrl $Item.TargetUrl -CacheDir $Item.CacheDir -Revision ([int]$chunk.Revision) -FilePaths @([string[]]$chunk.FilePaths)
+                $result = ConvertTo-NarutoResultAdapter -InputObject $result -SuccessCode 'SVN_BLAME_BATCH_READY' -SkippedCode 'SVN_BLAME_BATCH_INVALID_ARGUMENT'
+                $stats = $result.Data
+                if ($null -eq $stats)
+                {
+                    $stats = [pscustomobject]@{
+                        CacheHits = 0
+                        CacheMisses = 0
+                        BatchTargets = 0
+                        FallbackTargets = 0
+                    }
                 }
+                $totalCacheHits += [int]$stats.CacheHits
+                $totalCacheMisses += [int]$stats.CacheMisses
+                $totalBatchTargets += [int]$stats.BatchTargets
+                $totalFallbackTargets += [int]$stats.FallbackTargets
             }
             [pscustomobject]@{
-                CacheHits = [int]$stats.CacheHits
-                CacheMisses = [int]$stats.CacheMisses
-                BatchTargets = [int]$stats.BatchTargets
-                FallbackTargets = [int]$stats.FallbackTargets
-                Status = [string]$result.Status
-                ErrorCode = [string]$result.ErrorCode
+                CacheHits = [int]$totalCacheHits
+                CacheMisses = [int]$totalCacheMisses
+                BatchTargets = [int]$totalBatchTargets
+                FallbackTargets = [int]$totalFallbackTargets
+                Status = 'Success'
+                ErrorCode = 'OK'
             }
         }
-        $results = @(Invoke-ParallelWork -InputItems $workItems.ToArray() -WorkerScript $worker -MaxParallel $Parallel -RequiredFunctions @(
+        $results = @(Invoke-ParallelWork -InputItems $workItems.ToArray() -WorkerScript $worker -MaxParallel ([Math]::Max(1, [Math]::Min($Parallel, $workItems.Count))) -RequiredFunctions @(
                 $Context.Constants.RunspaceSvnCoreFunctions +
                 $Context.Constants.RunspaceBlameCacheFunctions +
                 @(
@@ -6738,7 +7054,8 @@ function Get-StrictBlamePrefetchTarget
         [object[]]$Commits,
         [int]$FromRevision,
         [int]$ToRevision,
-        [string]$CacheDir
+        [string]$CacheDir,
+        [hashtable]$RenameMap = @{}
     )
 
     $targets = New-Object 'System.Collections.Generic.List[object]'
@@ -6751,8 +7068,13 @@ function Get-StrictBlamePrefetchTarget
     $generalSparseCount = 0
     $skippedZeroCount = 0
     $transitionContextsByRevision = @{}
+    $metricFileCache = @{}
     $excludeCommentOnlyLines = Get-ContextRuntimeSwitchValue -Context $Context -PropertyName 'ExcludeCommentOnlyLines'
     $skipCacheExistenceCheck = $false
+    if ($null -ne $Context.Caches)
+    {
+        $Context.Caches.StrictTransitionContextByRevisionIsComplete = $false
+    }
     if (-not [string]::IsNullOrWhiteSpace($CacheDir))
     {
         $blameCacheRoot = Join-Path $CacheDir 'blame'
@@ -6773,7 +7095,7 @@ function Get-StrictBlamePrefetchTarget
         $transitions = @(Get-CommitFileTransition -Commit $c)
         foreach ($t in $transitions)
         {
-            $transitionContext = Resolve-StrictTransitionContext -Context $Context -Commit $c -Transition $t -RenameMap @{}
+            $transitionContext = Resolve-StrictTransitionContext -Context $Context -Commit $c -Transition $t -RenameMap $RenameMap -MetricFileCache $metricFileCache
             if ($null -eq $transitionContext)
             {
                 continue
@@ -6839,6 +7161,10 @@ function Get-StrictBlamePrefetchTarget
         $cachedTransitionContexts[[int]$revisionKey] = @($transitionContextsByRevision[$revisionKey].ToArray())
     }
     $Context.Caches.StrictTransitionContextByRevision = $cachedTransitionContexts
+    if ($null -ne $Context.Caches)
+    {
+        $Context.Caches.StrictTransitionContextByRevisionIsComplete = $true
+    }
 
     $needContentCount = 0
     foreach ($target in @($targets.ToArray()))
@@ -7071,7 +7397,8 @@ function Resolve-StrictTransitionContext
         [Parameter(Mandatory = $true)][hashtable]$Context,
         [object]$Commit,
         [object]$Transition,
-        [hashtable]$RenameMap
+        [hashtable]$RenameMap,
+        [hashtable]$MetricFileCache = $null
     )
     $beforePath = if ($null -ne $Transition.BeforePath)
     {
@@ -7119,6 +7446,8 @@ function Resolve-StrictTransitionContext
     $transitionDeleted = 0
     $transitionStat = $null
     $transitionHunks = @()
+    $hasDiffLineEntry = $false
+    $needTransitionHunks = $false
     if ($afterPath -and $Commit.FileDiffStats.ContainsKey($afterPath))
     {
         $transitionStat = $Commit.FileDiffStats[$afterPath]
@@ -7131,19 +7460,78 @@ function Resolve-StrictTransitionContext
     {
         $transitionAdded = [int]$transitionStat.AddedLines
         $transitionDeleted = [int]$transitionStat.DeletedLines
-        if ($transitionStat.PSObject.Properties.Match('Hunks').Count -gt 0)
+        $needTransitionHunks = ($transitionAdded -gt 0 -and $transitionDeleted -gt 0)
+        $hasPrecomputedDiffLineEntry = $false
+        $hasPrecomputedDiffLineEntryProperty = ($transitionStat.PSObject.Properties.Match('HasDiffLineEntry').Count -gt 0)
+        if ($hasPrecomputedDiffLineEntryProperty)
         {
-            $transitionHunks = @(ConvertTo-StrictHunkList -HunksRaw $transitionStat.Hunks)
+            $hasPrecomputedDiffLineEntry = [bool]$transitionStat.HasDiffLineEntry
+        }
+        if ($needTransitionHunks -and $transitionStat.PSObject.Properties.Match('Hunks').Count -gt 0)
+        {
+            if ($hasPrecomputedDiffLineEntryProperty)
+            {
+                if ($hasPrecomputedDiffLineEntry)
+                {
+                    $transitionHunks = @(ConvertTo-StrictHunkList -HunksRaw $transitionStat.Hunks)
+                    $hasDiffLineEntry = ($transitionHunks.Count -gt 0)
+                }
+            }
+            else
+            {
+                $transitionHunks = @(ConvertTo-StrictHunkList -HunksRaw $transitionStat.Hunks)
+                if ($transitionHunks.Count -gt 0)
+                {
+                    $entryCount = 0
+                    $isValidDiffLineEntry = $true
+                    foreach ($hunk in @($transitionHunks))
+                    {
+                        if ($null -eq $hunk)
+                        {
+                            $isValidDiffLineEntry = $false
+                            break
+                        }
+                        if ($hunk.PSObject.Properties.Match('AddedLineEntries').Count -eq 0 -or $hunk.PSObject.Properties.Match('DeletedLineEntries').Count -eq 0)
+                        {
+                            $isValidDiffLineEntry = $false
+                            break
+                        }
+                        $entryCount += @($hunk.AddedLineEntries).Count
+                        $entryCount += @($hunk.DeletedLineEntries).Count
+                    }
+                    if ($isValidDiffLineEntry -and $entryCount -gt 0)
+                    {
+                        $hasDiffLineEntry = $true
+                    }
+                }
+            }
         }
     }
 
-    $metricFile = if ($afterPath)
+    $metricSourcePath = if ($afterPath)
     {
-        Resolve-PathByRenameMap -Context $Context -FilePath $afterPath -RenameMap $RenameMap
+        [string]$afterPath
     }
     else
     {
-        Resolve-PathByRenameMap -Context $Context -FilePath $beforePath -RenameMap $RenameMap
+        [string]$beforePath
+    }
+    $metricFile = ''
+    if ([string]::IsNullOrWhiteSpace($metricSourcePath))
+    {
+        $metricFile = ''
+    }
+    elseif ($null -ne $MetricFileCache -and $MetricFileCache.ContainsKey($metricSourcePath))
+    {
+        $metricFile = [string]$MetricFileCache[$metricSourcePath]
+    }
+    else
+    {
+        $metricFile = [string](Resolve-PathByRenameMap -Context $Context -FilePath $metricSourcePath -RenameMap $RenameMap)
+        if ($null -ne $MetricFileCache)
+        {
+            $MetricFileCache[$metricSourcePath] = [string]$metricFile
+        }
     }
 
     return [pscustomobject]@{
@@ -7153,6 +7541,7 @@ function Resolve-StrictTransitionContext
         HasTransitionStat = ($null -ne $transitionStat)
         TransitionAdded = $transitionAdded
         TransitionDeleted = $transitionDeleted
+        HasDiffLineEntry = [bool]$hasDiffLineEntry
         TransitionHunks = @($transitionHunks)
     }
 }
@@ -7412,8 +7801,8 @@ function Get-StrictSparseTransitionLineNumberSet
     {
         $descriptor = $TransitionContext.SparseDiffDescriptor
         return [pscustomobject]@{
-            PreviousLineNumbers = @($descriptor.PreviousLineNumbers | ForEach-Object { [int]$_ })
-            CurrentLineNumbers = @($descriptor.CurrentLineNumbers | ForEach-Object { [int]$_ })
+            PreviousLineNumbers = @($descriptor.PreviousLineNumbers)
+            CurrentLineNumbers = @($descriptor.CurrentLineNumbers)
         }
     }
     $previousLineNumberSet = New-Object 'System.Collections.Generic.HashSet[int]'
@@ -7620,6 +8009,131 @@ function Get-StrictSparseTransitionComparisonInput
     return [pscustomobject]@{
         PreviousLines = @($previousSparse.ToArray())
         CurrentLines = @($currentSparse.ToArray())
+    }
+}
+function Compare-StrictSparseTransitionCountOnly
+{
+    <#
+    .SYNOPSIS
+        Strict sparse 比較結果を集計値のみで算出する。
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [object[]]$PreviousLines = @(),
+        [object[]]$CurrentLines = @(),
+        [int]$CurrentRevision
+    )
+
+    $prev = @($PreviousLines)
+    $curr = @($CurrentLines)
+    $m = $prev.Count
+    $n = $curr.Count
+    if ($m -eq 0 -and $n -eq 0)
+    {
+        return [pscustomobject]@{
+            BornCountCurrentRevision = 0
+            KilledCountByRevisionAuthor = @{}
+            MovedPairCount = 0
+        }
+    }
+
+    $prevIdentity = New-Object 'string[]' $m
+    $currIdentity = New-Object 'string[]' $n
+    $prevContent = New-Object 'string[]' $m
+    $currContent = New-Object 'string[]' $n
+    for ($i = 0
+        $i -lt $m
+        $i++)
+    {
+        $prevIdentity[$i] = Get-LineIdentityKey -Line $prev[$i]
+        $prevContent[$i] = [string]$prev[$i].Content
+    }
+    for ($j = 0
+        $j -lt $n
+        $j++)
+    {
+        $currIdentity[$j] = Get-LineIdentityKey -Line $curr[$j]
+        $currContent[$j] = [string]$curr[$j].Content
+    }
+
+    $state = New-BlameCompareState -PreviousLines $prev -CurrentLines $curr
+    Lock-BlamePrefixSuffixMatch -State $state -PreviousIdentity $prevIdentity -CurrentIdentity $currIdentity
+    Add-BlameLcsMatch -State $state -PreviousKeys $prevIdentity -CurrentKeys $currIdentity -MatchType 'LcsIdentity'
+    $movedPairCount = Get-BlameMovedPairCount -State $state -PreviousIdentity $prevIdentity -CurrentIdentity $currIdentity
+    if (Test-BlameHasUnmatchedSharedKey -PreviousKeys $prevContent -CurrentKeys $currContent -PreviousMatched $state.PreviousMatched -CurrentMatched $state.CurrentMatched)
+    {
+        Add-BlameLcsMatch -State $state -PreviousKeys $prevContent -CurrentKeys $currContent -MatchType 'LcsContent'
+    }
+
+    $bornCountCurrentRevision = 0
+    for ($currIdx = 0
+        $currIdx -lt $curr.Count
+        $currIdx++)
+    {
+        if ($state.CurrentMatched[$currIdx])
+        {
+            continue
+        }
+        $bornRevision = $null
+        try
+        {
+            $bornRevision = [int]$curr[$currIdx].Revision
+        }
+        catch
+        {
+            $bornRevision = $null
+        }
+        if ($bornRevision -eq $CurrentRevision)
+        {
+            $bornCountCurrentRevision++
+        }
+    }
+
+    $killedCountByRevisionAuthor = @{}
+    for ($prevIdx = 0
+        $prevIdx -lt $prev.Count
+        $prevIdx++)
+    {
+        if ($state.PreviousMatched[$prevIdx])
+        {
+            continue
+        }
+        $bornRevision = $null
+        try
+        {
+            $bornRevision = [int]$prev[$prevIdx].Revision
+        }
+        catch
+        {
+            $bornRevision = $null
+        }
+        if ($null -eq $bornRevision)
+        {
+            continue
+        }
+        $revisionKey = [string]$bornRevision
+        if (-not $killedCountByRevisionAuthor.ContainsKey($revisionKey))
+        {
+            $killedCountByRevisionAuthor[$revisionKey] = @{}
+        }
+        $bornAuthor = Get-NormalizedAuthorName -Author ([string]$prev[$prevIdx].Author)
+        if (-not $killedCountByRevisionAuthor[$revisionKey].ContainsKey($bornAuthor))
+        {
+            $killedCountByRevisionAuthor[$revisionKey][$bornAuthor] = 0
+        }
+        $killedCountByRevisionAuthor[$revisionKey][$bornAuthor]++
+    }
+
+    return [pscustomobject]@{
+        KilledLines = @()
+        BornLines = @()
+        BornCountCurrentRevision = [int]$bornCountCurrentRevision
+        KilledCountByRevisionAuthor = $killedCountByRevisionAuthor
+        MovedPairCount = [int]$movedPairCount
+        MovedPairs = @()
+        MatchedPairs = @()
+        ReattributedPairs = @()
     }
 }
 function Get-StrictTransitionComparison
@@ -7946,6 +8460,18 @@ function Get-StrictTransitionComparison
             $sparseInput = Get-StrictSparseTransitionComparisonInput -TransitionContext $TransitionContext -PreviousLineByNumber $prevSparseLineByNumber -CurrentLineByNumber $currSparseLineByNumber
             if ($null -ne $sparseInput)
             {
+                try
+                {
+                    $countOnly = Compare-StrictSparseTransitionCountOnly -PreviousLines @($sparseInput.PreviousLines) -CurrentLines @($sparseInput.CurrentLines) -CurrentRevision $Revision
+                    if ($null -ne $countOnly)
+                    {
+                        return $countOnly
+                    }
+                }
+                catch
+                {
+                    [void]$_
+                }
                 return (Compare-BlameOutput -PreviousLines @($sparseInput.PreviousLines) -CurrentLines @($sparseInput.CurrentLines) -MinimalOutput)
             }
         }
@@ -8014,7 +8540,15 @@ function Update-StrictAccumulatorFromComparison
         return
     }
 
-    $moveCount = @($Comparison.MovedPairs).Count
+    $moveCount = 0
+    if ($Comparison.PSObject.Properties.Match('MovedPairCount').Count -gt 0)
+    {
+        $moveCount = [int]$Comparison.MovedPairCount
+    }
+    elseif ($Comparison.PSObject.Properties.Match('MovedPairs').Count -gt 0)
+    {
+        $moveCount = @($Comparison.MovedPairs).Count
+    }
     if ($moveCount -gt 0)
     {
         Add-Count -Table $Accumulator.AuthorInternalMove -Key $Killer -Delta $moveCount
@@ -8329,23 +8863,37 @@ function Resolve-StrictCommitTransitionContextSet
     $resolvedTransitionContexts = New-Object 'System.Collections.Generic.List[object]'
     if ($PrefetchedTransitionContextByRevision.ContainsKey($revision))
     {
-        foreach ($transitionContext in @($PrefetchedTransitionContextByRevision[$revision]))
+        $prefetchedContexts = @($PrefetchedTransitionContextByRevision[$revision])
+        $canReturnPrefetchedDirectly = ($Context.Caches.ContainsKey('StrictTransitionContextByRevisionIsComplete') -and [bool]$Context.Caches.StrictTransitionContextByRevisionIsComplete)
+        if ($canReturnPrefetchedDirectly)
+        {
+            return @($prefetchedContexts)
+        }
+        foreach ($transitionContext in @($prefetchedContexts))
         {
             if ($null -eq $transitionContext)
             {
                 continue
             }
-            $metricFile = if (-not [string]::IsNullOrWhiteSpace([string]$transitionContext.AfterPath))
+            $hasMetricFile = $transitionContext.PSObject.Properties.Match('MetricFile').Count -gt 0
+            if (-not $hasMetricFile -or [string]::IsNullOrWhiteSpace([string]$transitionContext.MetricFile))
             {
-                Resolve-PathByRenameMap -Context $Context -FilePath ([string]$transitionContext.AfterPath) -RenameMap $RenameMap
-            }
-            else
-            {
-                Resolve-PathByRenameMap -Context $Context -FilePath ([string]$transitionContext.BeforePath) -RenameMap $RenameMap
-            }
-            if ($transitionContext.PSObject.Properties.Match('MetricFile').Count -gt 0)
-            {
-                $transitionContext.MetricFile = [string]$metricFile
+                $metricFile = if (-not [string]::IsNullOrWhiteSpace([string]$transitionContext.AfterPath))
+                {
+                    Resolve-PathByRenameMap -Context $Context -FilePath ([string]$transitionContext.AfterPath) -RenameMap $RenameMap
+                }
+                else
+                {
+                    Resolve-PathByRenameMap -Context $Context -FilePath ([string]$transitionContext.BeforePath) -RenameMap $RenameMap
+                }
+                if ($hasMetricFile)
+                {
+                    $transitionContext.MetricFile = [string]$metricFile
+                }
+                else
+                {
+                    $transitionContext | Add-Member -NotePropertyName 'MetricFile' -NotePropertyValue ([string]$metricFile)
+                }
             }
             [void]$resolvedTransitionContexts.Add($transitionContext)
         }
@@ -8513,20 +9061,14 @@ function Invoke-StrictCommitAttribution
         return $false
     }
     $killer = Resolve-StrictKillerAuthor -Commit $Commit -RevToAuthor $RevToAuthor
-    $contexts = New-Object 'System.Collections.Generic.List[object]'
+    $contexts = @()
     if (@($TransitionContexts).Count -gt 0)
     {
-        foreach ($transitionContext in @($TransitionContexts))
-        {
-            if ($null -eq $transitionContext)
-            {
-                continue
-            }
-            [void]$contexts.Add($transitionContext)
-        }
+        $contexts = @($TransitionContexts)
     }
     else
     {
+        $resolvedContexts = New-Object 'System.Collections.Generic.List[object]'
         $transitions = @(Get-CommitFileTransition -Commit $Commit)
         foreach ($transition in $transitions)
         {
@@ -8535,12 +9077,17 @@ function Invoke-StrictCommitAttribution
             {
                 continue
             }
-            [void]$contexts.Add($transitionContext)
+            [void]$resolvedContexts.Add($transitionContext)
         }
+        $contexts = @($resolvedContexts.ToArray())
     }
     $excludeCommentOnlyLines = Get-ContextRuntimeSwitchValue -Context $Context -PropertyName 'ExcludeCommentOnlyLines'
-    foreach ($transitionContext in @($contexts.ToArray()))
+    foreach ($transitionContext in @($contexts))
     {
+        if ($null -eq $transitionContext)
+        {
+            continue
+        }
         if (-not $excludeCommentOnlyLines)
         {
             $hasTransitionStat = [bool]$transitionContext.HasTransitionStat
@@ -8624,7 +9171,7 @@ function Get-ExactDeathAttribution
     $accumulator = New-StrictAttributionAccumulator
     $strictStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $Context.Caches.StrictTransitionContextByRevision = @{}
-    $prefetchTargets = @(Get-StrictBlamePrefetchTarget -Context $Context -Commits $Commits -FromRevision $FromRevision -ToRevision $ToRevision -CacheDir $CacheDir)
+    $prefetchTargets = @(Get-StrictBlamePrefetchTarget -Context $Context -Commits $Commits -FromRevision $FromRevision -ToRevision $ToRevision -CacheDir $CacheDir -RenameMap $RenameMap)
     $targetEnumerationSeconds = $strictStopwatch.Elapsed.TotalSeconds
     Invoke-StrictBlameCachePrefetch -Context $Context -Targets $prefetchTargets -TargetUrl $TargetUrl -CacheDir $CacheDir -Parallel $Parallel
     $prefetchSeconds = $strictStopwatch.Elapsed.TotalSeconds
@@ -8648,7 +9195,7 @@ function Get-ExactDeathAttribution
         foreach ($commit in $sortedCommits)
         {
             $pct = [Math]::Min(100, [int](($deathIdx / [Math]::Max(1, $deathTotal)) * 100))
-            Write-Progress -Id 3 -Activity '行単位の帰属解析' -Status ('r{0} ({1}/{2})' -f [int]$commit.Revision, ($deathIdx + 1), $deathTotal) -PercentComplete $pct
+            Write-NarutoProgress -Id 3 -Activity '行単位の帰属解析' -Status ('r{0} ({1}/{2})' -f [int]$commit.Revision, ($deathIdx + 1), $deathTotal) -PercentComplete $pct
             $commitTransitionContexts = @(Resolve-StrictCommitTransitionContextSet -Context $Context -Commit $commit -RenameMap $RenameMap -PrefetchedTransitionContextByRevision $prefetchedTransitionContextByRevision)
             $processed = Invoke-StrictCommitAttribution -Context $Context -Accumulator $accumulator -Commit $commit -RevToAuthor $RevToAuthor -TargetUrl $TargetUrl -FromRevision $FromRevision -ToRevision $ToRevision -CacheDir $CacheDir -RenameMap $RenameMap -TransitionContexts $commitTransitionContexts
             if ($processed)
@@ -8656,11 +9203,12 @@ function Get-ExactDeathAttribution
                 $deathIdx++
             }
         }
-        Write-Progress -Id 3 -Activity '行単位の帰属解析' -Completed
+        Write-NarutoProgress -Id 3 -Activity '行単位の帰属解析' -Completed
     }
     else
     {
-        $strictTransitionChunkSize = 64
+        $strictTransitionChunkSize = [Math]::Max(64, [Math]::Min(256, ([Math]::Max(1, [int]$Parallel) * 16)))
+        $strictTransitionWorkerBundleSize = [Math]::Max(1, [Math]::Min(16, [int][Math]::Ceiling([Math]::Max(1, [int]$Parallel) / 2)))
         $transitionWorkItems = New-Object 'System.Collections.Generic.List[object]'
         $deathTotal = $sortedCommits.Count
         $deathIdx = 0
@@ -8699,23 +9247,45 @@ function Get-ExactDeathAttribution
         $transitionWorker = {
             param($Item, $Index)
             [void]$Index # Required by Invoke-ParallelWork contract
+            $bundleDelta = New-StrictAttributionAccumulator
+            $activeTransition = $null
             try
             {
-                $comparison = Get-StrictTransitionComparison -Context $Context -TransitionContext $Item.TransitionContext -TargetUrl ([string]$Item.TargetUrl) -Revision ([int]$Item.Revision) -CacheDir ([string]$Item.CacheDir) -CurrentRevisionAuthor ([string]$Item.Killer)
-                $delta = Get-StrictTransitionComparisonDelta -Comparison $comparison -Revision ([int]$Item.Revision) -Killer ([string]$Item.Killer) -MetricFile ([string]$Item.MetricFile) -FromRevision ([int]$Item.FromRevision) -ToRevision ([int]$Item.ToRevision)
+                foreach ($transition in @($Item.Transitions))
+                {
+                    if ($null -eq $transition)
+                    {
+                        continue
+                    }
+                    $activeTransition = $transition
+                    $comparison = Get-StrictTransitionComparison -Context $Context -TransitionContext $transition.TransitionContext -TargetUrl ([string]$transition.TargetUrl) -Revision ([int]$transition.Revision) -CacheDir ([string]$transition.CacheDir) -CurrentRevisionAuthor ([string]$transition.Killer)
+                    if ($null -eq $comparison)
+                    {
+                        continue
+                    }
+                    Update-StrictAccumulatorFromComparison -Accumulator $bundleDelta -Comparison $comparison -Revision ([int]$transition.Revision) -Killer ([string]$transition.Killer) -MetricFile ([string]$transition.MetricFile) -FromRevision ([int]$transition.FromRevision) -ToRevision ([int]$transition.ToRevision
+                    )
+                }
                 [pscustomobject]@{
-                    WorkOrder = [int]$Item.WorkOrder
-                    Revision = [int]$Item.Revision
-                    MetricFile = [string]$Item.MetricFile
-                    Delta = $delta
+                    WorkOrder = [int]$Item.WorkOrderStart
+                    Delta = $bundleDelta
                 }
             }
             catch
             {
-                Throw-NarutoError -Category 'STRICT' -ErrorCode 'STRICT_BLAME_ATTRIBUTION_FAILED' -Message ("Strict blame attribution failed at r{0} (before='{1}', after='{2}'): {3}" -f [int]$Item.Revision, [string]$Item.TransitionContext.BeforePath, [string]$Item.TransitionContext.AfterPath, $_.Exception.Message) -Context @{
-                    Revision = [int]$Item.Revision
-                    BeforePath = [string]$Item.TransitionContext.BeforePath
-                    AfterPath = [string]$Item.TransitionContext.AfterPath
+                $failedRevision = 0
+                $failedBeforePath = ''
+                $failedAfterPath = ''
+                if ($null -ne $activeTransition)
+                {
+                    $failedRevision = [int]$activeTransition.Revision
+                    $failedBeforePath = [string]$activeTransition.TransitionContext.BeforePath
+                    $failedAfterPath = [string]$activeTransition.TransitionContext.AfterPath
+                }
+                Throw-NarutoError -Category 'STRICT' -ErrorCode 'STRICT_BLAME_ATTRIBUTION_FAILED' -Message ("Strict blame attribution failed at r{0} (before='{1}', after='{2}'): {3}" -f $failedRevision, $failedBeforePath, $failedAfterPath, $_.Exception.Message) -Context @{
+                    Revision = [int]$failedRevision
+                    BeforePath = [string]$failedBeforePath
+                    AfterPath = [string]$failedAfterPath
                 } -InnerException $_.Exception
             }
         }
@@ -8746,12 +9316,13 @@ function Get-ExactDeathAttribution
                 'Add-BlameLcsMatch',
                 'Test-BlameHasUnmatchedSharedKey',
                 'Get-BlameMovedPairList',
+                'Get-BlameMovedPairCount',
                 'Get-BlameUnmatchedLineList',
                 'Get-BlameReattributedPairList',
                 'Compare-BlameOutput',
+                'Compare-StrictSparseTransitionCountOnly',
                 'Get-StrictTransitionLineFilterResult',
                 'Get-StrictTransitionComparison',
-                'Get-StrictTransitionComparisonDelta',
                 'New-StrictAttributionAccumulator',
                 'Update-StrictAccumulatorFromComparison',
                 'Get-NormalizedAuthorName',
@@ -8775,12 +9346,30 @@ function Get-ExactDeathAttribution
                 {
                     $chunkItems[$chunkOffset] = $transitionWorkItems[$chunkStart + $chunkOffset]
                 }
-                $chunkResults = @(Invoke-ParallelWork -InputItems $chunkItems -WorkerScript $transitionWorker -MaxParallel ([Math]::Max(1, [Math]::Min($Parallel, $chunkLength))) -RequiredFunctions $transitionRequiredFunctions -SessionVariables @{
+                $bundleWorkItems = New-Object 'System.Collections.Generic.List[object]'
+                for ($bundleStart = 0
+                    $bundleStart -lt $chunkLength
+                    $bundleStart += $strictTransitionWorkerBundleSize)
+                {
+                    $bundleLength = [Math]::Min($strictTransitionWorkerBundleSize, $chunkLength - $bundleStart)
+                    $bundleTransitions = New-Object 'System.Collections.Generic.List[object]'
+                    for ($bundleOffset = 0
+                        $bundleOffset -lt $bundleLength
+                        $bundleOffset++)
+                    {
+                        [void]$bundleTransitions.Add($chunkItems[$bundleStart + $bundleOffset])
+                    }
+                    [void]$bundleWorkItems.Add([pscustomobject]@{
+                            WorkOrderStart = [int]$chunkItems[$bundleStart].WorkOrder
+                            Transitions = @($bundleTransitions.ToArray())
+                        })
+                }
+                $chunkResults = @(Invoke-ParallelWork -InputItems $bundleWorkItems.ToArray() -WorkerScript $transitionWorker -MaxParallel ([Math]::Max(1, [Math]::Min($Parallel, $bundleWorkItems.Count))) -RequiredFunctions $transitionRequiredFunctions -SessionVariables @{
                         Context = (Get-RunspaceNarutoContext -Context $Context)
                         SvnExecutable = $Context.Runtime.SvnExecutable
                         SvnGlobalArguments = @($Context.Runtime.SvnGlobalArguments)
                     } -ErrorContext 'strict transition attribution')
-                $orderedChunkResults = @($chunkResults | Sort-Object @{ Expression = { [int]$_.Revision } }, @{ Expression = { [string]$_.MetricFile } }, @{ Expression = { [int]$_.WorkOrder } })
+                $orderedChunkResults = @($chunkResults | Sort-Object @{ Expression = { [int]$_.WorkOrder } })
                 foreach ($chunkResult in @($orderedChunkResults))
                 {
                     if ($null -eq $chunkResult -or $null -eq $chunkResult.Delta)
@@ -8791,10 +9380,10 @@ function Get-ExactDeathAttribution
                 }
                 $processedTransitionCount += $chunkLength
                 $pct = [Math]::Min(100, [int](($processedTransitionCount / [Math]::Max(1, $transitionTotal)) * 100))
-                Write-Progress -Id 3 -Activity '行単位の帰属解析 (遷移並列)' -Status ('{0}/{1}' -f $processedTransitionCount, $transitionTotal) -PercentComplete $pct
+                Write-NarutoProgress -Id 3 -Activity '行単位の帰属解析 (遷移並列)' -Status ('{0}/{1}' -f $processedTransitionCount, $transitionTotal) -PercentComplete $pct
             }
         }
-        Write-Progress -Id 3 -Activity '行単位の帰属解析 (遷移並列)' -Completed
+        Write-NarutoProgress -Id 3 -Activity '行単位の帰属解析 (遷移並列)' -Completed
     }
     $commitLoopSeconds = $strictStopwatch.Elapsed.TotalSeconds
     try
@@ -13177,6 +13766,64 @@ function Get-CachedOrFetchDiffText
     [System.IO.File]::WriteAllText($cacheFile, $diffText, [System.Text.Encoding]::UTF8)
     return $diffText
 }
+function Test-SvnLogDiffSeparatorLine
+{
+    <#
+    .SYNOPSIS
+        svn log --diff の区切り線 (-----) 行かどうかを判定する。
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([string]$Line)
+    if ([string]::IsNullOrEmpty($Line) -or $Line.Length -lt 5)
+    {
+        return $false
+    }
+    if ($Line[0] -ne '-')
+    {
+        return $false
+    }
+    for ($i = 1
+        $i -lt $Line.Length
+        $i++)
+    {
+        if ($Line[$i] -ne '-')
+        {
+            return $false
+        }
+    }
+    return $true
+}
+function Get-SvnLogDiffRevisionHeaderRevision
+{
+    <#
+    .SYNOPSIS
+        svn log 見出し行 (rN | ...) から revision 番号を抽出する。
+    #>
+    [CmdletBinding()]
+    [OutputType([int])]
+    param([string]$Line)
+    if ([string]::IsNullOrEmpty($Line) -or $Line.Length -lt 3)
+    {
+        return $null
+    }
+    if ($Line[0] -ne 'r')
+    {
+        return $null
+    }
+    $separatorIndex = $Line.IndexOf(' |')
+    if ($separatorIndex -le 1)
+    {
+        return $null
+    }
+    $revisionText = $Line.Substring(1, $separatorIndex - 1)
+    $revision = 0
+    if (-not [int]::TryParse($revisionText, [ref]$revision))
+    {
+        return $null
+    }
+    return [int]$revision
+}
 function ConvertFrom-SvnLogDiffTextByRevision
 {
     <#
@@ -13191,54 +13838,74 @@ function ConvertFrom-SvnLogDiffTextByRevision
     {
         return $diffByRevision
     }
-    $lines = $LogDiffText -split "`r?`n"
     $currentRevision = $null
     $capturingDiff = $false
-    $diffLines = New-Object 'System.Collections.Generic.List[string]'
-    foreach ($line in @($lines))
+    $diffBuilder = New-Object System.Text.StringBuilder
+    $hasDiffLine = $false
+    $reader = New-Object System.IO.StringReader($LogDiffText)
+    try
     {
-        if ($line -match '^-{5,}$')
+        while ($null -ne ($line = $reader.ReadLine()))
         {
-            if ($null -ne $currentRevision)
+            if (Test-SvnLogDiffSeparatorLine -Line $line)
             {
-                $diffByRevision[[int]$currentRevision] = if ($capturingDiff)
+                if ($null -ne $currentRevision)
                 {
-                    ($diffLines.ToArray() -join "`n")
+                    $diffByRevision[[int]$currentRevision] = if ($capturingDiff -and $hasDiffLine)
+                    {
+                        $diffBuilder.ToString()
+                    }
+                    else
+                    {
+                        ''
+                    }
                 }
-                else
+                $currentRevision = $null
+                $capturingDiff = $false
+                [void]$diffBuilder.Clear()
+                $hasDiffLine = $false
+                continue
+            }
+            if ($null -eq $currentRevision)
+            {
+                $headerRevision = Get-SvnLogDiffRevisionHeaderRevision -Line $line
+                if ($null -ne $headerRevision)
                 {
-                    ''
+                    $currentRevision = [int]$headerRevision
                 }
+                continue
             }
-            $currentRevision = $null
-            $capturingDiff = $false
-            $diffLines.Clear()
-            continue
-        }
-        if ($null -eq $currentRevision)
-        {
-            if ($line -match '^r(\d+)\s+\|')
+            if (-not $capturingDiff)
             {
-                $currentRevision = [int]$Matches[1]
+                if ($line.Length -ge 7 -and $line.StartsWith('Index: '))
+                {
+                    $capturingDiff = $true
+                    if ($hasDiffLine)
+                    {
+                        [void]$diffBuilder.Append("`n")
+                    }
+                    [void]$diffBuilder.Append([string]$line)
+                    $hasDiffLine = $true
+                }
+                continue
             }
-            continue
-        }
-        if (-not $capturingDiff)
-        {
-            if ($line -like 'Index: *')
+            if ($hasDiffLine)
             {
-                $capturingDiff = $true
-                [void]$diffLines.Add([string]$line)
+                [void]$diffBuilder.Append("`n")
             }
-            continue
+            [void]$diffBuilder.Append([string]$line)
+            $hasDiffLine = $true
         }
-        [void]$diffLines.Add([string]$line)
+    }
+    finally
+    {
+        $reader.Dispose()
     }
     if ($null -ne $currentRevision)
     {
-        $diffByRevision[[int]$currentRevision] = if ($capturingDiff)
+        $diffByRevision[[int]$currentRevision] = if ($capturingDiff -and $hasDiffLine)
         {
-            ($diffLines.ToArray() -join "`n")
+            $diffBuilder.ToString()
         }
         else
         {
@@ -13858,10 +14525,35 @@ function New-CommitDiffPrefetchPlan
         }
         $filteredChangedPaths = @(Get-FilteredChangedPathEntry -ChangedPaths @($normalizedChangedPaths.ToArray()) -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns)
         $commit.ChangedPathsFiltered = $filteredChangedPaths
+        Set-ObjectPropertyValue -InputObject $commit -PropertyName 'ChangedPathsFilteredAreDiffRelative' -Value $true
         if ($filteredChangedPaths.Count -le 0)
         {
             continue
         }
+        $lineEntryPathSet = New-Object 'System.Collections.Generic.HashSet[string]'
+        foreach ($filteredPathEntry in @($filteredChangedPaths))
+        {
+            if ($null -eq $filteredPathEntry)
+            {
+                continue
+            }
+            $targetPath = [string]$filteredPathEntry.Path
+            if ([string]::IsNullOrWhiteSpace($targetPath))
+            {
+                continue
+            }
+            $action = ([string]$filteredPathEntry.Action).ToUpperInvariant()
+            $copyFromPath = [string]$filteredPathEntry.CopyFromPath
+            $isPureAdd = ($action -eq 'A' -and [string]::IsNullOrWhiteSpace($copyFromPath))
+            $isPureDelete = ($action -eq 'D')
+            if ($isPureAdd -or $isPureDelete)
+            {
+                continue
+            }
+            [void]$lineEntryPathSet.Add($targetPath)
+        }
+        $lineEntryPaths = @($lineEntryPathSet | ForEach-Object { [string]$_ })
+        $needDetailedDiffParse = ([bool]$ExcludeCommentOnlyLines -or $lineEntryPaths.Count -gt 0)
         [void]$phaseAItems.Add([pscustomobject]@{
                 Revision = $revision
                 CacheDir = $CacheDir
@@ -13869,6 +14561,9 @@ function New-CommitDiffPrefetchPlan
                 DiffArguments = @($DiffArguments)
                 ChangedPaths = @($filteredChangedPaths)
                 ExcludeCommentOnlyLines = [bool]$ExcludeCommentOnlyLines
+                LineEntryPaths = @($lineEntryPaths)
+                LineEntryPathsAreNormalized = $true
+                NeedDetailedDiffParse = [bool]$needDetailedDiffParse
             })
     }
     return [pscustomobject]@{
@@ -13932,6 +14627,17 @@ function Invoke-CommitDiffPrefetch
             {
                 $revision = [int]$prefetchItem.Revision
                 $hasPreloadedDiff = $combinedDiffByRevision.ContainsKey($revision)
+                $lineEntryPaths = @()
+                if ($prefetchItem.PSObject.Properties.Match('LineEntryPaths').Count -gt 0 -and $null -ne $prefetchItem.LineEntryPaths)
+                {
+                    $lineEntryPaths = @([string[]]$prefetchItem.LineEntryPaths)
+                }
+                $hasNeedDetailedDiffParse = ($prefetchItem.PSObject.Properties.Match('NeedDetailedDiffParse').Count -gt 0)
+                $needDetailedDiffParse = $false
+                if ($hasNeedDetailedDiffParse)
+                {
+                    $needDetailedDiffParse = [bool]$prefetchItem.NeedDetailedDiffParse
+                }
                 [void]$prefetchInputItems.Add([pscustomobject]@{
                         Revision = $revision
                         CacheDir = [string]$prefetchItem.CacheDir
@@ -13939,6 +14645,17 @@ function Invoke-CommitDiffPrefetch
                         DiffArguments = @($prefetchItem.DiffArguments)
                         ChangedPaths = @($prefetchItem.ChangedPaths)
                         ExcludeCommentOnlyLines = [bool]$prefetchItem.ExcludeCommentOnlyLines
+                        LineEntryPaths = @($lineEntryPaths)
+                        LineEntryPathsAreNormalized = if ($prefetchItem.PSObject.Properties.Match('LineEntryPathsAreNormalized').Count -gt 0)
+                        {
+                            [bool]$prefetchItem.LineEntryPathsAreNormalized
+                        }
+                        else
+                        {
+                            $false
+                        }
+                        HasNeedDetailedDiffParse = [bool]$hasNeedDetailedDiffParse
+                        NeedDetailedDiffParse = [bool]$needDetailedDiffParse
                         HasPreloadedDiff = [bool]$hasPreloadedDiff
                         PreloadedDiffText = if ($hasPreloadedDiff)
                         {
@@ -13952,6 +14669,7 @@ function Invoke-CommitDiffPrefetch
             }
             $effectivePrefetchItems = @($prefetchInputItems.ToArray())
         }
+        $combinedDiffByRevision = $null
     }
     if ($effectivePrefetchItems.Count -gt 0)
     {
@@ -13975,33 +14693,73 @@ function Invoke-CommitDiffPrefetch
                     $diffText = $null
                 }
             }
+            if ($Item.PSObject.Properties.Match('PreloadedDiffText').Count -gt 0)
+            {
+                $Item.PreloadedDiffText = $null
+            }
             if ($null -eq $diffText)
             {
                 $diffText = Get-CachedOrFetchDiffText -Context $Context -CacheDir $Item.CacheDir -Revision ([int]$Item.Revision) -TargetUrl $Item.TargetUrl -DiffArguments @($Item.DiffArguments)
             }
             $lineEntryPathSet = New-Object 'System.Collections.Generic.HashSet[string]'
-            foreach ($pathEntry in @($Item.ChangedPaths))
+            $hasNeedDetailedDiffParse = ($Item.PSObject.Properties.Match('HasNeedDetailedDiffParse').Count -gt 0)
+            if ($hasNeedDetailedDiffParse -and [bool]$Item.HasNeedDetailedDiffParse)
             {
-                if ($null -eq $pathEntry)
-                {
-                    continue
-                }
-                $targetPath = ConvertTo-PathKey -Path ([string]$pathEntry.Path)
-                if ([string]::IsNullOrWhiteSpace($targetPath))
-                {
-                    continue
-                }
-                $action = ([string]$pathEntry.Action).ToUpperInvariant()
-                $copyFromPath = ConvertTo-PathKey -Path ([string]$pathEntry.CopyFromPath)
-                $isPureAdd = ($action -eq 'A' -and [string]::IsNullOrWhiteSpace($copyFromPath))
-                $isPureDelete = ($action -eq 'D')
-                if ($isPureAdd -or $isPureDelete)
-                {
-                    continue
-                }
-                [void]$lineEntryPathSet.Add($targetPath)
+                $needDetailedDiffParse = [bool]$Item.NeedDetailedDiffParse
             }
-            $needDetailedDiffParse = ($lineEntryPathSet.Count -gt 0)
+            else
+            {
+                $needDetailedDiffParse = $false
+            }
+            if ($Item.PSObject.Properties.Match('LineEntryPaths').Count -gt 0 -and $null -ne $Item.LineEntryPaths)
+            {
+                $lineEntryPathsAreNormalized = ($Item.PSObject.Properties.Match('LineEntryPathsAreNormalized').Count -gt 0 -and [bool]$Item.LineEntryPathsAreNormalized)
+                foreach ($lineEntryPath in @($Item.LineEntryPaths))
+                {
+                    $normalizedLineEntryPath = [string]$lineEntryPath
+                    if (-not $lineEntryPathsAreNormalized)
+                    {
+                        $normalizedLineEntryPath = ConvertTo-PathKey -Path $normalizedLineEntryPath
+                    }
+                    if ([string]::IsNullOrWhiteSpace($normalizedLineEntryPath))
+                    {
+                        continue
+                    }
+                    [void]$lineEntryPathSet.Add($normalizedLineEntryPath)
+                }
+                if (-not ($hasNeedDetailedDiffParse -and [bool]$Item.HasNeedDetailedDiffParse) -and $lineEntryPathSet.Count -gt 0)
+                {
+                    $needDetailedDiffParse = $true
+                }
+            }
+            else
+            {
+                foreach ($pathEntry in @($Item.ChangedPaths))
+                {
+                    if ($null -eq $pathEntry)
+                    {
+                        continue
+                    }
+                    $targetPath = ConvertTo-PathKey -Path ([string]$pathEntry.Path)
+                    if ([string]::IsNullOrWhiteSpace($targetPath))
+                    {
+                        continue
+                    }
+                    $action = ([string]$pathEntry.Action).ToUpperInvariant()
+                    $copyFromPath = ConvertTo-PathKey -Path ([string]$pathEntry.CopyFromPath)
+                    $isPureAdd = ($action -eq 'A' -and [string]::IsNullOrWhiteSpace($copyFromPath))
+                    $isPureDelete = ($action -eq 'D')
+                    if ($isPureAdd -or $isPureDelete)
+                    {
+                        continue
+                    }
+                    [void]$lineEntryPathSet.Add($targetPath)
+                }
+                if ($lineEntryPathSet.Count -gt 0)
+                {
+                    $needDetailedDiffParse = $true
+                }
+            }
             if ([bool]$Item.ExcludeCommentOnlyLines)
             {
                 $needDetailedDiffParse = $true
@@ -14216,6 +14974,7 @@ function Invoke-CommitDiffPrefetch
                 }
             }
             $rawDiffByPath = ConvertFrom-SvnUnifiedDiff -Context $Context -DiffText $diffText -DetailLevel $detailLevel -ExcludeCommentOnlyLines:$([bool]$Item.ExcludeCommentOnlyLines) -LineMaskByPath $lineMaskByPath -SkipHashComputation -LineEntryPathSet $lineEntryPathSet
+            $diffText = $null
             [pscustomobject]@{
                 Revision = [int]$Item.Revision
                 RawDiffByPath = $rawDiffByPath
@@ -14265,21 +15024,34 @@ function Merge-CommitDiffForCommit
     {
         $rawDiffByPath = $RawDiffByRevision[$revision]
     }
-    $filteredDiffByPath = @{}
-    foreach ($path in $rawDiffByPath.Keys)
-    {
-        if (Test-ShouldCountFile -FilePath $path -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns)
-        {
-            $filteredDiffByPath[$path] = $rawDiffByPath[$path]
-        }
-    }
-    $Commit.FileDiffStats = $filteredDiffByPath
-
+    $hasPreFilteredChangedPaths = ($null -ne $Commit.ChangedPathsFiltered)
     if ($null -eq $Commit.ChangedPathsFiltered)
     {
         $Commit.ChangedPathsFiltered = Get-FilteredChangedPathEntry -ChangedPaths @($Commit.ChangedPaths) -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns
+        $hasPreFilteredChangedPaths = $false
+    }
+    if ($hasPreFilteredChangedPaths)
+    {
+        $Commit.FileDiffStats = $rawDiffByPath
+    }
+    else
+    {
+        $filteredDiffByPath = @{}
+        foreach ($path in $rawDiffByPath.Keys)
+        {
+            if (Test-ShouldCountFile -FilePath $path -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns)
+            {
+                $filteredDiffByPath[$path] = $rawDiffByPath[$path]
+            }
+        }
+        $Commit.FileDiffStats = $filteredDiffByPath
     }
 
+    $changedPathsAreDiffRelative = $false
+    if ($hasPreFilteredChangedPaths -and $Commit.PSObject.Properties.Match('ChangedPathsFilteredAreDiffRelative').Count -gt 0)
+    {
+        $changedPathsAreDiffRelative = [bool]$Commit.ChangedPathsFilteredAreDiffRelative
+    }
     $allowedFilePathSet = New-Object 'System.Collections.Generic.HashSet[string]'
     $logToDiffPathMap = @{}
     foreach ($pathEntry in @($Commit.ChangedPathsFiltered))
@@ -14287,7 +15059,11 @@ function Merge-CommitDiffForCommit
         $logPath = ConvertTo-PathKey -Path ([string]$pathEntry.Path)
         if ($logPath)
         {
-            $diffPath = ConvertTo-DiffRelativePath -Path $logPath -LogPathPrefix $LogPathPrefix
+            $diffPath = $logPath
+            if (-not $changedPathsAreDiffRelative)
+            {
+                $diffPath = ConvertTo-DiffRelativePath -Path $logPath -LogPathPrefix $LogPathPrefix
+            }
             [void]$allowedFilePathSet.Add($diffPath)
             $logToDiffPathMap[$logPath] = $diffPath
         }
@@ -14305,7 +15081,7 @@ function Merge-CommitDiffForCommit
     $Commit.FilesChanged = @($Commit.FileDiffStats.Keys | Sort-Object)
 
     # ChangedPathsFiltered のパスも diff 相対パスに統一する
-    if ($LogPathPrefix)
+    if ($LogPathPrefix -and -not $changedPathsAreDiffRelative)
     {
         $normalizedEntries = New-Object 'System.Collections.Generic.List[object]'
         foreach ($pathEntry in @($Commit.ChangedPathsFiltered))
@@ -14404,13 +15180,13 @@ function Initialize-CommitDiffData
     foreach ($commit in @($Commits))
     {
         $pct = [Math]::Min(100, [int](($commitIdx / [Math]::Max(1, $commitTotal)) * 100))
-        Write-Progress -Id 2 -Activity 'コミット差分の統合' -Status ('{0}/{1}' -f ($commitIdx + 1), $commitTotal) -PercentComplete $pct
+        Write-NarutoProgress -Id 2 -Activity 'コミット差分の統合' -Status ('{0}/{1}' -f ($commitIdx + 1), $commitTotal) -PercentComplete $pct
         $revision = [int]$commit.Revision
         Merge-CommitDiffForCommit -Commit $commit -RawDiffByRevision $rawDiffByRevision -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePathPatterns -ExcludePathPatterns $ExcludePathPatterns -LogPathPrefix $LogPathPrefix
         Complete-CommitDiffForCommit -Context $Context -Commit $commit -Revision $revision -TargetUrl $TargetUrl -CacheDir $CacheDir -DiffArguments $DiffArguments
         $commitIdx++
     }
-    Write-Progress -Id 2 -Activity 'コミット差分の統合' -Completed
+    Write-NarutoProgress -Id 2 -Activity 'コミット差分の統合' -Completed
     return $prefetchPlan.RevToAuthor
 }
 # endregion 差分処理パイプライン
@@ -14542,6 +15318,7 @@ function Get-StrictOwnershipAggregate
         [string[]]$ExcludePaths,
         [int]$Parallel = 1
     )
+    $effectiveParallel = [Math]::Max(1, [Math]::Min([int]$Parallel, 12))
     $ownershipTargets = @(Get-AllRepositoryFile -Context $Context -TargetUrl $TargetUrl -Revision $ToRevision -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePathPatterns $IncludePaths -ExcludePathPatterns $ExcludePaths)
     $existingFileSet = New-Object 'System.Collections.Generic.HashSet[string]'
     foreach ($file in $ownershipTargets)
@@ -14552,7 +15329,7 @@ function Get-StrictOwnershipAggregate
     $authorOwned = @{}
     $ownedTotal = 0
     $blameByFile = @{}
-    if ($Parallel -le 1)
+    if ($effectiveParallel -le 1)
     {
         $ownerTotal = $ownershipTargets.Count
         $ownerIdx = 0
@@ -14626,7 +15403,7 @@ function Get-StrictOwnershipAggregate
                 } -InnerException $_.Exception
             }
         }
-        $ownershipResults = @(Invoke-ParallelWork -InputItems $ownershipItems.ToArray() -WorkerScript $ownershipWorker -MaxParallel $Parallel -RequiredFunctions @(
+        $ownershipResults = @(Invoke-ParallelWork -InputItems $ownershipItems.ToArray() -WorkerScript $ownershipWorker -MaxParallel $effectiveParallel -RequiredFunctions @(
                 $Context.Constants.RunspaceSvnCoreFunctions +
                 $Context.Constants.RunspaceBlameCacheFunctions +
                 $Context.Constants.RunspaceCommentFilterFunctions +
@@ -15179,8 +15956,184 @@ function Get-StrictExecutionContext
         [hashtable]$RenameMap = @{}
     )
     $renameMap = Get-EffectiveStrictRenameMap -Commits $Commits -RenameMap $RenameMap
-    $strictDetail = Get-StrictDeathDetailOrThrow -Context $Context -Commits $Commits -RevToAuthor $RevToAuthor -TargetUrl $TargetUrl -FromRevision $FromRevision -ToRevision $ToRevision -CacheDir $CacheDir -RenameMap $renameMap -Parallel $Parallel
-    $ownershipAggregate = Get-StrictOwnershipAggregate -Context $Context -TargetUrl $TargetUrl -ToRevision $ToRevision -CacheDir $CacheDir -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -Parallel $Parallel
+    $effectiveParallel = [Math]::Max(1, [int]$Parallel)
+    $ownershipParallel = [Math]::Max(1, [Math]::Min($effectiveParallel, 12))
+    $strictDetail = $null
+    $ownershipAggregate = $null
+
+    if ($effectiveParallel -le 1)
+    {
+        $strictDetail = Get-StrictDeathDetailOrThrow -Context $Context -Commits $Commits -RevToAuthor $RevToAuthor -TargetUrl $TargetUrl -FromRevision $FromRevision -ToRevision $ToRevision -CacheDir $CacheDir -RenameMap $renameMap -Parallel $effectiveParallel
+        $ownershipAggregate = Get-StrictOwnershipAggregate -Context $Context -TargetUrl $TargetUrl -ToRevision $ToRevision -CacheDir $CacheDir -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -Parallel $ownershipParallel
+    }
+    else
+    {
+        $parallelWorkItems = @(
+            [pscustomobject]@{
+                WorkType = 'Death'
+                WorkContext = (Get-RunspaceNarutoContext -Context $Context)
+                Commits = @($Commits)
+                RevToAuthor = $RevToAuthor
+                TargetUrl = [string]$TargetUrl
+                FromRevision = [int]$FromRevision
+                ToRevision = [int]$ToRevision
+                CacheDir = [string]$CacheDir
+                RenameMap = $renameMap
+                Parallel = [int]$effectiveParallel
+            },
+            [pscustomobject]@{
+                WorkType = 'Ownership'
+                WorkContext = (Get-RunspaceNarutoContext -Context $Context)
+                TargetUrl = [string]$TargetUrl
+                ToRevision = [int]$ToRevision
+                CacheDir = [string]$CacheDir
+                IncludeExtensions = @($IncludeExtensions)
+                ExcludeExtensions = @($ExcludeExtensions)
+                IncludePaths = @($IncludePaths)
+                ExcludePaths = @($ExcludePaths)
+                Parallel = [int]$ownershipParallel
+            }
+        )
+        $strictExecutionWorker = {
+            param($Item, $Index)
+            [void]$Index # Required by Invoke-ParallelWork contract
+            $workContext = $Item.WorkContext
+            $svnCommandStats = @{}
+            $strictBreakdown = @{}
+            $strictTargetStats = @{}
+            if ([string]$Item.WorkType -eq 'Death')
+            {
+                $data = Get-StrictDeathDetailOrThrow -Context $workContext -Commits @($Item.Commits) -RevToAuthor $Item.RevToAuthor -TargetUrl ([string]$Item.TargetUrl) -FromRevision ([int]$Item.FromRevision) -ToRevision ([int]$Item.ToRevision) -CacheDir ([string]$Item.CacheDir) -RenameMap $Item.RenameMap -Parallel ([int]$Item.Parallel)
+                if ($null -ne $workContext.Diagnostics -and $null -ne $workContext.Diagnostics.Performance)
+                {
+                    if ($workContext.Diagnostics.Performance.Contains('SvnCommandStats') -and $null -ne $workContext.Diagnostics.Performance.SvnCommandStats)
+                    {
+                        foreach ($k in @($workContext.Diagnostics.Performance.SvnCommandStats.Keys))
+                        {
+                            $svnCommandStats[[string]$k] = [int]$workContext.Diagnostics.Performance.SvnCommandStats[$k]
+                        }
+                    }
+                    if ($workContext.Diagnostics.Performance.Contains('StrictBreakdown') -and $null -ne $workContext.Diagnostics.Performance.StrictBreakdown)
+                    {
+                        foreach ($k in @($workContext.Diagnostics.Performance.StrictBreakdown.Keys))
+                        {
+                            $strictBreakdown[[string]$k] = $workContext.Diagnostics.Performance.StrictBreakdown[$k]
+                        }
+                    }
+                    if ($workContext.Diagnostics.Performance.Contains('StrictTargetStats') -and $null -ne $workContext.Diagnostics.Performance.StrictTargetStats)
+                    {
+                        foreach ($k in @($workContext.Diagnostics.Performance.StrictTargetStats.Keys))
+                        {
+                            $strictTargetStats[[string]$k] = $workContext.Diagnostics.Performance.StrictTargetStats[$k]
+                        }
+                    }
+                }
+                return [pscustomobject]@{
+                    WorkType = 'Death'
+                    Data = $data
+                    CacheHits = [int]$workContext.Caches.StrictBlameCacheHits
+                    CacheMisses = [int]$workContext.Caches.StrictBlameCacheMisses
+                    SvnCommandStats = $svnCommandStats
+                    StrictBreakdown = $strictBreakdown
+                    StrictTargetStats = $strictTargetStats
+                }
+            }
+
+            if ([string]$Item.WorkType -eq 'Ownership')
+            {
+                $data = Get-StrictOwnershipAggregate -Context $workContext -TargetUrl ([string]$Item.TargetUrl) -ToRevision ([int]$Item.ToRevision) -CacheDir ([string]$Item.CacheDir) -IncludeExtensions @($Item.IncludeExtensions) -ExcludeExtensions @($Item.ExcludeExtensions) -IncludePaths @($Item.IncludePaths) -ExcludePaths @($Item.ExcludePaths) -Parallel ([int]$Item.Parallel)
+                if ($null -ne $workContext.Diagnostics -and $null -ne $workContext.Diagnostics.Performance -and $workContext.Diagnostics.Performance.Contains('SvnCommandStats') -and $null -ne $workContext.Diagnostics.Performance.SvnCommandStats)
+                {
+                    foreach ($k in @($workContext.Diagnostics.Performance.SvnCommandStats.Keys))
+                    {
+                        $svnCommandStats[[string]$k] = [int]$workContext.Diagnostics.Performance.SvnCommandStats[$k]
+                    }
+                }
+                return [pscustomobject]@{
+                    WorkType = 'Ownership'
+                    Data = $data
+                    CacheHits = [int]$workContext.Caches.StrictBlameCacheHits
+                    CacheMisses = [int]$workContext.Caches.StrictBlameCacheMisses
+                    SvnCommandStats = $svnCommandStats
+                    StrictBreakdown = @{}
+                    StrictTargetStats = @{}
+                }
+            }
+
+            Throw-NarutoError -Category 'INTERNAL' -ErrorCode 'INTERNAL_UNEXPECTED_ERROR' -Message ("Unknown strict execution work type: {0}" -f [string]$Item.WorkType) -Context @{
+                WorkType = [string]$Item.WorkType
+            }
+        }
+        $requiredFunctions = Get-NarutoScriptFunctionNameList -Context $Context
+        $parallelResults = @(Invoke-ParallelWork -InputItems $parallelWorkItems -WorkerScript $strictExecutionWorker -MaxParallel 2 -RequiredFunctions $requiredFunctions -ErrorContext 'strict execution context')
+        $orderedResults = @($parallelResults | Sort-Object WorkType)
+        foreach ($parallelResult in @($orderedResults))
+        {
+            $Context.Caches.StrictBlameCacheHits += [int]$parallelResult.CacheHits
+            $Context.Caches.StrictBlameCacheMisses += [int]$parallelResult.CacheMisses
+            if ($null -ne $parallelResult.SvnCommandStats)
+            {
+                foreach ($commandName in @($parallelResult.SvnCommandStats.Keys))
+                {
+                    $existing = 0
+                    if ($Context.Diagnostics.Performance.SvnCommandStats.Contains($commandName))
+                    {
+                        $existing = [int]$Context.Diagnostics.Performance.SvnCommandStats[$commandName]
+                    }
+                    Set-NarutoPerformanceValue -Context $Context -SectionName 'SvnCommandStats' -Key ([string]$commandName) -Value ([int]$existing + [int]$parallelResult.SvnCommandStats[$commandName])
+                }
+            }
+            if ([string]$parallelResult.WorkType -eq 'Death')
+            {
+                $strictDetail = $parallelResult.Data
+                if ($null -ne $parallelResult.StrictBreakdown)
+                {
+                    foreach ($key in @($parallelResult.StrictBreakdown.Keys))
+                    {
+                        Set-NarutoPerformanceValue -Context $Context -SectionName 'StrictBreakdown' -Key ([string]$key) -Value $parallelResult.StrictBreakdown[$key]
+                    }
+                }
+                if ($null -ne $parallelResult.StrictTargetStats)
+                {
+                    foreach ($key in @($parallelResult.StrictTargetStats.Keys))
+                    {
+                        Set-NarutoPerformanceValue -Context $Context -SectionName 'StrictTargetStats' -Key ([string]$key) -Value $parallelResult.StrictTargetStats[$key]
+                    }
+                }
+            }
+            elseif ([string]$parallelResult.WorkType -eq 'Ownership')
+            {
+                $ownershipAggregate = $parallelResult.Data
+            }
+        }
+    }
+
+    if ($null -eq $strictDetail)
+    {
+        Throw-NarutoError -Category 'STRICT' -ErrorCode 'STRICT_DEATH_ATTRIBUTION_NULL' -Message 'Strict death attribution returned null.' -Context @{}
+    }
+    if ($null -eq $ownershipAggregate)
+    {
+        Throw-NarutoError -Category 'STRICT' -ErrorCode 'STRICT_OWNERSHIP_BLAME_FAILED' -Message 'Strict ownership aggregate returned null.' -Context @{}
+    }
+    if ($strictDetail.PSObject.Properties.Match('RevsWhereKilledOthers').Count -gt 0 -and $strictDetail.RevsWhereKilledOthers -isnot [System.Collections.Generic.HashSet[string]])
+    {
+        $normalizedRevsWhereKilledOthers = New-Object 'System.Collections.Generic.HashSet[string]'
+        foreach ($entry in @($strictDetail.RevsWhereKilledOthers))
+        {
+            [void]$normalizedRevsWhereKilledOthers.Add([string]$entry)
+        }
+        $strictDetail.RevsWhereKilledOthers = $normalizedRevsWhereKilledOthers
+    }
+    if ($ownershipAggregate.PSObject.Properties.Match('ExistingFileSet').Count -gt 0 -and $ownershipAggregate.ExistingFileSet -isnot [System.Collections.Generic.HashSet[string]])
+    {
+        $normalizedExistingFileSet = New-Object 'System.Collections.Generic.HashSet[string]'
+        foreach ($filePath in @($ownershipAggregate.ExistingFileSet))
+        {
+            [void]$normalizedExistingFileSet.Add([string]$filePath)
+        }
+        $ownershipAggregate.ExistingFileSet = $normalizedExistingFileSet
+    }
     $authorModifiedOthersSurvived = Get-AuthorModifiedOthersSurvivedCount -BlameByFile $ownershipAggregate.BlameByFile -RevsWhereKilledOthers $strictDetail.RevsWhereKilledOthers -FromRevision $FromRevision -ToRevision $ToRevision
 
     return (New-StrictExecutionContext -RenameMap $renameMap -StrictDetail $strictDetail -AuthorOwned $ownershipAggregate.AuthorOwned -OwnedTotal ([int]$ownershipAggregate.OwnedTotal) -BlameByFile $ownershipAggregate.BlameByFile -ExistingFileSet $ownershipAggregate.ExistingFileSet -AuthorModifiedOthersSurvived $authorModifiedOthersSurvived)
@@ -15681,6 +16634,101 @@ function Initialize-PipelineSvnRuntimeContext
     $Context.Runtime.SvnGlobalArguments = Get-SvnGlobalArgumentList -Username $Username -Password $Password -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert
     return $Context.Runtime.SvnExecutable
 }
+function Get-DefaultParallelLimit
+{
+    <#
+    .SYNOPSIS
+        既定の並列ワーカー上限値を返す。
+    #>
+    [CmdletBinding()]
+    [OutputType([int])]
+    param()
+    return [Math]::Max(1, [Math]::Min(32, [Environment]::ProcessorCount))
+}
+function Resolve-AutoParallelWorkerCount
+{
+    <#
+    .SYNOPSIS
+        コミット件数と CPU コア数から自動並列ワーカー数を決定する。
+    #>
+    [CmdletBinding()]
+    [OutputType([int])]
+    param(
+        [int]$CommitCount,
+        [int]$CpuCount = [Environment]::ProcessorCount
+    )
+    $cpu = [Math]::Max(1, [int]$CpuCount)
+    $commits = [Math]::Max(0, [int]$CommitCount)
+    $selected = 1
+    if ($commits -ge 300)
+    {
+        # 高コミット帯は svn I/O 待機が支配的になりやすいため、CPU 数よりやや多めに確保する。
+        $selected = $cpu + [Math]::Max(4, [int][Math]::Ceiling($cpu * 0.5))
+        $selected = [Math]::Max(8, $selected)
+        $selected = [Math]::Min(24, $selected)
+    }
+    elseif ($commits -ge 100)
+    {
+        $selected = [int][Math]::Round(($cpu * 0.6), [System.MidpointRounding]::AwayFromZero)
+        $selected = [Math]::Max(4, $selected)
+        $selected = [Math]::Min(16, $selected)
+    }
+    else
+    {
+        $selected = [int][Math]::Round(($cpu * 0.5), [System.MidpointRounding]::AwayFromZero)
+        $selected = [Math]::Max(2, $selected)
+        $selected = [Math]::Min(8, $selected)
+    }
+    return [Math]::Max(1, [int]$selected)
+}
+function Get-NarutoScriptFunctionNameList
+{
+    <#
+    .SYNOPSIS
+        NarutoCode.ps1 で定義された関数名一覧を返す。
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param([Parameter(Mandatory = $true)][hashtable]$Context)
+    if ($null -ne $Context.Caches -and $Context.Caches.ContainsKey('ScriptFunctionNameList') -and $null -ne $Context.Caches.ScriptFunctionNameList)
+    {
+        return [string[]]@($Context.Caches.ScriptFunctionNameList)
+    }
+
+    $scriptPath = $PSCommandPath
+    if ([string]::IsNullOrWhiteSpace($scriptPath))
+    {
+        $selfCommand = Get-Command Get-NarutoScriptFunctionNameList -ErrorAction SilentlyContinue
+        if ($null -ne $selfCommand -and $null -ne $selfCommand.ScriptBlock)
+        {
+            $scriptPath = [string]$selfCommand.ScriptBlock.File
+        }
+    }
+    if (-not [System.IO.File]::Exists($scriptPath))
+    {
+        return [string[]]@()
+    }
+
+    $nameSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($line in [System.IO.File]::ReadLines($scriptPath))
+    {
+        if ([string]::IsNullOrWhiteSpace($line))
+        {
+            continue
+        }
+        if ($line -match '^\s*function\s+([A-Za-z_][A-Za-z0-9_-]*)\b')
+        {
+            [void]$nameSet.Add([string]$Matches[1])
+        }
+    }
+    $names = @($nameSet | Sort-Object)
+    if ($null -eq $Context.Caches)
+    {
+        $Context.Caches = @{}
+    }
+    $Context.Caches.ScriptFunctionNameList = @($names)
+    return [string[]]@($names)
+}
 function New-PipelineExecutionState
 {
     <#
@@ -15826,21 +16874,35 @@ function Invoke-PipelineLogAndDiffStage
         [Parameter(Mandatory = $true)][hashtable]$Context,
         [object]$ExecutionState,
         [switch]$IgnoreWhitespace,
-        [int]$Parallel
+        [int]$Parallel,
+        [switch]$ParallelExplicit
     )
     Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 2/8: SVN ログの取得' -PercentComplete 5
     $logText = Invoke-SvnCommand -Context $Context -Arguments @('log', '--xml', '--verbose', '-r', ("{0}:{1}" -f $ExecutionState.FromRevision, $ExecutionState.ToRevision), $ExecutionState.TargetUrl) -ErrorContext 'svn log'
     $commits = @(ConvertFrom-SvnLogXml -XmlText $logText)
+    $commitCount = [int]$commits.Count
+
+    $effectiveParallel = [Math]::Max(1, [int]$Parallel)
+    if (-not $ParallelExplicit)
+    {
+        $effectiveParallel = Resolve-AutoParallelWorkerCount -CommitCount $commitCount
+    }
+    Set-NarutoPerformanceValue -Context $Context -SectionName 'PerfGate' -Key 'ParallelExplicit' -Value ([bool]$ParallelExplicit)
+    Set-NarutoPerformanceValue -Context $Context -SectionName 'PerfGate' -Key 'ParallelRequested' -Value ([int]$Parallel)
+    Set-NarutoPerformanceValue -Context $Context -SectionName 'PerfGate' -Key 'ParallelEffective' -Value ([int]$effectiveParallel)
+    Set-NarutoPerformanceValue -Context $Context -SectionName 'PerfGate' -Key 'ParallelDecisionCpu' -Value ([int][Environment]::ProcessorCount)
+    Set-NarutoPerformanceValue -Context $Context -SectionName 'PerfGate' -Key 'ParallelDecisionCommitCount' -Value $commitCount
 
     Write-Progress -Id 0 -Activity 'NarutoCode' -Status 'ステップ 3/8: 差分の取得と統計構築' -PercentComplete 15
     $diffArgs = Get-SvnDiffArgumentList -IgnoreWhitespace:$IgnoreWhitespace
-    $revToAuthor = Initialize-CommitDiffData -Context $Context -Commits $commits -CacheDir $ExecutionState.CacheDir -TargetUrl $ExecutionState.TargetUrl -DiffArguments $diffArgs -IncludeExtensions $ExecutionState.IncludeExtensions -ExcludeExtensions $ExecutionState.ExcludeExtensions -IncludePathPatterns $ExecutionState.IncludePaths -ExcludePathPatterns $ExecutionState.ExcludePaths -LogPathPrefix $ExecutionState.LogPathPrefix -ExcludeCommentOnlyLines:$ExecutionState.ExcludeCommentOnlyLines -Parallel $Parallel
+    $revToAuthor = Initialize-CommitDiffData -Context $Context -Commits $commits -CacheDir $ExecutionState.CacheDir -TargetUrl $ExecutionState.TargetUrl -DiffArguments $diffArgs -IncludeExtensions $ExecutionState.IncludeExtensions -ExcludeExtensions $ExecutionState.ExcludeExtensions -IncludePathPatterns $ExecutionState.IncludePaths -ExcludePathPatterns $ExecutionState.ExcludePaths -LogPathPrefix $ExecutionState.LogPathPrefix -ExcludeCommentOnlyLines:$ExecutionState.ExcludeCommentOnlyLines -Parallel $effectiveParallel
     $renameMap = Get-RenameMap -Commits $commits -LogPathPrefix $ExecutionState.LogPathPrefix
 
     return [pscustomobject]@{
         Commits = $commits
         RevToAuthor = $revToAuthor
         RenameMap = $renameMap
+        EffectiveParallel = [int]$effectiveParallel
     }
 }
 function Invoke-PipelineAggregationStage
@@ -16091,6 +17153,7 @@ function Invoke-NarutoCodePipeline
         [switch]$NonInteractive,
         [switch]$TrustServerCert,
         [int]$Parallel,
+        [switch]$ParallelExplicit,
         [string[]]$IncludePaths,
         [string[]]$ExcludePaths,
         [string[]]$IncludeExtensions,
@@ -16105,21 +17168,36 @@ function Invoke-NarutoCodePipeline
     $Context = Initialize-StrictModeContext -Context $Context
     $Context.Runtime.ExcludeCommentOnlyLines = [bool]$ExcludeCommentOnlyLines
     $executionState = Resolve-PipelineExecutionState -Context $Context -RepoUrl $RepoUrl -FromRevision $FromRevision -ToRevision $ToRevision -OutDirectory $OutDirectory -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -SvnExecutable $SvnExecutable -Username $Username -Password $Password -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -ExcludeCommentOnlyLines:$ExcludeCommentOnlyLines
+    $requestedParallel = [int]$Parallel
+    if ($requestedParallel -le 0)
+    {
+        $requestedParallel = Get-DefaultParallelLimit
+    }
+    $effectiveParallelExplicit = [bool]$ParallelExplicit
+    if (-not $effectiveParallelExplicit)
+    {
+        $effectiveParallelExplicit = $PSBoundParameters.ContainsKey('Parallel')
+    }
 
     $stageStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-    $logAndDiffStage = Invoke-PipelineLogAndDiffStage -Context $Context -ExecutionState $executionState -IgnoreWhitespace:$IgnoreWhitespace -Parallel $Parallel
+    $logAndDiffStage = Invoke-PipelineLogAndDiffStage -Context $Context -ExecutionState $executionState -IgnoreWhitespace:$IgnoreWhitespace -Parallel $requestedParallel -ParallelExplicit:$effectiveParallelExplicit
+    $effectiveParallel = [int]$requestedParallel
+    if ($logAndDiffStage.PSObject.Properties.Match('EffectiveParallel').Count -gt 0)
+    {
+        $effectiveParallel = [Math]::Max(1, [int]$logAndDiffStage.EffectiveParallel)
+    }
     Set-NarutoPerformanceValue -Context $Context -SectionName 'StageSeconds' -Key 'LogAndDiff' -Value (Format-MetricValue -Value $stageStopwatch.Elapsed.TotalSeconds)
     $stageStopwatch.Restart()
     $aggregationStage = Invoke-PipelineAggregationStage -Context $Context -Commits $logAndDiffStage.Commits -RenameMap $logAndDiffStage.RenameMap
     Set-NarutoPerformanceValue -Context $Context -SectionName 'StageSeconds' -Key 'Aggregation' -Value (Format-MetricValue -Value $stageStopwatch.Elapsed.TotalSeconds)
     $stageStopwatch.Restart()
-    $strictResult = Invoke-PipelineStrictStage -Context $Context -ExecutionState $executionState -LogAndDiffStage $logAndDiffStage -AggregationStage $aggregationStage -Parallel $Parallel
+    $strictResult = Invoke-PipelineStrictStage -Context $Context -ExecutionState $executionState -LogAndDiffStage $logAndDiffStage -AggregationStage $aggregationStage -Parallel $effectiveParallel
     Set-NarutoPerformanceValue -Context $Context -SectionName 'StageSeconds' -Key 'Strict' -Value (Format-MetricValue -Value $stageStopwatch.Elapsed.TotalSeconds)
     $stageStopwatch.Restart()
 
     Write-PipelineCsvArtifacts -Context $Context -OutDirectory $executionState.OutDirectory -CommitterRows $aggregationStage.CommitterRows -FileRows $aggregationStage.FileRows -CommitRows $aggregationStage.CommitRows -CouplingRows $aggregationStage.CouplingRows -StrictResult $strictResult -Encoding $Encoding
     Write-PipelineVisualizationArtifacts -Context $Context -OutDirectory $executionState.OutDirectory -CommitterRows $aggregationStage.CommitterRows -FileRows $aggregationStage.FileRows -CommitRows $aggregationStage.CommitRows -CouplingRows $aggregationStage.CouplingRows -StrictResult $strictResult -TopNCount $TopNCount -Encoding $Encoding
-    $meta = Write-PipelineRunArtifacts -Context $Context -StartedAt $startedAt -ExecutionState $executionState -Parallel $Parallel -TopNCount $TopNCount -Encoding $Encoding -Commits $logAndDiffStage.Commits -FileRows $aggregationStage.FileRows -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -IgnoreWhitespace:$IgnoreWhitespace -ExcludeCommentOnlyLines:$ExcludeCommentOnlyLines
+    $meta = Write-PipelineRunArtifacts -Context $Context -StartedAt $startedAt -ExecutionState $executionState -Parallel $effectiveParallel -TopNCount $TopNCount -Encoding $Encoding -Commits $logAndDiffStage.Commits -FileRows $aggregationStage.FileRows -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -IgnoreWhitespace:$IgnoreWhitespace -ExcludeCommentOnlyLines:$ExcludeCommentOnlyLines
     Set-NarutoPerformanceValue -Context $Context -SectionName 'StageSeconds' -Key 'Artifacts' -Value (Format-MetricValue -Value $stageStopwatch.Elapsed.TotalSeconds)
     Set-NarutoPerformanceValue -Context $Context -SectionName 'StageSeconds' -Key 'Total' -Value (Format-MetricValue -Value $pipelineStopwatch.Elapsed.TotalSeconds)
 
@@ -16131,7 +17209,33 @@ if ($MyInvocation.InvocationName -ne '.')
     $cliContext = New-NarutoContext -SvnExecutable $SvnExecutable
     try
     {
-        [void](Invoke-NarutoCodePipeline -Context $cliContext -RepoUrl $RepoUrl -FromRevision $FromRevision -ToRevision $ToRevision -SvnExecutable $SvnExecutable -OutDirectory $OutDirectory -Username $Username -Password $Password -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -Parallel $Parallel -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -TopNCount $TopNCount -Encoding $Encoding -IgnoreWhitespace:$IgnoreWhitespace -ExcludeCommentOnlyLines:$ExcludeCommentOnlyLines)
+        $invokePipelineArgs = @{
+            Context = $cliContext
+            RepoUrl = $RepoUrl
+            FromRevision = $FromRevision
+            ToRevision = $ToRevision
+            SvnExecutable = $SvnExecutable
+            OutDirectory = $OutDirectory
+            Username = $Username
+            Password = $Password
+            NonInteractive = $NonInteractive
+            TrustServerCert = $TrustServerCert
+            IncludePaths = $IncludePaths
+            ExcludePaths = $ExcludePaths
+            IncludeExtensions = $IncludeExtensions
+            ExcludeExtensions = $ExcludeExtensions
+            TopNCount = $TopNCount
+            Encoding = $Encoding
+            IgnoreWhitespace = $IgnoreWhitespace
+            ExcludeCommentOnlyLines = $ExcludeCommentOnlyLines
+        }
+        $parallelSpecified = $PSBoundParameters.ContainsKey('Parallel')
+        if ($parallelSpecified)
+        {
+            $invokePipelineArgs.Parallel = [int]$Parallel
+            $invokePipelineArgs.ParallelExplicit = $true
+        }
+        [void](Invoke-NarutoCodePipeline @invokePipelineArgs)
     }
     catch
     {
