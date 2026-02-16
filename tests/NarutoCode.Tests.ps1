@@ -150,6 +150,47 @@ Index: src/add.cs
     }
 }
 
+Describe 'ConvertFrom-SvnLogDiffTextByRevision' {
+    It 'extracts revision-scoped diff text from svn log --diff output' {
+        $logDiffText = @"
+------------------------------------------------------------------------
+r10 | alice | 2025-01-01 00:00:00 +0900 | 1 line
+Changed paths:
+   M /src/a.cs
+
+message
+
+Index: src/a.cs
+===================================================================
+--- src/a.cs	(revision 9)
++++ src/a.cs	(revision 10)
+@@ -1 +1 @@
+-old
++new
+------------------------------------------------------------------------
+r11 | bob | 2025-01-01 01:00:00 +0900 | 1 line
+Changed paths:
+   M /src/b.cs
+
+message
+
+Index: src/b.cs
+===================================================================
+--- src/b.cs	(revision 10)
++++ src/b.cs	(revision 11)
+@@ -1 +1 @@
+-before
++after
+------------------------------------------------------------------------
+"@
+        $diffByRevision = ConvertFrom-SvnLogDiffTextByRevision -LogDiffText $logDiffText
+        $diffByRevision.ContainsKey(10) | Should -BeTrue
+        $diffByRevision.ContainsKey(11) | Should -BeTrue
+        ([string]$diffByRevision[10]) | Should -Match '^Index: src/a\.cs'
+        ([string]$diffByRevision[11]) | Should -Match '^Index: src/b\.cs'
+    }
+}
+
 Describe 'Comment syntax profile and line mask' {
     It 'resolves profile by extension' {
         (Get-CommentSyntaxProfileByPath -FilePath 'src/main.c').Name | Should -Be 'CStyle'
@@ -1766,6 +1807,69 @@ Index: trunk/src/Main.cs
         $hunk.AddedLineHashes.Count | Should -Be 1
     }
 
+    It 'captures changed line entries with original line numbers at DetailLevel 1' {
+        $diff = @"
+Index: trunk/src/Main.cs
+===================================================================
+--- trunk/src/Main.cs	(revision 9)
++++ trunk/src/Main.cs	(revision 10)
+@@ -10,3 +10,3 @@
+ context
+-old1
+-old2
++new1
++new2
+"@
+        $parsed = ConvertFrom-SvnUnifiedDiff -DiffText $diff -DetailLevel 1
+        $hunk = $parsed['trunk/src/Main.cs'].Hunks[0]
+        $hunk.DeletedLineEntries.Count | Should -Be 2
+        $hunk.AddedLineEntries.Count | Should -Be 2
+        $deletedEntry1 = [string]$hunk.DeletedLineEntries[0]
+        $deletedEntry2 = [string]$hunk.DeletedLineEntries[1]
+        $addedEntry1 = [string]$hunk.AddedLineEntries[0]
+        $addedEntry2 = [string]$hunk.AddedLineEntries[1]
+        $deletedParts1 = $deletedEntry1.Split(@([char]31), 2, [System.StringSplitOptions]::None)
+        $deletedParts2 = $deletedEntry2.Split(@([char]31), 2, [System.StringSplitOptions]::None)
+        $addedParts1 = $addedEntry1.Split(@([char]31), 2, [System.StringSplitOptions]::None)
+        $addedParts2 = $addedEntry2.Split(@([char]31), 2, [System.StringSplitOptions]::None)
+        $deletedParts1[0] | Should -Be '11'
+        $deletedParts2[0] | Should -Be '12'
+        $deletedParts1[1] | Should -Be 'old1'
+        $deletedParts2[1] | Should -Be 'old2'
+        $addedParts1[0] | Should -Be '11'
+        $addedParts2[0] | Should -Be '12'
+        $addedParts1[1] | Should -Be 'new1'
+        $addedParts2[1] | Should -Be 'new2'
+    }
+
+    It 'supports SkipHashComputation while keeping changed line entries' {
+        $diff = @"
+Index: trunk/src/Main.cs
+===================================================================
+--- trunk/src/Main.cs	(revision 9)
++++ trunk/src/Main.cs	(revision 10)
+@@ -1,2 +1,2 @@
+-old
++new
+"@
+        $parsed = ConvertFrom-SvnUnifiedDiff -DiffText $diff -DetailLevel 1 -SkipHashComputation
+        $stat = $parsed['trunk/src/Main.cs']
+        $hunk = $stat.Hunks[0]
+        $stat.AddedLineHashes.Count | Should -Be 0
+        $stat.DeletedLineHashes.Count | Should -Be 0
+        $hunk.ContextHash | Should -BeNullOrEmpty
+        $hunk.AddedLineHashes.Count | Should -Be 0
+        $hunk.DeletedLineHashes.Count | Should -Be 0
+        $hunk.AddedLineEntries.Count | Should -Be 1
+        $hunk.DeletedLineEntries.Count | Should -Be 1
+        $addedToken = ([string]$hunk.AddedLineEntries[0]).Split(@([char]31), 2, [System.StringSplitOptions]::None)
+        $deletedToken = ([string]$hunk.DeletedLineEntries[0]).Split(@([char]31), 2, [System.StringSplitOptions]::None)
+        $addedToken[0] | Should -Be '1'
+        $addedToken[1] | Should -Be 'new'
+        $deletedToken[0] | Should -Be '1'
+        $deletedToken[1] | Should -Be 'old'
+    }
+
     It 'does not capture hashes at DetailLevel 0' {
         $diff = @"
 Index: trunk/src/Main.cs
@@ -2619,6 +2723,252 @@ Describe 'Get-StrictTransitionComparison fast path' {
     }
 }
 
+Describe 'Get-StrictTransitionComparison sparse comparison path' {
+    BeforeEach {
+        $script:TestContext = Initialize-StrictModeContext -Context $script:TestContext
+        $PSDefaultParameterValues['*:Context'] = $script:TestContext
+        $script:TestContext.Runtime.ExcludeCommentOnlyLines = $false
+    }
+
+    It 'uses blame metadata only when diff line entries are available' {
+        Mock Get-SvnBlameSparseLineByNumber {
+            param([string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir, [int[]]$LineNumbers = @())
+            [void]$Repo
+            [void]$FilePath
+            [void]$CacheDir
+            [void]$LineNumbers
+            if ($Revision -eq 9)
+            {
+                return [pscustomobject]@{
+                    LineByNumber = @{
+                        2 = [pscustomobject]@{
+                            Revision = 5
+                            Author = 'alice'
+                        }
+                    }
+                }
+            }
+            return [pscustomobject]@{
+                LineByNumber = @{
+                    2 = [pscustomobject]@{
+                        Revision = 10
+                        Author = 'bob'
+                    }
+                }
+            }
+        } -Verifiable
+
+        $transitionContext = [pscustomobject]@{
+            BeforePath = 'src/a.cs'
+            AfterPath = 'src/a.cs'
+            MetricFile = 'src/a.cs'
+            HasTransitionStat = $true
+            TransitionAdded = 1
+            TransitionDeleted = 1
+            TransitionHunks = @(
+                [pscustomobject]@{
+                    OldStart = 2
+                    OldCount = 1
+                    NewStart = 2
+                    NewCount = 1
+                    AddedLineEntries = @([pscustomobject]@{ LineNumber = 2; Content = 'new value' })
+                    DeletedLineEntries = @([pscustomobject]@{ LineNumber = 2; Content = 'old value' })
+                }
+            )
+        }
+
+        $cmp = Get-StrictTransitionComparison -Context $script:TestContext -TransitionContext $transitionContext -TargetUrl 'https://example.invalid/svn/repo' -Revision 10 -CacheDir 'dummy'
+
+        Assert-MockCalled Get-SvnBlameSparseLineByNumber -Times 2 -Exactly
+        @($cmp.KilledLines).Count | Should -Be 1
+        @($cmp.BornLines).Count | Should -Be 1
+        [string]$cmp.KilledLines[0].Line.Author | Should -Be 'alice'
+        [string]$cmp.BornLines[0].Line.Author | Should -Be 'bob'
+    }
+
+    It 'skips current sparse blame lookup when CurrentRevisionAuthor is provided' {
+        Mock Get-SvnBlameSparseLineByNumber {
+            param([string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir, [int[]]$LineNumbers = @())
+            [void]$Repo
+            [void]$FilePath
+            [void]$CacheDir
+            [void]$LineNumbers
+            return [pscustomobject]@{
+                LineByNumber = @{
+                    2 = [pscustomobject]@{
+                        Revision = 5
+                        Author = 'alice'
+                    }
+                }
+            }
+        } -Verifiable
+
+        $transitionContext = [pscustomobject]@{
+            BeforePath = 'src/a.cs'
+            AfterPath = 'src/a.cs'
+            MetricFile = 'src/a.cs'
+            HasTransitionStat = $true
+            TransitionAdded = 1
+            TransitionDeleted = 1
+            TransitionHunks = @(
+                [pscustomobject]@{
+                    OldStart = 2
+                    OldCount = 1
+                    NewStart = 2
+                    NewCount = 1
+                    AddedLineEntries = @([pscustomobject]@{ LineNumber = 2; Content = 'new value' })
+                    DeletedLineEntries = @([pscustomobject]@{ LineNumber = 2; Content = 'old value' })
+                }
+            )
+        }
+
+        $cmp = Get-StrictTransitionComparison -Context $script:TestContext -TransitionContext $transitionContext -TargetUrl 'https://example.invalid/svn/repo' -Revision 10 -CacheDir 'dummy' -CurrentRevisionAuthor 'bob'
+
+        Assert-MockCalled Get-SvnBlameSparseLineByNumber -Times 1 -Exactly
+        @($cmp.KilledLines).Count | Should -Be 1
+        @($cmp.BornLines).Count | Should -Be 1
+        [string]$cmp.KilledLines[0].Line.Author | Should -Be 'alice'
+        [string]$cmp.BornLines[0].Line.Author | Should -Be 'bob'
+        [int]$cmp.BornLines[0].Line.Revision | Should -Be 10
+    }
+
+    It 'falls back to full-content blame comparison when diff line entries are missing' {
+        Mock Get-SvnBlameLine {
+            param([string]$Repo, [string]$FilePath, [int]$Revision, [string]$CacheDir, [bool]$NeedContent = $true, [bool]$NeedLines = $true)
+            [void]$Repo
+            [void]$FilePath
+            [void]$CacheDir
+            [void]$NeedLines
+            if ($Revision -eq 9)
+            {
+                return [pscustomobject]@{
+                    LineCountTotal = 1
+                    LineCountByRevision = @{}
+                    LineCountByAuthor = @{}
+                    LineCountByRevisionAuthor = @{}
+                    Lines = @([pscustomobject]@{ LineNumber = 1; Content = 'old value'; Revision = 5; Author = 'alice' })
+                }
+            }
+            return [pscustomobject]@{
+                LineCountTotal = 1
+                LineCountByRevision = @{}
+                LineCountByAuthor = @{}
+                LineCountByRevisionAuthor = @{}
+                Lines = @([pscustomobject]@{ LineNumber = 1; Content = 'new value'; Revision = 10; Author = 'bob' })
+            }
+        } -Verifiable
+
+        $transitionContext = [pscustomobject]@{
+            BeforePath = 'src/a.cs'
+            AfterPath = 'src/a.cs'
+            MetricFile = 'src/a.cs'
+            HasTransitionStat = $true
+            TransitionAdded = 1
+            TransitionDeleted = 1
+            TransitionHunks = @(
+                [pscustomobject]@{
+                    OldStart = 1
+                    OldCount = 1
+                    NewStart = 1
+                    NewCount = 1
+                }
+            )
+        }
+
+        $cmp = Get-StrictTransitionComparison -Context $script:TestContext -TransitionContext $transitionContext -TargetUrl 'https://example.invalid/svn/repo' -Revision 10 -CacheDir 'dummy'
+
+        Assert-MockCalled Get-SvnBlameLine -Times 2 -Exactly -ParameterFilter { $NeedContent }
+        @($cmp.KilledLines).Count | Should -Be 1
+        @($cmp.BornLines).Count | Should -Be 1
+    }
+}
+
+Describe 'Get-StrictBlamePrefetchTarget NeedContent policy' {
+    BeforeEach {
+        $script:TestContext = Initialize-StrictModeContext -Context $script:TestContext
+        $PSDefaultParameterValues['*:Context'] = $script:TestContext
+        $script:TestContext.Runtime.ExcludeCommentOnlyLines = $false
+    }
+
+    It 'uses NeedContent false for general transitions with diff line entries' {
+        $commit = [pscustomobject]@{
+            Revision = 10
+            Author = 'alice'
+            ChangedPathsFiltered = @(
+                [pscustomobject]@{
+                    Path = 'src/a.cs'
+                    Action = 'M'
+                    CopyFromPath = ''
+                    CopyFromRev = $null
+                    IsDirectory = $false
+                }
+            )
+            FileDiffStats = @{
+                'src/a.cs' = [pscustomobject]@{
+                    AddedLines = 1
+                    DeletedLines = 1
+                    IsBinary = $false
+                    Hunks = @(
+                        [pscustomobject]@{
+                            OldStart = 2
+                            OldCount = 1
+                            NewStart = 2
+                            NewCount = 1
+                            AddedLineEntries = @([pscustomobject]@{ LineNumber = 2; Content = 'new value' })
+                            DeletedLineEntries = @([pscustomobject]@{ LineNumber = 2; Content = 'old value' })
+                        }
+                    )
+                }
+            }
+            FilesChanged = @('src/a.cs')
+        }
+
+        $targets = @(Get-StrictBlamePrefetchTarget -Context $script:TestContext -Commits @($commit) -FromRevision 1 -ToRevision 20 -CacheDir '')
+
+        $targets.Count | Should -Be 1
+        (@($targets | Where-Object { [bool]$_.NeedContent })).Count | Should -Be 0
+        [string]$targets[0].FilePath | Should -Be 'src/a.cs'
+        [int]$targets[0].Revision | Should -Be 9
+    }
+
+    It 'keeps NeedContent true for general transitions without diff line entries' {
+        $commit = [pscustomobject]@{
+            Revision = 10
+            Author = 'alice'
+            ChangedPathsFiltered = @(
+                [pscustomobject]@{
+                    Path = 'src/a.cs'
+                    Action = 'M'
+                    CopyFromPath = ''
+                    CopyFromRev = $null
+                    IsDirectory = $false
+                }
+            )
+            FileDiffStats = @{
+                'src/a.cs' = [pscustomobject]@{
+                    AddedLines = 1
+                    DeletedLines = 1
+                    IsBinary = $false
+                    Hunks = @(
+                        [pscustomobject]@{
+                            OldStart = 2
+                            OldCount = 1
+                            NewStart = 2
+                            NewCount = 1
+                        }
+                    )
+                }
+            }
+            FilesChanged = @('src/a.cs')
+        }
+
+        $targets = @(Get-StrictBlamePrefetchTarget -Context $script:TestContext -Commits @($commit) -FromRevision 1 -ToRevision 20 -CacheDir '')
+
+        $targets.Count | Should -Be 2
+        (@($targets | Where-Object { [bool]$_.NeedContent })).Count | Should -Be 2
+    }
+}
+
 Describe 'Get-ExactDeathAttribution fast path' {
     BeforeAll {
         $script:origGetStrictBlamePrefetchTargetFast = (Get-Item function:Get-StrictBlamePrefetchTarget).ScriptBlock.ToString()
@@ -2826,39 +3176,54 @@ Describe 'Update-StrictAttributionMetric parallel consistency' {
         Set-Item -Path function:Update-CommitterRowWithStrictMetric -Value $script:origUpdateCommitterRowWithStrictMetric
     }
 
-    It 'produces identical outputs for -Parallel 1 and -Parallel 4' {
+    It 'produces identical outputs for -Parallel 1, -Parallel 16, and -Parallel 32' {
         $commits = @([pscustomobject]@{ Revision = 10; Author = 'alice'; FilesChanged = @(); ChangedPathsFiltered = @(); FileDiffStats = @{} })
         $revToAuthor = @{ 10 = 'alice' }
 
-        $fileRowsSeq = @(
+        $fileRows1 = @(
             [pscustomobject]@{ 'ファイルパス' = 'src/a.cs'; '生存行数 (範囲指定)' = $null },
             [pscustomobject]@{ 'ファイルパス' = 'src/b.cs'; '生存行数 (範囲指定)' = $null },
             [pscustomobject]@{ 'ファイルパス' = 'src/c.cs'; '生存行数 (範囲指定)' = $null }
         )
-        $fileRowsPar = @(
+        $fileRows16 = @(
             [pscustomobject]@{ 'ファイルパス' = 'src/a.cs'; '生存行数 (範囲指定)' = $null },
             [pscustomobject]@{ 'ファイルパス' = 'src/b.cs'; '生存行数 (範囲指定)' = $null },
             [pscustomobject]@{ 'ファイルパス' = 'src/c.cs'; '生存行数 (範囲指定)' = $null }
         )
-        $committerRowsSeq = @(
+        $fileRows32 = @(
+            [pscustomobject]@{ 'ファイルパス' = 'src/a.cs'; '生存行数 (範囲指定)' = $null },
+            [pscustomobject]@{ 'ファイルパス' = 'src/b.cs'; '生存行数 (範囲指定)' = $null },
+            [pscustomobject]@{ 'ファイルパス' = 'src/c.cs'; '生存行数 (範囲指定)' = $null }
+        )
+        $committerRows1 = @(
             [pscustomobject]@{ '作者' = 'alice'; '生存行数' = $null; '所有行数' = $null; '他者コード変更生存行数' = $null },
             [pscustomobject]@{ '作者' = 'bob'; '生存行数' = $null; '所有行数' = $null; '他者コード変更生存行数' = $null }
         )
-        $committerRowsPar = @(
+        $committerRows16 = @(
+            [pscustomobject]@{ '作者' = 'alice'; '生存行数' = $null; '所有行数' = $null; '他者コード変更生存行数' = $null },
+            [pscustomobject]@{ '作者' = 'bob'; '生存行数' = $null; '所有行数' = $null; '他者コード変更生存行数' = $null }
+        )
+        $committerRows32 = @(
             [pscustomobject]@{ '作者' = 'alice'; '生存行数' = $null; '所有行数' = $null; '他者コード変更生存行数' = $null },
             [pscustomobject]@{ '作者' = 'bob'; '生存行数' = $null; '所有行数' = $null; '他者コード変更生存行数' = $null }
         )
 
         $script:TestContext = Initialize-StrictModeContext -Context $script:TestContext
-    $PSDefaultParameterValues['*:Context'] = $script:TestContext
-        Update-StrictAttributionMetric -Commits $commits -RevToAuthor $revToAuthor -TargetUrl 'https://example.invalid/svn/repo' -FromRevision 1 -ToRevision 20 -CacheDir 'dummy' -IncludeExtensions @() -ExcludeExtensions @() -IncludePaths @() -ExcludePaths @() -FileRows $fileRowsSeq -CommitterRows $committerRowsSeq -Parallel 1
+        $PSDefaultParameterValues['*:Context'] = $script:TestContext
+        Update-StrictAttributionMetric -Commits $commits -RevToAuthor $revToAuthor -TargetUrl 'https://example.invalid/svn/repo' -FromRevision 1 -ToRevision 20 -CacheDir 'dummy' -IncludeExtensions @() -ExcludeExtensions @() -IncludePaths @() -ExcludePaths @() -FileRows $fileRows1 -CommitterRows $committerRows1 -Parallel 1
 
         $script:TestContext = Initialize-StrictModeContext -Context $script:TestContext
-    $PSDefaultParameterValues['*:Context'] = $script:TestContext
-        Update-StrictAttributionMetric -Commits $commits -RevToAuthor $revToAuthor -TargetUrl 'https://example.invalid/svn/repo' -FromRevision 1 -ToRevision 20 -CacheDir 'dummy' -IncludeExtensions @() -ExcludeExtensions @() -IncludePaths @() -ExcludePaths @() -FileRows $fileRowsPar -CommitterRows $committerRowsPar -Parallel 4
+        $PSDefaultParameterValues['*:Context'] = $script:TestContext
+        Update-StrictAttributionMetric -Commits $commits -RevToAuthor $revToAuthor -TargetUrl 'https://example.invalid/svn/repo' -FromRevision 1 -ToRevision 20 -CacheDir 'dummy' -IncludeExtensions @() -ExcludeExtensions @() -IncludePaths @() -ExcludePaths @() -FileRows $fileRows16 -CommitterRows $committerRows16 -Parallel 16
 
-        ($fileRowsSeq | ConvertTo-Json -Depth 10 -Compress) | Should -Be ($fileRowsPar | ConvertTo-Json -Depth 10 -Compress)
-        ($committerRowsSeq | ConvertTo-Json -Depth 10 -Compress) | Should -Be ($committerRowsPar | ConvertTo-Json -Depth 10 -Compress)
+        $script:TestContext = Initialize-StrictModeContext -Context $script:TestContext
+        $PSDefaultParameterValues['*:Context'] = $script:TestContext
+        Update-StrictAttributionMetric -Commits $commits -RevToAuthor $revToAuthor -TargetUrl 'https://example.invalid/svn/repo' -FromRevision 1 -ToRevision 20 -CacheDir 'dummy' -IncludeExtensions @() -ExcludeExtensions @() -IncludePaths @() -ExcludePaths @() -FileRows $fileRows32 -CommitterRows $committerRows32 -Parallel 32
+
+        ($fileRows1 | ConvertTo-Json -Depth 10 -Compress) | Should -Be ($fileRows16 | ConvertTo-Json -Depth 10 -Compress)
+        ($fileRows1 | ConvertTo-Json -Depth 10 -Compress) | Should -Be ($fileRows32 | ConvertTo-Json -Depth 10 -Compress)
+        ($committerRows1 | ConvertTo-Json -Depth 10 -Compress) | Should -Be ($committerRows16 | ConvertTo-Json -Depth 10 -Compress)
+        ($committerRows1 | ConvertTo-Json -Depth 10 -Compress) | Should -Be ($committerRows32 | ConvertTo-Json -Depth 10 -Compress)
     }
 }
 
