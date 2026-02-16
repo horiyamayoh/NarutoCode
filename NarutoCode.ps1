@@ -4517,8 +4517,23 @@ function Initialize-SvnBlameLineCache
     $misses = 0
     $skipReason = $null
 
-    $blameXml = Read-BlameCacheFile -Context $Context -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
-    if ([string]::IsNullOrWhiteSpace($blameXml))
+    $blameCachePath = Get-BlameCachePath -Context $Context -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
+    $hasBlameCache = [System.IO.File]::Exists($blameCachePath)
+    if ($hasBlameCache)
+    {
+        try
+        {
+            if (([System.IO.FileInfo]$blameCachePath).Length -le 0)
+            {
+                $hasBlameCache = $false
+            }
+        }
+        catch
+        {
+            $hasBlameCache = $false
+        }
+    }
+    if (-not $hasBlameCache)
     {
         $misses++
         $blameFetchResult = Invoke-SvnCommandAllowMissingTarget -Context $Context -Arguments @('blame', '--xml', '-r', [string]$Revision, $url) -ErrorContext ("svn blame $FilePath@$Revision")
@@ -4526,15 +4541,15 @@ function Initialize-SvnBlameLineCache
         if (Test-NarutoResultSuccess -Result $blameFetchResult)
         {
             $blameXml = [string]$blameFetchResult.Data
+            if (-not [string]::IsNullOrWhiteSpace($blameXml))
+            {
+                Write-BlameCacheFile -Context $Context -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath -Content $blameXml
+                $hasBlameCache = $true
+            }
         }
         else
         {
-            $blameXml = $null
             $skipReason = $blameFetchResult
-        }
-        if (-not [string]::IsNullOrWhiteSpace($blameXml))
-        {
-            Write-BlameCacheFile -Context $Context -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath -Content $blameXml
         }
     }
     else
@@ -4542,11 +4557,12 @@ function Initialize-SvnBlameLineCache
         $hits++
     }
 
-    $catText = $null
+    $hasCatCache = $true
     if ($NeedContent)
     {
-        $catText = Read-CatCacheFile -Context $Context -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
-        if ($null -eq $catText)
+        $catCachePath = Get-CatCachePath -Context $Context -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath
+        $hasCatCache = [System.IO.File]::Exists($catCachePath)
+        if (-not $hasCatCache)
         {
             $misses++
             $catFetchResult = Invoke-SvnCommandAllowMissingTarget -Context $Context -Arguments @('cat', '-r', [string]$Revision, $url) -ErrorContext ("svn cat $FilePath@$Revision")
@@ -4554,18 +4570,15 @@ function Initialize-SvnBlameLineCache
             if (Test-NarutoResultSuccess -Result $catFetchResult)
             {
                 $catText = [string]$catFetchResult.Data
+                Write-CatCacheFile -Context $Context -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath -Content $catText
+                $hasCatCache = $true
             }
             else
             {
-                $catText = $null
                 if ($null -eq $skipReason)
                 {
                     $skipReason = $catFetchResult
                 }
-            }
-            if ($null -ne $catText)
-            {
-                Write-CatCacheFile -Context $Context -CacheDir $CacheDir -Revision $Revision -FilePath $FilePath -Content $catText
             }
         }
         else
@@ -4578,7 +4591,7 @@ function Initialize-SvnBlameLineCache
         CacheHits = $hits
         CacheMisses = $misses
     }
-    if ([string]::IsNullOrWhiteSpace($blameXml) -or ($NeedContent -and $null -eq $catText))
+    if (-not $hasBlameCache -or ($NeedContent -and -not $hasCatCache))
     {
         if ($null -eq $skipReason)
         {
@@ -5802,7 +5815,8 @@ function Add-StrictBlamePrefetchTargetCandidate
         [string]$CacheDir,
         [int]$Revision,
         [string]$FilePath,
-        [switch]$NeedContent
+        [switch]$NeedContent,
+        [switch]$SkipCacheExistenceCheck
     )
     if ($Revision -le 0 -or [string]::IsNullOrWhiteSpace($FilePath))
     {
@@ -5824,15 +5838,18 @@ function Add-StrictBlamePrefetchTargetCandidate
         return
     }
 
-    $hasBlameCache = Test-BlameCacheFileExistence -Context $Context -CacheDir $CacheDir -Revision $Revision -FilePath $normalizedPath
-    $hasCatCache = $true
-    if ($NeedContent)
+    if (-not $SkipCacheExistenceCheck)
     {
-        $hasCatCache = Test-CatCacheFileExistence -Context $Context -CacheDir $CacheDir -Revision $Revision -FilePath $normalizedPath
-    }
-    if ($hasBlameCache -and $hasCatCache)
-    {
-        return
+        $hasBlameCache = Test-BlameCacheFileExistence -Context $Context -CacheDir $CacheDir -Revision $Revision -FilePath $normalizedPath
+        $hasCatCache = $true
+        if ($NeedContent)
+        {
+            $hasCatCache = Test-CatCacheFileExistence -Context $Context -CacheDir $CacheDir -Revision $Revision -FilePath $normalizedPath
+        }
+        if ($hasBlameCache -and $hasCatCache)
+        {
+            return
+        }
     }
 
     $target = [pscustomobject]@{
@@ -6255,6 +6272,16 @@ function Get-StrictBlamePrefetchTarget
     $generalCount = 0
     $skippedZeroCount = 0
     $excludeCommentOnlyLines = Get-ContextRuntimeSwitchValue -Context $Context -PropertyName 'ExcludeCommentOnlyLines'
+    $skipCacheExistenceCheck = $false
+    if (-not [string]::IsNullOrWhiteSpace($CacheDir))
+    {
+        $blameCacheRoot = Join-Path $CacheDir 'blame'
+        $catCacheRoot = Join-Path $CacheDir 'cat'
+        if (-not [System.IO.Directory]::Exists($blameCacheRoot) -and -not [System.IO.Directory]::Exists($catCacheRoot))
+        {
+            $skipCacheExistenceCheck = $true
+        }
+    }
 
     foreach ($c in @($Commits | Sort-Object Revision))
     {
@@ -6292,25 +6319,25 @@ function Get-StrictBlamePrefetchTarget
                     $fastAddOnlyNoBlameCount++
                     continue
                 }
-                Add-StrictBlamePrefetchTargetCandidate -Context $Context -Targets $targets -TargetByKey $targetByKey -CacheDir $CacheDir -Revision $rev -FilePath $afterPath -NeedContent:$false
+                Add-StrictBlamePrefetchTargetCandidate -Context $Context -Targets $targets -TargetByKey $targetByKey -CacheDir $CacheDir -Revision $rev -FilePath $afterPath -NeedContent:$false -SkipCacheExistenceCheck:$skipCacheExistenceCheck
                 continue
             }
 
             if ($hasTransitionStat -and $transitionDeleted -gt 0 -and $transitionAdded -eq 0 -and $beforePath -and (-not $afterPath))
             {
                 $fastDeleteOnlyCount++
-                Add-StrictBlamePrefetchTargetCandidate -Context $Context -Targets $targets -TargetByKey $targetByKey -CacheDir $CacheDir -Revision ($rev - 1) -FilePath $beforePath -NeedContent:$false
+                Add-StrictBlamePrefetchTargetCandidate -Context $Context -Targets $targets -TargetByKey $targetByKey -CacheDir $CacheDir -Revision ($rev - 1) -FilePath $beforePath -NeedContent:$false -SkipCacheExistenceCheck:$skipCacheExistenceCheck
                 continue
             }
 
             $generalCount++
             if ($beforePath -and ($rev - 1) -gt 0)
             {
-                Add-StrictBlamePrefetchTargetCandidate -Context $Context -Targets $targets -TargetByKey $targetByKey -CacheDir $CacheDir -Revision ($rev - 1) -FilePath $beforePath -NeedContent:$true
+                Add-StrictBlamePrefetchTargetCandidate -Context $Context -Targets $targets -TargetByKey $targetByKey -CacheDir $CacheDir -Revision ($rev - 1) -FilePath $beforePath -NeedContent:$true -SkipCacheExistenceCheck:$skipCacheExistenceCheck
             }
             if ($afterPath -and $rev -gt 0)
             {
-                Add-StrictBlamePrefetchTargetCandidate -Context $Context -Targets $targets -TargetByKey $targetByKey -CacheDir $CacheDir -Revision $rev -FilePath $afterPath -NeedContent:$true
+                Add-StrictBlamePrefetchTargetCandidate -Context $Context -Targets $targets -TargetByKey $targetByKey -CacheDir $CacheDir -Revision $rev -FilePath $afterPath -NeedContent:$true -SkipCacheExistenceCheck:$skipCacheExistenceCheck
             }
         }
     }

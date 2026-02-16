@@ -1869,6 +1869,22 @@ Describe 'Compare-BlameOutput' {
         $cmp.MovedPairs[0].MatchType | Should -Be 'Move'
     }
 
+    It 'classifies no-overlap lines as all killed and all born' {
+        $prev = @(
+            [pscustomobject]@{ LineNumber = 1; Content = 'alpha'; Revision = 10; Author = 'alice' },
+            [pscustomobject]@{ LineNumber = 2; Content = 'beta'; Revision = 10; Author = 'alice' }
+        )
+        $curr = @(
+            [pscustomobject]@{ LineNumber = 1; Content = 'gamma'; Revision = 11; Author = 'bob' },
+            [pscustomobject]@{ LineNumber = 2; Content = 'delta'; Revision = 11; Author = 'bob' }
+        )
+
+        $cmp = Compare-BlameOutput -PreviousLines $prev -CurrentLines $curr
+        $cmp.KilledLines.Count | Should -Be 2
+        $cmp.BornLines.Count | Should -Be 2
+        $cmp.MovedPairs.Count | Should -Be 0
+    }
+
     It 'completes within acceptable time for 1000-line blame comparison (Queue benchmark)' {
         # 1000 行のうち中央ブロックを移動させるシナリオで処理時間を計測する。
         # identity key = Revision + Author + Content のため、Revision と Author を
