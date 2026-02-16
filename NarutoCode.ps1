@@ -566,6 +566,11 @@ function New-NarutoContext
             SvnExecutable = $SvnExecutable
             SvnGlobalArguments = @($SvnGlobalArguments)
             ExcludeCommentOnlyLines = $false
+            FastCoreEnabled = $false
+            StrictModePath = 'Legacy'
+            StrictFallbackTransitionCount = 0
+            DiffStateApplyMismatchCount = 0
+            DiffStateOwnershipEnabled = $false
         }
         Diagnostics = @{
             WarningCount = 0
@@ -902,6 +907,785 @@ function New-NarutoContext
             )
         }
     }
+}
+function Get-FastCoreSourceText
+{
+    <#
+    .SYNOPSIS
+        高速化に利用する C# 補助クラスのソースを返す。
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+    return @'
+using System;
+using System.IO;
+using System.Text;
+using System.Collections.Generic;
+
+public static class UnifiedLogDiffScanner
+{
+    private static bool IsSeparatorLine(string line)
+    {
+        if (string.IsNullOrEmpty(line) || line.Length < 3)
+        {
+            return false;
+        }
+        for (int i = 0; i < line.Length; i++)
+        {
+            if (line[i] != '-')
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static int? ParseRevisionHeader(string line)
+    {
+        if (string.IsNullOrEmpty(line) || line.Length < 3)
+        {
+            return null;
+        }
+        if (line[0] != 'r')
+        {
+            return null;
+        }
+        int separatorIndex = line.IndexOf(" |", StringComparison.Ordinal);
+        if (separatorIndex <= 1)
+        {
+            return null;
+        }
+        int revision;
+        if (!Int32.TryParse(line.Substring(1, separatorIndex - 1), out revision))
+        {
+            return null;
+        }
+        return revision;
+    }
+
+    public static Dictionary<int, string> SplitByRevision(string text)
+    {
+        Dictionary<int, string> result = new Dictionary<int, string>();
+        if (String.IsNullOrWhiteSpace(text))
+        {
+            return result;
+        }
+
+        int? currentRevision = null;
+        bool capturingDiff = false;
+        bool hasDiffLine = false;
+        StringBuilder builder = new StringBuilder(4096);
+        using (StringReader reader = new StringReader(text))
+        {
+            string line;
+            while ((line = reader.ReadLine()) != null)
+            {
+                if (IsSeparatorLine(line))
+                {
+                    if (currentRevision.HasValue)
+                    {
+                        result[currentRevision.Value] = (capturingDiff && hasDiffLine) ? builder.ToString() : String.Empty;
+                    }
+                    currentRevision = null;
+                    capturingDiff = false;
+                    hasDiffLine = false;
+                    builder.Clear();
+                    continue;
+                }
+
+                if (!currentRevision.HasValue)
+                {
+                    int? parsedRevision = ParseRevisionHeader(line);
+                    if (parsedRevision.HasValue)
+                    {
+                        currentRevision = parsedRevision.Value;
+                    }
+                    continue;
+                }
+
+                if (!capturingDiff)
+                {
+                    if (line.Length >= 7 && line.StartsWith("Index: ", StringComparison.Ordinal))
+                    {
+                        capturingDiff = true;
+                        if (hasDiffLine)
+                        {
+                            builder.Append('\n');
+                        }
+                        builder.Append(line);
+                        hasDiffLine = true;
+                    }
+                    continue;
+                }
+
+                if (hasDiffLine)
+                {
+                    builder.Append('\n');
+                }
+                builder.Append(line);
+                hasDiffLine = true;
+            }
+        }
+
+        if (currentRevision.HasValue)
+        {
+            result[currentRevision.Value] = (capturingDiff && hasDiffLine) ? builder.ToString() : String.Empty;
+        }
+        return result;
+    }
+}
+
+public static class UnifiedLogDiffScannerV2
+{
+    public static Dictionary<int, string> SplitByRevision(string text)
+    {
+        return UnifiedLogDiffScanner.SplitByRevision(text);
+    }
+}
+
+public sealed class UnifiedDiffFastParserResult
+{
+    public int FileSectionCount { get; set; }
+    public int HunkHeaderCount { get; set; }
+}
+
+public static class UnifiedDiffFastParser
+{
+    public static UnifiedDiffFastParserResult Scan(string diffText)
+    {
+        UnifiedDiffFastParserResult result = new UnifiedDiffFastParserResult();
+        if (String.IsNullOrWhiteSpace(diffText))
+        {
+            return result;
+        }
+
+        using (StringReader reader = new StringReader(diffText))
+        {
+            string line;
+            while ((line = reader.ReadLine()) != null)
+            {
+                if (line.Length >= 7 && line.StartsWith("Index: ", StringComparison.Ordinal))
+                {
+                    result.FileSectionCount++;
+                    continue;
+                }
+                if (line.Length >= 2 && line[0] == '@' && line[1] == '@')
+                {
+                    result.HunkHeaderCount++;
+                }
+            }
+        }
+        return result;
+    }
+}
+
+public sealed class RepeatedHunkCountResult
+{
+    public Dictionary<string, int> AuthorCounts { get; set; }
+    public int FileCount { get; set; }
+
+    public RepeatedHunkCountResult()
+    {
+        AuthorCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+        FileCount = 0;
+    }
+}
+
+public sealed class PingPongCountResult
+{
+    public Dictionary<string, int> AuthorCounts { get; set; }
+    public int FileCount { get; set; }
+
+    public PingPongCountResult()
+    {
+        AuthorCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+        FileCount = 0;
+    }
+}
+
+public static class IntervalOverlapCounter
+{
+    public static bool IsOverlap(int startA, int endA, int startB, int endB)
+    {
+        return startA <= endB && startB <= endA;
+    }
+
+    public static int FirstIndexGreaterThan(int[] sortedValues, int value)
+    {
+        if (sortedValues == null || sortedValues.Length <= 0)
+        {
+            return 0;
+        }
+        int low = 0;
+        int high = sortedValues.Length;
+        while (low < high)
+        {
+            int mid = low + ((high - low) / 2);
+            if (sortedValues[mid] <= value)
+            {
+                low = mid + 1;
+            }
+            else
+            {
+                high = mid;
+            }
+        }
+        return low;
+    }
+
+    private static int FirstIndexGreaterThanValue(List<int> values, int value)
+    {
+        if (values.Count <= 0)
+        {
+            return 0;
+        }
+        int low = 0;
+        int high = values.Count;
+        while (low < high)
+        {
+            int mid = low + ((high - low) / 2);
+            if (values[mid] <= value)
+            {
+                low = mid + 1;
+            }
+            else
+            {
+                high = mid;
+            }
+        }
+        return low;
+    }
+
+    private static Dictionary<string, List<int>> BuildAuthorIndexListMap(string[] authors, int count)
+    {
+        Dictionary<string, List<int>> indicesByAuthor = new Dictionary<string, List<int>>(StringComparer.Ordinal);
+        for (int i = 0; i < count; i++)
+        {
+            string author = authors[i] ?? String.Empty;
+            List<int> indices;
+            if (!indicesByAuthor.TryGetValue(author, out indices))
+            {
+                indices = new List<int>();
+                indicesByAuthor[author] = indices;
+            }
+            indices.Add(i);
+        }
+        return indicesByAuthor;
+    }
+
+    public static int CountOverlaps(int[] starts, int[] ends)
+    {
+        if (starts == null || ends == null)
+        {
+            return 0;
+        }
+        int count = Math.Min(starts.Length, ends.Length);
+        if (count <= 1)
+        {
+            return 0;
+        }
+
+        int overlapCount = 0;
+        List<int> activeEnds = new List<int>();
+        for (int i = 0; i < count; i++)
+        {
+            int start = starts[i];
+            int end = ends[i];
+
+            int activeStartIndex = FirstIndexGreaterThanValue(activeEnds, start - 1);
+            if (activeStartIndex > 0)
+            {
+                activeEnds.RemoveRange(0, activeStartIndex);
+            }
+
+            overlapCount += activeEnds.Count;
+
+            int insertIndex = activeEnds.BinarySearch(end);
+            if (insertIndex < 0)
+            {
+                insertIndex = ~insertIndex;
+            }
+            activeEnds.Insert(insertIndex, end);
+        }
+        return overlapCount;
+    }
+
+    public static RepeatedHunkCountResult CountRepeatedByAuthor(string[] authors, int[] starts, int[] ends)
+    {
+        RepeatedHunkCountResult result = new RepeatedHunkCountResult();
+        if (authors == null || starts == null || ends == null)
+        {
+            return result;
+        }
+        int count = Math.Min(authors.Length, Math.Min(starts.Length, ends.Length));
+        if (count <= 1)
+        {
+            return result;
+        }
+
+        Dictionary<string, List<int>> indicesByAuthor = BuildAuthorIndexListMap(authors, count);
+        foreach (KeyValuePair<string, List<int>> entry in indicesByAuthor)
+        {
+            List<int> authorIndices = entry.Value;
+            if (authorIndices == null || authorIndices.Count <= 1)
+            {
+                continue;
+            }
+
+            authorIndices.Sort(delegate(int left, int right)
+            {
+                int startCompare = starts[left].CompareTo(starts[right]);
+                if (startCompare != 0)
+                {
+                    return startCompare;
+                }
+                return ends[left].CompareTo(ends[right]);
+            });
+
+            int authorCount = 0;
+            List<int> activeEnds = new List<int>();
+            for (int indexOffset = 0; indexOffset < authorIndices.Count; indexOffset++)
+            {
+                int eventIndex = authorIndices[indexOffset];
+                int start = starts[eventIndex];
+                int end = ends[eventIndex];
+
+                int activeStartIndex = FirstIndexGreaterThanValue(activeEnds, start - 1);
+                if (activeStartIndex > 0)
+                {
+                    activeEnds.RemoveRange(0, activeStartIndex);
+                }
+
+                authorCount += activeEnds.Count;
+
+                int insertIndex = activeEnds.BinarySearch(end);
+                if (insertIndex < 0)
+                {
+                    insertIndex = ~insertIndex;
+                }
+                activeEnds.Insert(insertIndex, end);
+            }
+
+            if (authorCount > 0)
+            {
+                result.AuthorCounts[entry.Key] = authorCount;
+                result.FileCount += authorCount;
+            }
+        }
+        return result;
+    }
+
+    public static PingPongCountResult CountPingPongByAuthor(string[] authors, int[] starts, int[] ends)
+    {
+        PingPongCountResult result = new PingPongCountResult();
+        if (authors == null || starts == null || ends == null)
+        {
+            return result;
+        }
+        int count = Math.Min(authors.Length, Math.Min(starts.Length, ends.Length));
+        if (count <= 2)
+        {
+            return result;
+        }
+
+        Dictionary<string, List<int>> indicesByAuthorList = BuildAuthorIndexListMap(authors, count);
+        Dictionary<string, int[]> indicesByAuthor = new Dictionary<string, int[]>(StringComparer.Ordinal);
+        foreach (KeyValuePair<string, List<int>> entry in indicesByAuthorList)
+        {
+            indicesByAuthor[entry.Key] = entry.Value.ToArray();
+        }
+
+        for (int i = 0; i < (count - 2); i++)
+        {
+            string authorA = authors[i] ?? String.Empty;
+            int[] authorIndices;
+            if (!indicesByAuthor.TryGetValue(authorA, out authorIndices) || authorIndices.Length <= 1)
+            {
+                continue;
+            }
+            int s1 = starts[i];
+            int e1 = ends[i];
+            for (int j = i + 1; j < (count - 1); j++)
+            {
+                string authorJ = authors[j] ?? String.Empty;
+                if (String.Equals(authorA, authorJ, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+                int sj = starts[j];
+                int ej = ends[j];
+                if (!IsOverlap(s1, e1, sj, ej))
+                {
+                    continue;
+                }
+                int intersectionStart = Math.Max(s1, sj);
+                int intersectionEnd = Math.Min(e1, ej);
+                int kStartOffset = FirstIndexGreaterThan(authorIndices, j);
+                for (int kOffset = kStartOffset; kOffset < authorIndices.Length; kOffset++)
+                {
+                    int k = authorIndices[kOffset];
+                    if (IsOverlap(intersectionStart, intersectionEnd, starts[k], ends[k]))
+                    {
+                        int currentCount = 0;
+                        result.AuthorCounts.TryGetValue(authorA, out currentCount);
+                        result.AuthorCounts[authorA] = currentCount + 1;
+                        result.FileCount++;
+                    }
+                }
+            }
+        }
+        return result;
+    }
+}
+
+public sealed class DiffStateLine
+{
+    public int Revision { get; set; }
+    public string Author { get; set; }
+    public string Content { get; set; }
+    public bool ContentKnown { get; set; }
+}
+
+public sealed class DiffStateTransition
+{
+    public int Revision { get; set; }
+    public string Author { get; set; }
+    public string BeforePath { get; set; }
+    public string AfterPath { get; set; }
+    public int AddedLineCount { get; set; }
+    public int DeletedLineCount { get; set; }
+    public int[] DeletedLineNumbers { get; set; }
+    public int[] AddedLineNumbers { get; set; }
+    public string[] AddedLineContents { get; set; }
+}
+
+public sealed class DiffStateApplyResult
+{
+    public bool Applied { get; set; }
+    public string Error { get; set; }
+    public DiffStateLine[] CurrentLines { get; set; }
+    public DiffStateLine[] DeletedLines { get; set; }
+}
+
+public sealed class DiffStateOwnershipFileSummary
+{
+    public int LineCountTotal { get; set; }
+    public Dictionary<string, int> LineCountByAuthor { get; set; }
+    public Dictionary<int, int> LineCountByRevision { get; set; }
+    public Dictionary<int, Dictionary<string, int>> LineCountByRevisionAuthor { get; set; }
+}
+
+public sealed class DiffStateOwnershipAggregate
+{
+    public Dictionary<string, DiffStateOwnershipFileSummary> ByFile { get; set; }
+    public Dictionary<string, int> AuthorOwned { get; set; }
+    public int OwnedTotal { get; set; }
+}
+
+public sealed class DiffStateEngine
+{
+    private static int[] NormalizeDistinctLineNumbers(int[] lineNumbers, int maxLineCount)
+    {
+        if (lineNumbers == null || lineNumbers.Length <= 0 || maxLineCount <= 0)
+        {
+            return new int[0];
+        }
+        HashSet<int> valid = new HashSet<int>();
+        for (int i = 0; i < lineNumbers.Length; i++)
+        {
+            int lineNumber = lineNumbers[i];
+            if (lineNumber <= 0 || lineNumber > maxLineCount)
+            {
+                continue;
+            }
+            valid.Add(lineNumber);
+        }
+        int[] result = new int[valid.Count];
+        int writeIndex = 0;
+        foreach (int lineNumber in valid)
+        {
+            result[writeIndex++] = lineNumber;
+        }
+        Array.Sort(result);
+        return result;
+    }
+
+    public static DiffStateLine[] CreateUnknownLines(int revision, string author, int count)
+    {
+        if (count <= 0)
+        {
+            return new DiffStateLine[0];
+        }
+        string normalizedAuthor = author ?? String.Empty;
+        DiffStateLine[] lines = new DiffStateLine[count];
+        for (int i = 0; i < count; i++)
+        {
+            lines[i] = new DiffStateLine
+            {
+                Revision = revision,
+                Author = normalizedAuthor,
+                Content = String.Empty,
+                ContentKnown = false
+            };
+        }
+        return lines;
+    }
+
+    public static DiffStateLine[] CreateAddedLines(int revision, string author, int[] addedLineNumbers, string[] addedLineContents)
+    {
+        int numberCount = (addedLineNumbers == null) ? 0 : addedLineNumbers.Length;
+        int contentCount = (addedLineContents == null) ? 0 : addedLineContents.Length;
+        int count = Math.Min(numberCount, contentCount);
+        if (count <= 0)
+        {
+            return new DiffStateLine[0];
+        }
+        string normalizedAuthor = author ?? String.Empty;
+        DiffStateLine[] lines = new DiffStateLine[count];
+        for (int i = 0; i < count; i++)
+        {
+            lines[i] = new DiffStateLine
+            {
+                Revision = revision,
+                Author = normalizedAuthor,
+                Content = addedLineContents[i] ?? String.Empty,
+                ContentKnown = true
+            };
+        }
+        return lines;
+    }
+
+    public static DiffStateApplyResult Apply(
+        DiffStateLine[] previousLines,
+        int[] deletedLineNumbers,
+        int[] addedLineNumbers,
+        string[] addedLineContents,
+        int currentRevision,
+        string currentAuthor)
+    {
+        DiffStateApplyResult failed = new DiffStateApplyResult
+        {
+            Applied = false,
+            Error = String.Empty,
+            CurrentLines = (previousLines ?? new DiffStateLine[0]),
+            DeletedLines = new DiffStateLine[0]
+        };
+
+        DiffStateLine[] safePrevious = previousLines ?? new DiffStateLine[0];
+        List<DiffStateLine> working = new List<DiffStateLine>(safePrevious.Length);
+        for (int i = 0; i < safePrevious.Length; i++)
+        {
+            DiffStateLine src = safePrevious[i];
+            if (src == null)
+            {
+                working.Add(new DiffStateLine
+                {
+                    Revision = 0,
+                    Author = String.Empty,
+                    Content = String.Empty,
+                    ContentKnown = false
+                });
+                continue;
+            }
+            working.Add(new DiffStateLine
+            {
+                Revision = src.Revision,
+                Author = src.Author ?? String.Empty,
+                Content = src.Content ?? String.Empty,
+                ContentKnown = src.ContentKnown
+            });
+        }
+
+        List<DiffStateLine> deleted = new List<DiffStateLine>();
+        int[] normalizedDeletes = NormalizeDistinctLineNumbers(deletedLineNumbers, working.Count);
+        for (int i = normalizedDeletes.Length - 1; i >= 0; i--)
+        {
+            int lineNumber = normalizedDeletes[i];
+            int removeIndex = lineNumber - 1;
+            if (removeIndex < 0 || removeIndex >= working.Count)
+            {
+                failed.Error = "delete index out of range";
+                return failed;
+            }
+            DiffStateLine removed = working[removeIndex];
+            deleted.Insert(0, removed);
+            working.RemoveAt(removeIndex);
+        }
+
+        int addedNumberCount = (addedLineNumbers == null) ? 0 : addedLineNumbers.Length;
+        int addedContentCount = (addedLineContents == null) ? 0 : addedLineContents.Length;
+        int addedCount = Math.Min(addedNumberCount, addedContentCount);
+        if (addedCount > 0)
+        {
+            List<KeyValuePair<int, string>> adds = new List<KeyValuePair<int, string>>(addedCount);
+            for (int i = 0; i < addedCount; i++)
+            {
+                adds.Add(new KeyValuePair<int, string>(addedLineNumbers[i], addedLineContents[i] ?? String.Empty));
+            }
+            adds.Sort(delegate (KeyValuePair<int, string> left, KeyValuePair<int, string> right)
+            {
+                int c = left.Key.CompareTo(right.Key);
+                if (c != 0)
+                {
+                    return c;
+                }
+                return 0;
+            });
+            string normalizedAuthor = currentAuthor ?? String.Empty;
+            for (int i = 0; i < adds.Count; i++)
+            {
+                int insertLineNumber = adds[i].Key;
+                int insertIndex = insertLineNumber - 1;
+                if (insertIndex < 0)
+                {
+                    insertIndex = 0;
+                }
+                if (insertIndex > working.Count)
+                {
+                    insertIndex = working.Count;
+                }
+                working.Insert(insertIndex, new DiffStateLine
+                {
+                    Revision = currentRevision,
+                    Author = normalizedAuthor,
+                    Content = adds[i].Value,
+                    ContentKnown = true
+                });
+            }
+        }
+
+        return new DiffStateApplyResult
+        {
+            Applied = true,
+            Error = String.Empty,
+            CurrentLines = working.ToArray(),
+            DeletedLines = deleted.ToArray()
+        };
+    }
+
+    public static DiffStateOwnershipAggregate BuildOwnership(Dictionary<string, DiffStateLine[]> stateByFile)
+    {
+        DiffStateOwnershipAggregate aggregate = new DiffStateOwnershipAggregate
+        {
+            ByFile = new Dictionary<string, DiffStateOwnershipFileSummary>(StringComparer.Ordinal),
+            AuthorOwned = new Dictionary<string, int>(StringComparer.Ordinal),
+            OwnedTotal = 0
+        };
+        if (stateByFile == null)
+        {
+            return aggregate;
+        }
+
+        foreach (KeyValuePair<string, DiffStateLine[]> entry in stateByFile)
+        {
+            string filePath = entry.Key ?? String.Empty;
+            DiffStateLine[] lines = entry.Value ?? new DiffStateLine[0];
+            DiffStateOwnershipFileSummary summary = new DiffStateOwnershipFileSummary
+            {
+                LineCountTotal = lines.Length,
+                LineCountByAuthor = new Dictionary<string, int>(StringComparer.Ordinal),
+                LineCountByRevision = new Dictionary<int, int>(),
+                LineCountByRevisionAuthor = new Dictionary<int, Dictionary<string, int>>()
+            };
+            for (int i = 0; i < lines.Length; i++)
+            {
+                DiffStateLine line = lines[i];
+                int revision = (line == null) ? 0 : line.Revision;
+                string author = String.Empty;
+                if (line != null && line.Author != null)
+                {
+                    author = line.Author;
+                }
+                if (!summary.LineCountByAuthor.ContainsKey(author))
+                {
+                    summary.LineCountByAuthor[author] = 0;
+                }
+                summary.LineCountByAuthor[author]++;
+
+                if (!summary.LineCountByRevision.ContainsKey(revision))
+                {
+                    summary.LineCountByRevision[revision] = 0;
+                }
+                summary.LineCountByRevision[revision]++;
+
+                if (!summary.LineCountByRevisionAuthor.ContainsKey(revision))
+                {
+                    summary.LineCountByRevisionAuthor[revision] = new Dictionary<string, int>(StringComparer.Ordinal);
+                }
+                Dictionary<string, int> byAuthor = summary.LineCountByRevisionAuthor[revision];
+                if (!byAuthor.ContainsKey(author))
+                {
+                    byAuthor[author] = 0;
+                }
+                byAuthor[author]++;
+            }
+            aggregate.ByFile[filePath] = summary;
+            aggregate.OwnedTotal += lines.Length;
+            foreach (KeyValuePair<string, int> byAuthor in summary.LineCountByAuthor)
+            {
+                if (!aggregate.AuthorOwned.ContainsKey(byAuthor.Key))
+                {
+                    aggregate.AuthorOwned[byAuthor.Key] = 0;
+                }
+                aggregate.AuthorOwned[byAuthor.Key] += byAuthor.Value;
+            }
+        }
+
+        return aggregate;
+    }
+}
+'@
+}
+function Initialize-FastCore
+{
+    <#
+    .SYNOPSIS
+        C# 高速化コアを初期化する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([Parameter(Mandatory = $true)][hashtable]$Context)
+
+    if ($null -eq $Context.Runtime)
+    {
+        return $false
+    }
+
+    $Context.Runtime.FastCoreEnabled = $false
+    $scannerType = 'UnifiedLogDiffScanner' -as [type]
+    $scannerV2Type = 'UnifiedLogDiffScannerV2' -as [type]
+    $diffParserType = 'UnifiedDiffFastParser' -as [type]
+    $counterType = 'IntervalOverlapCounter' -as [type]
+    $diffStateType = 'DiffStateEngine' -as [type]
+    if ($null -ne $scannerType -and $null -ne $scannerV2Type -and $null -ne $diffParserType -and $null -ne $counterType -and $null -ne $diffStateType)
+    {
+        $Context.Runtime.FastCoreEnabled = $true
+        return $true
+    }
+
+    try
+    {
+        Add-Type -TypeDefinition (Get-FastCoreSourceText) -Language CSharp -ErrorAction Stop
+    }
+    catch
+    {
+        # 既に同名型がロード済みの場合は利用可能かどうかのみ再判定する。
+        $scannerType = 'UnifiedLogDiffScanner' -as [type]
+        $scannerV2Type = 'UnifiedLogDiffScannerV2' -as [type]
+        $diffParserType = 'UnifiedDiffFastParser' -as [type]
+        $counterType = 'IntervalOverlapCounter' -as [type]
+        $diffStateType = 'DiffStateEngine' -as [type]
+        if ($null -eq $scannerType -or $null -eq $scannerV2Type -or $null -eq $diffParserType -or $null -eq $counterType -or $null -eq $diffStateType)
+        {
+            Write-NarutoDiagnostic -Context $Context -Level 'Warning' -ErrorCode 'FAST_CORE_LOAD_FAILED' -Message ("FastCore の初期化に失敗しました: {0}" -f $_.Exception.Message)
+            return $false
+        }
+    }
+
+    $Context.Runtime.FastCoreEnabled = $true
+    return $true
 }
 function Get-RunspaceNarutoContext
 {
@@ -6375,6 +7159,7 @@ function Get-StrictHunkOverlapSummary
     $fileRepeated = @{}
     $authorPingPong = @{}
     $filePingPong = @{}
+    $intervalOverlapCounterType = 'IntervalOverlapCounter' -as [type]
     foreach ($file in $EventsByFile.Keys)
     {
         $events = @($EventsByFile[$file].ToArray() | Sort-Object Revision)
@@ -6403,6 +7188,42 @@ function Get-StrictHunkOverlapSummary
             [void]$indicesByAuthor[$evtAuthor[$x]].Add($x)
         }
 
+        $fastRepeatedResult = $null
+        $fastPingPongResult = $null
+        if ($null -ne $intervalOverlapCounterType)
+        {
+            try
+            {
+                $fastRepeatedResult = $intervalOverlapCounterType::CountRepeatedByAuthor($evtAuthor, $evtStart, $evtEnd)
+                $fastPingPongResult = $intervalOverlapCounterType::CountPingPongByAuthor($evtAuthor, $evtStart, $evtEnd)
+            }
+            catch
+            {
+                $fastRepeatedResult = $null
+                $fastPingPongResult = $null
+            }
+        }
+        if ($null -ne $fastRepeatedResult -and $null -ne $fastPingPongResult)
+        {
+            foreach ($authorKey in @($fastRepeatedResult.AuthorCounts.Keys))
+            {
+                Add-Count -Table $authorRepeated -Key ([string]$authorKey) -Delta ([int]$fastRepeatedResult.AuthorCounts[$authorKey])
+            }
+            if ([int]$fastRepeatedResult.FileCount -gt 0)
+            {
+                Add-Count -Table $fileRepeated -Key $file -Delta ([int]$fastRepeatedResult.FileCount)
+            }
+            foreach ($authorKey in @($fastPingPongResult.AuthorCounts.Keys))
+            {
+                Add-Count -Table $authorPingPong -Key ([string]$authorKey) -Delta ([int]$fastPingPongResult.AuthorCounts[$authorKey])
+            }
+            if ([int]$fastPingPongResult.FileCount -gt 0)
+            {
+                Add-Count -Table $filePingPong -Key $file -Delta ([int]$fastPingPongResult.FileCount)
+            }
+            continue
+        }
+
         # 同一作者の重なりは作者ごとの開始点ソートで数える。
         $fileRepeatedCount = 0
         $authorIndexArrayByAuthor = @{}
@@ -6419,26 +7240,43 @@ function Get-StrictHunkOverlapSummary
                     Sort-Object @{ Expression = { [int]$evtStart[$_] } }, @{ Expression = { [int]$evtEnd[$_] } }
             )
             $authorRepeatedCount = 0
-            for ($i = 0
-                $i -lt $sortedAuthorIndexes.Count
-                $i++)
+            if ($null -ne $intervalOverlapCounterType)
             {
-                $eventIndexI = [int]$sortedAuthorIndexes[$i]
-                $s1 = [int]$evtStart[$eventIndexI]
-                $e1 = [int]$evtEnd[$eventIndexI]
-                for ($j = $i + 1
-                    $j -lt $sortedAuthorIndexes.Count
-                    $j++)
+                $intervalStarts = New-Object 'int[]' $sortedAuthorIndexes.Count
+                $intervalEnds = New-Object 'int[]' $sortedAuthorIndexes.Count
+                for ($sortedIndex = 0
+                    $sortedIndex -lt $sortedAuthorIndexes.Count
+                    $sortedIndex++)
                 {
-                    $eventIndexJ = [int]$sortedAuthorIndexes[$j]
-                    $s2 = [int]$evtStart[$eventIndexJ]
-                    if ($s2 -gt $e1)
+                    $eventIndex = [int]$sortedAuthorIndexes[$sortedIndex]
+                    $intervalStarts[$sortedIndex] = [int]$evtStart[$eventIndex]
+                    $intervalEnds[$sortedIndex] = [int]$evtEnd[$eventIndex]
+                }
+                $authorRepeatedCount = [int]$intervalOverlapCounterType::CountOverlaps($intervalStarts, $intervalEnds)
+            }
+            else
+            {
+                for ($i = 0
+                    $i -lt $sortedAuthorIndexes.Count
+                    $i++)
+                {
+                    $eventIndexI = [int]$sortedAuthorIndexes[$i]
+                    $s1 = [int]$evtStart[$eventIndexI]
+                    $e1 = [int]$evtEnd[$eventIndexI]
+                    for ($j = $i + 1
+                        $j -lt $sortedAuthorIndexes.Count
+                        $j++)
                     {
-                        break
-                    }
-                    if ([int]$evtEnd[$eventIndexJ] -ge $s1)
-                    {
-                        $authorRepeatedCount++
+                        $eventIndexJ = [int]$sortedAuthorIndexes[$j]
+                        $s2 = [int]$evtStart[$eventIndexJ]
+                        if ($s2 -gt $e1)
+                        {
+                            break
+                        }
+                        if ([int]$evtEnd[$eventIndexJ] -ge $s1)
+                        {
+                            $authorRepeatedCount++
+                        }
                     }
                 }
             }
@@ -6487,7 +7325,14 @@ function Get-StrictHunkOverlapSummary
                 }
                 $intersectionStart = [Math]::Max($s1, $sj)
                 $intersectionEnd = [Math]::Min($e1, $ej)
-                $kStartOffset = Get-FirstIntIndexGreaterThan -SortedValues $authorIndexes -Value $j
+                $kStartOffset = if ($null -ne $intervalOverlapCounterType)
+                {
+                    [int]$intervalOverlapCounterType::FirstIndexGreaterThan($authorIndexes, [int]$j)
+                }
+                else
+                {
+                    Get-FirstIntIndexGreaterThan -SortedValues $authorIndexes -Value $j
+                }
                 if ($kStartOffset -ge $authorIndexes.Count)
                 {
                     continue
@@ -6497,7 +7342,15 @@ function Get-StrictHunkOverlapSummary
                     $kOffset++)
                 {
                     $k = [int]$authorIndexes[$kOffset]
-                    if (Test-StrictHunkRangeOverlap -StartA $intersectionStart -EndA $intersectionEnd -StartB ([int]$evtStart[$k]) -EndB ([int]$evtEnd[$k]))
+                    $hasOverlap = if ($null -ne $intervalOverlapCounterType)
+                    {
+                        [bool]$intervalOverlapCounterType::IsOverlap([int]$intersectionStart, [int]$intersectionEnd, [int]$evtStart[$k], [int]$evtEnd[$k])
+                    }
+                    else
+                    {
+                        Test-StrictHunkRangeOverlap -StartA $intersectionStart -EndA $intersectionEnd -StartB ([int]$evtStart[$k]) -EndB ([int]$evtEnd[$k])
+                    }
+                    if ($hasOverlap)
                     {
                         Add-Count -Table $authorPingPong -Key $a1
                         $filePingPongCount++
@@ -7447,6 +8300,7 @@ function Resolve-StrictTransitionContext
     $transitionStat = $null
     $transitionHunks = @()
     $hasDiffLineEntry = $false
+    $hasAnyDiffLineEntry = $false
     $needTransitionHunks = $false
     if ($afterPath -and $Commit.FileDiffStats.ContainsKey($afterPath))
     {
@@ -7460,7 +8314,7 @@ function Resolve-StrictTransitionContext
     {
         $transitionAdded = [int]$transitionStat.AddedLines
         $transitionDeleted = [int]$transitionStat.DeletedLines
-        $needTransitionHunks = ($transitionAdded -gt 0 -and $transitionDeleted -gt 0)
+        $needTransitionHunks = ($transitionAdded -gt 0 -or $transitionDeleted -gt 0)
         $hasPrecomputedDiffLineEntry = $false
         $hasPrecomputedDiffLineEntryProperty = ($transitionStat.PSObject.Properties.Match('HasDiffLineEntry').Count -gt 0)
         if ($hasPrecomputedDiffLineEntryProperty)
@@ -7469,41 +8323,34 @@ function Resolve-StrictTransitionContext
         }
         if ($needTransitionHunks -and $transitionStat.PSObject.Properties.Match('Hunks').Count -gt 0)
         {
-            if ($hasPrecomputedDiffLineEntryProperty)
+            $transitionHunks = @(ConvertTo-StrictHunkList -HunksRaw $transitionStat.Hunks)
+
+            $addedEntryTotal = 0
+            $deletedEntryTotal = 0
+            $isValidDiffLineEntry = $true
+            foreach ($hunk in @($transitionHunks))
             {
-                if ($hasPrecomputedDiffLineEntry)
+                if ($null -eq $hunk)
                 {
-                    $transitionHunks = @(ConvertTo-StrictHunkList -HunksRaw $transitionStat.Hunks)
-                    $hasDiffLineEntry = ($transitionHunks.Count -gt 0)
+                    $isValidDiffLineEntry = $false
+                    break
                 }
+                if ($hunk.PSObject.Properties.Match('AddedLineEntries').Count -eq 0 -or $hunk.PSObject.Properties.Match('DeletedLineEntries').Count -eq 0)
+                {
+                    $isValidDiffLineEntry = $false
+                    break
+                }
+                $addedEntryTotal += @($hunk.AddedLineEntries).Count
+                $deletedEntryTotal += @($hunk.DeletedLineEntries).Count
             }
-            else
+            $hasAnyDiffLineEntry = (($addedEntryTotal + $deletedEntryTotal) -gt 0)
+            if ($hasPrecomputedDiffLineEntryProperty -and $hasPrecomputedDiffLineEntry)
             {
-                $transitionHunks = @(ConvertTo-StrictHunkList -HunksRaw $transitionStat.Hunks)
-                if ($transitionHunks.Count -gt 0)
-                {
-                    $entryCount = 0
-                    $isValidDiffLineEntry = $true
-                    foreach ($hunk in @($transitionHunks))
-                    {
-                        if ($null -eq $hunk)
-                        {
-                            $isValidDiffLineEntry = $false
-                            break
-                        }
-                        if ($hunk.PSObject.Properties.Match('AddedLineEntries').Count -eq 0 -or $hunk.PSObject.Properties.Match('DeletedLineEntries').Count -eq 0)
-                        {
-                            $isValidDiffLineEntry = $false
-                            break
-                        }
-                        $entryCount += @($hunk.AddedLineEntries).Count
-                        $entryCount += @($hunk.DeletedLineEntries).Count
-                    }
-                    if ($isValidDiffLineEntry -and $entryCount -gt 0)
-                    {
-                        $hasDiffLineEntry = $true
-                    }
-                }
+                $hasDiffLineEntry = ($transitionAdded -gt 0 -and $transitionDeleted -gt 0 -and $hasAnyDiffLineEntry)
+            }
+            elseif ($isValidDiffLineEntry -and $addedEntryTotal -gt 0 -and $deletedEntryTotal -gt 0)
+            {
+                $hasDiffLineEntry = $true
             }
         }
     }
@@ -7542,6 +8389,7 @@ function Resolve-StrictTransitionContext
         TransitionAdded = $transitionAdded
         TransitionDeleted = $transitionDeleted
         HasDiffLineEntry = [bool]$hasDiffLineEntry
+        HasAnyDiffLineEntry = [bool]$hasAnyDiffLineEntry
         TransitionHunks = @($transitionHunks)
     }
 }
@@ -8911,6 +9759,690 @@ function Resolve-StrictCommitTransitionContextSet
         [void]$resolvedTransitionContexts.Add($transitionContext)
     }
     return @($resolvedTransitionContexts.ToArray())
+}
+function Test-StrictDiffStateEligibility
+{
+    <#
+    .SYNOPSIS
+        DiffState 高速経路の適用可否を判定する。
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Context,
+        [int]$FromRevision
+    )
+    if (Get-ContextRuntimeSwitchValue -Context $Context -PropertyName 'ExcludeCommentOnlyLines')
+    {
+        return $false
+    }
+    if ([int]$FromRevision -ne 1)
+    {
+        return $false
+    }
+    if (-not [bool]$Context.Runtime.FastCoreEnabled)
+    {
+        return $false
+    }
+    if ($null -eq ('DiffStateEngine' -as [type]))
+    {
+        return $false
+    }
+    return $true
+}
+function ConvertTo-DiffStateLineFromBlameLine
+{
+    <#
+    .SYNOPSIS
+        blame 行を DiffStateLine へ変換する。
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param([object]$BlameLine)
+    if ($null -eq $BlameLine)
+    {
+        return $null
+    }
+    $lineRevision = 0
+    try
+    {
+        $lineRevision = [int]$BlameLine.Revision
+    }
+    catch
+    {
+        $lineRevision = 0
+    }
+    $line = New-Object DiffStateLine
+    $line.Revision = [int]$lineRevision
+    $line.Author = Get-NormalizedAuthorName -Author ([string]$BlameLine.Author)
+    $line.Content = [string]$BlameLine.Content
+    $line.ContentKnown = $true
+    return $line
+}
+function ConvertTo-DiffStateLineArrayFromBlame
+{
+    <#
+    .SYNOPSIS
+        blame 結果の Lines 配列を DiffStateLine 配列へ変換する。
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param([object[]]$Lines = @())
+    $converted = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($line in @($Lines))
+    {
+        $convertedLine = ConvertTo-DiffStateLineFromBlameLine -BlameLine $line
+        if ($null -eq $convertedLine)
+        {
+            continue
+        }
+        [void]$converted.Add($convertedLine)
+    }
+    return @($converted.ToArray())
+}
+function Get-StrictDiffStateLineStateFromBlameRevision
+{
+    <#
+    .SYNOPSIS
+        指定 revision の blame から DiffState 行状態を復元する。
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Context,
+        [string]$TargetUrl,
+        [string]$FilePath,
+        [int]$Revision,
+        [string]$CacheDir
+    )
+    if ([string]::IsNullOrWhiteSpace($FilePath))
+    {
+        return @()
+    }
+    if ($Revision -le 0)
+    {
+        return @()
+    }
+    $blameResult = Get-SvnBlameLine -Context $Context -Repo $TargetUrl -FilePath $FilePath -Revision $Revision -CacheDir $CacheDir -NeedContent:$true
+    $blameResult = ConvertTo-NarutoResultAdapter -InputObject $blameResult -SuccessCode 'SVN_BLAME_LINE_READY' -SkippedCode 'SVN_BLAME_LINE_EMPTY'
+    if (-not (Test-NarutoResultSuccess -Result $blameResult))
+    {
+        Throw-NarutoError -Category 'STRICT' -ErrorCode ([string]$blameResult.ErrorCode) -Message ("Strict diff-state blame restore failed for '{0}' at r{1}: {2}" -f [string]$FilePath, [int]$Revision, [string]$blameResult.Message) -Context @{
+            FilePath = [string]$FilePath
+            Revision = [int]$Revision
+        }
+    }
+    return @(ConvertTo-DiffStateLineArrayFromBlame -Lines @($blameResult.Data.Lines))
+}
+function Get-StrictDiffStateLineEntrySet
+{
+    <#
+    .SYNOPSIS
+        遷移 hunk から追加・削除行エントリを抽出する。
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param([object]$TransitionContext)
+    if ($null -eq $TransitionContext)
+    {
+        return $null
+    }
+    if ($TransitionContext.PSObject.Properties.Match('TransitionHunks').Count -eq 0)
+    {
+        return [pscustomobject]@{
+            DeletedEntries = @()
+            AddedEntries = @()
+        }
+    }
+    $deletedEntries = New-Object 'System.Collections.Generic.List[object]'
+    $addedEntries = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($hunk in @(ConvertTo-StrictHunkList -HunksRaw $TransitionContext.TransitionHunks | Sort-Object OldStart, NewStart))
+    {
+        if ($null -eq $hunk)
+        {
+            return $null
+        }
+        if ($hunk.PSObject.Properties.Match('DeletedLineEntries').Count -gt 0)
+        {
+            foreach ($entry in @($hunk.DeletedLineEntries))
+            {
+                $normalized = ConvertFrom-StrictDiffLineEntryToken -Entry $entry
+                if ($null -eq $normalized)
+                {
+                    return $null
+                }
+                [void]$deletedEntries.Add($normalized)
+            }
+        }
+        if ($hunk.PSObject.Properties.Match('AddedLineEntries').Count -gt 0)
+        {
+            foreach ($entry in @($hunk.AddedLineEntries))
+            {
+                $normalized = ConvertFrom-StrictDiffLineEntryToken -Entry $entry
+                if ($null -eq $normalized)
+                {
+                    return $null
+                }
+                [void]$addedEntries.Add($normalized)
+            }
+        }
+    }
+    $deletedSorted = @($deletedEntries.ToArray() | Sort-Object LineNumber)
+    $addedSorted = @($addedEntries.ToArray() | Sort-Object LineNumber)
+    return [pscustomobject]@{
+        DeletedEntries = $deletedSorted
+        AddedEntries = $addedSorted
+    }
+}
+function Get-StrictDiffStateDeletedCountByRevisionAuthor
+{
+    <#
+    .SYNOPSIS
+        DiffState 削除行配列から killed 集計を生成する。
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param([object[]]$DeletedLines = @())
+    $killedCountByRevisionAuthor = @{}
+    foreach ($line in @($DeletedLines))
+    {
+        if ($null -eq $line)
+        {
+            continue
+        }
+        $bornRevision = $null
+        try
+        {
+            $bornRevision = [int]$line.Revision
+        }
+        catch
+        {
+            $bornRevision = $null
+        }
+        if ($null -eq $bornRevision)
+        {
+            continue
+        }
+        $revisionKey = [string]$bornRevision
+        if (-not $killedCountByRevisionAuthor.ContainsKey($revisionKey))
+        {
+            $killedCountByRevisionAuthor[$revisionKey] = @{}
+        }
+        $bornAuthor = Get-NormalizedAuthorName -Author ([string]$line.Author)
+        if (-not $killedCountByRevisionAuthor[$revisionKey].ContainsKey($bornAuthor))
+        {
+            $killedCountByRevisionAuthor[$revisionKey][$bornAuthor] = 0
+        }
+        $killedCountByRevisionAuthor[$revisionKey][$bornAuthor]++
+    }
+    return $killedCountByRevisionAuthor
+}
+function Set-StrictDiffStateMapEntry
+{
+    <#
+    .SYNOPSIS
+        遷移適用後の DiffState をパス単位で更新する。
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
+    [CmdletBinding()]
+    param(
+        [hashtable]$StateByFile,
+        [string]$BeforePath,
+        [string]$AfterPath,
+        [object[]]$CurrentLines = @(),
+        [switch]$RemoveOnly
+    )
+    if ($null -eq $StateByFile)
+    {
+        return
+    }
+    if ($RemoveOnly)
+    {
+        if (-not [string]::IsNullOrWhiteSpace($BeforePath))
+        {
+            [void]$StateByFile.Remove([string]$BeforePath)
+        }
+        return
+    }
+    if (-not [string]::IsNullOrWhiteSpace($AfterPath))
+    {
+        $StateByFile[[string]$AfterPath] = @($CurrentLines)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($BeforePath) -and ([string]$BeforePath -ne [string]$AfterPath))
+    {
+        [void]$StateByFile.Remove([string]$BeforePath)
+    }
+}
+function Get-StrictDiffStateComparisonForTransition
+{
+    <#
+    .SYNOPSIS
+        DiffState で遷移比較を実行し、必要時は legacy 比較へフォールバックする。
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Context,
+        [Parameter(Mandatory = $true)][hashtable]$FileLineStateByPath,
+        [object]$TransitionContext,
+        [string]$TargetUrl,
+        [int]$Revision,
+        [string]$CacheDir,
+        [string]$CurrentRevisionAuthor = ''
+    )
+    $beforePath = [string]$TransitionContext.BeforePath
+    $afterPath = [string]$TransitionContext.AfterPath
+    $hasTransitionStat = [bool]$TransitionContext.HasTransitionStat
+    $transitionAdded = [int]$TransitionContext.TransitionAdded
+    $transitionDeleted = [int]$TransitionContext.TransitionDeleted
+
+    $previousLines = @()
+    if (-not [string]::IsNullOrWhiteSpace($beforePath) -and $FileLineStateByPath.ContainsKey($beforePath))
+    {
+        $previousLines = @($FileLineStateByPath[$beforePath])
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($afterPath) -and $FileLineStateByPath.ContainsKey($afterPath))
+    {
+        $previousLines = @($FileLineStateByPath[$afterPath])
+    }
+
+    if ($hasTransitionStat -and $transitionAdded -eq 0 -and $transitionDeleted -eq 0)
+    {
+        if (-not [string]::IsNullOrWhiteSpace($beforePath) -and -not [string]::IsNullOrWhiteSpace($afterPath) -and $beforePath -ne $afterPath -and $FileLineStateByPath.ContainsKey($beforePath))
+        {
+            Set-StrictDiffStateMapEntry -StateByFile $FileLineStateByPath -BeforePath $beforePath -AfterPath $afterPath -CurrentLines @($FileLineStateByPath[$beforePath])
+        }
+        return [pscustomobject]@{
+            Comparison = $null
+            FallbackUsed = $false
+        }
+    }
+
+    $lineEntrySet = Get-StrictDiffStateLineEntrySet -TransitionContext $TransitionContext
+    $addedEntries = @()
+    $deletedEntries = @()
+    if ($null -ne $lineEntrySet)
+    {
+        $addedEntries = @($lineEntrySet.AddedEntries)
+        $deletedEntries = @($lineEntrySet.DeletedEntries)
+    }
+
+    $fallbackReason = $null
+    $comparison = $null
+    $applyCurrentLines = @()
+
+    if ($hasTransitionStat -and $transitionAdded -gt 0 -and $transitionDeleted -eq 0 -and -not [string]::IsNullOrWhiteSpace($afterPath))
+    {
+        if (@($addedEntries).Count -gt 0)
+        {
+            $addedLineNumbers = @($addedEntries | ForEach-Object { [int]$_.LineNumber })
+            $addedContents = @($addedEntries | ForEach-Object { [string]$_.Content })
+            $applyResult = [DiffStateEngine]::Apply([DiffStateLine[]]@($previousLines), [int[]]@(), [int[]]$addedLineNumbers, [string[]]$addedContents, [int]$Revision, [string]$CurrentRevisionAuthor)
+            if (-not $applyResult.Applied)
+            {
+                $Context.Runtime.DiffStateApplyMismatchCount = [int]$Context.Runtime.DiffStateApplyMismatchCount + 1
+                $fallbackReason = 'APPLY_ADD_ONLY_FAILED'
+            }
+            else
+            {
+                $applyCurrentLines = @($applyResult.CurrentLines)
+                Set-StrictDiffStateMapEntry -StateByFile $FileLineStateByPath -BeforePath $beforePath -AfterPath $afterPath -CurrentLines $applyCurrentLines
+                $comparison = [pscustomobject]@{
+                    KilledLines = @()
+                    BornLines = @()
+                    BornCountCurrentRevision = [int]$transitionAdded
+                    KilledCountByRevisionAuthor = @{}
+                    MovedPairCount = 0
+                    MovedPairs = @()
+                    MatchedPairs = @()
+                    ReattributedPairs = @()
+                }
+            }
+        }
+        elseif (@($previousLines).Count -eq 0)
+        {
+            $unknownAdded = [DiffStateEngine]::CreateUnknownLines([int]$Revision, [string]$CurrentRevisionAuthor, [int]$transitionAdded)
+            Set-StrictDiffStateMapEntry -StateByFile $FileLineStateByPath -BeforePath $beforePath -AfterPath $afterPath -CurrentLines @($unknownAdded)
+            $comparison = [pscustomobject]@{
+                KilledLines = @()
+                BornLines = @()
+                BornCountCurrentRevision = [int]$transitionAdded
+                KilledCountByRevisionAuthor = @{}
+                MovedPairCount = 0
+                MovedPairs = @()
+                MatchedPairs = @()
+                ReattributedPairs = @()
+            }
+        }
+        else
+        {
+            $fallbackReason = 'ADD_ONLY_WITHOUT_LINE_ENTRY'
+        }
+    }
+    elseif ($hasTransitionStat -and $transitionDeleted -gt 0 -and $transitionAdded -eq 0 -and -not [string]::IsNullOrWhiteSpace($beforePath) -and [string]::IsNullOrWhiteSpace($afterPath))
+    {
+        if (@($previousLines).Count -eq 0)
+        {
+            $fallbackReason = 'DELETE_ONLY_WITHOUT_STATE'
+        }
+        else
+        {
+            $killedCount = Get-StrictDiffStateDeletedCountByRevisionAuthor -DeletedLines @($previousLines)
+            Set-StrictDiffStateMapEntry -StateByFile $FileLineStateByPath -BeforePath $beforePath -AfterPath $afterPath -RemoveOnly
+            $comparison = [pscustomobject]@{
+                KilledLines = @()
+                BornLines = @()
+                BornCountCurrentRevision = 0
+                KilledCountByRevisionAuthor = $killedCount
+                MovedPairCount = 0
+                MovedPairs = @()
+                MatchedPairs = @()
+                ReattributedPairs = @()
+            }
+        }
+    }
+    else
+    {
+        if ($null -eq $lineEntrySet)
+        {
+            $fallbackReason = 'INVALID_LINE_ENTRY_SET'
+        }
+        elseif (@($previousLines).Count -eq 0 -and @($deletedEntries).Count -gt 0)
+        {
+            $fallbackReason = 'MISSING_PREVIOUS_STATE'
+        }
+        else
+        {
+            $previousSparse = New-Object 'System.Collections.Generic.List[object]'
+            $currentSparse = New-Object 'System.Collections.Generic.List[object]'
+            foreach ($deletedEntry in @($deletedEntries))
+            {
+                $lineNumber = [int]$deletedEntry.LineNumber
+                $lineIndex = $lineNumber - 1
+                if ($lineIndex -lt 0 -or $lineIndex -ge $previousLines.Count)
+                {
+                    $fallbackReason = 'DELETE_LINE_OUT_OF_RANGE'
+                    break
+                }
+                $source = $previousLines[$lineIndex]
+                [void]$previousSparse.Add([pscustomobject]@{
+                        LineNumber = [int]$lineNumber
+                        Content = [string]$deletedEntry.Content
+                        Revision = $source.Revision
+                        Author = [string]$source.Author
+                    })
+            }
+            if ($null -eq $fallbackReason)
+            {
+                foreach ($addedEntry in @($addedEntries))
+                {
+                    $lineNumber = [int]$addedEntry.LineNumber
+                    [void]$currentSparse.Add([pscustomobject]@{
+                            LineNumber = [int]$lineNumber
+                            Content = [string]$addedEntry.Content
+                            Revision = [int]$Revision
+                            Author = [string]$CurrentRevisionAuthor
+                        })
+                }
+                $comparison = Compare-StrictSparseTransitionCountOnly -PreviousLines @($previousSparse.ToArray()) -CurrentLines @($currentSparse.ToArray()) -CurrentRevision $Revision
+                $deletedLineNumbers = @($deletedEntries | ForEach-Object { [int]$_.LineNumber })
+                $addedLineNumbers = @($addedEntries | ForEach-Object { [int]$_.LineNumber })
+                $addedContents = @($addedEntries | ForEach-Object { [string]$_.Content })
+                $applyResult = [DiffStateEngine]::Apply([DiffStateLine[]]@($previousLines), [int[]]$deletedLineNumbers, [int[]]$addedLineNumbers, [string[]]$addedContents, [int]$Revision, [string]$CurrentRevisionAuthor)
+                if (-not $applyResult.Applied)
+                {
+                    $Context.Runtime.DiffStateApplyMismatchCount = [int]$Context.Runtime.DiffStateApplyMismatchCount + 1
+                    $fallbackReason = 'APPLY_GENERAL_FAILED'
+                }
+                else
+                {
+                    $applyCurrentLines = @($applyResult.CurrentLines)
+                    Set-StrictDiffStateMapEntry -StateByFile $FileLineStateByPath -BeforePath $beforePath -AfterPath $afterPath -CurrentLines $applyCurrentLines
+                }
+            }
+        }
+    }
+
+    if ($null -eq $fallbackReason)
+    {
+        return [pscustomobject]@{
+            Comparison = $comparison
+            FallbackUsed = $false
+        }
+    }
+
+    $Context.Runtime.StrictFallbackTransitionCount = [int]$Context.Runtime.StrictFallbackTransitionCount + 1
+    $legacyComparison = Get-StrictTransitionComparison -Context $Context -TransitionContext $TransitionContext -TargetUrl $TargetUrl -Revision $Revision -CacheDir $CacheDir -CurrentRevisionAuthor $CurrentRevisionAuthor
+    if (-not [string]::IsNullOrWhiteSpace($afterPath))
+    {
+        $restoredLines = @(Get-StrictDiffStateLineStateFromBlameRevision -Context $Context -TargetUrl $TargetUrl -FilePath $afterPath -Revision $Revision -CacheDir $CacheDir)
+        Set-StrictDiffStateMapEntry -StateByFile $FileLineStateByPath -BeforePath $beforePath -AfterPath $afterPath -CurrentLines $restoredLines
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($beforePath))
+    {
+        Set-StrictDiffStateMapEntry -StateByFile $FileLineStateByPath -BeforePath $beforePath -AfterPath $afterPath -RemoveOnly
+    }
+
+    return [pscustomobject]@{
+        Comparison = $legacyComparison
+        FallbackUsed = $true
+    }
+}
+function Get-StrictOwnershipAggregateFromDiffState
+{
+    <#
+    .SYNOPSIS
+        DiffState の最終行状態から strict ownership 集計を生成する。
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Context,
+        [hashtable]$DiffStateByFile = @{}
+    )
+    [void]$Context
+    $blameByFile = @{}
+    $authorOwned = @{}
+    $ownedTotal = 0
+    $existingFileSet = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($filePathKey in @($DiffStateByFile.Keys))
+    {
+        $filePath = [string]$filePathKey
+        [void]$existingFileSet.Add($filePath)
+        $lines = @($DiffStateByFile[$filePathKey])
+        $lineCountByRevision = @{}
+        $lineCountByAuthor = @{}
+        $lineCountByRevisionAuthor = @{}
+        foreach ($line in @($lines))
+        {
+            $lineRevision = 0
+            try
+            {
+                $lineRevision = [int]$line.Revision
+            }
+            catch
+            {
+                $lineRevision = 0
+            }
+            $lineAuthor = Get-NormalizedAuthorName -Author ([string]$line.Author)
+            Add-Count -Table $lineCountByRevision -Key $lineRevision
+            Add-Count -Table $lineCountByAuthor -Key $lineAuthor
+            if (-not $lineCountByRevisionAuthor.ContainsKey($lineRevision))
+            {
+                $lineCountByRevisionAuthor[$lineRevision] = @{}
+            }
+            Add-Count -Table $lineCountByRevisionAuthor[$lineRevision] -Key $lineAuthor
+        }
+        $summary = [pscustomobject]@{
+            LineCountTotal = [int]$lines.Count
+            LineCountByRevision = $lineCountByRevision
+            LineCountByAuthor = $lineCountByAuthor
+            LineCountByRevisionAuthor = $lineCountByRevisionAuthor
+            Lines = @()
+        }
+        Add-StrictOwnershipBlameSummary -BlameByFile $blameByFile -AuthorOwned $authorOwned -OwnedTotal ([ref]$ownedTotal) -FilePath $filePath -Blame $summary
+    }
+    return [pscustomobject]@{
+        OwnershipTargets = @($existingFileSet)
+        ExistingFileSet = $existingFileSet
+        BlameByFile = $blameByFile
+        AuthorOwned = $authorOwned
+        OwnedTotal = [int]$ownedTotal
+    }
+}
+function Get-AuthorModifiedOthersSurvivedCountFromRevisionAuthorSummary
+{
+    <#
+    .SYNOPSIS
+        revision-author 集計テーブルから他者コード変更生存行数を算出する。
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [hashtable]$BlameByFile,
+        [System.Collections.Generic.HashSet[string]]$RevsWhereKilledOthers,
+        [int]$FromRevision,
+        [int]$ToRevision
+    )
+    $authorModifiedOthersSurvived = @{}
+    foreach ($filePath in @($BlameByFile.Keys))
+    {
+        $blame = $BlameByFile[$filePath]
+        if ($null -eq $blame)
+        {
+            continue
+        }
+        if ($blame.PSObject.Properties.Match('LineCountByRevisionAuthor').Count -eq 0 -or $null -eq $blame.LineCountByRevisionAuthor)
+        {
+            continue
+        }
+        foreach ($revisionKey in @($blame.LineCountByRevisionAuthor.Keys))
+        {
+            $lineRevision = $null
+            try
+            {
+                $lineRevision = [int]$revisionKey
+            }
+            catch
+            {
+                $lineRevision = $null
+            }
+            if ($null -eq $lineRevision -or $lineRevision -lt $FromRevision -or $lineRevision -gt $ToRevision)
+            {
+                continue
+            }
+            $authorTable = $blame.LineCountByRevisionAuthor[$revisionKey]
+            if ($authorTable -isnot [hashtable])
+            {
+                continue
+            }
+            foreach ($authorKey in @($authorTable.Keys))
+            {
+                $lineAuthor = Get-NormalizedAuthorName -Author ([string]$authorKey)
+                $lookupKey = [string]$lineRevision + [char]31 + $lineAuthor
+                if (-not $RevsWhereKilledOthers.Contains($lookupKey))
+                {
+                    continue
+                }
+                Add-Count -Table $authorModifiedOthersSurvived -Key $lineAuthor -Delta ([int]$authorTable[$authorKey])
+            }
+        }
+    }
+    return $authorModifiedOthersSurvived
+}
+function Get-ExactDeathAttributionFromDiffState
+{
+    <#
+    .SYNOPSIS
+        DiffState エンジンを用いて strict death attribution を算出する。
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Context,
+        [object[]]$Commits,
+        [hashtable]$RevToAuthor,
+        [string]$TargetUrl,
+        [int]$FromRevision,
+        [int]$ToRevision,
+        [string]$CacheDir,
+        [hashtable]$RenameMap = @{}
+    )
+    $accumulator = New-StrictAttributionAccumulator
+    $strictStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $Context.Caches.StrictTransitionContextByRevision = @{}
+    $Context.Runtime.StrictFallbackTransitionCount = 0
+    $Context.Runtime.DiffStateApplyMismatchCount = 0
+    $fileLineStateByPath = @{}
+
+    [void](Get-StrictBlamePrefetchTarget -Context $Context -Commits $Commits -FromRevision $FromRevision -ToRevision $ToRevision -CacheDir $CacheDir -RenameMap $RenameMap)
+    $targetEnumerationSeconds = $strictStopwatch.Elapsed.TotalSeconds
+    $prefetchSeconds = $targetEnumerationSeconds
+    $prefetchedTransitionContextByRevision = @{}
+    if ($Context.Caches.ContainsKey('StrictTransitionContextByRevision') -and $Context.Caches.StrictTransitionContextByRevision -is [hashtable])
+    {
+        $prefetchedTransitionContextByRevision = $Context.Caches.StrictTransitionContextByRevision
+    }
+
+    $sortedCommits = @($Commits | Sort-Object Revision)
+    $deathTotal = $sortedCommits.Count
+    $deathIdx = 0
+    foreach ($commit in $sortedCommits)
+    {
+        $revision = [int]$commit.Revision
+        if ($revision -lt $FromRevision -or $revision -gt $ToRevision)
+        {
+            continue
+        }
+        $pct = [Math]::Min(100, [int](($deathIdx / [Math]::Max(1, $deathTotal)) * 100))
+        Write-NarutoProgress -Id 3 -Activity '行単位の帰属解析 (DiffState)' -Status ('r{0} ({1}/{2})' -f $revision, ($deathIdx + 1), $deathTotal) -PercentComplete $pct
+        $killer = Resolve-StrictKillerAuthor -Commit $commit -RevToAuthor $RevToAuthor
+        $commitTransitionContexts = @(Resolve-StrictCommitTransitionContextSet -Context $Context -Commit $commit -RenameMap $RenameMap -PrefetchedTransitionContextByRevision $prefetchedTransitionContextByRevision)
+        foreach ($transitionContext in @($commitTransitionContexts))
+        {
+            if ($null -eq $transitionContext)
+            {
+                continue
+            }
+            $transitionResult = Get-StrictDiffStateComparisonForTransition -Context $Context -FileLineStateByPath $fileLineStateByPath -TransitionContext $transitionContext -TargetUrl $TargetUrl -Revision $revision -CacheDir $CacheDir -CurrentRevisionAuthor $killer
+            if ($null -eq $transitionResult -or $null -eq $transitionResult.Comparison)
+            {
+                continue
+            }
+            Update-StrictAccumulatorFromComparison -Accumulator $accumulator -Comparison $transitionResult.Comparison -Revision $revision -Killer $killer -MetricFile ([string]$transitionContext.MetricFile) -FromRevision $FromRevision -ToRevision $ToRevision
+        }
+        $deathIdx++
+    }
+    Write-NarutoProgress -Id 3 -Activity '行単位の帰属解析 (DiffState)' -Completed
+
+    $commitLoopSeconds = $strictStopwatch.Elapsed.TotalSeconds
+    try
+    {
+        $strictHunk = Get-StrictHunkDetail -Context $Context -Commits $Commits -RevToAuthor $RevToAuthor -RenameMap $RenameMap
+    }
+    catch
+    {
+        Throw-NarutoError -Category 'STRICT' -ErrorCode 'STRICT_HUNK_ANALYSIS_FAILED' -Message ("Strict hunk analysis failed: {0}`n{1}" -f $_.Exception.Message, $_.ScriptStackTrace) -Context @{} -InnerException $_.Exception
+    }
+    $hunkSeconds = $strictStopwatch.Elapsed.TotalSeconds
+    Set-NarutoPerformanceValue -Context $Context -SectionName 'StrictBreakdown' -Key 'TargetEnumeration' -Value (Format-MetricValue -Value $targetEnumerationSeconds)
+    Set-NarutoPerformanceValue -Context $Context -SectionName 'StrictBreakdown' -Key 'Prefetch' -Value (Format-MetricValue -Value ($prefetchSeconds - $targetEnumerationSeconds))
+    Set-NarutoPerformanceValue -Context $Context -SectionName 'StrictBreakdown' -Key 'CommitLoop' -Value (Format-MetricValue -Value ($commitLoopSeconds - $prefetchSeconds))
+    Set-NarutoPerformanceValue -Context $Context -SectionName 'StrictBreakdown' -Key 'Hunk' -Value (Format-MetricValue -Value ($hunkSeconds - $commitLoopSeconds))
+    Set-NarutoPerformanceValue -Context $Context -SectionName 'StrictBreakdown' -Key 'Total' -Value (Format-MetricValue -Value $hunkSeconds)
+
+    if ([int]$Context.Runtime.StrictFallbackTransitionCount -gt 0)
+    {
+        $Context.Runtime.StrictModePath = 'Mixed'
+    }
+    else
+    {
+        $Context.Runtime.StrictModePath = 'DiffState'
+    }
+
+    $result = Get-StrictAttributionResult -Accumulator $accumulator -StrictHunk $strictHunk
+    $result | Add-Member -NotePropertyName 'DiffStateByFile' -NotePropertyValue $fileLineStateByPath
+    return $result
 }
 function Get-StrictAttributionResult
 {
@@ -13838,6 +15370,47 @@ function ConvertFrom-SvnLogDiffTextByRevision
     {
         return $diffByRevision
     }
+
+    if ('UnifiedLogDiffScannerV2' -as [type])
+    {
+        try
+        {
+            $fastParsed = [UnifiedLogDiffScannerV2]::SplitByRevision($LogDiffText)
+            if ($null -ne $fastParsed)
+            {
+                foreach ($fastRevisionKey in @($fastParsed.Keys))
+                {
+                    $diffByRevision[[int]$fastRevisionKey] = [string]$fastParsed[$fastRevisionKey]
+                }
+                return $diffByRevision
+            }
+        }
+        catch
+        {
+            # FastCore の失敗は機能退行を避けるため既存実装へフォールバックする。
+            [void]$_
+        }
+    }
+    elseif ('UnifiedLogDiffScanner' -as [type])
+    {
+        try
+        {
+            $fastParsed = [UnifiedLogDiffScanner]::SplitByRevision($LogDiffText)
+            if ($null -ne $fastParsed)
+            {
+                foreach ($fastRevisionKey in @($fastParsed.Keys))
+                {
+                    $diffByRevision[[int]$fastRevisionKey] = [string]$fastParsed[$fastRevisionKey]
+                }
+                return $diffByRevision
+            }
+        }
+        catch
+        {
+            [void]$_
+        }
+    }
+
     $currentRevision = $null
     $capturingDiff = $false
     $diffBuilder = New-Object System.Text.StringBuilder
@@ -15078,7 +16651,7 @@ function Merge-CommitDiffForCommit
         }
     }
     $Commit.FileDiffStats = $filteredByLog
-    $Commit.FilesChanged = @($Commit.FileDiffStats.Keys | Sort-Object)
+    $Commit.FilesChanged = @($Commit.FileDiffStats.Keys)
 
     # ChangedPathsFiltered のパスも diff 相対パスに統一する
     if ($LogPathPrefix -and -not $changedPathsAreDiffRelative)
@@ -15960,6 +17533,57 @@ function Get-StrictExecutionContext
     $ownershipParallel = [Math]::Max(1, [Math]::Min($effectiveParallel, 12))
     $strictDetail = $null
     $ownershipAggregate = $null
+    $Context.Runtime.StrictFallbackTransitionCount = 0
+    $Context.Runtime.DiffStateApplyMismatchCount = 0
+    $Context.Runtime.DiffStateOwnershipEnabled = $false
+
+    if (Test-StrictDiffStateEligibility -Context $Context -FromRevision $FromRevision)
+    {
+        try
+        {
+            $Context.Runtime.StrictModePath = 'DiffState'
+            $strictDetail = Get-ExactDeathAttributionFromDiffState -Context $Context -Commits $Commits -RevToAuthor $RevToAuthor -TargetUrl $TargetUrl -FromRevision $FromRevision -ToRevision $ToRevision -CacheDir $CacheDir -RenameMap $renameMap
+            if ($null -eq $strictDetail -or $strictDetail.PSObject.Properties.Match('DiffStateByFile').Count -eq 0 -or $null -eq $strictDetail.DiffStateByFile)
+            {
+                Throw-NarutoError -Category 'STRICT' -ErrorCode 'STRICT_DEATH_ATTRIBUTION_NULL' -Message 'DiffState strict detail has no final file state.' -Context @{}
+            }
+            $ownershipAggregate = Get-StrictOwnershipAggregateFromDiffState -Context $Context -DiffStateByFile $strictDetail.DiffStateByFile
+            $Context.Runtime.DiffStateOwnershipEnabled = $true
+
+            if ($strictDetail.PSObject.Properties.Match('RevsWhereKilledOthers').Count -gt 0 -and $strictDetail.RevsWhereKilledOthers -isnot [System.Collections.Generic.HashSet[string]])
+            {
+                $normalizedRevsWhereKilledOthers = New-Object 'System.Collections.Generic.HashSet[string]'
+                foreach ($entry in @($strictDetail.RevsWhereKilledOthers))
+                {
+                    [void]$normalizedRevsWhereKilledOthers.Add([string]$entry)
+                }
+                $strictDetail.RevsWhereKilledOthers = $normalizedRevsWhereKilledOthers
+            }
+            if ($ownershipAggregate.PSObject.Properties.Match('ExistingFileSet').Count -gt 0 -and $ownershipAggregate.ExistingFileSet -isnot [System.Collections.Generic.HashSet[string]])
+            {
+                $normalizedExistingFileSet = New-Object 'System.Collections.Generic.HashSet[string]'
+                foreach ($filePath in @($ownershipAggregate.ExistingFileSet))
+                {
+                    [void]$normalizedExistingFileSet.Add([string]$filePath)
+                }
+                $ownershipAggregate.ExistingFileSet = $normalizedExistingFileSet
+            }
+            $authorModifiedOthersSurvived = Get-AuthorModifiedOthersSurvivedCountFromRevisionAuthorSummary -BlameByFile $ownershipAggregate.BlameByFile -RevsWhereKilledOthers $strictDetail.RevsWhereKilledOthers -FromRevision $FromRevision -ToRevision $ToRevision
+            return (New-StrictExecutionContext -RenameMap $renameMap -StrictDetail $strictDetail -AuthorOwned $ownershipAggregate.AuthorOwned -OwnedTotal ([int]$ownershipAggregate.OwnedTotal) -BlameByFile $ownershipAggregate.BlameByFile -ExistingFileSet $ownershipAggregate.ExistingFileSet -AuthorModifiedOthersSurvived $authorModifiedOthersSurvived)
+        }
+        catch
+        {
+            Write-NarutoDiagnostic -Context $Context -Level 'Warning' -ErrorCode 'STRICT_DIFFSTATE_FALLBACK' -Message ("DiffState fast path failed. Fallback to legacy strict path: {0}" -f $_.Exception.Message)
+            $Context.Runtime.StrictModePath = 'Legacy'
+            $Context.Runtime.StrictFallbackTransitionCount = 0
+            $Context.Runtime.DiffStateApplyMismatchCount = 0
+            $Context.Runtime.DiffStateOwnershipEnabled = $false
+        }
+    }
+    else
+    {
+        $Context.Runtime.StrictModePath = 'Legacy'
+    }
 
     if ($effectiveParallel -le 1)
     {
@@ -16337,6 +17961,11 @@ function New-RunMetaData
     $diagnosticWarningCount = 0
     $diagnosticWarningCodes = [ordered]@{}
     $diagnosticSkippedOutputs = @()
+    $diagnosticStrictModePath = 'Legacy'
+    $diagnosticStrictFallbackTransitionCount = 0
+    $diagnosticDiffStateApplyMismatchCount = 0
+    $diagnosticDiffStateOwnershipEnabled = $false
+    $diagnosticFastCoreEnabled = $false
     $stageSeconds = [ordered]@{}
     $strictBreakdown = [ordered]@{}
     $strictTargetStats = [ordered]@{}
@@ -16352,6 +17981,29 @@ function New-RunMetaData
         if ($null -ne $Context.Diagnostics.SkippedOutputs)
         {
             $diagnosticSkippedOutputs = @($Context.Diagnostics.SkippedOutputs.ToArray())
+        }
+        if ($Context.ContainsKey('Runtime') -and $null -ne $Context.Runtime)
+        {
+            if ($Context.Runtime.ContainsKey('StrictModePath') -and -not [string]::IsNullOrWhiteSpace([string]$Context.Runtime.StrictModePath))
+            {
+                $diagnosticStrictModePath = [string]$Context.Runtime.StrictModePath
+            }
+            if ($Context.Runtime.ContainsKey('StrictFallbackTransitionCount'))
+            {
+                $diagnosticStrictFallbackTransitionCount = [int]$Context.Runtime.StrictFallbackTransitionCount
+            }
+            if ($Context.Runtime.ContainsKey('DiffStateApplyMismatchCount'))
+            {
+                $diagnosticDiffStateApplyMismatchCount = [int]$Context.Runtime.DiffStateApplyMismatchCount
+            }
+            if ($Context.Runtime.ContainsKey('DiffStateOwnershipEnabled'))
+            {
+                $diagnosticDiffStateOwnershipEnabled = [bool]$Context.Runtime.DiffStateOwnershipEnabled
+            }
+            if ($Context.Runtime.ContainsKey('FastCoreEnabled'))
+            {
+                $diagnosticFastCoreEnabled = [bool]$Context.Runtime.FastCoreEnabled
+            }
         }
         if ($Context.Diagnostics.ContainsKey('Performance') -and $null -ne $Context.Diagnostics.Performance)
         {
@@ -16418,6 +18070,11 @@ function New-RunMetaData
             WarningCount = $diagnosticWarningCount
             WarningCodes = $diagnosticWarningCodes
             SkippedOutputs = $diagnosticSkippedOutputs
+            StrictModePath = $diagnosticStrictModePath
+            StrictFallbackTransitionCount = [int]$diagnosticStrictFallbackTransitionCount
+            DiffStateApplyMismatchCount = [int]$diagnosticDiffStateApplyMismatchCount
+            DiffStateOwnershipEnabled = [bool]$diagnosticDiffStateOwnershipEnabled
+            FastCoreEnabled = [bool]$diagnosticFastCoreEnabled
         }
         Outputs = [ordered]@{
             CommittersCsv = 'committers.csv'
@@ -17166,6 +18823,8 @@ function Invoke-NarutoCodePipeline
     $startedAt = Get-Date
     $pipelineStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $Context = Initialize-StrictModeContext -Context $Context
+    $fastCoreEnabled = Initialize-FastCore -Context $Context
+    Set-NarutoPerformanceValue -Context $Context -SectionName 'PerfGate' -Key 'FastCoreEnabled' -Value ([bool]$fastCoreEnabled)
     $Context.Runtime.ExcludeCommentOnlyLines = [bool]$ExcludeCommentOnlyLines
     $executionState = Resolve-PipelineExecutionState -Context $Context -RepoUrl $RepoUrl -FromRevision $FromRevision -ToRevision $ToRevision -OutDirectory $OutDirectory -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths -IncludeExtensions $IncludeExtensions -ExcludeExtensions $ExcludeExtensions -SvnExecutable $SvnExecutable -Username $Username -Password $Password -NonInteractive:$NonInteractive -TrustServerCert:$TrustServerCert -ExcludeCommentOnlyLines:$ExcludeCommentOnlyLines
     $requestedParallel = [int]$Parallel

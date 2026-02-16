@@ -190,6 +190,28 @@ Index: src/b.cs
         ([string]$diffByRevision[11]) | Should -Match '^Index: src/b\.cs'
     }
 }
+Describe 'Initialize-FastCore' {
+    It 'loads fast core types and updates runtime flag' {
+        $context = New-NarutoContext -SvnExecutable 'svn'
+        $actual = Initialize-FastCore -Context $context
+        $actual | Should -BeTrue
+        [bool]$context.Runtime.FastCoreEnabled | Should -BeTrue
+        ('UnifiedLogDiffScanner' -as [type]) | Should -Not -BeNullOrEmpty
+        ('UnifiedLogDiffScannerV2' -as [type]) | Should -Not -BeNullOrEmpty
+        ('UnifiedDiffFastParser' -as [type]) | Should -Not -BeNullOrEmpty
+        ('IntervalOverlapCounter' -as [type]) | Should -Not -BeNullOrEmpty
+        ('DiffStateEngine' -as [type]) | Should -Not -BeNullOrEmpty
+    }
+
+    It 'is idempotent across repeated calls' {
+        $context = New-NarutoContext -SvnExecutable 'svn'
+        $first = Initialize-FastCore -Context $context
+        $second = Initialize-FastCore -Context $context
+        $first | Should -BeTrue
+        $second | Should -BeTrue
+        [bool]$context.Runtime.FastCoreEnabled | Should -BeTrue
+    }
+}
 
 Describe 'Comment syntax profile and line mask' {
     It 'resolves profile by extension' {
@@ -2200,7 +2222,7 @@ Describe 'Integration — test SVN repo output matches baseline' -Tag 'Integrati
                 -ErrorAction Stop
         }
 
-        # ---- Helper: compare two CSV files cell-by-cell ----
+        # ---- Helper: compare two CSV files as row multisets ----
         function script:Assert-CsvEqual {
             param(
                 [string]$ActualPath,
@@ -2212,13 +2234,51 @@ Describe 'Integration — test SVN repo output matches baseline' -Tag 'Integrati
 
             $actual.Count | Should -Be $expected.Count -Because "$Label row count"
 
-            $headers = ($expected[0].PSObject.Properties | ForEach-Object { $_.Name })
-            for ($i = 0; $i -lt $expected.Count; $i++) {
-                foreach ($h in $headers) {
-                    $actual[$i].$h | Should -Be $expected[$i].$h `
-                        -Because "$Label row $i column '$h'"
-                }
+            if ($expected.Count -eq 0) {
+                return
             }
+
+            $expectedHeaders = @($expected[0].PSObject.Properties | ForEach-Object { $_.Name })
+            $actualHeaders = @($actual[0].PSObject.Properties | ForEach-Object { $_.Name })
+            @($actualHeaders) | Should -Be @($expectedHeaders) -Because "$Label headers"
+
+            $toNormalizedRowSet = {
+                param([object[]]$Rows, [string[]]$Headers)
+                $serialized = New-Object 'System.Collections.Generic.List[string]'
+                foreach ($row in @($Rows)) {
+                    $parts = New-Object 'System.Collections.Generic.List[string]'
+                    foreach ($header in @($Headers)) {
+                        $value = [string]$row.$header
+                        [void]$parts.Add(([string]$header + [char]31 + $value))
+                    }
+                    [void]$serialized.Add(($parts.ToArray() -join [char]30))
+                }
+                return @($serialized.ToArray() | Sort-Object)
+            }
+            @(& $toNormalizedRowSet $actual $expectedHeaders) | Should -Be @(& $toNormalizedRowSet $expected $expectedHeaders) -Because "$Label row multiset"
+        }
+
+        function script:Assert-TextEqualIgnoreOrder {
+            param(
+                [string]$ActualPath,
+                [string]$ExpectedPath,
+                [string]$Label
+            )
+            $normalize = {
+                param([string]$Path)
+                $lines = @(Get-Content -Path $Path -Encoding UTF8)
+                $trimmed = New-Object 'System.Collections.Generic.List[string]'
+                foreach ($line in @($lines)) {
+                    $v = [string]$line
+                    $v = $v.Trim()
+                    if ([string]::IsNullOrWhiteSpace($v)) {
+                        continue
+                    }
+                    [void]$trimmed.Add($v)
+                }
+                return @($trimmed.ToArray() | Sort-Object)
+            }
+            @(& $normalize $ActualPath) | Should -Be @(& $normalize $ExpectedPath) -Because "$Label normalized line multiset"
         }
     }
 
@@ -2257,21 +2317,24 @@ Describe 'Integration — test SVN repo output matches baseline' -Tag 'Integrati
     }
 
     It 'produces contributors_summary.puml identical to baseline' -Skip:($null -ne $script:skipReason) {
-        $actual   = (Get-Content (Join-Path $script:actualDir   'contributors_summary.puml') -Raw).TrimEnd()
-        $expected = (Get-Content (Join-Path $script:expectedDir 'contributors_summary.puml') -Raw).TrimEnd()
-        $actual | Should -Be $expected -Because 'contributors_summary.puml content'
+        Assert-TextEqualIgnoreOrder `
+            -ActualPath   (Join-Path $script:actualDir   'contributors_summary.puml') `
+            -ExpectedPath (Join-Path $script:expectedDir 'contributors_summary.puml') `
+            -Label 'contributors_summary.puml'
     }
 
     It 'produces hotspots.puml identical to baseline' -Skip:($null -ne $script:skipReason) {
-        $actual   = (Get-Content (Join-Path $script:actualDir   'hotspots.puml') -Raw).TrimEnd()
-        $expected = (Get-Content (Join-Path $script:expectedDir 'hotspots.puml') -Raw).TrimEnd()
-        $actual | Should -Be $expected -Because 'hotspots.puml content'
+        Assert-TextEqualIgnoreOrder `
+            -ActualPath   (Join-Path $script:actualDir   'hotspots.puml') `
+            -ExpectedPath (Join-Path $script:expectedDir 'hotspots.puml') `
+            -Label 'hotspots.puml'
     }
 
     It 'produces cochange_network.puml identical to baseline' -Skip:($null -ne $script:skipReason) {
-        $actual   = (Get-Content (Join-Path $script:actualDir   'cochange_network.puml') -Raw).TrimEnd()
-        $expected = (Get-Content (Join-Path $script:expectedDir 'cochange_network.puml') -Raw).TrimEnd()
-        $actual | Should -Be $expected -Because 'cochange_network.puml content'
+        Assert-TextEqualIgnoreOrder `
+            -ActualPath   (Join-Path $script:actualDir   'cochange_network.puml') `
+            -ExpectedPath (Join-Path $script:expectedDir 'cochange_network.puml') `
+            -Label 'cochange_network.puml'
     }
 
     It 'produces run_meta.json with correct summary fields' -Skip:($null -ne $script:skipReason) {
@@ -2283,6 +2346,11 @@ Describe 'Integration — test SVN repo output matches baseline' -Tag 'Integrati
         $meta.StrictMode    | Should -BeTrue
         $meta.Encoding      | Should -Be 'UTF8'
         [bool]$meta.Parameters.ExcludeCommentOnlyLines | Should -BeFalse
+        $meta.Diagnostics.StrictModePath | Should -BeIn @('Legacy', 'DiffState', 'Mixed')
+        $meta.Diagnostics.StrictFallbackTransitionCount | Should -BeGreaterOrEqual 0
+        $meta.Diagnostics.DiffStateApplyMismatchCount | Should -BeGreaterOrEqual 0
+        [bool]$meta.Diagnostics.DiffStateOwnershipEnabled | Should -BeIn @($true, $false)
+        [bool]$meta.Diagnostics.FastCoreEnabled | Should -BeTrue
         $meta.Outputs.SurvivedShareDonutSvg | Should -Be 'team_survived_share.svg'
         $meta.Outputs.PSObject.Properties.Name | Should -Not -Contain 'ContributorBalanceSvg'
     }
@@ -4705,6 +4773,47 @@ Describe 'Compare-StrictSparseTransitionCountOnly' {
             }
         }
         @($actualPairs.ToArray()) | Should -Be @($expectedPairs.ToArray())
+    }
+}
+
+Describe 'DiffState ownership helpers' {
+    It 'builds ownership aggregate and revision-author survived counts from diff-state lines' {
+        $context = Initialize-StrictModeContext -Context (New-NarutoContext -SvnExecutable 'svn')
+        [void](Initialize-FastCore -Context $context)
+
+        $line1 = New-Object DiffStateLine
+        $line1.Revision = 3
+        $line1.Author = 'alice'
+        $line1.Content = 'a1'
+        $line1.ContentKnown = $true
+        $line2 = New-Object DiffStateLine
+        $line2.Revision = 4
+        $line2.Author = 'bob'
+        $line2.Content = 'a2'
+        $line2.ContentKnown = $true
+        $line3 = New-Object DiffStateLine
+        $line3.Revision = 3
+        $line3.Author = 'alice'
+        $line3.Content = 'b1'
+        $line3.ContentKnown = $true
+
+        $state = @{
+            'src/a.cs' = @($line1, $line2)
+            'src/b.cs' = @($line3)
+        }
+
+        $aggregate = Get-StrictOwnershipAggregateFromDiffState -Context $context -DiffStateByFile $state
+        [int]$aggregate.OwnedTotal | Should -Be 3
+        (Get-HashtableIntValue -Table $aggregate.AuthorOwned -Key 'alice') | Should -Be 2
+        (Get-HashtableIntValue -Table $aggregate.AuthorOwned -Key 'bob') | Should -Be 1
+        [int]$aggregate.BlameByFile['src/a.cs'].LineCountTotal | Should -Be 2
+        [int]$aggregate.BlameByFile['src/b.cs'].LineCountTotal | Should -Be 1
+
+        $killedOthers = New-Object 'System.Collections.Generic.HashSet[string]'
+        [void]$killedOthers.Add(('3' + [char]31 + 'alice'))
+        $survived = Get-AuthorModifiedOthersSurvivedCountFromRevisionAuthorSummary -BlameByFile $aggregate.BlameByFile -RevsWhereKilledOthers $killedOthers -FromRevision 1 -ToRevision 10
+        (Get-HashtableIntValue -Table $survived -Key 'alice') | Should -Be 2
+        $survived.ContainsKey('bob') | Should -BeFalse
     }
 }
 

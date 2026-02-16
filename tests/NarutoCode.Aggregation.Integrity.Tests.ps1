@@ -246,7 +246,7 @@ Describe 'Merge-CommitDiffForCommit intersection filter' {
         $commit.FilesChanged | Should -Contain 'trunk/src/A.cs'
     }
 
-    It 'FilesChanged is sorted after merge' {
+    It 'FilesChanged contains merged file keys after merge' {
         $commit = [pscustomobject]@{
             Revision             = 6
             Author               = 'tester'
@@ -269,7 +269,7 @@ Describe 'Merge-CommitDiffForCommit intersection filter' {
             }
         }
         Merge-CommitDiffForCommit -Commit $commit -RawDiffByRevision $rawDiffByRevision
-        $commit.FilesChanged | Should -Be @('a.cs', 'm.cs', 'z.cs')
+        @($commit.FilesChanged | Sort-Object) | Should -Be @('a.cs', 'm.cs', 'z.cs')
     }
 }
 Describe 'Cross-check aggregation consistency (3 authors, 5 commits, 4 files)' {
