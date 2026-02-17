@@ -46,6 +46,13 @@ Describe 'Test-ShouldCountFile' {
         Test-ShouldCountFile -FilePath 'src/generated/a.cs' -IncludePathPatterns @('src/*') -ExcludePathPatterns @('*generated*') | Should -BeFalse
         Test-ShouldCountFile -FilePath 'src/core/a.cs' -IncludePathPatterns @('src/*') -ExcludePathPatterns @('*generated*') | Should -BeTrue
     }
+
+    It 'keeps result identical when PathAlreadyNormalized is specified' {
+        $filterCacheKey = @('cs', '', 'src/*', '') -join [char]31
+        $actual = Test-ShouldCountFile -FilePath 'src/a.cs' -IncludeExtensions @('cs') -IncludePathPatterns @('src/*')
+        $normalized = Test-ShouldCountFile -FilePath 'src/a.cs' -IncludeExtensions @('cs') -IncludePathPatterns @('src/*') -PathAlreadyNormalized -FilterCacheKey $filterCacheKey
+        $normalized | Should -Be $actual
+    }
 }
 
 Describe 'ConvertFrom-SvnLogXml' {
@@ -196,11 +203,18 @@ Describe 'Initialize-FastCore' {
         $actual = Initialize-FastCore -Context $context
         $actual | Should -BeTrue
         [bool]$context.Runtime.FastCoreEnabled | Should -BeTrue
+        [bool]$context.Runtime.FastCoreV3Enabled | Should -BeTrue
         ('UnifiedLogDiffScanner' -as [type]) | Should -Not -BeNullOrEmpty
         ('UnifiedLogDiffScannerV2' -as [type]) | Should -Not -BeNullOrEmpty
+        ('UnifiedLogDiffScannerV3' -as [type]) | Should -Not -BeNullOrEmpty
         ('UnifiedDiffFastParser' -as [type]) | Should -Not -BeNullOrEmpty
+        ('UnifiedDiffStructuredParserV3' -as [type]) | Should -Not -BeNullOrEmpty
+        ('DiffStatProjectorV3' -as [type]) | Should -Not -BeNullOrEmpty
+        ('StrictTransitionProjectorV3' -as [type]) | Should -Not -BeNullOrEmpty
         ('IntervalOverlapCounter' -as [type]) | Should -Not -BeNullOrEmpty
         ('DiffStateEngine' -as [type]) | Should -Not -BeNullOrEmpty
+        ('DiffStateApplyEngineV3' -as [type]) | Should -Not -BeNullOrEmpty
+        ('DiffStateOwnershipAggregatorV3' -as [type]) | Should -Not -BeNullOrEmpty
     }
 
     It 'is idempotent across repeated calls' {
@@ -210,6 +224,7 @@ Describe 'Initialize-FastCore' {
         $first | Should -BeTrue
         $second | Should -BeTrue
         [bool]$context.Runtime.FastCoreEnabled | Should -BeTrue
+        [bool]$context.Runtime.FastCoreV3Enabled | Should -BeTrue
     }
 }
 
@@ -1790,6 +1805,25 @@ Describe 'ConvertTo-ContextHash' {
 }
 
 Describe 'ConvertFrom-SvnUnifiedDiff with DetailLevel' {
+    BeforeAll {
+        $script:getLineEntryParts = {
+            param([object]$Entry)
+            if ($null -eq $Entry)
+            {
+                return @('', '')
+            }
+            if ($Entry.PSObject.Properties.Match('LineNumber').Count -gt 0 -and $Entry.PSObject.Properties.Match('Content').Count -gt 0)
+            {
+                return @([string]([int]$Entry.LineNumber), [string]$Entry.Content)
+            }
+            return ([string]$Entry).Split(@([char]31), 2, [System.StringSplitOptions]::None)
+        }
+    }
+
+    AfterAll {
+        Remove-Variable -Name 'getLineEntryParts' -Scope Script -ErrorAction SilentlyContinue
+    }
+
     It 'captures line hashes at DetailLevel 1' {
         $diff = @"
 Index: trunk/src/Main.cs
@@ -1846,14 +1880,10 @@ Index: trunk/src/Main.cs
         $hunk = $parsed['trunk/src/Main.cs'].Hunks[0]
         $hunk.DeletedLineEntries.Count | Should -Be 2
         $hunk.AddedLineEntries.Count | Should -Be 2
-        $deletedEntry1 = [string]$hunk.DeletedLineEntries[0]
-        $deletedEntry2 = [string]$hunk.DeletedLineEntries[1]
-        $addedEntry1 = [string]$hunk.AddedLineEntries[0]
-        $addedEntry2 = [string]$hunk.AddedLineEntries[1]
-        $deletedParts1 = $deletedEntry1.Split(@([char]31), 2, [System.StringSplitOptions]::None)
-        $deletedParts2 = $deletedEntry2.Split(@([char]31), 2, [System.StringSplitOptions]::None)
-        $addedParts1 = $addedEntry1.Split(@([char]31), 2, [System.StringSplitOptions]::None)
-        $addedParts2 = $addedEntry2.Split(@([char]31), 2, [System.StringSplitOptions]::None)
+        $deletedParts1 = & $script:getLineEntryParts -Entry $hunk.DeletedLineEntries[0]
+        $deletedParts2 = & $script:getLineEntryParts -Entry $hunk.DeletedLineEntries[1]
+        $addedParts1 = & $script:getLineEntryParts -Entry $hunk.AddedLineEntries[0]
+        $addedParts2 = & $script:getLineEntryParts -Entry $hunk.AddedLineEntries[1]
         $deletedParts1[0] | Should -Be '11'
         $deletedParts2[0] | Should -Be '12'
         $deletedParts1[1] | Should -Be 'old1'
@@ -1884,8 +1914,8 @@ Index: trunk/src/Main.cs
         $hunk.DeletedLineHashes.Count | Should -Be 0
         $hunk.AddedLineEntries.Count | Should -Be 1
         $hunk.DeletedLineEntries.Count | Should -Be 1
-        $addedToken = ([string]$hunk.AddedLineEntries[0]).Split(@([char]31), 2, [System.StringSplitOptions]::None)
-        $deletedToken = ([string]$hunk.DeletedLineEntries[0]).Split(@([char]31), 2, [System.StringSplitOptions]::None)
+        $addedToken = & $script:getLineEntryParts -Entry $hunk.AddedLineEntries[0]
+        $deletedToken = & $script:getLineEntryParts -Entry $hunk.DeletedLineEntries[0]
         $addedToken[0] | Should -Be '1'
         $addedToken[1] | Should -Be 'new'
         $deletedToken[0] | Should -Be '1'
@@ -2351,6 +2381,11 @@ Describe 'Integration — test SVN repo output matches baseline' -Tag 'Integrati
         $meta.Diagnostics.DiffStateApplyMismatchCount | Should -BeGreaterOrEqual 0
         [bool]$meta.Diagnostics.DiffStateOwnershipEnabled | Should -BeIn @($true, $false)
         [bool]$meta.Diagnostics.FastCoreEnabled | Should -BeTrue
+        [bool]$meta.Diagnostics.FastCoreV3Enabled | Should -BeTrue
+        [string]$meta.Diagnostics.LogDiffParsePath | Should -BeIn @('Legacy', 'V1', 'V2', 'V3')
+        $meta.Diagnostics.UnifiedDiffParseFallbackCount | Should -BeGreaterOrEqual 0
+        [string]$meta.Diagnostics.StrictTransitionProjectorPath | Should -BeIn @('Legacy', 'V3')
+        [string]$meta.Diagnostics.DiffStateApplyPath | Should -BeIn @('Legacy', 'V3')
         $meta.Outputs.SurvivedShareDonutSvg | Should -Be 'team_survived_share.svg'
         $meta.Outputs.PSObject.Properties.Name | Should -Not -Contain 'ContributorBalanceSvg'
     }
@@ -4567,9 +4602,20 @@ Describe 'Resolve-PathByRenameMap - 連鎖解決' {
 
 Describe 'Resolve-AutoParallelWorkerCount' {
     It 'uses high range rule for >=300 commits' {
-        (Resolve-AutoParallelWorkerCount -CommitCount 300 -CpuCount 32) | Should -Be 24
-        (Resolve-AutoParallelWorkerCount -CommitCount 300 -CpuCount 16) | Should -Be 24
+        (Resolve-AutoParallelWorkerCount -CommitCount 300 -CpuCount 32) | Should -Be 20
+        (Resolve-AutoParallelWorkerCount -CommitCount 300 -CpuCount 16) | Should -Be 12
         (Resolve-AutoParallelWorkerCount -CommitCount 500 -CpuCount 4) | Should -Be 8
+    }
+
+    It 'uses conservative rule for local repositories in high range' {
+        (Resolve-AutoParallelWorkerCount -CommitCount 300 -CpuCount 32 -PreferConservativeParallel) | Should -Be 16
+        (Resolve-AutoParallelWorkerCount -CommitCount 300 -CpuCount 16 -PreferConservativeParallel) | Should -Be 16
+        (Resolve-AutoParallelWorkerCount -CommitCount 500 -CpuCount 4 -PreferConservativeParallel) | Should -Be 8
+    }
+
+    It 'expands conservative parallel for very large local histories' {
+        (Resolve-AutoParallelWorkerCount -CommitCount 440 -CpuCount 16 -PreferConservativeParallel) | Should -Be 28
+        (Resolve-AutoParallelWorkerCount -CommitCount 440 -CpuCount 12 -PreferConservativeParallel) | Should -Be 21
     }
 
     It 'uses medium range rule for 100-299 commits' {
@@ -4686,6 +4732,39 @@ Describe 'Invoke-PipelineLogAndDiffStage parallel decision' {
 
         [int]$stage.EffectiveParallel | Should -Be 7
         [int]$script:autoParallelObserved | Should -Be 7
+    }
+
+    It 'uses conservative auto-parallel for local file repository' {
+        $script:logCommitsForAutoParallel = @(
+            1..320 | ForEach-Object {
+                [pscustomobject]@{
+                    Revision = $_
+                    Author = 'alice'
+                    ChangedPaths = @()
+                    ChangedPathsFiltered = @()
+                    FileDiffStats = @{}
+                    FilesChanged = @()
+                }
+            }
+        )
+        $executionState = [pscustomobject]@{
+            FromRevision = 1
+            ToRevision = 320
+            TargetUrl = 'file:///C:/tmp/repo'
+            CacheDir = 'dummy'
+            IncludeExtensions = @()
+            ExcludeExtensions = @()
+            IncludePaths = @()
+            ExcludePaths = @()
+            LogPathPrefix = ''
+            ExcludeCommentOnlyLines = $false
+        }
+        $context = Initialize-StrictModeContext -Context (New-NarutoContext -SvnExecutable 'svn')
+        $stage = Invoke-PipelineLogAndDiffStage -Context $context -ExecutionState $executionState -Parallel 32
+        $expected = Resolve-AutoParallelWorkerCount -CommitCount 320 -CpuCount $([Environment]::ProcessorCount) -PreferConservativeParallel
+
+        [int]$stage.EffectiveParallel | Should -Be $expected
+        [int]$script:autoParallelObserved | Should -Be $expected
     }
 }
 
